@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://albilich.local/schemas/phase2_patch.schema.json",
+  "title": "Albilich v1 Patch",
+  "type": "object",
+  "required": ["schema_version", "problem_id", "base_revision", "actor_role", "operations"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {"const": 1},
+    "patch_id": {"type": "string"},
+    "problem_id": {"type": "string", "minLength": 1},
+    "base_revision": {"type": "integer", "minimum": 0},
+    "actor_role": {"type": "string", "minLength": 1},
+    "target_id": {"type": "string"},
+    "evidence_artifact_ids": {"type": "array", "items": {"type": "string"}},
+    "rationale": {"type": "string"},
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["op"],
+        "additionalProperties": true,
+        "properties": {
+          "op": {
+            "enum": [
+              "attach_artifact",
+              "add_claim",
+              "add_route",
+              "add_inference",
+              "add_debt",
+              "update_debt",
+              "resolve_debt",
+              "propose_status_transition",
+              "record_run_metrics",
+              "abandon_route",
+              "reactivate_route",
+              "cache_retrieval_card",
+              "certify_external_citation"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Agent runtime artifacts
+.albilich/
+agents/generation/logs/
+agents/generation/memory/
+agents/generation/results/
+agents/generation/downloads/
+agents/generation/data/**/*.refs/.extracted/
+agents/verification/logs/
+agents/verification/memory/
+agents/verification/results/
+
+# Zola build output and downloaded theme are ignored by agents/generation/site/.gitignore too.
+agents/generation/site/public/
+agents/generation/site/themes/
+agents/generation/site/content/*/
+__pycache__/
+*.pyc
