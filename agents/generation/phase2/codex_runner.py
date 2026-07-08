@@ -1110,6 +1110,8 @@ def execute_session(
                 stale_retry_seconds = _stale_retry_timeout_seconds(timeout_sec)
                 last_progress_signature = _codex_live_progress_signature(log_path)
                 last_progress_at = time.monotonic()
+                active_retry_marker = _codex_retry_stall_marker(log_path)
+                retry_stall_started_at: float | None = None
                 while True:
                     if stop_event is not None and stop_event.is_set():
                         status = "cancelled"
@@ -1133,10 +1135,21 @@ def execute_session(
                         emit_progress("timeout", progress_status=status, current_returncode=returncode)
                         break
                     current_signature = _codex_live_progress_signature(log_path)
+                    current_retry_marker = _codex_retry_stall_marker(log_path)
                     if current_signature != last_progress_signature:
+                        retry_marker_changed = current_retry_marker != active_retry_marker
                         last_progress_signature = current_signature
                         last_progress_at = time.monotonic()
-                    elif stale_retry_seconds > 0 and _codex_retry_stall_seen(log_path) and time.monotonic() - last_progress_at >= stale_retry_seconds:
+                        active_retry_marker = current_retry_marker
+                        if retry_marker_changed and current_retry_marker is not None:
+                            retry_stall_started_at = last_progress_at
+                        else:
+                            retry_stall_started_at = None
+                    elif (
+                        stale_retry_seconds > 0
+                        and retry_stall_started_at is not None
+                        and time.monotonic() - retry_stall_started_at >= stale_retry_seconds
+                    ):
                         status = "timeout"
                         failure_kind = "stale_stream"
                         _terminate_process(process)
@@ -1874,8 +1887,40 @@ def _codex_live_progress_signature(path: Path) -> tuple[int, int, int, int]:
 
 
 def _codex_retry_stall_seen(path: Path) -> bool:
-    sample = _join_log_samples(_read_text_head(path), _read_text_tail(path))
-    return any(fragment in sample for fragment in STALE_RETRY_LOG_FRAGMENTS)
+    return _codex_retry_stall_marker(path) is not None
+
+
+def _codex_retry_stall_marker(path: Path) -> tuple[int, str, str] | None:
+    if not path.exists():
+        return None
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > LOG_PARSE_TAIL_BYTES:
+                fh.seek(-LOG_PARSE_TAIL_BYTES, os.SEEK_END)
+                base_offset = size - LOG_PARSE_TAIL_BYTES
+            else:
+                base_offset = 0
+            data = fh.read()
+    except OSError:
+        return None
+
+    best_index = -1
+    best_fragment = ""
+    for fragment in STALE_RETRY_LOG_FRAGMENTS:
+        index = data.rfind(fragment.encode("utf-8"))
+        if index > best_index:
+            best_index = index
+            best_fragment = fragment
+    if best_index < 0:
+        return None
+
+    line_start = data.rfind(b"\n", 0, best_index) + 1
+    line_end = data.find(b"\n", best_index)
+    if line_end < 0:
+        line_end = len(data)
+    line = data[line_start:line_end].decode("utf-8", errors="replace").strip()
+    return (base_offset + best_index, best_fragment, line[:500])
 
 
 def _read_text_tail(path: Path, max_bytes: int = LOG_PARSE_TAIL_BYTES) -> str:

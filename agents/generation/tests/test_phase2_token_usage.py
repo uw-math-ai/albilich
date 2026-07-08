@@ -243,6 +243,70 @@ class Phase2TokenUsageTest(unittest.TestCase):
             self.assertIn("no log/token progress after a Codex stream retry", log)
             self.assertIn("Codex stream retry stalled", result["patch_error"])
 
+    def test_old_codex_retry_warning_does_not_poison_later_quiet_period(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_codex = root / "fake_codex.py"
+            patch = {
+                "schema_version": 1,
+                "problem_id": "codex-old-retry-warning-test",
+                "base_revision": 0,
+                "actor_role": "researcher",
+                "target_id": "root",
+                "operations": [
+                    {
+                        "op": "attach_artifact",
+                        "artifact_id": "post-retry-progress-dossier",
+                        "artifact_type": "proof_dossier",
+                        "content": "The session made ordinary progress after an old retry warning.",
+                        "metadata": {"target_id": "root"},
+                    }
+                ],
+            }
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, time\n"
+                "print('session id: 019ef5aa-0000-7000-9000-oldretry1', flush=True)\n"
+                "print('2026-06-28T00:00:00Z  WARN codex_core::responses_retry: stream disconnected - retrying sampling request (1/5 in 196ms)...', flush=True)\n"
+                "time.sleep(0.2)\n"
+                "print('[fake-codex] ordinary progress after the retry warning', flush=True)\n"
+                "time.sleep(0.25)\n"
+                f"print({json.dumps(json.dumps(patch))}, flush=True)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            store = ProofStateStore("codex-old-retry-warning-test", generation_root=root / "generation")
+            store.init_problem("Prove the target theorem.")
+            action = {"mode": "prove", "target_id": "root"}
+            plan = prepare_session(store, action)
+            old_stale = os.environ.get("ALBILICH_CODEX_STALE_RETRY_SECONDS")
+            old_heartbeat = os.environ.get("ALBILICH_UI_HEARTBEAT_SECONDS")
+            os.environ["ALBILICH_CODEX_STALE_RETRY_SECONDS"] = "0.15"
+            os.environ["ALBILICH_UI_HEARTBEAT_SECONDS"] = "0.05"
+            try:
+                result = execute_session(
+                    store,
+                    action,
+                    plan,
+                    codex_bin=str(fake_codex),
+                    timeout_sec=5,
+                )
+            finally:
+                if old_stale is None:
+                    os.environ.pop("ALBILICH_CODEX_STALE_RETRY_SECONDS", None)
+                else:
+                    os.environ["ALBILICH_CODEX_STALE_RETRY_SECONDS"] = old_stale
+                if old_heartbeat is None:
+                    os.environ.pop("ALBILICH_UI_HEARTBEAT_SECONDS", None)
+                else:
+                    os.environ["ALBILICH_UI_HEARTBEAT_SECONDS"] = old_heartbeat
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["patch"]["operations"][0]["artifact_id"], "post-retry-progress-dossier")
+            log = Path(result["log_path"]).read_text(encoding="utf-8")
+            self.assertIn("ordinary progress after the retry warning", log)
+            self.assertNotIn("no log/token progress after a Codex stream retry", log)
+
     def test_default_codex_retry_stall_timeout_is_short(self) -> None:
         old_stale = os.environ.get("ALBILICH_CODEX_STALE_RETRY_SECONDS")
         try:
