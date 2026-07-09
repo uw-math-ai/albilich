@@ -2995,7 +2995,14 @@ def _has_artifact_type(
     return False
 
 
-ZERO_GAP_VERIFICATION_VERDICTS = {"correct", "correct_no_gaps", "correct_refutation", "informally_verified", "verified"}
+ZERO_GAP_VERIFICATION_VERDICTS = {
+    "correct",
+    "correct_no_gaps",
+    "correct_refutation",
+    "informally_verified",
+    "pass",
+    "verified",
+}
 
 
 def _has_correct_verification(conn: sqlite3.Connection, evidence_ids: Sequence[str], *, producer_role: Optional[str] = None) -> bool:

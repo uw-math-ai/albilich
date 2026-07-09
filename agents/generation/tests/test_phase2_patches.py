@@ -2148,9 +2148,9 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(integrated.accepted, integrated.errors)
 
-    def test_correct_no_gaps_report_can_certify_claim(self) -> None:
+    def _assert_zero_gap_verdict_can_certify_claim(self, verdict: str) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = ProofStateStore("verification-correct-no-gaps-test", generation_root=Path(tmpdir) / "generation")
+            store = ProofStateStore(f"verification-{verdict}-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("prove the root theorem")
 
             seed = apply_patch(
@@ -2197,16 +2197,14 @@ class Phase2ExternalCitationTest(unittest.TestCase):
                             "op": "attach_artifact",
                             "artifact_id": "verification-report",
                             "artifact_type": "verification_report",
-                            "content": "verdict: correct_no_gaps\ncritical_errors: []\ngaps: []\n",
+                            "content": f"verdict: {verdict}\ncritical_errors: []\ngaps: []\n",
                             "metadata": {
-                                "verdict": "correct_no_gaps",
-                                "verification_report": {
-                                    "summary": "No gaps.",
-                                    "checked_items": ["Checked the complete local proof packet."],
-                                    "critical_errors": [],
-                                    "gaps": [],
-                                    "blocking_gap": None,
-                                },
+                                "verdict": verdict,
+                                "summary": "No gaps.",
+                                "checked_items": ["Checked the complete local proof packet."],
+                                "critical_errors": [],
+                                "gaps": [],
+                                "blocking_gap": None,
                             },
                         },
                         {
@@ -2237,6 +2235,12 @@ class Phase2ExternalCitationTest(unittest.TestCase):
                 inference = conn.execute("SELECT validation_status FROM inferences WHERE inference_id = 'inf-root'").fetchone()
             self.assertEqual(root["validation_status"], "informally_verified")
             self.assertEqual(inference["validation_status"], "informally_verified")
+
+    def test_correct_no_gaps_report_can_certify_claim(self) -> None:
+        self._assert_zero_gap_verdict_can_certify_claim("correct_no_gaps")
+
+    def test_pass_report_can_certify_claim(self) -> None:
+        self._assert_zero_gap_verdict_can_certify_claim("pass")
 
     def test_exact_external_citation_certifies_root_and_resolves_root_debt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4655,6 +4659,12 @@ class Phase2PreflightPatchTest(unittest.TestCase):
         from agents.generation.phase2.patches import preflight_patch_errors
 
         errors = preflight_patch_errors(self._verifier_patch(verdict="correct", gaps=[]), "strict_informal_verifier")
+        self.assertEqual(errors, [])
+
+    def test_pass_report_passes_preflight(self) -> None:
+        from agents.generation.phase2.patches import preflight_patch_errors
+
+        errors = preflight_patch_errors(self._verifier_patch(verdict="pass", gaps=[]), "strict_informal_verifier")
         self.assertEqual(errors, [])
 
     def test_gappy_report_with_verified_transition_fails_preflight(self) -> None:

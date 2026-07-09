@@ -124,7 +124,14 @@ def _artifact_type(conn: sqlite3.Connection, artifact_id: str) -> str:
     return row["artifact_type"] if row else ""
 
 
-ZERO_GAP_VERIFICATION_VERDICTS = {"correct", "correct_no_gaps", "correct_refutation", "informally_verified", "verified"}
+ZERO_GAP_VERIFICATION_VERDICTS = {
+    "correct",
+    "correct_no_gaps",
+    "correct_refutation",
+    "informally_verified",
+    "pass",
+    "verified",
+}
 
 
 def _has_premiseless_verification_evidence(conn: sqlite3.Connection, artifact_ids: List[str]) -> bool:

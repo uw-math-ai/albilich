@@ -276,6 +276,8 @@ def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[M
             "all verified branches to the parent. "
             f"Rigorously check {route_text}. If it is correct with no gaps, attach a verification_report artifact "
             "with concise metadata: verdict, checked_items, a short summary, critical_errors, gaps, blocking_gap, and repair_hints. "
+            "Use verdict='verified' or verdict='correct_no_gaps' for a zero-gap pass; verdict='pass' is accepted for "
+            "backward compatibility but the canonical verifier verdicts are preferred. "
             "External mathematics may discharge a step when a retrieval card or source artifact gives a reasonable citation: a locatable "
             "paper/book/source, theorem/proposition/lemma/corollary number or precise page/section location, source version when available, "
             "statement, hypotheses, definitions, and source location, and you independently check that those hypotheses match the current "
