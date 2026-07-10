@@ -162,6 +162,8 @@ Run-level research modes set the opening portfolio:
 Run from the repository root. The default backend is the Codex CLI. With live
 search on, an executed session may export repo-derived proof context to external
 model and search services; use `--web-search disabled` for offline attempts.
+Codex sessions default to `gpt-5.6-sol` with `xhigh` (Extra High) reasoning;
+use `--model` and `--reasoning-effort` to override either setting for a run.
 
 ```bash
 # initialize, then attempt with defaults

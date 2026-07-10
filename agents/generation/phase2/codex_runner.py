@@ -19,7 +19,7 @@ from .patches import preflight_patch_errors
 from .role_capabilities import role_can_use_cas, session_cas_enabled
 from .store import ProofStateStore
 
-DEFAULT_CODEX_MODEL = "gpt-5.5"
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_SANDBOX = "workspace-write"
 DEFAULT_CHILD_TIMEOUT_SECONDS = 7200
