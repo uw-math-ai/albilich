@@ -25,17 +25,23 @@ def evaluate_route_for_integration(store: ProofStateStore, route_id: str) -> Dic
     route_inferences = [row for row in state["inferences"] if row["route_id"] == route_id]
     if not route_inferences:
         missing.append("route has no inferences")
-    for inf in route_inferences:
-        if inf["validation_status"] not in VERIFIED:
-            missing.append(f"inference {inf['inference_id']} is not verified")
-        for premise_id in inf.get("premise_claim_ids", []):
-            if claim_status.get(premise_id) not in VERIFIED:
-                missing.append(f"premise {premise_id} is not verified")
+    terminal_inferences = [
+        inf
+        for inf in route_inferences
+        if str(inf.get("conclusion_claim_id") or "") == str(route["conclusion_claim_id"])
+        and inf["validation_status"] in VERIFIED
+        and all(claim_status.get(premise_id) in VERIFIED for premise_id in inf.get("premise_claim_ids", []))
+    ]
+    if route_inferences and not terminal_inferences:
+        missing.append("route has no verified terminal inference with verified premises")
     return {
         "route_id": route_id,
         "claim_id": route["conclusion_claim_id"],
         "integrates": not missing,
         "missing": missing,
+        "terminal_inference_ids": sorted(
+            str(inf["inference_id"]) for inf in terminal_inferences
+        ),
     }
 
 

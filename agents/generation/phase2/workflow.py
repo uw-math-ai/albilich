@@ -7,6 +7,7 @@ import re
 import time
 import threading
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional
 
@@ -39,7 +40,16 @@ from .research_policy import (
     research_intent_for_action,
     search_policy_for_action,
 )
-from .scheduler import _artifact_is_proof_candidate, next_action, parallel_companion_actions, verifier_ready_route_summaries
+from .branch_summary import sync_branch_workbenches
+from .scheduler import (
+    DEFAULT_MULTI_BRANCH_WORKERS,
+    _artifact_is_proof_candidate,
+    multi_branch_research_actions,
+    next_action,
+    normalize_parallel_branches,
+    parallel_companion_actions,
+    verifier_ready_route_summaries,
+)
 from .store import ProofStateStore
 from . import steering
 
@@ -52,9 +62,44 @@ STOP_WRITER_NO_ROUTE_TOKEN_THRESHOLD = 1_000_000
 DEFAULT_STALE_RETRY_RECOVERY_ATTEMPTS = 2
 STALE_RETRY_RECOVERY_ATTEMPTS_ENV = "ALBILICH_STALE_RETRY_RECOVERY_ATTEMPTS"
 STALE_RETRY_FAILURE_FRAGMENT = "Codex stream retry stalled"
+CONSOLE_REFRESH_INTERVAL_ENV = "ALBILICH_CONSOLE_REFRESH_INTERVAL_SECONDS"
+DEFAULT_CONSOLE_REFRESH_INTERVAL_SECONDS = 15.0
 
 Executor = Callable[..., Mapping[str, Any]]
 TERMINAL_MODES = {"stop_with_partial_results", "stop_solved"}
+# Run-control (2026-07-09 TODO 5): persisted pause/stop states honored between
+# action dispatches; the watcher polls for hard stops during child sessions.
+RUN_CONTROL_POLL_SECONDS = 2.0
+RUN_CONTROL_BLOCKING_STATUSES = {"pause_requested", "paused", "stopping", "stopped"}
+
+
+class _ConsoleWriteThrottle:
+    """Bound expensive full-state console rebuilds during live heartbeats."""
+
+    def __init__(self, interval_seconds: float) -> None:
+        self.interval_seconds = max(0.0, float(interval_seconds))
+        self.last_write_at: float | None = None
+
+    def should_write(self, *, force: bool = False, now: float | None = None) -> bool:
+        current = time.monotonic() if now is None else float(now)
+        if (
+            force
+            or self.last_write_at is None
+            or current - self.last_write_at >= self.interval_seconds
+        ):
+            self.last_write_at = current
+            return True
+        return False
+
+
+def _console_refresh_interval_seconds() -> float:
+    raw = os.environ.get(CONSOLE_REFRESH_INTERVAL_ENV, "").strip()
+    if not raw:
+        return DEFAULT_CONSOLE_REFRESH_INTERVAL_SECONDS
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return DEFAULT_CONSOLE_REFRESH_INTERVAL_SECONDS
 DOWNLOAD_PATH_RE = re.compile(r"(?:/[^\s\"'<>]*agents/generation/downloads(?:/[^\s\"'<>]+)?|agents/generation/downloads(?:/[^\s\"'<>]+)?)")
 ARTIFACT_PATH_RE = re.compile(
     r"(?:/[^\s\"'<>]*agents/generation/results/[^\s\"'<>]+/phase2/artifacts/[^\s\"'<>]+|"
@@ -62,6 +107,28 @@ ARTIFACT_PATH_RE = re.compile(
 )
 
 
+def _persist_abnormal_workflow_exit(func: Callable[..., Dict[str, Any]]) -> Callable[..., Dict[str, Any]]:
+    """Ensure an executing workflow never leaves a stale ``running`` state.
+
+    Normal scheduler exits are finalized inside ``run_workflow``.  This wrapper
+    covers exceptions and process signals converted to Python exceptions by the
+    CLI, after the child runner has terminated any in-flight Codex process.
+    """
+
+    @wraps(func)
+    def wrapped(store: ProofStateStore, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        execute = bool(kwargs.get("execute", False))
+        try:
+            return func(store, *args, **kwargs)
+        except BaseException as exc:
+            if execute:
+                _record_abnormal_workflow_exit(store, exc)
+            raise
+
+    return wrapped
+
+
+@_persist_abnormal_workflow_exit
 def run_workflow(
     store: ProofStateStore,
     *,
@@ -78,6 +145,7 @@ def run_workflow(
     timeout_sec: int = DEFAULT_CHILD_TIMEOUT_SECONDS,
     max_wall_seconds: int | None = None,
     parallel_librarian_verifier: bool = True,
+    parallel_branches: int = DEFAULT_MULTI_BRANCH_WORKERS,
     stop_on_rejection: bool = True,
     write_on_stop: bool = True,
     write_report: bool = False,
@@ -91,28 +159,52 @@ def run_workflow(
     one Codex session per scheduler action, applies the returned patch, records
     run metrics, and repeats until the root is integrated, the budget stops work,
     or the step limit is reached.
+
+    parallel_branches (TODO 2): defaults to three branch slots; 0 explicitly
+    disables multi_branch_research, while 2..5 plans up to that many simultaneous
+    branch-scoped researcher/villain workers per step window through the existing
+    companion-session machinery.
     """
     research_mode = normalize_research_mode(research_mode)
+    parallel_branches = normalize_parallel_branches(parallel_branches)
     history = []
     console_path = ""
     console_lock = threading.Lock()
+    console_write_throttle = _ConsoleWriteThrottle(_console_refresh_interval_seconds())
     started = time.monotonic()
+    if execute:
+        # Launching the workflow is an explicit (re)start: clear any prior
+        # pause/stop so the run continues from the latest accepted revision.
+        _sync_run_status_at_start(store)
+        # Record the multi_branch_research mode (or its absence) on
+        # problem_state; a no-op event-free update when unchanged.
+        try:
+            store.set_parallel_branches(
+                parallel_branches,
+                reason="explicit --parallel-branches flag" if parallel_branches else "parallel branch mode off for this run",
+                source="workflow",
+            )
+            # Branch workbenches survive across sessions: refresh them from
+            # the latest accepted proof state before the first dispatch.
+            sync_branch_workbenches(store)
+        except ValueError:
+            pass
     # Per-role live session registry for same-role session resume:
     # actor_role -> {session_id, target_id, chain_len, last_revision}.
     role_sessions: Dict[str, Dict[str, Any]] = {}
     stale_retry_recoveries = 0
     max_stale_retry_recoveries = _stale_retry_recovery_attempts()
 
-    def write_console_snapshot_locked() -> None:
+    def write_console_snapshot_locked(*, force: bool = False) -> None:
         nonlocal console_path
-        if write_console:
+        if write_console and console_write_throttle.should_write(force=force):
             console_path = str(write_run_console(store, history=history))
 
     def record_entry(entry: Dict[str, Any]) -> None:
         with console_lock:
             if not any(item is entry for item in history):
                 history.append(entry)
-            write_console_snapshot_locked()
+            write_console_snapshot_locked(force=True)
             _write_partial_result_locked(store, history)
 
     def progress_callback_for(entry: Dict[str, Any]) -> Callable[[Mapping[str, Any]], None]:
@@ -127,7 +219,11 @@ def run_workflow(
                     live_updates = {}
                     entry["live_session_updates"] = live_updates
                 live_updates[run_id] = dict(progress)
-                write_console_snapshot_locked()
+                # The executor is allowed to inspect the dashboard snapshot as
+                # soon as it starts.  Bypass the mature-run refresh throttle for
+                # that first synthetic heartbeat so the UI never starts a child
+                # with an empty live-session list.
+                write_console_snapshot_locked(force=str(progress.get("phase") or "") == "started")
 
         return update
 
@@ -141,6 +237,18 @@ def run_workflow(
         index += 1
         if index >= step_limit:
             break
+        if execute:
+            # Pause/stop checkpoint: honored before every new action dispatch.
+            control_action = _run_control_stop_action(store)
+            if control_action is not None:
+                entry = {
+                    "step": index + 1,
+                    "action": control_action,
+                    "stop_reason": control_action["reason"],
+                    "terminal_classification": control_action["terminal_classification"],
+                }
+                record_entry(entry)
+                break
         remaining_wall = _remaining_wall_seconds(started, max_wall_seconds)
         if remaining_wall is not None and remaining_wall <= 0:
             action = _wall_limit_action(max_wall_seconds)
@@ -181,6 +289,20 @@ def run_workflow(
                 parallel_companion_actions(
                     store,
                     action,
+                    research_mode=research_mode,
+                    web_search=web_search,
+                )
+            )
+        if parallel_branches:
+            # multi_branch_research (TODO 2): top the wave up to N
+            # simultaneous branch-scoped workers via the same companion
+            # machinery; the shared store stays the coordination layer.
+            actions.extend(
+                multi_branch_research_actions(
+                    store,
+                    action,
+                    actions[1:],
+                    parallel_branches=parallel_branches,
                     research_mode=research_mode,
                     web_search=web_search,
                 )
@@ -321,7 +443,7 @@ def run_workflow(
         )
         with console_lock:
             flush_completed_results_locked(force=True)
-            write_console_snapshot_locked()
+            write_console_snapshot_locked(force=True)
         action_results = [
             item["action_result"]
             for item in executed_items
@@ -355,6 +477,13 @@ def run_workflow(
         entry["execution_phase"] = str(primary_result.get("status") or "completed")
         entry["finished_at"] = utc_now()
         record_entry(entry)
+
+        # Persist the per-branch workbenches from the just-accepted proof
+        # state (idempotent: no write when a branch's workbench is unchanged).
+        try:
+            sync_branch_workbenches(store)
+        except Exception:
+            pass
 
         if pending_steering_ids:
             steering.mark_consumed(store.state_dir, pending_steering_ids)
@@ -429,6 +558,14 @@ def run_workflow(
                 entry["execution_phase"] = "recovering_after_stale_retry"
                 record_entry(entry)
                 continue
+            # A failure caused by an operator pause/stop request (e.g. a hard
+            # stop terminating the child) must not launch a stop-writer child.
+            control_action = _run_control_stop_action(store)
+            if control_action is not None:
+                entry["stop_reason"] = control_action["reason"]
+                entry["terminal_classification"] = control_action["terminal_classification"]
+                record_entry(entry)
+                break
             if write_on_stop:
                 stop_action = _execution_stop_action(action, status, primary_result)
                 entry["stop_reason"] = stop_action["reason"]
@@ -478,6 +615,8 @@ def run_workflow(
             )
             record_entry(entry)
 
+    if execute:
+        _finalize_run_status(store, history)
     report_path = str(write_markdown_report(store)) if write_report else ""
     if write_console and not console_path:
         console_path = str(write_run_console(store, history=history))
@@ -493,9 +632,130 @@ def run_workflow(
         "wall_time_seconds": round(wall_time_seconds, 3),
         "wall_limit_seconds": max_wall_seconds,
         "parallel_librarian_verifier": parallel_librarian_verifier,
+        "parallel_branches": parallel_branches,
         "write_on_stop": write_on_stop,
         "write_console": write_console,
     }
+
+
+def _sync_run_status_at_start(store: ProofStateStore) -> None:
+    """Normalize an already-honored terminal run_status when a workflow launches.
+
+    Relaunching after 'stopped'/'completed' is an explicit new attempt, so those
+    become 'running' (the scheduler always plans from the latest accepted
+    proof-state revision). Pending pause/stop requests ('pause_requested',
+    'paused', 'stopping') are NOT cleared here: they are honored by the loop
+    checkpoint before the first dispatch, and only an explicit `resume` clears
+    them. dashboard_paused is display-only and is normalized.
+    """
+    try:
+        current = store.get_run_status()
+    except ValueError:
+        return
+    if current not in {"stopped", "completed", "dashboard_paused"}:
+        return
+    store.set_run_status(
+        "running",
+        reason=f"workflow started; clearing already-honored run_status {current}",
+        source="workflow",
+    )
+
+
+def _run_control_stop_action(store: ProofStateStore) -> Optional[Dict[str, Any]]:
+    """Return a synthetic stop action when a pause/stop request must halt the
+    loop before the next dispatch; None when the run should keep going.
+
+    Soft pause semantics: the current child session has already finished by the
+    time this checkpoint runs, so honoring 'pause_requested' here implements
+    finish-current-child-then-pause.
+    """
+    try:
+        status = store.get_run_status()
+    except ValueError:
+        return None
+    if status not in RUN_CONTROL_BLOCKING_STATUSES:
+        return None
+    if status == "pause_requested":
+        store.set_run_status(
+            "paused",
+            reason="pause request honored: current child session finished; no new actions dispatched",
+            source="workflow",
+        )
+        reason = "run paused by operator request (soft pause honored before the next action dispatch)"
+        classification = "paused"
+    elif status == "paused":
+        reason = "run is paused; not dispatching new actions"
+        classification = "paused"
+    else:
+        if status == "stopping":
+            store.set_run_status(
+                "stopped",
+                reason="stop request honored: workflow exited before the next action dispatch",
+                source="workflow",
+            )
+        reason = "run stopped by operator request"
+        classification = "interrupted"
+    return {
+        "mode": "pause_run" if classification == "paused" else "stop_run",
+        "target_id": "root",
+        "reason": reason,
+        "terminal_classification": classification,
+    }
+
+
+def _finalize_run_status(store: ProofStateStore, history: list[Mapping[str, Any]]) -> None:
+    """Persist the terminal run_status when the executed workflow exits."""
+    try:
+        current = store.get_run_status()
+    except ValueError:
+        return
+    if current in {"paused", "stopped", "completed"}:
+        return
+    last = history[-1] if history else {}
+    action = last.get("action") if isinstance(last.get("action"), Mapping) else {}
+    mode = str(action.get("mode") or "")
+    if mode in TERMINAL_MODES:
+        stop_code = str(action.get("stop_reason_code") or "")
+        reason = f"scheduler stopped: {mode}"
+        if stop_code:
+            reason = f"{reason} (stop_reason_code={stop_code})"
+        store.set_run_status(
+            "completed",
+            reason=reason,
+            source="workflow",
+        )
+        return
+    reason = str(last.get("stop_reason") or "") or "workflow exited (step budget reached or execution stopped)"
+    store.set_run_status("stopped", reason=reason, source="workflow")
+
+
+def _record_abnormal_workflow_exit(store: ProofStateStore, exc: BaseException) -> None:
+    """Persist a truthful terminal state when the workflow unwinds abnormally."""
+
+    exception_type = type(exc).__name__
+    message = str(exc).strip()
+    reason = f"workflow aborted by {exception_type}"
+    if message:
+        reason = f"{reason}: {message[:240]}"
+    try:
+        current = store.get_run_status()
+        if current not in {"paused", "stopped", "completed"}:
+            store.set_run_status("stopped", reason=reason, source="workflow_exception")
+        with store.connect() as conn:
+            store.write_event(
+                conn,
+                store.get_revision(conn),
+                "workflow_aborted",
+                {
+                    "exception_type": exception_type,
+                    "message": message[:400],
+                    "reason": reason,
+                },
+            )
+            conn.commit()
+    except Exception:
+        # Never mask the original workflow exception with diagnostic I/O.
+        pass
 
 
 def _stale_retry_recovery_attempts() -> int:
@@ -561,7 +821,7 @@ def _attach_stop_writer(
         entry["stop_writer_action"] = _blocked_stop_writer_action(stop_action, blocker)
         return
 
-    writer_action = _stop_writer_action(stop_action)
+    writer_action = _stop_writer_action(stop_action, research_mode=research_mode)
     scheduled = [
         _prepare_scheduled_session(
             store,
@@ -599,11 +859,12 @@ def _attach_stop_writer(
     entry["stop_writer_results"] = action_results
 
 
-def _stop_writer_action(stop_action: Mapping[str, Any]) -> Dict[str, Any]:
+def _stop_writer_action(stop_action: Mapping[str, Any], *, research_mode: str = "") -> Dict[str, Any]:
     return {
         "mode": "write",
         "target_id": "root",
         "route_id": "",
+        "research_mode": research_mode,
         "reason": "workflow stopped before a solved final proof; write existing verified and partial proof material honestly",
         "budget": {
             "allowed": True,
@@ -613,6 +874,7 @@ def _stop_writer_action(stop_action: Mapping[str, Any]) -> Dict[str, Any]:
         },
         "write_existing_proofs_on_stop": True,
         "stop_reason": str(stop_action.get("reason") or "workflow stopped"),
+        "stop_reason_code": str(stop_action.get("stop_reason_code") or ""),
         "terminal_classification": str(stop_action.get("terminal_classification") or "partial"),
         "search_intent": "stop_writer_closure",
     }
@@ -813,6 +1075,9 @@ def _execution_stop_action(
         "reason": reason,
         "budget": dict(action.get("budget") or {}),
         "terminal_classification": "execution_stopped_partial",
+        # Infrastructure stop, outside the completion policy's jurisdiction
+        # (TODO 7): the run stopped on a failed session, not on mathematics.
+        "stop_reason_code": "execution_failure",
     }
 
 
@@ -827,6 +1092,9 @@ def _step_limit_action(steps: int) -> Dict[str, Any]:
             "reason": "workflow step limit reached",
         },
         "terminal_classification": "step_limited_partial",
+        # The step budget is an operator-set budget (TODO 7).
+        "stop_reason_code": "exhausted_budget",
+        "stop_reason_detail": "workflow step limit reached",
     }
 
 
@@ -896,91 +1164,108 @@ def _execute_scheduled_sessions(
         return executor(**call_kwargs)
 
     stop_event = threading.Event()
-    if executor is not None or len(scheduled) == 1:
-        executed: list[Dict[str, Any]] = []
-        try:
-            for item in scheduled:
-                item_progress = _progress_callback_for_item(progress_callback, item)
-                if executor is not None:
-                    _emit_synthetic_progress(item_progress, item, phase="started", status="running")
-                    execution = dict(
-                        _invoke_executor(
-                            executor,
-                            store=store,
-                            action=item["action"],
-                            session_plan=item["session_plan"],
+    watcher_stop = threading.Event()
+
+    def _watch_run_control() -> None:
+        # Hard-stop watcher: a `stop --hard` from another process flips the
+        # persisted run_status to 'stopping' (hard=True); terminate the active
+        # child sessions via the existing stop_event machinery.
+        while not watcher_stop.wait(RUN_CONTROL_POLL_SECONDS):
+            control = store.peek_run_control()
+            if control.get("run_status") == "stopping" and control.get("hard"):
+                stop_event.set()
+                return
+
+    watcher = threading.Thread(target=_watch_run_control, daemon=True, name="albilich-run-control-watcher")
+    watcher.start()
+    try:
+        if executor is not None or len(scheduled) == 1:
+            executed: list[Dict[str, Any]] = []
+            try:
+                for item in scheduled:
+                    item_progress = _progress_callback_for_item(progress_callback, item)
+                    if executor is not None:
+                        _emit_synthetic_progress(item_progress, item, phase="started", status="running")
+                        execution = dict(
+                            _invoke_executor(
+                                executor,
+                                store=store,
+                                action=item["action"],
+                                session_plan=item["session_plan"],
+                                progress_callback=item_progress,
+                                stop_event=stop_event,
+                            )
+                        )
+                        _emit_synthetic_progress(item_progress, item, phase="completed", status=str(execution.get("status") or "completed"), execution=execution)
+                    else:
+                        execution = execute_session(
+                            store,
+                            item["action"],
+                            item["session_plan"],
+                            model=model,
+                            reasoning_effort=reasoning_effort,
+                            model_profile=model_profile,
+                            codex_bin=codex_bin,
+                            sandbox=sandbox,
+                            web_search=item["session_web_search"],
+                            timeout_sec=timeout_sec,
                             progress_callback=item_progress,
                             stop_event=stop_event,
                         )
-                    )
-                    _emit_synthetic_progress(item_progress, item, phase="completed", status=str(execution.get("status") or "completed"), execution=execution)
-                else:
-                    execution = execute_session(
-                        store,
-                        item["action"],
-                        item["session_plan"],
-                        model=model,
-                        reasoning_effort=reasoning_effort,
-                        model_profile=model_profile,
-                        codex_bin=codex_bin,
-                        sandbox=sandbox,
-                        web_search=item["session_web_search"],
-                        timeout_sec=timeout_sec,
-                        progress_callback=item_progress,
-                        stop_event=stop_event,
-                    )
-                completed_item = {**item, "execution": execution}
-                if result_callback is not None:
-                    result_callback(completed_item)
-                executed.append(completed_item)
-        except BaseException:
-            stop_event.set()
-            raise
-        return executed
+                    completed_item = {**item, "execution": execution}
+                    if result_callback is not None:
+                        result_callback(completed_item)
+                    executed.append(completed_item)
+            except BaseException:
+                stop_event.set()
+                raise
+            return executed
 
-    executed: list[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=len(scheduled)) as pool:
-        futures = {
-            pool.submit(
-                execute_session,
-                store,
-                item["action"],
-                item["session_plan"],
-                model=model,
-                reasoning_effort=reasoning_effort,
-                model_profile=model_profile,
-                codex_bin=codex_bin,
-                sandbox=sandbox,
-                web_search=item["session_web_search"],
-                timeout_sec=timeout_sec,
-                progress_callback=_progress_callback_for_item(progress_callback, item),
-                stop_event=stop_event,
-            ): item
-            for item in scheduled
-        }
-        try:
-            for future in as_completed(futures):
-                item = futures[future]
-                try:
-                    execution = future.result()
-                except CancelledError:
-                    execution = _cancelled_execution_for_item(item)
-                completed_item = {**item, "execution": execution}
-                if result_callback is not None:
-                    result_callback(completed_item)
-                executed.append(completed_item)
-                if cancel_on_primary_failure and _primary_failure_should_cancel_companions(item, execution):
-                    stop_event.set()
-                    for pending in futures:
-                        if pending is not future:
-                            pending.cancel()
-        except BaseException:
-            stop_event.set()
-            for future in futures:
-                future.cancel()
-            raise
-    executed.sort(key=lambda item: int(item["is_companion"]))
-    return executed
+        executed: list[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=len(scheduled)) as pool:
+            futures = {
+                pool.submit(
+                    execute_session,
+                    store,
+                    item["action"],
+                    item["session_plan"],
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    model_profile=model_profile,
+                    codex_bin=codex_bin,
+                    sandbox=sandbox,
+                    web_search=item["session_web_search"],
+                    timeout_sec=timeout_sec,
+                    progress_callback=_progress_callback_for_item(progress_callback, item),
+                    stop_event=stop_event,
+                ): item
+                for item in scheduled
+            }
+            try:
+                for future in as_completed(futures):
+                    item = futures[future]
+                    try:
+                        execution = future.result()
+                    except CancelledError:
+                        execution = _cancelled_execution_for_item(item)
+                    completed_item = {**item, "execution": execution}
+                    if result_callback is not None:
+                        result_callback(completed_item)
+                    executed.append(completed_item)
+                    if cancel_on_primary_failure and _primary_failure_should_cancel_companions(item, execution):
+                        stop_event.set()
+                        for pending in futures:
+                            if pending is not future:
+                                pending.cancel()
+            except BaseException:
+                stop_event.set()
+                for future in futures:
+                    future.cancel()
+                raise
+        executed.sort(key=lambda item: int(item["is_companion"]))
+        return executed
+    finally:
+        watcher_stop.set()
 
 
 def _write_partial_result_locked(store: ProofStateStore, history: list[Mapping[str, Any]]) -> None:
@@ -1364,7 +1649,9 @@ def _record_parallel_signals(
         if not isinstance(raw_signal, Mapping):
             continue
         payload = {
-            "created_at": str(raw_signal.get("created_at") or utc_now()),
+            # A child may guess or hallucinate its wall-clock time.  Stamp the
+            # accepted exchange entry here so ordering reflects workflow time.
+            "created_at": utc_now(),
             "run_id": _signal_field(raw_signal.get("run_id"), fallback=run_id, invalid_values=invalid_run_ids),
             "actor_role": str(raw_signal.get("actor_role") or actor_role),
             "mode": str(raw_signal.get("mode") or mode),
@@ -1769,6 +2056,10 @@ def _wall_limit_action(max_wall_seconds: int | None) -> Dict[str, Any]:
             "reason": "workflow wall time limit reached",
         },
         "terminal_classification": "time_limited_partial",
+        # Operator-set wall clock is a budget: exhausting it always allows the
+        # stop under every completion policy (TODO 7).
+        "stop_reason_code": "exhausted_budget",
+        "stop_reason_detail": "workflow wall time limit reached",
     }
 
 

@@ -123,6 +123,20 @@ def write_latex_pdf_sidecars(
 write_receipt_latex_sidecars = write_latex_pdf_sidecars
 
 
+def compile_latex_artifact(tex_path: Path | str, pdf_path: Path | str) -> Dict[str, str]:
+    """Compile an artifact that already IS LaTeX source (e.g. a ``final_paper``).
+
+    Unlike :func:`write_latex_pdf_sidecars` there is no markdown→LaTeX
+    conversion: ``tex_path`` is compiled as-is with the shared pdflatex
+    machinery. Returns the same sidecar dict shape (``pdf_status``,
+    ``pdf_path``, ``latex_log_path`` on failure) plus ``latex_path``.
+    """
+    tex_path = Path(tex_path)
+    sidecars = {"latex_path": str(tex_path)}
+    sidecars.update(_compile_latex(tex_path, Path(pdf_path)))
+    return sidecars
+
+
 def format_receipt_latex(content: str, *, title: str = "Albilich v1 Partial Receipt") -> str:
     lines = _latex_document_preamble(title)
     lines.extend(_render_receipt_content_latex(content))

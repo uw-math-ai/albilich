@@ -260,13 +260,53 @@ class ResearcherWorkModeDecisionTest(unittest.TestCase):
         self.assertEqual(decision["work_mode"], "offline")
         self.assertEqual(decision["source"], "structural")
 
-    def test_companion_actions_default_offline(self) -> None:
+    def test_companion_actions_rotate_and_diversify(self) -> None:
         state = {"recent_runs": [], "research_artifacts": []}
-        decision = researcher_work_mode_decision(
-            state, {"mode": "prove", "parallel_companion": True}, research_mode="hard_problem", web_search="live"
+        first = researcher_work_mode_decision(
+            state,
+            {"mode": "prove", "parallel_companion": True, "parallel_companion_index": 0},
+            research_mode="hard_problem",
+            web_search="live",
         )
-        self.assertEqual(decision["work_mode"], "offline")
-        self.assertEqual(decision["source"], "companion_default")
+        second = researcher_work_mode_decision(
+            state,
+            {"mode": "prove", "parallel_companion": True, "parallel_companion_index": 1},
+            research_mode="hard_problem",
+            web_search="live",
+        )
+        self.assertEqual(first["work_mode"], "online")
+        self.assertEqual(second["work_mode"], "offline")
+        self.assertEqual(first["source"], "companion_rotation")
+
+        after_offline = {
+            "recent_runs": [
+                {
+                    "run_id": "companion-offline",
+                    "actor_role": "researcher",
+                    "researcher_work_mode": "offline",
+                    "work_mode_source": "companion_rotation",
+                    "status": "completed",
+                }
+            ],
+            "research_artifacts": [],
+        }
+        rotated = researcher_work_mode_decision(
+            after_offline,
+            {"mode": "prove", "parallel_companion": True},
+            research_mode="hard_problem",
+            web_search="live",
+        )
+        self.assertEqual(rotated["work_mode"], "cas")
+
+    def test_companion_computation_request_still_forces_cas(self) -> None:
+        decision = researcher_work_mode_decision(
+            {"recent_runs": [], "research_artifacts": []},
+            {"mode": "prove", "parallel_companion": True, "cas_check_recommended": True},
+            research_mode="hard_problem",
+            web_search="live",
+        )
+        self.assertEqual(decision["work_mode"], "cas")
+        self.assertEqual(decision["source"], "companion_structural")
 
     def test_advisor_directive_overrides_rotation_and_structural_bias(self) -> None:
         state = {
@@ -277,7 +317,7 @@ class ResearcherWorkModeDecisionTest(unittest.TestCase):
                     "artifact_type": "advisor_report",
                     "producer_role": "phd_advisor",
                     "state_revision": 7,
-                    "metadata_json": json.dumps({"directed_researcher_mode": "cas", "directed_researcher_mode_reason": "compute chain-closures"}),
+                    "metadata_json": json.dumps({"directed_researcher_mode": "cas", "directed_researcher_mode_reason": "compute 3-closures"}),
                 }
             ],
         }
@@ -575,6 +615,7 @@ class VillainWorkModeTest(unittest.TestCase):
             actor_role="villain",
         )
         self.assertIn("CAS REFUTATION pass", cas_prompt)
+        self.assertIn("Never launch an interactive CAS REPL", cas_prompt)
         offline_prompt = build_session_prompt(
             context_path=Path("/tmp/context.json"),
             action={**base, "researcher_work_mode": "offline", "work_mode_source": "rotation"},
@@ -712,7 +753,7 @@ class ResearcherWorkModeSchedulerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = _make_store(tmpdir, "work-mode-directive-test")
             _record_mode_run(store, run_id="run-retrieve", mode="retrieve", actor_role="literature_researcher")
-            _attach_advisor_directive(store, artifact_id="adv-mode-1", directed_mode="cas", reason="run the finite check on the smallest cases")
+            _attach_advisor_directive(store, artifact_id="adv-mode-1", directed_mode="cas", reason="run the finite 3-closure checks")
             action = next_action(store, research_mode="hard_problem", web_search="live")
             self.assertTrue(action_expects_researcher_session(action), action)
             self.assertEqual(action["researcher_work_mode"], "cas")

@@ -31,6 +31,53 @@ def _patch(store: ProofStateStore, *, base_revision: int, operations: list[dict]
 
 
 class Phase2CentralObstructionTest(unittest.TestCase):
+    def test_central_debt_clusters_merge_same_bridge_with_different_wording(self) -> None:
+        debts = [
+            {
+                "debt_id": "debt-dhr-bridge",
+                "owner_type": "claim",
+                "owner_id": "root_bridge",
+                "suggested_next_target": "root_bridge",
+                "severity": "blocking",
+                "status": "active",
+                "repeated_count": 1,
+                "obligation": "Prove the DHR-to-alcoved-complex bridge for the actual MSSS line bundle L_P.",
+            },
+            {
+                "debt_id": "debt-pure-alcoved",
+                "owner_type": "claim",
+                "owner_id": "root_bridge",
+                "suggested_next_target": "root_bridge",
+                "severity": "blocking",
+                "status": "active",
+                "repeated_count": 2,
+                "obligation": "Show the DHR rank-union feasible set gives a pure relative alcoved model whose h-star is the matroid h-star.",
+            },
+            {
+                "debt_id": "debt-hd-stars",
+                "owner_type": "route",
+                "owner_id": "route-root",
+                "suggested_next_target": "root_bridge",
+                "severity": "blocking",
+                "status": "active",
+                "repeated_count": 1,
+                "obligation": "Identify h_d with interior lattice points/full local stars in the DHR alcoved construction.",
+            },
+        ]
+
+        clusters = central_debt_clusters(debts, min_alias_count=2)
+
+        self.assertEqual(len(clusters), 1)
+        cluster = clusters[0]
+        self.assertEqual(cluster["primary_debt_id"], "debt-pure-alcoved")
+        self.assertEqual(
+            set(cluster["alias_debt_ids"]),
+            {"debt-dhr-bridge", "debt-pure-alcoved", "debt-hd-stars"},
+        )
+        self.assertEqual(cluster["target_id"], "root_bridge")
+        self.assertIn("dhr", cluster["keywords"])
+        self.assertIn("alcoved", cluster["keywords"])
+
     def test_central_bridge_debt_schedules_researcher_workbench(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("central-workbench-scheduler-test", generation_root=Path(tmpdir) / "generation")
@@ -43,7 +90,7 @@ class Phase2CentralObstructionTest(unittest.TestCase):
                         "op": "add_claim",
                         "claim_id": "root_bridge",
                         "kind": "lemma",
-                        "statement": "The central Rank chained bridge lemma.",
+                        "statement": "The central DHR alcoved bridge lemma.",
                         "parent_ids": ["root"],
                         "root_impact": 0.9,
                         "reduction_depth": 1,
@@ -53,18 +100,18 @@ class Phase2CentralObstructionTest(unittest.TestCase):
                         "route_id": "route-root-bridge",
                         "conclusion_claim_id": "root_bridge",
                         "relation_to_parent": "sufficient",
-                        "strategy": "Prove the Rank chained bridge.",
+                        "strategy": "Prove the DHR alcoved bridge.",
                     },
                     {
                         "op": "attach_artifact",
-                        "artifact_id": "route-obstruction-rank",
+                        "artifact_id": "route-obstruction-dhr",
                         "artifact_type": "research_diagnostic",
-                        "content": "Previous Rank attempt failed because it identified terms but not a common pure complex.",
+                        "content": "Previous DHR attempt failed because it identified terms but not a common pure complex.",
                         "metadata": {
                             "target_id": "root_bridge",
                             "route_id": "route-root-bridge",
-                            "failure_fingerprint": "termwise-Rank-not-pure-complex",
-                            "lesson": "Do not reuse the termwise Rank expansion without proving the pure relative chained model.",
+                            "failure_fingerprint": "termwise-DHR-not-pure-complex",
+                            "lesson": "Do not reuse the termwise DHR expansion without proving the pure relative alcoved model.",
                         },
                     },
                     {
@@ -79,21 +126,21 @@ class Phase2CentralObstructionTest(unittest.TestCase):
                     },
                     {
                         "op": "add_debt",
-                        "debt_id": "debt-rank-bridge",
+                        "debt_id": "debt-dhr-bridge",
                         "owner_type": "claim",
                         "owner_id": "root_bridge",
                         "debt_type": "gap",
                         "severity": "blocking",
-                        "obligation": "Prove the Rank-to-chained-complex bridge for the actual MSSS line bundle L_P.",
+                        "obligation": "Prove the DHR-to-alcoved-complex bridge for the actual MSSS line bundle L_P.",
                     },
                     {
                         "op": "add_debt",
-                        "debt_id": "debt-pure-chained",
+                        "debt_id": "debt-pure-alcoved",
                         "owner_type": "claim",
                         "owner_id": "root_bridge",
                         "debt_type": "gap",
                         "severity": "blocking",
-                        "obligation": "Show the Rank rank-union feasible set gives a pure relative chained model.",
+                        "obligation": "Show the DHR rank-union feasible set gives a pure relative alcoved model.",
                     },
                     {
                         "op": "add_debt",
@@ -102,7 +149,7 @@ class Phase2CentralObstructionTest(unittest.TestCase):
                         "owner_id": "route-root-bridge",
                         "debt_type": "gap",
                         "severity": "blocking",
-                        "obligation": "Identify h_d with interior local stars in the Rank chained construction.",
+                        "obligation": "Identify h_d with interior local stars in the DHR alcoved construction.",
                     },
                 ],
             )
@@ -118,7 +165,7 @@ class Phase2CentralObstructionTest(unittest.TestCase):
         self.assertEqual(action["central_obstruction"]["target_id"], "root_bridge")
         self.assertEqual(
             set(action["central_obstruction"]["alias_debt_ids"]),
-            {"debt-rank-bridge", "debt-pure-chained", "debt-hd-stars"},
+            {"debt-dhr-bridge", "debt-pure-alcoved", "debt-hd-stars"},
         )
         self.assertEqual(manifest["central_obstruction"]["target_id"], "root_bridge")
         self.assertTrue(manifest["workflow_action"]["bridge_lemma_workbench_required"])
@@ -128,15 +175,15 @@ class Phase2CentralObstructionTest(unittest.TestCase):
             manifest["researcher_packet"]["staged_attack_policy"]["bridge_lemma_workbench_rule"],
         )
         self.assertIn("negative_result_ledger", manifest)
-        self.assertEqual(manifest["negative_result_ledger"][0]["artifact_id"], "route-obstruction-rank")
-        self.assertEqual(manifest["negative_result_ledger"][0]["failure_fingerprint"], "termwise-Rank-not-pure-complex")
+        self.assertEqual(manifest["negative_result_ledger"][0]["artifact_id"], "route-obstruction-dhr")
+        self.assertEqual(manifest["negative_result_ledger"][0]["failure_fingerprint"], "termwise-DHR-not-pure-complex")
         self.assertNotIn(
             "zz-generic-diagnostic",
             {row["artifact_id"] for row in manifest["negative_result_ledger"]},
         )
         self.assertIn("proof_architecture_templates", manifest)
         self.assertIn(
-            "combinatorial-bridge-patterns",
+            "matroid-hstar-bridge-patterns",
             {row["template_id"] for row in manifest["proof_architecture_templates"]},
         )
         self.assertIn("cas_trigger_policy", manifest)

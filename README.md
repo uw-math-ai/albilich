@@ -10,6 +10,43 @@ role and evidence invariants. A theorem counts as solved after strict
 verification of the proof and a root-alignment check against the original
 statement, never because a proof sounded plausible or a source looked relevant.
 
+## Current release
+
+This release brings the standalone package up to date with the current
+Albilich research workflow. It is a consolidated framework update rather than
+a collection of historical run files.
+
+- **Multi-branch research by default.** Hard-problem runs use three research
+  branches, sharing compact branch summaries and negative evidence while
+  researchers, villains, literature scouts, and verifiers work concurrently
+  where proof-state mutations are safe.
+- **A stronger strategy layer.** Bidirectional bridge search, bottleneck-local
+  conjectures, reviewed method cards, coherent deep sessions, information-gain
+  scoring, proof compression, and persisted advisor syntheses focus effort on
+  the weakest statement that would complete the best proof route.
+- **Parallel verification with strict authority.** Ready claims can receive
+  independent strict checks while safe research continues. Integration and
+  counterexample validation remain separate gates, and only verifying roles
+  can certify or refute mathematical claims.
+- **More accurate proof-state lifecycle.** Superseded, retired, challenged,
+  and route-local claims retain their proper scope. Recovered integrations,
+  claim relations, blocking debts, verifier readiness, and root alignment are
+  represented explicitly rather than inferred from prose.
+- **A clearer live dashboard.** The monitor shows claim hierarchy and
+  containment, lifecycle colors, branch activity, verifier capacity, recovered
+  integrations, run progress, and cached-versus-new token accounting.
+- **More reliable long runs.** The workflow repairs common structured-output
+  failures, including malformed JSON and LaTeX escapes; handles abnormal child
+  exits and missing executables; suppresses duplicate advisor loops; preserves
+  workflow timestamps; and stops solved runs before optional paper polishing.
+- **Disciplined computation and writing.** CAS passes follow an
+  experiment-conjecture-proof contract, configured GAP paths reach child
+  sessions, and the optional writing gate uses deterministic normalization,
+  separate revision budgets, stronger templates, and hard output checks.
+- **Expanded regression coverage.** The scheduler, proof store, parallel
+  workflow, verifiers, dashboard, recovery paths, research strategy, and
+  writing gate are covered by the public test suite included in this release.
+
 ## Quickstart
 
 ```bash
@@ -95,6 +132,32 @@ verification. A repeated broad task, or search and repair alternating without a
 new mathematical delta, triggers a bottleneck lock or an advisor pass instead of
 another identical prompt.
 
+### Research strategy layer
+
+Mature runs add a deterministic strategy layer over the same persisted proof
+state. It does not add roles or verification authority.
+
+- Bidirectional bridge search compares the verified forward frontier with the
+  backward obligations from the root and selects at most two serious bridge
+  candidates.
+- The PhD advisor alternates tactical steering with persisted global syntheses
+  that identify one decisive missing statement and supersede stale advice.
+- Bottleneck-local conjectures and exceptional auxiliary definitions are
+  capped, stress-tested, and admitted only when they have a precise route back
+  to the root.
+- Reviewed method cards are retrieved by structural signature and include
+  failure modes; they guide proof search but never become proof premises.
+- High-leverage branches can receive a coherent deep session, while every
+  resulting claim, route, and inference still passes the ordinary patch and
+  verifier gates.
+- Information-gain scores expose expected root progress, route-killing value,
+  duplication risk, verification cost, and resource cost.
+- Proof compression preserves the full history while shrinking the primary
+  context to the best route's dependency closure and weakest sufficient bridge.
+
+The complete contracts and artifact schemas are documented in
+[`docs/albilich_research_strategy.md`](docs/albilich_research_strategy.md).
+
 ## Verification discipline
 
 The strict verifier checks one route packet: the target claim, the route and
@@ -128,7 +191,7 @@ loop of the original rethlas proposer plus a computation mode:
 | --- | --- |
 | `online` | Live web search enabled: find exact/stronger/equivalent theorems and methods, read the strongest sources, translate them into local notation. No CAS. |
 | `offline` | No web, no CAS: prove from the manifest, cached cards, and the theorem library; record precise requests for later passes. |
-| `cas` | CAS emphasized: design bounded decisive computations and end with a conclusion in a `cas_experiment_report`. Tool execution needs a CAS MCP server (configured separately). No web. |
+| `cas` | CAS enabled: run bounded decisive computations and end with a conclusion in a `cas_experiment_report`. No web. |
 
 The scheduler rotates `online → offline → cas` by default, dropping `online`
 when live search is off. Bottleneck locks and synthesis passes bias `offline`;
@@ -197,6 +260,7 @@ with `--codex-bin` or `--claude-bin`. Default `attempt` settings:
 research_mode = hard_problem      steps = 48              web_search = live
 timeout_sec = 7200                max_wall_sec = 86400    max_reduction_depth = 4
 total_token_budget = 80000000     reserved_verification_budget = 12000000
+parallel_branches = 3
 ```
 
 A run writes to `agents/generation/results/<problem_id>/phase2/`: the SQLite
@@ -211,7 +275,8 @@ agents/generation/
   phase2/      the Albilich proof-state workflow (scheduler, runners, store, verifiers)
   results/     per-problem databases, consoles, reports, artifacts (gitignored)
   tests/       the test suite
-docs/          architecture notes
+math-writing-harness/   deterministic paper-quality rules and source corpus
+docs/          architecture, research-strategy, and writing-gate documentation
 ```
 
 Role prompts are assembled in `agents/generation/phase2/codex_runner.py`.
@@ -222,9 +287,9 @@ Role prompts are assembled in `agents/generation/phase2/codex_runner.py`.
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s agents/generation/tests -t .
 ```
 
-The suite is 367 stdlib `unittest` tests over the scheduler, the patch
-validator, the workflow loop, the runners, the dashboard, and the work-mode
-loops.
+The 750-test stdlib `unittest` suite covers the scheduler, patch validator,
+proof store, parallel workflow, runners, dashboard, research strategy,
+work-mode loops, verification gates, recovery paths, and paper-writing checks.
 
 ## Requirements
 

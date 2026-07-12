@@ -28,13 +28,17 @@ from .models import (
     json_dumps,
     json_loads,
     normalize_text,
+    statement_is_interrogative_problem,
     utc_now,
 )
 from .budget import run_spend_from_operation
-from .receipt import format_partial_receipt_appendix, receipt_appendix_present, write_latex_pdf_sidecars
+from .receipt import compile_latex_artifact, format_partial_receipt_appendix, receipt_appendix_present, write_latex_pdf_sidecars
+from .research_strategy import STRATEGIC_MARKDOWN_ARTIFACT_TYPES, strategic_artifact_errors
 from .research_policy import normalize_retrieval_relation, theorem_matching_confidence
 from .result_status import SOLVED_RELATIONS, root_alignment_from_metadata
 from .store import ProofStateStore
+from .writing.latex_template import normalize_paper_template
+from .writing.linter import run_paper_lint, run_residue_scan
 
 
 class PatchRejected(Exception):
@@ -48,8 +52,30 @@ ARTIFACT_PRODUCER_ROLES = {
     "formal_backend_result": {"formal_backend"},
     "confirmed_counterexample": {"counterexample_validator"},
     "integration_report": {"integration_verifier"},
+    "writing_review": {"writing_critic"},
+    "final_paper": {"writer"},
+    "advisor_synthesis": {"phd_advisor", "advisor"},
+    "invention_authorization": {"phd_advisor", "advisor"},
+    "bridge_lemma_search": {"researcher"},
+    "conjecture_portfolio": {"researcher", "villain"},
+    "definition_candidate": {"researcher"},
+    "deep_session_report": {"researcher"},
+    "proof_compression": {"researcher", "phd_advisor", "advisor"},
 }
 STRICT_VERIFIER_ARTIFACT_TYPES = {"verification_report"}
+WRITING_CRITIC_ROLE = "writing_critic"
+WRITING_CRITIC_ARTIFACT_TYPES = {"writing_review"}
+WRITING_REVIEW_VERDICTS = {"pass", "fail"}
+# "editor" is the single lens the scheduler dispatches; the legacy three-lens
+# names stay accepted so old review data still parses.
+WRITING_CRITIC_LENSES = {"editor", "confused_reader", "skeptical_editor", "provenance_auditor"}
+# Writer artifact types scanned for generation residue (rule L1-CITE-03) at
+# patch time; residue in the shipped exposition is always rejected.
+WRITER_RESIDUE_SCANNED_ARTIFACT_TYPES = {"final_proof", "partial_proof_report", "final_paper"}
+# Artifact types whose file extension is not the markdown/txt default; the
+# final_paper's content IS complete LaTeX source, so it ships as a .tex file
+# that the attach-time sidecar compiles directly (no markdown->LaTeX pass).
+ARTIFACT_CONTENT_EXTENSIONS = {"final_paper": ".tex"}
 LITERATURE_RESEARCHER_ROLE = "literature_researcher"
 GRAPH_OWNER_ROLE_NAMES = VERIFYING_ROLES | NON_VERIFYING_ROLES | {
     "strict_verifier",
@@ -63,6 +89,20 @@ WRITER_REFERENCE_REQUIRED_ARTIFACT_TYPES = {
     "stop_summary_report",
     "writer_report",
 }
+# Writer artifact types that may be attached BY PATH instead of inline content
+# (final_paper especially): the writer authors the document as a real file
+# under state_dir/artifacts/ — recommended staging path
+# state_dir/artifacts/staging/<artifact_id>.tex, which _validated_artifact_path
+# already permits because it resolves under the artifacts root — and attaches
+# with {"op": "attach_artifact", "path": ...} and NO content field, so the
+# LaTeX never passes through JSON string escaping. The staged file is loaded
+# (size-capped), run through the full writer guard chain exactly as inline
+# content, then COPIED to the standard artifacts/<artifact_id>.<ext> location;
+# the recorded artifact never points at the mutable staging file.
+WRITER_PATH_ATTACH_ARTIFACT_TYPES = (
+    WRITER_RESIDUE_SCANNED_ARTIFACT_TYPES | WRITER_REFERENCE_REQUIRED_ARTIFACT_TYPES
+)
+WRITER_PATH_ATTACH_MAX_BYTES = 2 * 1024 * 1024
 REFERENCE_SECTION_RE = re.compile(
     r"(?im)^\s*(?:#{1,6}\s+References|References|\\section\*?\{References\})\s*$"
 )
@@ -637,6 +677,7 @@ def _normalize_patch_aliases(patch: Dict[str, Any]) -> Dict[str, Any]:
 
     normalized_operations: list[Any] = []
     integration_evidence_ids: list[str] = []
+    blocking_verification_evidence_ids: list[str] = []
     for op in operations:
         if not isinstance(op, dict):
             normalized_operations.append(op)
@@ -700,6 +741,23 @@ def _normalize_patch_aliases(patch: Dict[str, Any]) -> Dict[str, Any]:
                     normalized_op["artifact_id"] = artifact_id
             if normalized_op.get("artifact_type") == "verification_report":
                 _backfill_verification_metadata(normalized_op)
+                metadata = normalized_op.get("metadata") if isinstance(normalized_op.get("metadata"), Mapping) else {}
+                report = (
+                    metadata.get("verification_report")
+                    if isinstance(metadata.get("verification_report"), Mapping)
+                    else {}
+                )
+                if (
+                    metadata.get("blocking_gap")
+                    or metadata.get("critical_errors")
+                    or metadata.get("gaps")
+                    or report.get("blocking_gap")
+                    or report.get("critical_errors")
+                    or report.get("gaps")
+                ):
+                    artifact_id = str(normalized_op.get("artifact_id") or "")
+                    if artifact_id:
+                        blocking_verification_evidence_ids.append(artifact_id)
             if normalized_op.get("artifact_type") == "integration_report" and normalized_op.get("artifact_id"):
                 integration_evidence_ids.append(str(normalized_op["artifact_id"]))
         if kind in {"add_claim", "add_route", "add_inference"}:
@@ -735,6 +793,29 @@ def _normalize_patch_aliases(patch: Dict[str, Any]) -> Dict[str, Any]:
             ):
                 normalized_op["evidence_artifact_ids"] = list(integration_evidence_ids)
         normalized_operations.append(normalized_op)
+    if str(normalized.get("actor_role") or "") == "strict_informal_verifier" and blocking_verification_evidence_ids:
+        target_id = str(normalized.get("target_id") or "")
+        already_challenged = any(
+            isinstance(op, Mapping)
+            and str(op.get("op") or "") == "propose_status_transition"
+            and str(op.get("target_type") or "claim") == "claim"
+            and str(op.get("target_id") or "") == target_id
+            and str(op.get("status_type") or "validation") == "validation"
+            and str(op.get("new_status") or "") == "challenged"
+            for op in normalized_operations
+        )
+        if target_id and not already_challenged:
+            normalized_operations.append(
+                {
+                    "op": "propose_status_transition",
+                    "target_type": "claim",
+                    "target_id": target_id,
+                    "status_type": "validation",
+                    "new_status": "challenged",
+                    "evidence_artifact_ids": list(dict.fromkeys(blocking_verification_evidence_ids)),
+                    "reason": "strict verification found a blocking error or gap",
+                }
+            )
     normalized["operations"] = normalized_operations
     return normalized
 
@@ -1416,15 +1497,35 @@ def _attach_artifact(conn: sqlite3.Connection, store: ProofStateStore, patch: Di
     if not isinstance(metadata, dict):
         raise PatchRejected(["artifact metadata must be an object"])
     metadata = _compact_artifact_metadata(artifact_type, metadata)
+    strategy_errors = strategic_artifact_errors(
+        conn,
+        artifact_type=artifact_type,
+        metadata=metadata,
+        actor_role=actor,
+        base_revision=int(patch["base_revision"]),
+    )
+    if strategy_errors:
+        raise PatchRejected(strategy_errors)
     content = _artifact_inline_content(op)
-    if content is not None and not content.endswith("\n"):
-        content += "\n"
-    content, content_augmented = _augment_writer_partial_receipt_content(conn, actor, artifact_type, metadata, content)
-    _guard_writer_references(actor, artifact_type, content)
-    _guard_writer_mathematical_exposition(actor, artifact_type, content)
     path = _validated_artifact_path(store, op.get("path", ""))
     if content is not None and path:
         raise PatchRejected(["attach_artifact with inline content must omit path; the proof-state store writes artifacts under state_dir/artifacts"])
+    staged_from_path = False
+    if content is None and path and actor == "writer" and artifact_type in WRITER_PATH_ATTACH_ARTIFACT_TYPES:
+        # Path-based writer attach: load the staged file so the full writer
+        # guard chain below runs on it exactly as for inline content.
+        content = _load_writer_staged_content(path)
+        staged_from_path = True
+    if content is not None and not content.endswith("\n"):
+        content += "\n"
+    content, content_augmented = _augment_writer_partial_receipt_content(conn, actor, artifact_type, metadata, content)
+    content = _normalize_writer_latex_escaping(artifact_type, content)
+    content = _normalize_writer_paper_template(artifact_type, content)
+    _guard_writer_references(actor, artifact_type, content)
+    _guard_writer_mathematical_exposition(actor, artifact_type, content)
+    _guard_writer_generation_residue(actor, artifact_type, content)
+    _guard_writer_paper_register(artifact_type, content)
+    _guard_writing_review_metadata(artifact_type, artifact_id, metadata)
     # Always recompute the digest: a caller-supplied sha256 was trusted verbatim
     # here, letting an agent bypass duplicate-artifact rejection with a bogus hash.
     digest = artifact_hash(content=content, metadata=metadata)
@@ -1439,11 +1540,27 @@ def _attach_artifact(conn: sqlite3.Connection, store: ProofStateStore, patch: Di
         ).fetchone()
         if duplicate:
             raise PatchRejected([f"duplicate {artifact_type} artifact content matches existing artifact {duplicate['artifact_id']}; reuse that artifact_id"])
-    wrote_inline_content = content is not None and not path
-    if wrote_inline_content:
+    if content is not None and (not path or staged_from_path):
+        # Inline content, or a writer's staged file: the recorded artifact must
+        # point at the store-managed copy under state_dir/artifacts with the
+        # standard naming/extension, never at the mutable staging file.
         path = str(_write_artifact_content(store, artifact_id, artifact_type, content))
     if actor == "writer" and content is not None and path:
-        write_latex_pdf_sidecars(path, content, title=_writer_artifact_title(artifact_id, artifact_type))
+        if artifact_type == "final_paper":
+            # The final_paper's content IS LaTeX source already stored as .tex;
+            # compile it directly — no markdown->LaTeX conversion pass.
+            sidecars = compile_latex_artifact(Path(path), Path(path).with_suffix(".pdf"))
+        else:
+            sidecars = write_latex_pdf_sidecars(path, content, title=_writer_artifact_title(artifact_id, artifact_type))
+        # Persist the LaTeX compile outcome so the writing gate can tell whether
+        # the shipped .tex actually compiled without re-running pdflatex. Merged
+        # after the digest so it does not affect content-dedup hashing.
+        pdf_status = str(sidecars.get("pdf_status") or "")
+        if pdf_status:
+            metadata = {**metadata, "pdf_status": pdf_status}
+            log_path = str(sidecars.get("latex_log_path") or "")
+            if log_path:
+                metadata["latex_log_path"] = log_path
     conn.execute(
         """
         INSERT INTO artifacts(
@@ -1473,6 +1590,32 @@ def _artifact_inline_content(op: Mapping[str, Any]) -> Optional[str]:
     if isinstance(raw_content, str):
         return raw_content
     return json.dumps(raw_content, indent=2, sort_keys=True, ensure_ascii=False)
+
+
+def _load_writer_staged_content(path: str) -> str:
+    """Load a writer-staged document for a path-based attach_artifact.
+
+    ``path`` has already passed _validated_artifact_path, so it is a real file
+    under state_dir/artifacts (recommended staging location:
+    state_dir/artifacts/staging/<artifact_id>.tex). Size-capped so a runaway
+    staging file cannot be slurped into the guards whole.
+    """
+    staged = Path(path)
+    try:
+        size = staged.stat().st_size
+    except OSError as exc:
+        raise PatchRejected([f"could not stat staged artifact file {path}: {exc}"])
+    if size > WRITER_PATH_ATTACH_MAX_BYTES:
+        raise PatchRejected(
+            [
+                f"staged artifact file {path} is {size} bytes; path-based attach_artifact accepts at most "
+                f"{WRITER_PATH_ATTACH_MAX_BYTES} bytes"
+            ]
+        )
+    try:
+        return staged.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PatchRejected([f"could not read staged artifact file {path} as UTF-8 text: {exc}"])
 
 
 def _augment_writer_partial_receipt_content(
@@ -1539,6 +1682,135 @@ def _guard_writer_mathematical_exposition(actor: str, artifact_type: str, conten
         )
     if artifact_type == "final_proof" and not FINAL_PROOF_RE.search(content):
         raise PatchRejected(["writer final_proof artifacts must contain an explicit Proof section or proof environment"])
+
+
+def _guard_writer_generation_residue(actor: str, artifact_type: str, content: Optional[str]) -> None:
+    """Reject writer exposition that still carries generation residue (L1-CITE-03).
+
+    Mirrors the _guard_writer_* style above: deterministic, patch-time, and
+    scoped to the artifact types that ship as the public mathematical text.
+    """
+    if actor != "writer" or content is None:
+        return
+    if artifact_type not in WRITER_RESIDUE_SCANNED_ARTIFACT_TYPES:
+        return
+    findings = run_residue_scan(content)
+    if not findings:
+        return
+    details = "; ".join(
+        f"{finding.rule_id} line {finding.line}: {finding.message} ({finding.excerpt[:80]!r})"
+        for finding in findings[:6]
+    )
+    raise PatchRejected(
+        [
+            (
+                f"writer {artifact_type} artifacts must not contain generation residue "
+                f"(rule L1-CITE-03); remove the residue and re-attach: {details}"
+            )
+        ]
+    )
+
+
+def _normalize_writer_latex_escaping(artifact_type: str, content: Optional[str]) -> Optional[str]:
+    """Repair a fully double-escaped final_paper before the guards run.
+
+    Some writer sessions over-escape the JSON patch, so the parsed LaTeX arrives
+    with every backslash doubled (\\\\documentclass...). That document is
+    unambiguous garbage as LaTeX, and rejecting it costs a whole authoring
+    session, so unescape deterministically instead. Detection is strict: the
+    doubled form of \\documentclass must be present and the single form absent,
+    which cannot occur in a correctly escaped paper. Quadruple backslashes
+    (doubled tabular row breaks) are protected so they collapse back to the
+    row-break double backslash.
+    """
+    if artifact_type != "final_paper" or not content:
+        return content
+    if "\\\\documentclass" not in content:
+        return content
+    if content.replace("\\\\documentclass", "").find("\\documentclass") != -1:
+        return content
+    sentinel = "\x00ROWBREAK\x00"
+    repaired = content.replace("\\\\\\\\", sentinel).replace("\\\\", "\\").replace(sentinel, "\\\\")
+    return repaired
+
+
+def _normalize_writer_paper_template(artifact_type: str, content: Optional[str]) -> Optional[str]:
+    """Normalize a final_paper onto the house LaTeX template before the guards.
+
+    Layout must not depend on model compliance: the deterministic normalizer
+    (writing/latex_template.py) rewrites a non-house preamble to the house
+    package set and converts every tabular to canonical booktabs rules. The
+    stored .tex, the compile sidecar, and the writing gate all see the
+    normalized document. Idempotent: an already-house paper is unchanged.
+    """
+    if artifact_type != "final_paper" or not content:
+        return content
+    return normalize_paper_template(content)
+
+
+def _guard_writer_paper_register(artifact_type: str, content: Optional[str]) -> None:
+    """Reject a final_paper that fails the deterministic paper-register lint.
+
+    Mirrors the residue guard style: patch-time, deterministic, and scoped to
+    the shipped paper. Any L5-PAPER-01 (markdown residue), L5-PAPER-02
+    (internal system register in the main text), or L5-PAPER-03 (missing
+    article structure) finding rejects the attach outright — a document that
+    trips these is not a paper, so no gate cycle should be spent on it.
+
+    Anti-slop findings (run_slop_lint, L4-SLOP-*/L4-HOUSE-03) are deliberately
+    NOT checked here: slop is a writing debt synced by the scheduler's gate
+    (majors force the single revision), never an attach-rejection.
+    """
+    if artifact_type != "final_paper" or content is None:
+        return
+    findings = run_paper_lint(content)
+    if not findings:
+        return
+    details = "; ".join(
+        f"{finding.rule_id} line {finding.line}: {finding.message} ({finding.excerpt[:80]!r})"
+        for finding in findings[:6]
+    )
+    raise PatchRejected(
+        [
+            (
+                "writer final_paper artifacts must pass the paper-register lint "
+                f"(rules L5-PAPER-01/02/03); fix the findings and re-attach: {details}"
+            )
+        ]
+    )
+
+
+def _guard_writing_review_metadata(artifact_type: str, artifact_id: str, metadata: Mapping[str, Any]) -> None:
+    """writing_review artifacts must carry a decidable verdict + lens.
+
+    Mirrors the verification_report verdict guard: the scheduler's writing gate
+    keys lens convergence off this metadata, so a review without it is useless.
+    """
+    if artifact_type not in WRITING_CRITIC_ARTIFACT_TYPES:
+        return
+    verdict = str(metadata.get("verdict") or "").strip().lower()
+    if verdict not in WRITING_REVIEW_VERDICTS:
+        raise PatchRejected(
+            [
+                f"writing_review artifact {artifact_id} requires metadata.verdict in "
+                f"{sorted(WRITING_REVIEW_VERDICTS)}; got {verdict or 'missing'}"
+            ]
+        )
+    lens = str(metadata.get("lens") or "").strip().lower()
+    if lens not in WRITING_CRITIC_LENSES:
+        raise PatchRejected(
+            [
+                f"writing_review artifact {artifact_id} requires metadata.lens in "
+                f"{sorted(WRITING_CRITIC_LENSES)}; got {lens or 'missing'}"
+            ]
+        )
+    if not str(metadata.get("artifact_reviewed") or "").strip():
+        raise PatchRejected(
+            [
+                f"writing_review artifact {artifact_id} requires metadata.artifact_reviewed naming the reviewed "
+                "final_proof or final_paper"
+            ]
+        )
 
 
 def _looks_like_raw_writer_ledger_dump(content: str) -> bool:
@@ -2011,9 +2283,25 @@ def _debt_operation(
         severity = _normalize_debt_severity(op.get("severity", row["severity"]))
         if status not in DEBT_STATUSES or severity not in DEBT_SEVERITIES:
             raise PatchRejected(["invalid debt status or severity"])
+        resolution_json = row["resolution_evidence_json"]
+        resolution_note = str(op.get("resolution_note") or "").strip()
+        resolution_ids = [str(item) for item in (op.get("resolution_evidence_artifact_ids") or []) if str(item or "")]
+        resolution_extra = op.get("resolution_evidence") if isinstance(op.get("resolution_evidence"), Mapping) else {}
+        if resolution_note or resolution_ids or resolution_extra:
+            evidence = json_loads(resolution_json, {})
+            if not isinstance(evidence, dict):
+                evidence = {}
+            evidence.update(resolution_extra)
+            if resolution_note:
+                evidence["resolution_note"] = resolution_note
+            if resolution_ids:
+                evidence["resolution_evidence_artifact_ids"] = sorted(
+                    set(list(evidence.get("resolution_evidence_artifact_ids", [])) + resolution_ids)
+                )
+            resolution_json = json_dumps(evidence)
         conn.execute(
-            "UPDATE debts SET status = ?, severity = ?, last_seen = ?, suggested_next_target = ? WHERE debt_id = ?",
-            (status, severity, utc_now(), op.get("suggested_next_target", row["suggested_next_target"]), debt_id),
+            "UPDATE debts SET status = ?, severity = ?, last_seen = ?, suggested_next_target = ?, resolution_evidence_json = ? WHERE debt_id = ?",
+            (status, severity, utc_now(), op.get("suggested_next_target", row["suggested_next_target"]), resolution_json, debt_id),
         )
         return
 
@@ -2149,6 +2437,11 @@ def _status_transition(conn: sqlite3.Connection, patch: Dict[str, Any], op: Dict
     actor = patch["actor_role"]
     evidence_ids = list(op.get("evidence_artifact_ids") or patch.get("evidence_artifact_ids", []))
 
+    if actor == WRITING_CRITIC_ROLE:
+        raise PatchRejected([
+            "writing_critic may not transition claim, inference, or route statuses; "
+            "report findings as writing debts and writing_review artifacts only"
+        ])
     if target_type not in {"claim", "inference", "route"}:
         raise PatchRejected([f"unsupported transition target_type: {target_type}"])
     if target_type == "route":
@@ -2205,6 +2498,10 @@ def _status_transition(conn: sqlite3.Connection, patch: Dict[str, Any], op: Dict
             raise PatchRejected([f"unknown claim: {target_id}"])
         if target_id == "root" and status_type == "validation" and new_status == "refuted" and not op.get("confirmed_root_counterexample"):
             raise PatchRejected(["root theorem refutation requires confirmed_root_counterexample=true"])
+        if target_id == "root" and status_type == "validation" and new_status == "refuted":
+            root_row = conn.execute("SELECT statement FROM claims WHERE claim_id = 'root'").fetchone()
+            if root_row and statement_is_interrogative_problem(str(root_row[0] or "")):
+                raise PatchRejected(["an interrogative root problem cannot be marked refuted; record the checked example as partial evidence and keep the root active"])
         col = "validation_status" if status_type == "validation" else "lifecycle_status"
         conn.execute(
             f"UPDATE claims SET {col} = ?, evidence_artifact_ids_json = ?, updated_at = ? WHERE claim_id = ?",
@@ -2250,7 +2547,10 @@ def _guard_integration(
         raise PatchRejected(["integration route conclusion does not match target claim"])
     if route["relation_to_parent"] != "sufficient":
         raise PatchRejected(["only sufficient routes can support integration"])
-    conclusion = conn.execute("SELECT validation_status FROM claims WHERE claim_id = ?", (claim_id,)).fetchone()
+    conclusion = conn.execute(
+        "SELECT validation_status, evidence_artifact_ids_json FROM claims WHERE claim_id = ?",
+        (claim_id,),
+    ).fetchone()
     if conclusion is None or conclusion["validation_status"] not in VERIFIED_STATUSES:
         raise PatchRejected([f"claim {claim_id} is not verified"])
     integration_errors = _integration_report_errors(conn, evidence_ids, claim_id=claim_id, route=route, producer_role="integration_verifier")
@@ -2263,18 +2563,48 @@ def _guard_integration(
         )
     )
     resolved = set(resolved_debt_ids)
-    if any(_debt_blocks_integration(row, claim_id=claim_id) for row in blockers if row["debt_id"] not in resolved):
+    clean_verification_at = _latest_clean_claim_verification_at(
+        conn,
+        json_loads(conclusion["evidence_artifact_ids_json"], []),
+    )
+    if any(
+        _debt_blocks_integration(
+            row,
+            claim_id=claim_id,
+            clean_verification_at=clean_verification_at,
+        )
+        for row in blockers
+        if row["debt_id"] not in resolved
+    ):
         raise PatchRejected(["active blocking debt prevents integration"])
     inferences = list(conn.execute("SELECT * FROM inferences WHERE route_id = ?", (route_id,)))
     if not inferences:
         raise PatchRejected(["integration route has no inferences"])
+    verified_terminal_inferences = []
     for inf in inferences:
-        if inf["validation_status"] not in VERIFIED_STATUSES:
-            raise PatchRejected([f"inference {inf['inference_id']} is not verified"])
-        for premise in conn.execute("SELECT premise_claim_id FROM inference_premises WHERE inference_id = ?", (inf["inference_id"],)):
-            claim = conn.execute("SELECT validation_status FROM claims WHERE claim_id = ?", (premise["premise_claim_id"],)).fetchone()
+        if (
+            str(inf["conclusion_claim_id"] or "") != claim_id
+            or inf["validation_status"] not in VERIFIED_STATUSES
+        ):
+            continue
+        premises_verified = True
+        for premise in conn.execute(
+            "SELECT premise_claim_id FROM inference_premises WHERE inference_id = ?",
+            (inf["inference_id"],),
+        ):
+            claim = conn.execute(
+                "SELECT validation_status FROM claims WHERE claim_id = ?",
+                (premise["premise_claim_id"],),
+            ).fetchone()
             if claim is None or claim["validation_status"] not in VERIFIED_STATUSES:
-                raise PatchRejected([f"premise {premise['premise_claim_id']} is not verified"])
+                premises_verified = False
+                break
+        if premises_verified:
+            verified_terminal_inferences.append(str(inf["inference_id"]))
+    if not verified_terminal_inferences:
+        raise PatchRejected([
+            "integration route has no verified terminal inference with verified premises"
+        ])
 
 
 def _integration_resolved_debt_ids(conn: sqlite3.Connection, op: Mapping[str, Any], evidence_ids: Sequence[str]) -> List[str]:
@@ -2332,7 +2662,44 @@ def _resolve_integration_debts(
         )
 
 
-def _debt_blocks_integration(debt: sqlite3.Row, *, claim_id: str) -> bool:
+def _latest_clean_claim_verification_at(
+    conn: sqlite3.Connection,
+    evidence_ids: Sequence[str],
+) -> str:
+    """Timestamp of the newest clean verifier/formal certificate on a claim."""
+    latest = ""
+    for artifact_id in evidence_ids:
+        row = conn.execute(
+            "SELECT artifact_type, producer_role, created_at FROM artifacts WHERE artifact_id = ?",
+            (artifact_id,),
+        ).fetchone()
+        if not row:
+            continue
+        artifact_type = str(row["artifact_type"] or "")
+        producer_role = str(row["producer_role"] or "")
+        clean = (
+            artifact_type == "verification_report"
+            and producer_role == "strict_informal_verifier"
+            and _has_correct_verification(
+                conn,
+                [artifact_id],
+                producer_role="strict_informal_verifier",
+            )
+        ) or (
+            artifact_type == "formal_backend_result"
+            and producer_role == "formal_backend"
+        )
+        if clean:
+            latest = max(latest, str(row["created_at"] or ""))
+    return latest
+
+
+def _debt_blocks_integration(
+    debt: sqlite3.Row,
+    *,
+    claim_id: str,
+    clean_verification_at: str = "",
+) -> bool:
     owner_type = str(debt["owner_type"] or "")
     owner_id = str(debt["owner_id"] or "")
     if owner_type != "claim" or owner_id != claim_id:
@@ -2341,6 +2708,13 @@ def _debt_blocks_integration(debt: sqlite3.Row, *, claim_id: str) -> bool:
     if debt_type == "missing_proof_or_counterexample":
         return False
     if debt_type == "blocking_bridge" and _looks_like_downstream_claim_debt(debt):
+        return False
+    # A later zero-gap strict/formal certificate adjudicates the exact claim
+    # after this debt was recorded.  The old debt may still describe useful
+    # downstream root work, but it must not trap the already verified claim in
+    # an endless integration-rejection loop.  Any blocker added or refreshed
+    # after the certificate remains binding.
+    if clean_verification_at and clean_verification_at > str(debt["last_seen"] or ""):
         return False
     return True
 
@@ -2825,7 +3199,7 @@ def _compact_artifact_metadata(artifact_type: str, metadata: Dict[str, Any]) -> 
         if "notes" in compact:
             compact["notes"] = _compact_text(compact["notes"], 600)
         return compact
-    if artifact_type == "final_proof":
+    if artifact_type in {"final_proof", "final_paper"}:
         compact = dict(metadata)
         compact["source_artifact_ids"] = _compact_list(compact.get("source_artifact_ids", []), item_chars=120, max_items=24)
         return compact
@@ -2936,8 +3310,12 @@ def _write_artifact_content(store: ProofStateStore, artifact_id: str, artifact_t
         "definition_audit_report",
         "route_triage_report",
         "advisor_report",
+        "writing_review",
+        *STRATEGIC_MARKDOWN_ARTIFACT_TYPES,
     }
-    suffix = ".md" if artifact_type in markdown_types else ".txt"
+    suffix = ARTIFACT_CONTENT_EXTENSIONS.get(
+        artifact_type, ".md" if artifact_type in markdown_types else ".txt"
+    )
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", artifact_id).strip("._") or "artifact"
     artifact_dir = store.state_dir / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -2971,6 +3349,11 @@ def _guard_artifact_actor(actor: str, artifact_type: str, artifact_id: str) -> N
         raise PatchRejected([
             f"strict_informal_verifier cannot attach {artifact_type} artifact {artifact_id}; "
             "strict verification may only attach verification_report artifacts"
+        ])
+    if actor == WRITING_CRITIC_ROLE and artifact_type not in WRITING_CRITIC_ARTIFACT_TYPES:
+        raise PatchRejected([
+            f"writing_critic cannot attach {artifact_type} artifact {artifact_id}; "
+            "writing review may only attach writing_review artifacts"
         ])
     allowed = ARTIFACT_PRODUCER_ROLES.get(artifact_type)
     if allowed and actor not in allowed:
@@ -3071,7 +3454,7 @@ def _root_alignment_target_matches(target_statement: str, root_statement: str) -
     candidates = {root_norm}
     if first_paragraph:
         candidates.add(first_paragraph)
-    # H1-titled problem files start with an H1 title, making the
+    # Kourovka-style problem files start with an H1 title, making the
     # first-paragraph candidate just the title line; accept the '## Problem'
     # section body and its question paragraph verbatim as well.
     problem_section = _markdown_sections(root_statement).get("problem", "")
@@ -3129,8 +3512,8 @@ def _check_owner_exists(
     *,
     pending_owners: Mapping[str, set[str]] | None = None,
 ) -> None:
-    table = {"claim": "claims", "route": "routes", "inference": "inferences"}.get(owner_type)
-    key = {"claim": "claim_id", "route": "route_id", "inference": "inference_id"}.get(owner_type)
+    table = {"claim": "claims", "route": "routes", "inference": "inferences", "artifact": "artifacts"}.get(owner_type)
+    key = {"claim": "claim_id", "route": "route_id", "inference": "inference_id", "artifact": "artifact_id"}.get(owner_type)
     if not table or not key:
         raise PatchRejected([f"invalid owner_type: {owner_type}"])
     if owner_id in (pending_owners or {}).get(owner_type, set()):

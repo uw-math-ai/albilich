@@ -45,6 +45,43 @@ def add_debt_patch(*, problem_id: str, base_revision: int, debt_id: str, obligat
 
 
 class Phase2PatchDebtTest(unittest.TestCase):
+    def test_interrogative_root_cannot_be_marked_refuted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("patch-question-root-refutation-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("Does an absolute bound exist? Find its minimum value.")
+            outcome = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "counterexample_validator",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "confirmed-lower-bound-example",
+                            "artifact_type": "confirmed_counterexample",
+                            "content": "The checked example rules out the proposed bound two.",
+                            "metadata": {"confirmed": True, "failed_hypothesis": "k is at most two"},
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "claim",
+                            "target_id": "root",
+                            "status_type": "validation",
+                            "new_status": "refuted",
+                            "confirmed_root_counterexample": True,
+                            "evidence_artifact_ids": ["confirmed-lower-bound-example"],
+                        },
+                    ],
+                    "rationale": "incorrectly treat lower-bound evidence as refuting a question",
+                },
+            )
+
+        self.assertFalse(outcome.accepted)
+        self.assertTrue(any("interrogative root problem" in error for error in outcome.errors))
+
     def test_debt_sources_drop_retrieval_card_ids_from_literature_patch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("patch-debt-retrieval-card-source-test", generation_root=Path(tmpdir) / "generation")
@@ -191,6 +228,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
                             "state_revision": 0,
                             "context_revision": 0,
                             "input_tokens": 1,
+                            "cached_input_tokens": 1,
                             "output_tokens": 2,
                             "reasoning_output_tokens": 3,
                             "total_tokens": 123,
@@ -240,6 +278,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
             usage = payload["usage_summary"]
             self.assertEqual(usage["total_recorded"]["total_tokens"], 579)
+            self.assertEqual(usage["total_recorded"]["cached_input_tokens"], 1)
             self.assertNotIn("prior_stopped_carryover", usage)
             self.assertNotIn("current_invocation", usage)
             self.assertEqual(usage["total_recorded"]["peak_memory_mb"], 222.5)
@@ -2045,7 +2084,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
                             "route_id": "route-root",
                             "conclusion_claim_id": "root",
                             "relation_to_parent": "sufficient",
-                            "strategy": "Use the direct bridge argument.",
+                            "strategy": "Use the Euclid square-plus-one argument.",
                         },
                         {
                             "op": "add_inference",
@@ -2604,7 +2643,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             self.assertEqual(root["lifecycle_status"], "integrated")
             self.assertEqual(route_row["status"], "integrated")
 
-    def test_downstream_claim_debt_does_not_block_integration(self) -> None:
+    def test_older_claim_debt_does_not_block_after_clean_verification(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("integration-downstream-debt-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("Target theorem.")
@@ -2650,13 +2689,13 @@ class Phase2ExternalCitationTest(unittest.TestCase):
                         },
                         {
                             "op": "add_debt",
-                            "debt_id": "debt-after-side-bridge",
+                            "debt_id": "debt-before-side-bridge-verification",
                             "owner_type": "claim",
                             "owner_id": "side-bridge",
-                            "debt_type": "blocking_bridge",
+                            "debt_type": "proof_gap",
                             "severity": "blocking",
                             "status": "active",
-                            "obligation": "After this bridge is proved, decide the remaining downstream bottleneck for the root theorem.",
+                            "obligation": "Prove the exact side bridge without hidden assumptions.",
                             "suggested_next_target": "side-bridge",
                         },
                     ],
@@ -2750,9 +2789,13 @@ class Phase2ExternalCitationTest(unittest.TestCase):
                 conn.row_factory = sqlite3.Row
                 claim = conn.execute("SELECT lifecycle_status FROM claims WHERE claim_id = 'side-bridge'").fetchone()
                 route = conn.execute("SELECT status FROM routes WHERE route_id = 'route-side-bridge'").fetchone()
+                debt = conn.execute(
+                    "SELECT status FROM debts WHERE debt_id = 'debt-before-side-bridge-verification'"
+                ).fetchone()
 
         self.assertEqual(claim["lifecycle_status"], "integrated")
         self.assertEqual(route["status"], "integrated")
+        self.assertEqual(debt["status"], "active")
 
     def test_rejects_new_active_sufficient_route_to_integrated_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3052,24 +3095,24 @@ class Phase2ExternalCitationTest(unittest.TestCase):
                     "operations": [
                         {
                             "op": "add_claim",
-                            "claim_id": "lemma-bridge",
+                            "claim_id": "lemma-frattini",
                             "kind": "lemma",
-                            "statement": "The bridge lemma preserves the selected generators.",
+                            "statement": "Frattini lifting preserves the selected invariable generators.",
                             "parent_ids": ["root"],
                             "validation_status": "untested",
                         },
                         {
                             "op": "add_route",
-                            "route_id": "route-bridge",
-                            "conclusion_claim_id": "lemma-bridge",
+                            "route_id": "route-frattini",
+                            "conclusion_claim_id": "lemma-frattini",
                             "relation_to_parent": "sufficient",
-                            "strategy": "Direct Bridge lifting proof.",
+                            "strategy": "Direct Frattini lifting proof.",
                         },
                         {
                             "op": "add_inference",
-                            "inference_id": "inf-bridge",
-                            "route_id": "route-bridge",
-                            "conclusion_claim_id": "lemma-bridge",
+                            "inference_id": "inf-frattini",
+                            "route_id": "route-frattini",
+                            "conclusion_claim_id": "lemma-frattini",
                             "premise_claim_ids": [],
                             "validation_status": "plausible",
                             "explanation": "The route proves the lemma.",
@@ -3087,11 +3130,11 @@ class Phase2ExternalCitationTest(unittest.TestCase):
                     "problem_id": store.problem_id,
                     "base_revision": store.get_revision(),
                     "actor_role": "strict_informal_verifier",
-                    "target_id": "lemma-bridge",
+                    "target_id": "lemma-frattini",
                     "operations": [
                         {
                             "op": "attach_artifact",
-                            "artifact_id": "verification-bridge",
+                            "artifact_id": "verification-frattini",
                             "artifact_type": "verification_report",
                             "content": "{\"verdict\":\"verified\",\"critical_errors\":[],\"gaps\":[],\"blocking_gap\":false}",
                             "metadata": {
@@ -3106,13 +3149,13 @@ class Phase2ExternalCitationTest(unittest.TestCase):
                         {
                             "op": "propose_status_transition",
                             "target_kind": "inference",
-                            "target_id": "inf-bridge",
+                            "target_id": "inf-frattini",
                             "to_status": "informally_verified",
                         },
                         {
                             "op": "propose_status_transition",
                             "object_type": "claim",
-                            "object_id": "lemma-bridge",
+                            "object_id": "lemma-frattini",
                             "proposed_status": "informally_verified",
                         },
                     ],
@@ -3123,12 +3166,12 @@ class Phase2ExternalCitationTest(unittest.TestCase):
 
             with sqlite3.connect(store.db_path) as conn:
                 conn.row_factory = sqlite3.Row
-                claim = conn.execute("SELECT validation_status, evidence_artifact_ids_json FROM claims WHERE claim_id = 'lemma-bridge'").fetchone()
-                inference = conn.execute("SELECT validation_status, evidence_artifact_ids_json FROM inferences WHERE inference_id = 'inf-bridge'").fetchone()
+                claim = conn.execute("SELECT validation_status, evidence_artifact_ids_json FROM claims WHERE claim_id = 'lemma-frattini'").fetchone()
+                inference = conn.execute("SELECT validation_status, evidence_artifact_ids_json FROM inferences WHERE inference_id = 'inf-frattini'").fetchone()
             self.assertEqual(claim["validation_status"], "informally_verified")
             self.assertEqual(inference["validation_status"], "informally_verified")
-            self.assertEqual(json.loads(claim["evidence_artifact_ids_json"]), ["verification-bridge"])
-            self.assertEqual(json.loads(inference["evidence_artifact_ids_json"]), ["verification-bridge"])
+            self.assertEqual(json.loads(claim["evidence_artifact_ids_json"]), ["verification-frattini"])
+            self.assertEqual(json.loads(inference["evidence_artifact_ids_json"]), ["verification-frattini"])
 
     def test_root_integration_accepts_target_statement_with_definition_qualifier(self) -> None:
         theorem = (
@@ -4266,6 +4309,77 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
 
 
 class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
+    def test_add_claim_rejects_near_restatement_of_integrated_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("integrated-claim-duplicate-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("root")
+            outcome = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "add_claim",
+                            "claim_id": "closed-psl2-branch",
+                            "kind": "lemma",
+                            "statement": (
+                                "Let ell>=5 be an odd prime, S=PSL_2(ell), and let Gamma be S when ell=3 mod 4 "
+                                "and PGL_2(ell) when ell=1 mod 4. Let |Omega|>1 and let K satisfy "
+                                "S^Omega <= K <= Gamma wr P with P transitive on Omega. Then no pair x,y in K "
+                                "of orders 2 and ell invariably generates K."
+                            ),
+                            "parent_ids": ["root"],
+                            "root_impact": 0.9,
+                        }
+                    ],
+                    "rationale": "seed closed branch",
+                },
+            )
+            self.assertTrue(outcome.accepted, outcome.errors)
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE claims
+                    SET validation_status='informally_verified', lifecycle_status='integrated'
+                    WHERE claim_id='closed-psl2-branch'
+                    """
+                )
+
+            duplicate = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "add_claim",
+                            "claim_id": "new-psl2-restatement",
+                            "kind": "lemma",
+                            "statement": (
+                                "Let ell>=5 be an odd prime, S=PSL_2(ell), and Gamma=S if ell=3 mod 4 "
+                                "while Gamma=PGL_2(ell) if ell=1 mod 4. Let Omega have size >1, and let K be "
+                                "a finite group with S^Omega <= K <= Gamma wr Sym(Omega) whose top image P is "
+                                "transitive on Omega. Then no pair x,y in K with |x|=2 and |y|=ell invariably generates K."
+                            ),
+                            "parent_ids": ["root"],
+                            "root_impact": 0.9,
+                        }
+                    ],
+                    "rationale": "try duplicate closed branch",
+                },
+            )
+
+            self.assertFalse(duplicate.accepted)
+            self.assertIn("duplicate claim", " ".join(duplicate.errors))
+            self.assertIn("closed-psl2-branch", " ".join(duplicate.errors))
+
     def test_add_claim_allows_substantive_extension_of_integrated_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("integrated-claim-extension-test", generation_root=Path(tmpdir) / "generation")
@@ -4510,7 +4624,7 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
 class Phase2StatusTransitionGraphIdAliasTest(unittest.TestCase):
     """propose_status_transition must accept concrete graph-id fields as target aliases.
 
-    Observed live (2026-07-03, a research problem): the integration verifier emitted
+    Observed live (2026-07-03, problem 20.2): the integration verifier emitted
     claim_id/route_id instead of target_id and the whole integrate patch was
     rejected for a missing target.
     """
@@ -4595,11 +4709,11 @@ class Phase2StatusTransitionGraphIdAliasTest(unittest.TestCase):
 
 class Phase2RootAlignmentMatcherTest(unittest.TestCase):
     ROOT = (
-        "# Problem 7: Widget-closed modular lattices\n\n"
+        "# Problem 20.2: Totally 3-closed nonabelian simple groups of Lie type\n\n"
         "## Problem\n\n"
-        "Let L be a finite modular lattice; define widget-closure as usual.\n\n"
-        "**Question (Problem 7).** Are there any finite modular lattices\n"
-        "which are widget-closed?\n\n"
+        "Let G be a permutation group; define the k-closure as usual.\n\n"
+        "**Question (Problem 20.2).** Are there any nonabelian simple groups of Lie type\n"
+        "which are totally 3-closed?\n\n"
         "## Instructions\n\n"
         "Treat this as a serious research problem.\n"
     )
@@ -4608,17 +4722,17 @@ class Phase2RootAlignmentMatcherTest(unittest.TestCase):
         from agents.generation.phase2.patches import _root_alignment_target_matches
 
         self.assertTrue(_root_alignment_target_matches(self.ROOT, self.ROOT))
-        question = "**Question (Problem 7).** Are there any finite modular lattices\nwhich are widget-closed?"
+        question = "**Question (Problem 20.2).** Are there any nonabelian simple groups of Lie type\nwhich are totally 3-closed?"
         self.assertTrue(_root_alignment_target_matches(question, self.ROOT))
-        section = "Let L be a finite modular lattice; define widget-closure as usual.\n\n" + question
+        section = "Let G be a permutation group; define the k-closure as usual.\n\n" + question
         self.assertTrue(_root_alignment_target_matches(section, self.ROOT))
         self.assertTrue(
-            _root_alignment_target_matches("Problem 7: Widget-closed modular lattices", self.ROOT)
+            _root_alignment_target_matches("Problem 20.2: Totally 3-closed nonabelian simple groups of Lie type", self.ROOT)
         )
         # Paraphrases still fail.
         self.assertFalse(
             _root_alignment_target_matches(
-                "Does there exist a widget-closed finite modular lattice?", self.ROOT
+                "Does there exist a totally 3-closed nonabelian simple group of Lie type?", self.ROOT
             )
         )
 
@@ -4694,6 +4808,26 @@ class Phase2PreflightPatchTest(unittest.TestCase):
             "strict_informal_verifier",
         )
         self.assertEqual(errors, [])
+
+    def test_blocking_verification_report_marks_claim_challenged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("patch-blocking-report-status-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("Prove the target theorem.")
+            patch = self._verifier_patch(
+                verdict="not_verified",
+                gaps=["the normalizer step is missing"],
+                with_transition=False,
+            )
+            patch["problem_id"] = store.problem_id
+            patch["base_revision"] = 0
+            patch["target_id"] = "root"
+            patch["operations"][0]["metadata"]["verification_report"]["blocking_gap"] = True
+            outcome = apply_patch(store, patch)
+            state = store.get_state()
+
+        self.assertTrue(outcome.accepted, outcome.errors)
+        root = next(row for row in state["claims"] if row["claim_id"] == "root")
+        self.assertEqual(root["validation_status"], "challenged")
 
     def test_external_evidence_is_left_to_apply_patch(self) -> None:
         from agents.generation.phase2.patches import preflight_patch_errors

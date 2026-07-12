@@ -11,12 +11,54 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from agents.generation.phase2.cli import _maybe_start_run_dashboard
-from agents.generation.phase2.monitor import _make_handler, build_monitor_payload, start_background_monitor
+from agents.generation.phase2.console import _run_timeline
+import agents.generation.phase2.monitor as monitor_mod
+from agents.generation.phase2.monitor import (
+    INDEX_HTML,
+    _claim_verification_history,
+    _make_handler,
+    _monitor_refresh_interval_seconds,
+    build_monitor_payload,
+    start_background_monitor,
+)
 from agents.generation.phase2.models import utc_now
 from agents.generation.phase2.store import ProofStateStore
 
 
 class MonitorTest(unittest.TestCase):
+    def test_verification_history_recovers_legacy_blocking_report_target(self) -> None:
+        state = {
+            "runs": [{"run_id": "verify-lemma", "target_id": "claim-lemma"}],
+            "artifacts": [
+                {
+                    "artifact_id": "verification-gap",
+                    "artifact_type": "verification_report",
+                    "run_id": "verify-lemma",
+                    "state_revision": 12,
+                    "metadata_json": json.dumps(
+                        {
+                            "verdict": "gap_found",
+                            "verification_report": {
+                                "critical_errors": [],
+                                "gaps": ["missing premise"],
+                                "blocking_gap": True,
+                            },
+                        }
+                    ),
+                }
+            ],
+        }
+
+        history = _claim_verification_history(state)
+
+        self.assertTrue(history["claim-lemma"]["blocking_gap"])
+        self.assertEqual(history["claim-lemma"]["latest_state_revision"], 12)
+
+    def test_authoritative_refresh_is_decoupled_from_browser_polling(self) -> None:
+        with patch.dict(os.environ, {"ALBILICH_MONITOR_REFRESH_INTERVAL_SECONDS": ""}):
+            self.assertEqual(_monitor_refresh_interval_seconds(3000), 60.0)
+            self.assertEqual(_monitor_refresh_interval_seconds(120000), 120.0)
+
     def _store(self, tmpdir: str) -> ProofStateStore:
         store = ProofStateStore("monitor-test", generation_root=Path(tmpdir) / "generation")
         store.init_problem("Prove the root theorem.")
@@ -31,6 +73,115 @@ class MonitorTest(unittest.TestCase):
             self.assertEqual(payload["_monitor"]["problem_id"], "monitor-test")
             self.assertIn(payload["_monitor"]["source"], {"store", "store+console"})
             self.assertIn("live", payload["_monitor"])
+
+    def test_token_ui_distinguishes_processed_from_budget_spend(self) -> None:
+        self.assertIn('cached/input*100', INDEX_HTML)
+        self.assertIn('>Processed</th>', INDEX_HTML)
+        self.assertIn('budget spend excludes cached input and includes reasoning', INDEX_HTML)
+
+    def test_run_timeline_marks_integration_failures_recovered_by_later_success(self) -> None:
+        runs = [
+            {
+                "run_id": "reject-1", "actor_role": "integration_verifier", "mode": "integrate",
+                "target_id": "claim-a", "route_id": "route-a", "status": "patch_rejected",
+            },
+            {
+                "run_id": "reject-other", "actor_role": "integration_verifier", "mode": "integrate",
+                "target_id": "claim-b", "route_id": "route-b", "status": "patch_rejected",
+            },
+            {
+                "run_id": "accept-1", "actor_role": "integration_verifier", "mode": "integrate",
+                "target_id": "claim-a", "route_id": "route-a", "status": "completed",
+            },
+        ]
+
+        timeline = _run_timeline(runs)
+
+        self.assertTrue(timeline[0]["failure_recovered"])
+        self.assertEqual(timeline[0]["recovered_by_run_id"], "accept-1")
+        self.assertNotIn("failure_recovered", timeline[1])
+        self.assertIn("recovered later", INDEX_HTML)
+
+    def test_claim_ledger_prioritizes_retired_lifecycle_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            with store.connect() as conn:
+                conn.execute(
+                    """UPDATE claims
+                       SET lifecycle_status = 'superseded', validation_status = 'informally_verified'
+                       WHERE claim_id = 'root'"""
+                )
+                conn.commit()
+
+            payload = build_monitor_payload(store)
+
+        root = next(row for row in payload["claims"] if row["claim_id"] == "root")
+        self.assertEqual(root["validation_status"], "informally_verified")
+        self.assertEqual(root["display_validation_status"], "superseded")
+        self.assertFalse(root["verified"])
+        self.assertTrue(root["retired"])
+        self.assertEqual(payload["verified_claim_total"], 0)
+        self.assertEqual(payload["snapshot"]["current_claim_count"], 0)
+        self.assertEqual(payload["snapshot"]["retired_claim_count"], 1)
+        self.assertEqual(payload["snapshot"]["verified_claim_count"], 0)
+        self.assertEqual(root["reduction_depth"], 0)
+        self.assertIn("superseded · stronger result", INDEX_HTML)
+        self.assertIn("Retired / superseded / falsified claims", INDEX_HTML)
+        self.assertIn("Current proof tree", INDEX_HTML)
+        self.assertIn("status-superseded", INDEX_HTML)
+        self.assertIn("status-plausible", INDEX_HTML)
+        self.assertIn("status-active", INDEX_HTML)
+        self.assertIn('class=\"claim-tree-children\"', INDEX_HTML)
+
+    def test_claim_ledger_exposes_superseding_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            now = utc_now()
+            with store.connect() as conn:
+                conn.execute(
+                    """INSERT INTO claims(
+                           claim_id, kind, statement, normalized_statement, fingerprint,
+                           hypotheses, conditions_json, validation_status, lifecycle_status,
+                           root_impact, reduction_depth, parent_ids_json, source_ids_json,
+                           tags_json, evidence_artifact_ids_json, created_at, updated_at
+                       ) VALUES (?, 'lemma', ?, 'a strictly stronger lower bound',
+                                 'fp-stronger', '', '[]', 'informally_verified', 'integrated',
+                                 1.0, 1, '[\"root\"]', '[]', '[]', '[]', ?, ?)""",
+                    ("claim-stronger", "A strictly stronger lower bound.", now, now),
+                )
+                conn.execute(
+                    """INSERT INTO claims(
+                           claim_id, kind, statement, normalized_statement, fingerprint,
+                           hypotheses, conditions_json, validation_status, lifecycle_status,
+                           root_impact, reduction_depth, parent_ids_json, source_ids_json,
+                           tags_json, evidence_artifact_ids_json, created_at, updated_at
+                       ) VALUES (?, 'lemma', ?, 'a weaker lower bound', 'fp-weaker', '', '[]',
+                                 'informally_verified', 'superseded', 0.5, 1, '[\"root\"]',
+                                 '[]', '[]', '[]', ?, ?)""",
+                    ("claim-weaker", "A weaker lower bound.", now, now),
+                )
+                conn.execute(
+                    """INSERT INTO artifacts(
+                           artifact_id, artifact_type, path, sha256, producer_role, run_id,
+                           state_revision, content_summary, metadata_json, created_at
+                       ) VALUES (?, 'advisor_report', '', '', 'phd_advisor', '', 1,
+                                 'Supersession audit.', ?, ?)""",
+                    (
+                        "advisor-lower-bound-supersession",
+                        json.dumps({
+                            "superseded_claim_ids": ["claim-weaker"],
+                            "replacement_claim_id": "claim-stronger",
+                        }),
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            payload = build_monitor_payload(store)
+
+        weaker = next(row for row in payload["claims"] if row["claim_id"] == "claim-weaker")
+        self.assertEqual(weaker["superseded_by_claim_ids"], ["claim-stronger"])
+        self.assertIn('relationPill("superseded by"', INDEX_HTML)
 
     def test_payload_exposes_bottleneck_frontier(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -200,6 +351,60 @@ class MonitorTest(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
 
+    def test_console_endpoint_coalesces_payload_rebuilds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            payload = {"_monitor": {"problem_id": "monitor-test"}, "snapshot": {"revision": 0}}
+            with patch.object(monitor_mod, "build_monitor_payload", return_value=payload) as build:
+                handler = _make_handler(store, poll_ms=2000)
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+                port = httpd.server_address[1]
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    for _ in range(2):
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/console") as resp:
+                            self.assertEqual(json.loads(resp.read().decode("utf-8")), payload)
+                    self.assertEqual(build.call_count, 1)
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+
+    def test_console_endpoint_serves_persisted_state_while_refreshing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            persisted = {
+                "problem_id": "monitor-test",
+                "snapshot": {"revision": 7},
+                "live_logs": [],
+                "current_invocation": [],
+            }
+            (store.state_dir / "albilich_run_console.json").write_text(json.dumps(persisted), encoding="utf-8")
+            refresh_started = threading.Event()
+            release_refresh = threading.Event()
+
+            def slow_refresh(_store: ProofStateStore) -> dict:
+                refresh_started.set()
+                release_refresh.wait(timeout=5)
+                return {"_monitor": {"source": "store"}, "snapshot": {"revision": 8}}
+
+            with patch.object(monitor_mod, "build_monitor_payload", side_effect=slow_refresh):
+                handler = _make_handler(store, poll_ms=2000)
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+                port = httpd.server_address[1]
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/console") as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(data["snapshot"]["revision"], 7)
+                    self.assertEqual(data["_monitor"]["source"], "console-fallback")
+                    self.assertTrue(refresh_started.wait(timeout=1))
+                finally:
+                    release_refresh.set()
+                    httpd.shutdown()
+                    httpd.server_close()
+
     def test_proof_graph_marks_verifier_ready_routes_and_blockers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(tmpdir)
@@ -312,6 +517,21 @@ class MonitorTest(unittest.TestCase):
                 for edge in graph["edges"]
             )
         )
+        claims = {row["claim_id"]: row for row in payload["claims"]}
+        self.assertEqual(claims["root"]["contains_subclaim_ids"], ["lemma-a"])
+        self.assertEqual(claims["root"]["supports_claim_ids"], ["lemma-a"])
+        self.assertEqual(claims["lemma-a"]["subclaim_of_claim_ids"], ["root"])
+        self.assertEqual(claims["lemma-a"]["supported_by_claim_ids"], ["root"])
+        self.assertTrue(
+            any(
+                edge["source"] == "claim:root"
+                and edge["target"] == "claim:lemma-a"
+                and edge["relation"] == "supports claim"
+                for edge in graph["edges"]
+            )
+        )
+        self.assertIn("subclaim of", INDEX_HTML)
+        self.assertIn("supported by", INDEX_HTML)
 
     def test_tail_endpoint_and_path_safety(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

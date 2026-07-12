@@ -24,6 +24,7 @@ from agents.generation.phase2.codex_runner import (
     execute_session,
     parse_codex_session_usage,
     prepare_session,
+    resolve_codex_executable,
     resolve_cli_usage,
 )
 from agents.generation.phase2.console import _live_usage_scope
@@ -59,6 +60,39 @@ def token_count_event(total_tokens: int, *, input_tokens: int, output_tokens: in
 
 
 class Phase2TokenUsageTest(unittest.TestCase):
+    def test_missing_codex_path_uses_configured_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fallback = Path(temp_dir) / "codex"
+            fallback.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fallback.chmod(0o755)
+            old = os.environ.get("ALBILICH_CODEX_BIN_FALLBACK")
+            os.environ["ALBILICH_CODEX_BIN_FALLBACK"] = str(fallback)
+            try:
+                self.assertEqual(
+                    resolve_codex_executable("/missing/Codex.app/Contents/Resources/codex"),
+                    str(fallback),
+                )
+            finally:
+                if old is None:
+                    os.environ.pop("ALBILICH_CODEX_BIN_FALLBACK", None)
+                else:
+                    os.environ["ALBILICH_CODEX_BIN_FALLBACK"] = old
+
+    def test_requested_codex_path_wins_over_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            requested = Path(temp_dir) / "requested-codex"
+            requested.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            requested.chmod(0o755)
+            old = os.environ.get("ALBILICH_CODEX_BIN_FALLBACK")
+            os.environ["ALBILICH_CODEX_BIN_FALLBACK"] = "/missing/fallback-codex"
+            try:
+                self.assertEqual(resolve_codex_executable(str(requested)), str(requested))
+            finally:
+                if old is None:
+                    os.environ.pop("ALBILICH_CODEX_BIN_FALLBACK", None)
+                else:
+                    os.environ["ALBILICH_CODEX_BIN_FALLBACK"] = old
+
     def test_codex_child_default_sandbox_allows_cas_temp_files(self) -> None:
         self.assertEqual(DEFAULT_SANDBOX, "workspace-write")
 
@@ -119,6 +153,41 @@ class Phase2TokenUsageTest(unittest.TestCase):
                 if old_rust_log is not None:
                     os.environ["RUST_LOG"] = old_rust_log
 
+    def test_codex_child_env_exposes_tools_bundled_next_to_codex(self) -> None:
+        old_path = os.environ.get("PATH")
+        old_gap = os.environ.pop("GAP_BIN", None)
+        old_real_gap = os.environ.pop("ALBILICH_REAL_GAP_BIN", None)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tool_dir = Path(tmpdir) / "Codex.app" / "Contents" / "Resources"
+            tool_dir.mkdir(parents=True)
+            codex_bin = tool_dir / "codex"
+            rg_bin = tool_dir / "rg"
+            codex_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            rg_bin.write_text("#!/bin/sh\nprintf 'rg-ready\\n'\n", encoding="utf-8")
+            codex_bin.chmod(0o755)
+            rg_bin.chmod(0o755)
+            os.environ["PATH"] = "/usr/bin:/bin"
+            try:
+                env = _codex_child_env(codex_bin=str(codex_bin))
+                self.assertIn(str(tool_dir), env["PATH"].split(os.pathsep))
+                result = subprocess.run(
+                    ["rg"],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+                self.assertEqual(result.stdout, "rg-ready\n")
+            finally:
+                if old_path is None:
+                    os.environ.pop("PATH", None)
+                else:
+                    os.environ["PATH"] = old_path
+                if old_gap is not None:
+                    os.environ["GAP_BIN"] = old_gap
+                if old_real_gap is not None:
+                    os.environ["ALBILICH_REAL_GAP_BIN"] = old_real_gap
+
     def test_codex_child_env_wraps_gap_with_no_history_flag(self) -> None:
         old_tmp = os.environ.get("ALBILICH_CODEX_TMPDIR")
         old_gap = os.environ.get("GAP_BIN")
@@ -172,6 +241,45 @@ class Phase2TokenUsageTest(unittest.TestCase):
                     os.environ.pop("ALBILICH_REAL_GAP_BIN", None)
                 else:
                     os.environ["ALBILICH_REAL_GAP_BIN"] = old_real_gap
+
+    def test_codex_child_env_honors_documented_gap_path(self) -> None:
+        names = (
+            "ALBILICH_CODEX_TMPDIR",
+            "ALBILICH_REAL_GAP_BIN",
+            "ALBILICH_GAP_PATH",
+            "GAP_BIN",
+            "GAP_PATH",
+            "GAP_EXECUTABLE",
+            "PATH",
+        )
+        old = {name: os.environ.get(name) for name in names}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_gap = tmp_path / "documented-gap"
+            real_gap.write_text("#!/bin/sh\nprintf 'ARGS=%s\\n' \"$*\"\n", encoding="utf-8")
+            real_gap.chmod(0o755)
+            os.environ["ALBILICH_CODEX_TMPDIR"] = str(tmp_path / "child")
+            os.environ["ALBILICH_GAP_PATH"] = str(real_gap)
+            os.environ["PATH"] = "/usr/bin:/bin"
+            for name in ("ALBILICH_REAL_GAP_BIN", "GAP_BIN", "GAP_PATH", "GAP_EXECUTABLE"):
+                os.environ.pop(name, None)
+            try:
+                env = _codex_child_env()
+                self.assertEqual(env["ALBILICH_REAL_GAP_BIN"], str(real_gap))
+                result = subprocess.run(
+                    ["gap", "-q"],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+                self.assertEqual(result.stdout, "ARGS=-n -q\n")
+            finally:
+                for name, value in old.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
 
     def test_child_log_filter_suppresses_only_known_startup_noise(self) -> None:
         self.assertTrue(
@@ -307,6 +415,60 @@ class Phase2TokenUsageTest(unittest.TestCase):
             self.assertIn("ordinary progress after the retry warning", log)
             self.assertNotIn("no log/token progress after a Codex stream retry", log)
 
+    def test_malformed_final_json_gets_one_session_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_codex = root / "fake_codex.py"
+            repaired_patch = {
+                "schema_version": 1,
+                "problem_id": "codex-malformed-json-repair-test",
+                "base_revision": 0,
+                "actor_role": "researcher",
+                "target_id": "root",
+                "operations": [
+                    {
+                        "op": "attach_artifact",
+                        "artifact_id": "recovered-proof-dossier",
+                        "artifact_type": "proof_dossier",
+                        "content": "The repaired patch preserves the mathematical work.",
+                        "metadata": {"target_id": "root"},
+                    }
+                ],
+            }
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "args = sys.argv\n"
+                "out = pathlib.Path(args[args.index('--output-last-message') + 1])\n"
+                "state = pathlib.Path(__file__).with_suffix('.state')\n"
+                "if not state.exists():\n"
+                "    print('session id: 019ef5aa-0000-7000-9000-jsonfix001', flush=True)\n"
+                "    out.write_text(r'{\"schema_version\":1,\"problem_id\":\"codex-malformed-json-repair-test\",\"base_revision\":0,\"actor_role\":\"researcher\",\"target_id\":\"root\",\"operations\":[{\"op\":\"attach_artifact\",\"artifact_id\":\"broken\",\"artifact_type\":\"proof_dossier\",\"content\":\"G\\uZZZZ H\"}]}')\n"
+                "    state.write_text('repair')\n"
+                "else:\n"
+                f"    out.write_text({json.dumps(json.dumps(repaired_patch))})\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            store = ProofStateStore("codex-malformed-json-repair-test", generation_root=root / "generation")
+            store.init_problem("Prove the target theorem.")
+            action = {"mode": "prove", "target_id": "root"}
+            plan = prepare_session(store, action)
+
+            result = execute_session(
+                store,
+                action,
+                plan,
+                codex_bin=str(fake_codex),
+                timeout_sec=200,
+            )
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["patch"]["operations"][0]["artifact_id"], "recovered-proof-dossier")
+            self.assertTrue(result["preflight_repair"]["attempted"])
+            self.assertIn("not valid Albilich patch JSON", result["preflight_repair"]["errors_before"][0])
+            self.assertEqual(result["preflight_repair"]["errors_after"], [])
+
     def test_default_codex_retry_stall_timeout_is_short(self) -> None:
         old_stale = os.environ.get("ALBILICH_CODEX_STALE_RETRY_SECONDS")
         try:
@@ -406,7 +568,13 @@ class Phase2TokenUsageTest(unittest.TestCase):
                 {
                     "elapsed_seconds": 1.25,
                     "peak_memory_mb": 111.0,
-                    "usage": {"input_tokens": 100, "output_tokens": 20, "reasoning_output_tokens": 5, "total_tokens": 120},
+                    "usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 70,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 5,
+                        "total_tokens": 120,
+                    },
                 },
                 {
                     "elapsed_seconds": 2.25,
@@ -419,6 +587,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
         self.assertEqual(summary["run_count"], 2)
         self.assertEqual(summary["total_tokens"], 579)
         self.assertEqual(summary["input_tokens"], 500)
+        self.assertEqual(summary["cached_input_tokens"], 70)
         self.assertEqual(summary["output_tokens"], 79)
         self.assertEqual(summary["reasoning_output_tokens"], 15)
         self.assertEqual(summary["wall_time_seconds"], 3.5)

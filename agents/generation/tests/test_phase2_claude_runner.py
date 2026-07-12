@@ -91,12 +91,12 @@ class ClaudeRunnerTest(unittest.TestCase):
     def test_stream_activity_tail_renders_tool_calls(self) -> None:
         stream = "\n".join([
             json.dumps({"type": "assistant", "message": {"content": [
-                {"type": "text", "text": "Let me compute the invariant-vector."},
-                {"type": "tool_use", "name": "Bash", "input": {"command": "M2 sample_helper.m2"}}]}}),
+                {"type": "text", "text": "Let me compute the h-vector."},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "M2 hStarMat.m2"}}]}}),
         ])
         tail = stream_activity_tail(stream)
         self.assertIn("Let me compute", tail)
-        self.assertIn("⏵ Bash: M2 sample_helper.m2", tail)
+        self.assertIn("⏵ Bash: M2 hStarMat.m2", tail)
 
     def test_parse_stream_salvages_last_assistant_on_no_result(self) -> None:
         # Simulates a session killed at the timeout before the result event.
@@ -205,9 +205,9 @@ class CasToolingManifestTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("cas-tooling-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("Prove the root theorem.")
-            asset = "agents/generation/data/example/sample_helper.m2"
+            asset = "experiment data/eur_matroid_h_vectors/bibliography/hStar Matroid Upload.m2"
             prev = os.environ.get("ALBILICH_CAS_ASSETS")
-            os.environ["ALBILICH_CAS_ASSETS"] = f"{asset}::example Macaulay2 helper"
+            os.environ["ALBILICH_CAS_ASSETS"] = f"{asset}::Eur h* matroid Macaulay2 helper"
             try:
                 # Large budget so advisory blocks (local_search_policy) are not trimmed.
                 manifest = build_context_manifest(
@@ -285,7 +285,7 @@ class CasToolingManifestTest(unittest.TestCase):
         # Newline-separated; paths/descriptions contain ':' which must not split.
         os.environ["ALBILICH_CAS_ASSETS"] = "\n".join([
             "dir/build.m2::Macaulay2 helper",
-            "dir/examples.jsonl::300k invariant-vectors: palindromic/unimodal flags",
+            "dir/examples.jsonl::300k h*-vectors: palindromic/unimodal flags",
             "dir/gen.jl::Julia generator",
         ])
         try:

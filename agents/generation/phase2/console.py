@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .graph_policy import route_scoreboard
+from .graph_policy import claim_is_verified, route_scoreboard
 from .metrics import compute_metrics
 from .research_policy import researcher_mode_summary
 from .result_status import classify_state
@@ -40,9 +40,14 @@ RESEARCH_ARTIFACT_TYPES = {
 }
 
 
-def build_run_console_payload(store: ProofStateStore, *, history: list[Mapping[str, Any]] | None = None) -> dict[str, Any]:
-    state = store.get_state()
-    metrics = compute_metrics(store)
+def build_run_console_payload(
+    store: ProofStateStore,
+    *,
+    history: list[Mapping[str, Any]] | None = None,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    state = state if state is not None else store.get_state()
+    metrics = compute_metrics(store, state=state)
     result = classify_state(state)
     runs = sorted(state.get("runs", []), key=lambda row: row.get("created_at", ""))
     verifier_audit = _verifier_audit(state, runs)
@@ -459,6 +464,8 @@ def _run_snapshot(
         "summary": result.get("summary", ""),
         "revision": metrics.get("revision", 0),
         "claim_count": metrics.get("claim_count", 0),
+        "current_claim_count": metrics.get("current_claim_count", metrics.get("claim_count", 0)),
+        "retired_claim_count": metrics.get("retired_claim_count", 0),
         "verified_claim_count": metrics.get("verified_claim_count", 0),
         "integrated_claim_count": metrics.get("integrated_claim_count", 0),
         "route_count": metrics.get("route_count", 0),
@@ -563,6 +570,7 @@ def _usage_scope(rows: list[Mapping[str, Any]], *, note: str = "") -> dict[str, 
         "run_count": len(rows),
         "total_tokens": sum(_token_total(row) for row in rows),
         "input_tokens": sum(int(row.get("input_tokens") or 0) for row in rows),
+        "cached_input_tokens": sum(int(row.get("cached_input_tokens") or 0) for row in rows),
         "output_tokens": sum(int(row.get("output_tokens") or 0) for row in rows),
         "reasoning_output_tokens": sum(int(row.get("reasoning_output_tokens") or 0) for row in rows),
         "wall_time_seconds": round(sum(float(row.get("wall_time_seconds", 0.0) or 0.0) for row in rows), 3),
@@ -578,6 +586,7 @@ def _live_usage_scope(updates: list[Mapping[str, Any]]) -> dict[str, Any]:
         "run_count": len(updates),
         "total_tokens": sum(_token_total(row) for row in usage_rows),
         "input_tokens": sum(int(row.get("input_tokens") or 0) for row in usage_rows),
+        "cached_input_tokens": sum(int(row.get("cached_input_tokens") or 0) for row in usage_rows),
         "output_tokens": sum(int(row.get("output_tokens") or 0) for row in usage_rows),
         "reasoning_output_tokens": sum(int(row.get("reasoning_output_tokens") or 0) for row in usage_rows),
         "wall_time_seconds": round(sum(float(update.get("elapsed_seconds", 0.0) or 0.0) for update in updates), 3),
@@ -644,6 +653,38 @@ def _run_timeline(runs: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
                 "output_artifact_ids": _json_list(row.get("output_artifact_ids_json")),
             }
         )
+
+    # An integration verifier can legitimately reject several stale proposals
+    # before a refreshed proposal for the same target/route is accepted.  Keep
+    # the historical attempts, but annotate failures that a later successful
+    # integration resolved so the dashboard does not present them as current
+    # unresolved failures.
+    recovered_by_key: dict[tuple[str, str], tuple[int, str, str]] = {}
+    for index, row in enumerate(timeline):
+        if (
+            row.get("actor_role") == "integration_verifier"
+            and row.get("mode") == "integrate"
+            and row.get("status") == "completed"
+        ):
+            key = (str(row.get("target_id") or ""), str(row.get("route_id") or ""))
+            recovered_by_key[key] = (
+                index,
+                str(row.get("run_id") or ""),
+                str(row.get("created_at") or ""),
+            )
+    for index, row in enumerate(timeline):
+        if (
+            row.get("actor_role") != "integration_verifier"
+            or row.get("mode") != "integrate"
+            or row.get("status") not in {"patch_rejected", "failed", "no_patch"}
+        ):
+            continue
+        key = (str(row.get("target_id") or ""), str(row.get("route_id") or ""))
+        recovery = recovered_by_key.get(key)
+        if recovery and recovery[0] > index:
+            row["failure_recovered"] = True
+            row["recovered_by_run_id"] = recovery[1]
+            row["recovered_at"] = recovery[2]
     return timeline
 
 
@@ -905,7 +946,7 @@ def _verifier_audit(state: Mapping[str, Any], runs: list[Mapping[str, Any]]) -> 
     verified_claim_count = sum(
         1
         for row in state.get("claims", [])
-        if row.get("validation_status") in {"informally_verified", "formally_verified"}
+        if claim_is_verified(row)
     )
     failed_launches = [row for row in verifier_runs if _is_failed_launch(row)]
     audit_runs = [row for row in verifier_runs if not _is_failed_launch(row)]

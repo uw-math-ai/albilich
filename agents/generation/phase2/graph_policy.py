@@ -7,6 +7,7 @@ from .models import fingerprint_text, json_loads, normalize_text
 
 VERIFIED_VALIDATION_STATUSES = {"informally_verified", "formally_verified"}
 UNRESOLVED_VALIDATION_STATUSES = {"untested", "plausible", "challenged"}
+RETIRED_CLAIM_LIFECYCLES = {"superseded", "abandoned"}
 DECOMPOSITION_MODES = {"reduce", "weaken", "strengthen"}
 PROOF_WORK_MODES = {"prove", "integrate", "formalize", "validate_counterexample", "refute", "write"}
 FAR_FROM_ROOT_DISTANCE = 5
@@ -104,7 +105,8 @@ def _json_strings(value: Any) -> list[str]:
         stripped = value.strip()
         if not stripped:
             return []
-        loaded = json_loads(stripped, None)
+        invalid = object()
+        loaded = json_loads(stripped, invalid)
         if isinstance(loaded, list):
             return [str(item).strip() for item in loaded if str(item).strip()]
         if isinstance(loaded, Mapping):
@@ -142,6 +144,25 @@ def _artifact_rows(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
                 seen.add(artifact_id)
             rows.append(row)
     return rows
+
+
+def _explicitly_refuted_debt_ids(state: Mapping[str, Any]) -> set[str]:
+    """Debts defeated by a validator-confirmed counterexample artifact."""
+    refuted: set[str] = set()
+    for artifact in _artifact_rows(state):
+        if str(artifact.get("artifact_type") or "") != "confirmed_counterexample":
+            continue
+        metadata = _json_object(artifact.get("metadata_json", artifact.get("metadata")))
+        refuted.update(
+            _metadata_strings(
+                metadata,
+                "refuted_obligation_id",
+                "refuted_obligation_ids",
+                "refuted_debt_id",
+                "refuted_debt_ids",
+            )
+        )
+    return refuted
 
 
 def supersession_index(state: Mapping[str, Any]) -> Dict[str, Any]:
@@ -314,8 +335,20 @@ def supersession_index(state: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def claim_is_retired(row: Mapping[str, Any]) -> bool:
+    """Return whether a claim is historical rather than part of the live proof."""
+    return (
+        row.get("lifecycle_status") in RETIRED_CLAIM_LIFECYCLES
+        or row.get("validation_status") == "refuted"
+    )
+
+
 def claim_is_verified(row: Mapping[str, Any]) -> bool:
-    return row.get("validation_status") in VERIFIED_VALIDATION_STATUSES
+    """Return whether a current claim has a positive verification verdict."""
+    return (
+        not claim_is_retired(row)
+        and row.get("validation_status") in VERIFIED_VALIDATION_STATUSES
+    )
 
 
 def claim_map(state: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -754,9 +787,12 @@ def decisive_theorem_test_signal(
 ) -> Dict[str, Any]:
     """Pick one theorem-level obligation that should decide the next branch."""
     superseded_claim_ids = set(supersession_index(state).get("superseded_claim_ids", []))
+    refuted_debt_ids = _explicitly_refuted_debt_ids(state)
     candidates: list[tuple[float, Mapping[str, Any]]] = []
     for debt in state.get("debts", []):
         if debt.get("status") != "active" or debt.get("severity") != "blocking":
+            continue
+        if str(debt.get("debt_id") or "") in refuted_debt_ids:
             continue
         if debt_id and str(debt.get("debt_id") or "") != debt_id:
             continue
@@ -816,6 +852,71 @@ def decisive_theorem_test_signal(
     }
 
 
+def _action_decisive_theorem_test_signal(
+    state: Mapping[str, Any],
+    action: Optional[Mapping[str, Any]],
+    *,
+    target_id: str,
+) -> Dict[str, Any]:
+    """Prefer the theorem explicitly selected by the current workflow action."""
+    if not action:
+        return {}
+    explicit = action.get("decisive_theorem_test")
+    if isinstance(explicit, Mapping) and str(explicit.get("theorem_obligation") or "").strip():
+        return dict(explicit)
+    if action.get("verify_ready_route_policy") or action.get("strict_verifier_scope"):
+        action_target = str(action.get("target_id") or target_id)
+        target_claim = claim_map(state).get(action_target, {})
+        obligation = _compact_text(str(target_claim.get("statement") or ""), 900)
+        if obligation:
+            return {
+                "policy": "selected-route-verification-test",
+                "target_id": action_target,
+                "debt_id": "",
+                "owner_id": action_target,
+                "debt_type": "route_verification",
+                "theorem_obligation": obligation,
+                "why_decisive": (
+                    "This child is a bounded strict verification of the selected route; its conclusion claim "
+                    "supersedes advisor research bottlenecks for this session."
+                ),
+                "acceptance_criteria": [
+                    "Check the selected route against its exact conclusion claim and listed evidence.",
+                    "Verify only if the route proves the claim with no gaps or hidden hypotheses.",
+                    "Otherwise attach a verification report and add precise local gap debts.",
+                ],
+            }
+    obligation = _compact_text(str(action.get("advisor_decisive_missing_statement") or ""), 900)
+    if not obligation:
+        return {}
+    acceptance_criteria = [
+        str(item).strip()
+        for item in action.get("validation_acceptance_criteria", [])
+        if str(item).strip()
+    ]
+    if not acceptance_criteria:
+        acceptance_criteria = [
+            "State the exact theorem or counterexample test in local notation.",
+            "Either prove it, refute it, or cite a precise theorem with checked hypotheses.",
+            "If it cannot be decided, emit one strictly narrower theorem-level debt with clear acceptance criteria.",
+            "Do not produce broad route inventories or generic status summaries.",
+        ]
+    action_target = str(action.get("target_id") or target_id)
+    return {
+        "policy": "advisor-decisive-theorem-test",
+        "target_id": action_target,
+        "debt_id": str(action.get("debt_id") or ""),
+        "owner_id": action_target,
+        "debt_type": "advisor_bottleneck",
+        "theorem_obligation": obligation,
+        "why_decisive": (
+            "The current advisor-directed workflow action selected this theorem as the decisive bottleneck; "
+            "it supersedes generic ranking among older active debts for this child session."
+        ),
+        "acceptance_criteria": acceptance_criteria,
+    }
+
+
 def build_proof_spine(
     state: Mapping[str, Any],
     *,
@@ -824,6 +925,7 @@ def build_proof_spine(
 ) -> Dict[str, Any]:
     supersession = supersession_index(state)
     superseded_claim_ids = set(supersession.get("superseded_claim_ids", []))
+    refuted_debt_ids = _explicitly_refuted_debt_ids(state)
     verified: list[Dict[str, Any]] = []
     for claim in state.get("claims", []):
         claim_id = str(claim.get("claim_id") or "")
@@ -846,6 +948,8 @@ def build_proof_spine(
     blocking_debts: list[Dict[str, Any]] = []
     for debt in state.get("debts", []):
         if debt.get("status") != "active" or debt.get("severity") != "blocking":
+            continue
+        if str(debt.get("debt_id") or "") in refuted_debt_ids:
             continue
         owner_id = str(debt.get("owner_id") or "")
         suggested = str(debt.get("suggested_next_target") or "")
@@ -870,7 +974,9 @@ def build_proof_spine(
     blocking_debts.sort(key=lambda row: (-row["repeated_count"], row["debt_id"]))
 
     route_rows = route_scoreboard(state, limit=8)
-    decisive = decisive_theorem_test_signal(state, target_id=target_id)
+    decisive = _action_decisive_theorem_test_signal(
+        state, action, target_id=target_id
+    ) or decisive_theorem_test_signal(state, target_id=target_id)
     return {
         "policy": "always-current-proof-spine",
         "target_id": target_id,

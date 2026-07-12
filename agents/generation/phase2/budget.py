@@ -4,7 +4,7 @@ import math
 from typing import Any, Dict, Mapping, Optional
 
 
-VERIFICATION_MODES = {"integrate", "formalize", "validate_counterexample", "write"}
+VERIFICATION_MODES = {"integrate", "formalize", "validate_counterexample", "write", "review_writing"}
 RESEARCH_MANAGEMENT_MODES = {"synthesize_sources", "audit_definitions", "triage_routes", "regulate_decomposition"}
 DEFAULT_STEP_BUDGET = 200_000
 DEFAULT_RESEARCH_MANAGEMENT_BUDGET = 120_000

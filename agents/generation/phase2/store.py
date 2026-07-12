@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .models import (
     CLAIM_KINDS,
+    COMPLETION_POLICIES,
+    DEFAULT_COMPLETION_POLICY,
     LIFECYCLE_STATUSES,
     ROUTE_RELATIONS,
     ROUTE_STATUSES,
+    RUN_STATUSES,
     SCHEMA_VERSION,
     VALIDATION_STATUSES,
     compact_dict,
@@ -18,6 +22,7 @@ from .models import (
     json_dumps,
     json_loads,
     sanitize_problem_id,
+    sha256_text,
     utc_now,
 )
 
@@ -253,6 +258,18 @@ class ProofStateStore:
         )
         self._ensure_column(conn, "runs", "search_intent", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "runs", "actor_role", "TEXT NOT NULL DEFAULT ''")
+        # Whole-run control state (2026-07-09 TODO 5): running | dashboard_paused |
+        # pause_requested | paused | stopping | stopped | completed.
+        self._ensure_column(conn, "problem_state", "run_status", "TEXT NOT NULL DEFAULT 'running'")
+        # Run-level completion policy (2026-07-09 TODO 7): full_proof_first |
+        # partial_ok | exploratory. Only the explicit CLI flag changes it; soft
+        # wording in the problem markdown never flips it.
+        self._ensure_column(conn, "problem_state", "completion_policy", "TEXT NOT NULL DEFAULT 'full_proof_first'")
+        # Parallel branch research mode (2026-07-09 TODO 2): worker count for
+        # the multi_branch_research work mode (0 = off, 2..5 = on) plus the
+        # recorded mode name; set only by the explicit --parallel-branches flag.
+        self._ensure_column(conn, "problem_state", "parallel_branches", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "problem_state", "research_parallel_mode", "TEXT NOT NULL DEFAULT ''")
         total_tokens_added = self._ensure_column(conn, "runs", "total_tokens", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column(conn, "runs", "peak_memory_mb", "REAL NOT NULL DEFAULT 0.0")
         self._ensure_column(conn, "runs", "researcher_work_mode", "TEXT NOT NULL DEFAULT ''")
@@ -405,9 +422,9 @@ class ProofStateStore:
                 compact_dict(row)
                 for row in conn.execute(
                     """
-                    SELECT artifact_id, artifact_type, path, metadata_json, created_at
+                    SELECT artifact_id, artifact_type, path, state_revision, metadata_json, created_at
                     FROM artifacts
-                    WHERE artifact_type IN ('final_proof', 'verified_blueprint')
+                    WHERE artifact_type IN ('final_proof', 'verified_blueprint', 'final_paper')
                     ORDER BY created_at DESC
                     """
                 ).fetchall()
@@ -438,10 +455,29 @@ class ProofStateStore:
                         'cas_experiment_report',
                         'definition_audit_report',
                         'route_triage_report',
-                        'advisor_report'
+                        'advisor_report',
+                        'advisor_synthesis',
+                        'bridge_lemma_search',
+                        'conjecture_portfolio',
+                        'deep_session_report',
+                        'definition_candidate',
+                        'invention_authorization',
+                        'proof_compression'
                     )
                     ORDER BY state_revision DESC, created_at DESC
                     LIMIT 48
+                    """
+                ).fetchall()
+            ]
+            confirmed_counterexamples = [
+                compact_dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT artifact_id, artifact_type, producer_role, state_revision,
+                           content_summary, metadata_json, path, created_at
+                    FROM artifacts
+                    WHERE artifact_type = 'confirmed_counterexample'
+                    ORDER BY state_revision DESC, created_at DESC
                     """
                 ).fetchall()
             ]
@@ -486,6 +522,7 @@ class ProofStateStore:
             "theorem_library_entries": theorem_library_entries,
             "final_artifacts": final_artifacts,
             "research_artifacts": research_artifacts,
+            "confirmed_counterexamples": confirmed_counterexamples,
         }
 
     def get_revision(self, conn: Optional[sqlite3.Connection] = None) -> int:
@@ -582,3 +619,349 @@ class ProofStateStore:
             list(owner_ids),
         ).fetchall()
         return [compact_dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Completion policy (2026-07-09 TODO 7): run-level full-proof-first vs
+    # partial-results policy persisted on problem_state.
+    # ------------------------------------------------------------------
+
+    def get_completion_policy(self, conn: Optional[sqlite3.Connection] = None) -> str:
+        close = conn is None
+        conn = conn or self.connect()
+        try:
+            row = conn.execute(
+                "SELECT completion_policy FROM problem_state WHERE problem_id = ?", (self.problem_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("problem state is not initialized")
+            return str(row["completion_policy"] or DEFAULT_COMPLETION_POLICY)
+        finally:
+            if close:
+                conn.close()
+
+    def set_completion_policy(self, policy: str, *, reason: str = "", source: str = "cli") -> Dict[str, Any]:
+        """Persist the explicit run-level completion policy and record an event.
+
+        Only this explicit setter changes the policy; soft wording in the
+        problem markdown never flips it.
+        """
+        if policy not in COMPLETION_POLICIES:
+            allowed = ", ".join(sorted(COMPLETION_POLICIES))
+            raise ValueError(f"invalid completion_policy: {policy}; expected one of {allowed}")
+        now = utc_now()
+        with self.connect() as conn:
+            state = self.get_problem_row(conn)
+            previous = str(state.get("completion_policy") or DEFAULT_COMPLETION_POLICY)
+            if previous == policy:
+                return {"problem_id": self.problem_id, "previous": previous, "completion_policy": policy, "unchanged": True}
+            conn.execute(
+                "UPDATE problem_state SET completion_policy = ?, updated_at = ? WHERE problem_id = ?",
+                (policy, now, self.problem_id),
+            )
+            self.write_event(
+                conn,
+                int(state["current_revision"]),
+                "completion_policy",
+                {"from": previous, "to": policy, "reason": reason, "source": source},
+            )
+            conn.commit()
+        return {"problem_id": self.problem_id, "previous": previous, "completion_policy": policy, "at": now}
+
+    # ------------------------------------------------------------------
+    # Parallel branch mode (2026-07-09 TODO 2): explicit multi_branch_research
+    # worker count persisted on problem_state.
+    # ------------------------------------------------------------------
+
+    def set_parallel_branches(self, workers: int, *, reason: str = "", source: str = "cli") -> Dict[str, Any]:
+        """Persist the multi_branch_research worker count (0 off, 2..5 on).
+
+        Records the mode name on problem_state.research_parallel_mode and a
+        parallel_branch_mode event; a no-op when the value is unchanged.
+        """
+        workers = int(workers or 0)
+        if workers != 0 and not (2 <= workers <= 5):
+            raise ValueError("parallel_branches must be 0 (off) or between 2 and 5")
+        mode = "multi_branch_research" if workers >= 2 else ""
+        now = utc_now()
+        with self.connect() as conn:
+            state = self.get_problem_row(conn)
+            previous = int(state.get("parallel_branches") or 0)
+            if previous == workers:
+                return {
+                    "problem_id": self.problem_id,
+                    "previous": previous,
+                    "parallel_branches": workers,
+                    "research_parallel_mode": mode,
+                    "unchanged": True,
+                }
+            conn.execute(
+                "UPDATE problem_state SET parallel_branches = ?, research_parallel_mode = ?, updated_at = ? "
+                "WHERE problem_id = ?",
+                (workers, mode, now, self.problem_id),
+            )
+            self.write_event(
+                conn,
+                int(state["current_revision"]),
+                "parallel_branch_mode",
+                {"from": previous, "to": workers, "mode": mode, "reason": reason, "source": source},
+            )
+            conn.commit()
+        return {
+            "problem_id": self.problem_id,
+            "previous": previous,
+            "parallel_branches": workers,
+            "research_parallel_mode": mode,
+            "at": now,
+        }
+
+    # ------------------------------------------------------------------
+    # Run control (2026-07-09 TODO 5): persisted pause/stop semantics and
+    # wall-clock vs active-compute vs paused-time accounting.
+    # ------------------------------------------------------------------
+
+    def get_run_status(self, conn: Optional[sqlite3.Connection] = None) -> str:
+        close = conn is None
+        conn = conn or self.connect()
+        try:
+            row = conn.execute(
+                "SELECT run_status FROM problem_state WHERE problem_id = ?", (self.problem_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("problem state is not initialized")
+            return str(row["run_status"] or "running")
+        finally:
+            if close:
+                conn.close()
+
+    def peek_run_control(self) -> Dict[str, Any]:
+        """Cheap, migration-free read of the current run-control state.
+
+        Safe to poll from a watcher thread while a child session runs: it never
+        migrates, never raises, and returns {} when the state is unreadable
+        (e.g. run_status column not yet migrated).
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT run_status FROM problem_state WHERE problem_id = ?", (self.problem_id,)
+                ).fetchone()
+                if row is None:
+                    return {}
+                event = conn.execute(
+                    "SELECT payload_json FROM events WHERE event_type = 'run_control' ORDER BY event_id DESC LIMIT 1"
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return {}
+        payload = json_loads(event["payload_json"] if event else None, {})
+        if not isinstance(payload, dict):
+            payload = {}
+        return {"run_status": str(row["run_status"] or "running"), "hard": bool(payload.get("hard"))}
+
+    def set_run_status(
+        self,
+        new_status: str,
+        *,
+        reason: str = "",
+        source: str = "cli",
+        hard: bool = False,
+    ) -> Dict[str, Any]:
+        """Transition problem_state.run_status and record a run_control event."""
+        if new_status not in RUN_STATUSES:
+            raise ValueError(f"invalid run_status: {new_status}")
+        now = utc_now()
+        with self.connect() as conn:
+            state = self.get_problem_row(conn)
+            previous = str(state.get("run_status") or "running")
+            conn.execute(
+                "UPDATE problem_state SET run_status = ?, updated_at = ? WHERE problem_id = ?",
+                (new_status, now, self.problem_id),
+            )
+            payload = {
+                "from": previous,
+                "to": new_status,
+                "reason": reason,
+                "source": source,
+                "hard": bool(hard),
+            }
+            self.write_event(conn, int(state["current_revision"]), "run_control", payload)
+            conn.commit()
+        return {"problem_id": self.problem_id, "previous": previous, "run_status": new_status, "at": now}
+
+    def request_pause(self, *, reason: str = "", source: str = "cli") -> Dict[str, Any]:
+        """Soft pause: the workflow finishes the current child session, then
+        stops dispatching new actions and parks the run as 'paused'."""
+        current = self.get_run_status()
+        if current in {"paused", "pause_requested"}:
+            return {"problem_id": self.problem_id, "previous": current, "run_status": current, "unchanged": True}
+        return self.set_run_status(
+            "pause_requested",
+            reason=reason or "run pause requested; finish the current child session, then stop dispatching",
+            source=source,
+        )
+
+    def resume_run(self, *, reason: str = "", source: str = "cli") -> Dict[str, Any]:
+        """Clear a pause/stop so the workflow may continue from the latest
+        accepted proof-state revision."""
+        current = self.get_run_status()
+        if current == "running":
+            return {"problem_id": self.problem_id, "previous": current, "run_status": current, "unchanged": True}
+        return self.set_run_status(
+            "running",
+            reason=reason or f"run resumed from {current}; continuing from the latest accepted proof-state revision",
+            source=source,
+        )
+
+    def request_stop(self, *, hard: bool = False, reason: str = "", source: str = "cli") -> Dict[str, Any]:
+        """Stop the run. Soft stop finishes the current child session first;
+        hard stop also terminates the active child session (the workflow's
+        run-control watcher observes 'stopping' with hard=True) and records an
+        interruption event artifact."""
+        result = self.set_run_status(
+            "stopping",
+            reason=reason or ("hard stop requested" if hard else "soft stop requested"),
+            source=source,
+            hard=hard,
+        )
+        if hard:
+            result["interruption_artifact_id"] = self.record_interruption_artifact(
+                reason=reason or "hard stop requested; active child sessions terminated",
+                source=source,
+            )
+        return result
+
+    def record_interruption_artifact(self, *, reason: str, source: str = "cli") -> str:
+        """Record a clean interruption event artifact for a hard stop."""
+        now = utc_now()
+        stamp = now.replace(":", "").replace("-", "").replace("+0000", "Z").replace(".", "_")
+        artifact_id = f"run_interruption_{stamp}"
+        content = (
+            f"# Run interruption event\n\n"
+            f"- problem_id: {self.problem_id}\n"
+            f"- at: {now}\n"
+            f"- source: {source}\n"
+            f"- reason: {reason}\n\n"
+            "The active child session (if any) was terminated by a hard stop request. "
+            "The proof state is unaffected; resume continues from the latest accepted revision.\n"
+        )
+        artifact_dir = self.state_dir / "artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        path = artifact_dir / f"{artifact_id}.md"
+        path.write_text(content, encoding="utf-8")
+        with self.connect() as conn:
+            revision = int(self.get_problem_row(conn)["current_revision"])
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO artifacts(
+                    artifact_id, artifact_type, path, sha256, producer_role, run_id,
+                    state_revision, content_summary, metadata_json, created_at
+                ) VALUES (?, 'run_interruption_event', ?, ?, 'human_operator', '', ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id,
+                    str(path),
+                    sha256_text(content),
+                    revision,
+                    f"Hard stop interruption: {reason}"[:500],
+                    json_dumps({"reason": reason, "source": source}),
+                    now,
+                ),
+            )
+            self.write_event(conn, revision, "run_interrupted", {"artifact_id": artifact_id, "reason": reason, "source": source})
+            conn.commit()
+        return artifact_id
+
+    def get_run_timing(self) -> Dict[str, Any]:
+        """Three separated timing numbers for reports/benchmarks.
+
+        - wall_clock_seconds: elapsed from problem init to the last recorded
+          activity (or now while the run is live).
+        - active_compute_seconds: recorded child-session wall time (the runs
+          table); scheduler overhead is deliberately not attributed here.
+        - paused_seconds: total time inside explicit paused intervals derived
+          from run_control events (paused -> next non-paused transition).
+        """
+        with self.connect() as conn:
+            state = self.get_problem_row(conn)
+            events = [
+                compact_dict(row)
+                for row in conn.execute(
+                    "SELECT event_id, event_type, payload_json, created_at FROM events "
+                    "WHERE event_type IN ('run_control', 'run_interrupted') ORDER BY event_id ASC"
+                ).fetchall()
+            ]
+            runs_wall = conn.execute(
+                "SELECT COALESCE(SUM(wall_time_seconds), 0.0) AS total FROM runs"
+            ).fetchone()["total"]
+            last_activity = conn.execute("SELECT MAX(created_at) AS latest FROM events").fetchone()["latest"]
+
+        run_status = str(state.get("run_status") or "running")
+        started_at = _parse_timestamp(str(state.get("created_at") or ""))
+        now = datetime.now(timezone.utc)
+        if run_status in {"stopped", "completed"}:
+            end_candidates = [
+                _parse_timestamp(str(last_activity or "")),
+                _parse_timestamp(str(state.get("updated_at") or "")),
+            ]
+            end_time = max((ts for ts in end_candidates if ts is not None), default=now)
+        else:
+            end_time = now
+
+        paused_seconds = 0.0
+        pause_count = 0
+        pause_started: Optional[datetime] = None
+        control_events: List[Dict[str, Any]] = []
+        for event in events:
+            payload = json_loads(event.get("payload_json"), {})
+            if not isinstance(payload, dict):
+                payload = {}
+            created = _parse_timestamp(str(event.get("created_at") or ""))
+            control_events.append(
+                {
+                    "event_type": str(event.get("event_type") or ""),
+                    "from": str(payload.get("from") or ""),
+                    "to": str(payload.get("to") or ""),
+                    "reason": str(payload.get("reason") or ""),
+                    "source": str(payload.get("source") or ""),
+                    "hard": bool(payload.get("hard")),
+                    "at": str(event.get("created_at") or ""),
+                }
+            )
+            if str(event.get("event_type") or "") != "run_control" or created is None:
+                continue
+            to_status = str(payload.get("to") or "")
+            if to_status == "paused" and pause_started is None:
+                pause_started = created
+                pause_count += 1
+            elif to_status not in {"paused", ""} and pause_started is not None:
+                paused_seconds += max(0.0, (created - pause_started).total_seconds())
+                pause_started = None
+        if pause_started is not None:
+            paused_seconds += max(0.0, (end_time - pause_started).total_seconds())
+
+        wall_clock = 0.0
+        if started_at is not None:
+            wall_clock = max(0.0, (end_time - started_at).total_seconds())
+        return {
+            "run_status": run_status,
+            "wall_clock_seconds": round(wall_clock, 3),
+            "active_compute_seconds": round(float(runs_wall or 0.0), 3),
+            "paused_seconds": round(paused_seconds, 3),
+            "pause_count": pause_count,
+            "run_control_events": control_events,
+        }
+
+
+def _parse_timestamp(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed

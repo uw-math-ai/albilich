@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -16,6 +17,7 @@ from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.patches import apply_patch
 from agents.generation.phase2.store import ProofStateStore
 from agents.generation.phase2.workflow import (
+    _ConsoleWriteThrottle,
     _blocked_by_pending_priority_barrier,
     _merge_priority,
     _record_parallel_signals,
@@ -29,6 +31,15 @@ from agents.generation.phase2.workflow import (
 
 
 class WorkflowOutageBreakerTests(unittest.TestCase):
+    def test_console_write_throttle_coalesces_heartbeats_but_allows_forced_snapshots(self) -> None:
+        throttle = _ConsoleWriteThrottle(15.0)
+
+        self.assertTrue(throttle.should_write(now=100.0))
+        self.assertFalse(throttle.should_write(now=110.0))
+        self.assertTrue(throttle.should_write(force=True, now=111.0))
+        self.assertFalse(throttle.should_write(now=120.0))
+        self.assertTrue(throttle.should_write(now=126.0))
+
     def test_backend_outage_backs_off_and_refunds_steps(self) -> None:
         import agents.generation.phase2.workflow as workflow_mod
 
@@ -890,7 +901,7 @@ class WorkflowParallelRebaseTests(unittest.TestCase):
                         "op": "cache_retrieval_card",
                         "card_id": "retrieval-partial-match",
                         "target_id": "root",
-                        "exact_statement": "A nearby theorem proves a weaker chain-generation target.",
+                        "exact_statement": "A nearby theorem proves a weaker invariable-generation target.",
                         "source_identifiers": {"title": "Nearby theorem"},
                         "source_version": "source v1",
                         "source_location": "Theorem 1",
@@ -1176,7 +1187,7 @@ class WorkflowParallelRebaseTests(unittest.TestCase):
                     "op": "add_debt",
                     "debt_id": "debt-root-existing-h2-claim",
                     "owner_type": "claim",
-                    "owner_id": "claim_root_irreducible_h2_bridge_lift_bridge_rev115",
+                    "owner_id": "claim_root_irreducible_h2_frattini_lift_bridge_rev115",
                     "debt_type": "sharpened_blocker",
                     "severity": "blocking",
                     "status": "active",
@@ -1219,7 +1230,7 @@ class WorkflowParallelRebaseTests(unittest.TestCase):
                     "op": "add_debt",
                     "debt_id": "debt-root-central-multiplier",
                     "owner_type": "route",
-                    "owner_id": "route_root_bridge_h2_head_capacity_criterion_rev122",
+                    "owner_id": "route_root_frattini_h2_head_capacity_criterion_rev122",
                     "debt_type": "proof_obligation",
                     "severity": "blocking",
                     "status": "active",
@@ -1262,7 +1273,7 @@ class WorkflowParallelRebaseTests(unittest.TestCase):
                 {
                     "op": "add_debt",
                     "debt_id": "debt-root-simple-multiplier",
-                    "owner_id": "route_root_bridge_h2_head_capacity_criterion_rev122",
+                    "owner_id": "route_root_frattini_h2_head_capacity_criterion_rev122",
                     "debt_type": "proof_obligation",
                     "status": "active",
                     "obligation": "Decide the simple multiplier reservoir test.",
@@ -1551,6 +1562,38 @@ class WorkflowParallelRebaseTests(unittest.TestCase):
 
         self.assertEqual(payload["run_id"], "run-retrieve-root")
         self.assertEqual(payload["signal_type"], "source_found")
+
+    def test_parallel_signal_timestamp_is_workflow_stamped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore(
+                "workflow-parallel-signal-time-test",
+                generation_root=Path(tmpdir) / "generation",
+            )
+            store.init_problem("Target theorem.")
+            with patch(
+                "agents.generation.phase2.workflow.utc_now",
+                return_value="2026-07-12T06:08:17+00:00",
+            ):
+                _record_parallel_signals(
+                    store,
+                    {
+                        "actor_role": "villain",
+                        "target_id": "root",
+                        "parallel_signals": [
+                            {
+                                "created_at": "2099-01-01T00:00:00Z",
+                                "signal_type": "obstruction_found",
+                                "summary": "A bounded search found no witness.",
+                            }
+                        ],
+                    },
+                    action={"mode": "refute", "target_id": "root"},
+                    execution={"run_id": "run-refute-root", "actor_role": "villain"},
+                )
+            path = store.state_dir / "parallel_exchange.jsonl"
+            payload = json.loads(path.read_text(encoding="utf-8").strip())
+
+        self.assertEqual(payload["created_at"], "2026-07-12T06:08:17+00:00")
 
     def test_parallel_signals_are_deduplicated_by_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -35,7 +35,7 @@ INBOX_FILE = "steering_inbox.jsonl"
 
 
 def _now() -> str:
-    return datetime.datetime.utcnow().isoformat() + "Z"
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _path(state_dir: os.PathLike | str, name: str) -> Path:

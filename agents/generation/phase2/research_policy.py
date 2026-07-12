@@ -5,7 +5,17 @@ from typing import Any, Dict, Mapping
 
 from .result_status import normalize_result_relation
 
-RESEARCH_MODES = {"independent", "proof_first", "balanced", "hard_problem", "citation_first", "citation_pass"}
+RESEARCH_MODES = {
+    "independent",
+    "proof_first",
+    "balanced",
+    "hard_problem",
+    "citation_first",
+    "citation_pass",
+    # Conservative referee mode (2026-07-09 TODO 6): audit a submitted proof
+    # document instead of proving the statement; see phase2/audit.py.
+    "paper_solution_audit",
+}
 DEFAULT_RESEARCH_MODE = "hard_problem"
 DEFAULT_WEB_SEARCH = "live"
 RESEARCH_MODE_ALIASES = {
@@ -127,6 +137,8 @@ def should_run_librarian(
         reason = "citation_pass adds literature context after independent integration"
     elif mode == "hard_problem":
         reason = "hard_problem mode starts literature scouting alongside a serious researcher attack"
+    elif mode == "paper_solution_audit":
+        reason = "paper_solution_audit starts a citation-audit scan: external theorems used by the submitted proof need exact source/theorem/hypothesis checks"
     else:
         reason = "balanced mode starts a literature scout alongside direct research"
     return {
@@ -325,7 +337,7 @@ def researcher_work_mode_decision(
 ) -> Dict[str, Any]:
     """Choose the researcher work mode for one session.
 
-    Priority: explicit action stamp, companion default, advisor directive,
+    Priority: explicit action stamp, companion rotation, advisor directive,
     structural action bias, then the clean online -> offline -> cas rotation.
     """
     mode = normalize_research_mode(research_mode)
@@ -340,11 +352,28 @@ def researcher_work_mode_decision(
     if action_expects_villain_session(action):
         return _villain_work_mode_decision(state, action, online_allowed=online_allowed)
     if action.get("parallel_companion"):
-        companion_mode = "cas" if action.get("cas_check_recommended") else "offline"
+        if action.get("cas_check_recommended"):
+            return {
+                "work_mode": "cas",
+                "source": "companion_structural",
+                "reason": "parallel researcher companion has a bounded computation assigned",
+            }
+        cycle = [m for m in RESEARCHER_WORK_MODE_CYCLE if m != "online" or online_allowed]
+        history = _researcher_work_mode_history(state, include_companions=True)
+        last = history[0]["work_mode"] if history else ""
+        start = (cycle.index(last) + 1) % len(cycle) if last in cycle else 0
+        try:
+            slot = max(0, int(action.get("parallel_companion_index") or 0))
+        except (TypeError, ValueError):
+            slot = 0
+        companion_mode = cycle[(start + slot) % len(cycle)]
         return {
             "work_mode": companion_mode,
-            "source": "companion_default",
-            "reason": "parallel researcher companions default to offline proof work (or cas when a computation is recommended); rotation and advisor directives steer primary passes",
+            "source": "companion_rotation",
+            "reason": (
+                "parallel researcher companions rotate across search, proof, and computation modes; "
+                f"companion slot {slot + 1} selected {companion_mode}"
+            ),
         }
     directive = advisor_mode_directive(state)
     if directive:

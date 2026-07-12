@@ -17,6 +17,7 @@ Albilich v1 adds an executable proof-state workflow beside the Albilich v0.5 run
 - Research policy modes that separate independent proof search from literature scoping and post-proof citation passes, with adaptive literature-researcher retrieval levels for scout, reader, and hard theorem-matching work.
 - Economical state storage: duplicate claims are rejected by normalized statement fingerprint, retrieval cards are deduplicated by content hash, and verifier reports are compacted before storage.
 - Final proof closing: after root integration, the scheduler runs a writer session to emit a `final_proof` artifact before stopping as solved.
+- A persisted research-strategy layer for bridge search, global PhD-advisor synthesis, exceptional invention authorization, experimental mathematics, bounded conjectures, structural method cards, deep sessions, information-gain scoring, and active proof compression. The layer uses ordinary artifacts and patch gates rather than a second state store; see `docs/albilich_research_strategy.md`.
 
 ## Use
 

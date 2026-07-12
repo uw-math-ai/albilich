@@ -3,30 +3,35 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
+import threading
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from .audit import PAPER_AUDIT_RESEARCH_MODE, ingest_paper_audit
 from .claude_runner import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CLAUDE_PERMISSION_MODE,
     make_claude_executor,
 )
+from .completion_policy import record_root_intent_resolution
 from .codex_runner import DEFAULT_CHILD_TIMEOUT_SECONDS, DEFAULT_CODEX_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_SANDBOX, prepare_session
 from .console import build_run_console, write_run_console
 from .context_builder import build_context_manifest
 from .formal_handoff import write_formalization_manifest
 from .invariants import validate_conn
 from .metrics import compute_metrics
-from .models import problem_id_from_file, sanitize_problem_id
+from .models import COMPLETION_POLICIES, DEFAULT_COMPLETION_POLICY, problem_id_from_file, sanitize_problem_id
 from .monitor import BackgroundMonitor, start_background_monitor
 from .patches import apply_patch
 from .report import build_markdown_report, write_markdown_report
 from .result_status import classify_result
 from .research_policy import DEFAULT_RESEARCH_MODE, DEFAULT_WEB_SEARCH, RESEARCH_MODES
-from .scheduler import next_action
+from .scheduler import DEFAULT_MULTI_BRANCH_WORKERS, next_action
 from .store import GENERATION_ROOT, ProofStateStore
 from .workflow import run_workflow
 
@@ -39,6 +44,37 @@ DEFAULT_ATTEMPT_VERIFICATION_RESERVE = 12_000_000
 DEFAULT_ATTEMPT_MAX_REDUCTION_DEPTH = 4
 
 
+class _WorkflowTerminationSignal(BaseException):
+    def __init__(self, signum: int):
+        self.signum = int(signum)
+        super().__init__(f"received signal {self.signum}")
+
+
+@contextmanager
+def _workflow_termination_guard():
+    """Turn terminal/session shutdown signals into a finalizable exception."""
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous: dict[int, Any] = {}
+
+    def _raise_signal(signum: int, _frame: Any) -> None:
+        raise _WorkflowTerminationSignal(signum)
+
+    try:
+        for signal_name in ("SIGHUP", "SIGTERM"):
+            signum = getattr(signal, signal_name, None)
+            if signum is None:
+                continue
+            previous[int(signum)] = signal.getsignal(signum)
+            signal.signal(signum, _raise_signal)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Albilich v1 proof-state workflow")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -49,6 +85,7 @@ def main(argv: list[str] | None = None) -> None:
     p_init.add_argument("--total-token-budget", type=int, default=DEFAULT_INIT_TOTAL_TOKEN_BUDGET)
     p_init.add_argument("--reserved-verification-budget", type=int, default=DEFAULT_INIT_VERIFICATION_RESERVE)
     p_init.add_argument("--max-reduction-depth", type=int, default=DEFAULT_ATTEMPT_MAX_REDUCTION_DEPTH)
+    _add_completion_policy_arg(p_init)
 
     p_status = sub.add_parser("status", help="print proof-state metrics")
     p_status.add_argument("problem")
@@ -72,6 +109,7 @@ def main(argv: list[str] | None = None) -> None:
     p_step.add_argument("--model-profile", default="default")
     p_step.add_argument("--web-search", choices=["disabled", "live"], default=DEFAULT_WEB_SEARCH, help="search policy used by research-mode planning")
     p_step.add_argument("--research-mode", choices=sorted(RESEARCH_MODES), default=DEFAULT_RESEARCH_MODE)
+    _add_completion_policy_arg(p_step)
 
     p_run = sub.add_parser("run", help="run the Albilich v1 workflow planner or executor")
     p_run.add_argument("problem")
@@ -87,10 +125,12 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--sandbox", default=DEFAULT_SANDBOX)
     p_run.add_argument("--web-search", choices=["disabled", "live"], default=DEFAULT_WEB_SEARCH, help="Codex web_search policy for executed sessions")
     p_run.add_argument("--research-mode", choices=sorted(RESEARCH_MODES), default=DEFAULT_RESEARCH_MODE)
+    _add_completion_policy_arg(p_run)
     p_run.add_argument("--timeout-sec", type=int, default=DEFAULT_CHILD_TIMEOUT_SECONDS)
     p_run.add_argument("--max-wall-sec", type=int, help="optional whole-workflow wall-clock cap in seconds")
     p_run.add_argument("--parallel-librarian-verifier", dest="parallel_librarian_verifier", action="store_true", default=True)
     p_run.add_argument("--no-parallel-librarian-verifier", dest="parallel_librarian_verifier", action="store_false")
+    _add_parallel_branches_arg(p_run)
     p_run.add_argument("--write-report", action="store_true")
     p_run.add_argument("--write-console", dest="write_console", action="store_true", default=True)
     p_run.add_argument("--no-write-console", dest="write_console", action="store_false")
@@ -115,10 +155,12 @@ def main(argv: list[str] | None = None) -> None:
     p_attempt.add_argument("--sandbox", default=DEFAULT_SANDBOX)
     p_attempt.add_argument("--web-search", choices=["disabled", "live"], default=DEFAULT_WEB_SEARCH)
     p_attempt.add_argument("--research-mode", choices=sorted(RESEARCH_MODES), default=DEFAULT_RESEARCH_MODE)
+    _add_completion_policy_arg(p_attempt)
     p_attempt.add_argument("--timeout-sec", type=int, default=DEFAULT_CHILD_TIMEOUT_SECONDS)
     p_attempt.add_argument("--max-wall-sec", type=int, default=DEFAULT_ATTEMPT_WALL_SECONDS)
     p_attempt.add_argument("--parallel-librarian-verifier", dest="parallel_librarian_verifier", action="store_true", default=True)
     p_attempt.add_argument("--no-parallel-librarian-verifier", dest="parallel_librarian_verifier", action="store_false")
+    _add_parallel_branches_arg(p_attempt)
     p_attempt.add_argument("--total-token-budget", type=int, default=DEFAULT_ATTEMPT_TOTAL_TOKEN_BUDGET)
     p_attempt.add_argument("--reserved-verification-budget", type=int, default=DEFAULT_ATTEMPT_VERIFICATION_RESERVE)
     p_attempt.add_argument("--max-reduction-depth", type=int, default=DEFAULT_ATTEMPT_MAX_REDUCTION_DEPTH)
@@ -133,6 +175,16 @@ def main(argv: list[str] | None = None) -> None:
     p_attempt.add_argument("--no-write-console", dest="write_console", action="store_false")
     _add_dashboard_args(p_attempt)
 
+    p_audit = sub.add_parser(
+        "audit-paper",
+        help="ingest a LaTeX/markdown/pasted proof file as a paper_solution_audit subject (conservative referee mode)",
+    )
+    p_audit.add_argument("document", help="path to the proof document to audit (.tex/.md/.txt)")
+    p_audit.add_argument("--problem-id", help="explicit problem id (default: audit/<document stem>)")
+    p_audit.add_argument("--title", default="", help="statement/title being audited (default: derived from the document)")
+    p_audit.add_argument("--total-token-budget", type=int, default=DEFAULT_INIT_TOTAL_TOKEN_BUDGET)
+    p_audit.add_argument("--reserved-verification-budget", type=int, default=DEFAULT_INIT_VERIFICATION_RESERVE)
+
     p_patch = sub.add_parser("apply-patch", help="apply a structured Albilich v1 patch JSON file")
     p_patch.add_argument("problem")
     p_patch.add_argument("patch_json")
@@ -144,6 +196,29 @@ def main(argv: list[str] | None = None) -> None:
     p_console = sub.add_parser("console", help="write or print the consolidated Albilich run console")
     p_console.add_argument("problem")
     p_console.add_argument("--write", action="store_true")
+
+    p_pause = sub.add_parser(
+        "pause",
+        help="soft-pause the run: the workflow finishes the current child session, then stops dispatching new actions (this pauses the run itself, not just the dashboard)",
+    )
+    p_pause.add_argument("problem")
+    p_pause.add_argument("--reason", default="")
+
+    p_resume = sub.add_parser(
+        "resume",
+        help="clear a run pause/stop; the workflow (relaunch run/attempt if none is active) continues from the latest accepted proof-state revision",
+    )
+    p_resume.add_argument("problem")
+    p_resume.add_argument("--reason", default="")
+
+    p_stop = sub.add_parser("stop", help="stop the run after the current child session finishes")
+    p_stop.add_argument("problem")
+    p_stop.add_argument(
+        "--hard",
+        action="store_true",
+        help="also terminate the active child session immediately and record an interruption event artifact",
+    )
+    p_stop.add_argument("--reason", default="")
 
     p_formal = sub.add_parser("formal-handoff", help="write a formalization handoff manifest")
     p_formal.add_argument("problem")
@@ -161,14 +236,34 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "init":
         store = _store(args.problem, args.problem_id)
         root_statement = _read_root_statement(args.problem)
-        _print(
-            store.init_problem(
-                root_statement,
-                total_token_budget=args.total_token_budget,
-                reserved_verification_budget=args.reserved_verification_budget,
-                max_reduction_depth=args.max_reduction_depth,
-            )
+        state = store.init_problem(
+            root_statement,
+            total_token_budget=args.total_token_budget,
+            reserved_verification_budget=args.reserved_verification_budget,
+            max_reduction_depth=args.max_reduction_depth,
         )
+        _apply_completion_policy(store, args)
+        # Root-intent parsing (TODO 7): record how exploratory wording in the
+        # problem file relates to the formal target; soft wording never flips
+        # the completion policy by itself.
+        state["root_intent_resolution"] = record_root_intent_resolution(store, markdown=root_statement)
+        state["completion_policy"] = store.get_completion_policy()
+        _print(state)
+        return
+    if args.command == "audit-paper":
+        problem_id = args.problem_id or ("audit/" + sanitize_problem_id(Path(args.document).stem))
+        store = ProofStateStore(problem_id)
+        result = ingest_paper_audit(
+            store,
+            Path(args.document),
+            title=args.title,
+            total_token_budget=args.total_token_budget,
+            reserved_verification_budget=args.reserved_verification_budget,
+        )
+        result["next_step"] = (
+            f"run the audit with: run {store.problem_id} --execute --research-mode {PAPER_AUDIT_RESEARCH_MODE}"
+        )
+        _print(result)
         return
 
     store = _store(args.problem, getattr(args, "problem_id", None))
@@ -182,6 +277,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     else:
         _ensure_initialized_if_problem_file(store, args.problem)
+    _apply_completion_policy(store, args)
 
     if args.command == "status":
         payload = compute_metrics(store)
@@ -220,6 +316,7 @@ def main(argv: list[str] | None = None) -> None:
             timeout_sec=args.timeout_sec,
             max_wall_seconds=args.max_wall_sec,
             parallel_librarian_verifier=args.parallel_librarian_verifier,
+            parallel_branches=args.parallel_branches,
             stop_on_rejection=args.stop_on_rejection,
             session_resume=args.session_resume,
             write_on_stop=args.write_on_stop,
@@ -233,28 +330,33 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "attempt":
         _apply_cas_assets(args)
         dashboard, _dashboard_handle = _maybe_start_run_dashboard(args, store)
-        result = run_workflow(
-            store,
-            steps=args.steps,
-            execute=not args.dry_run,
-            max_context_chars=args.max_context_chars,
-            model_profile=args.model_profile,
-            model=_resolve_model_for_backend(args),
-            reasoning_effort=args.reasoning_effort,
-            codex_bin=args.codex_bin,
-            sandbox=args.sandbox,
-            web_search=args.web_search,
-            research_mode=args.research_mode,
-            timeout_sec=args.timeout_sec,
-            max_wall_seconds=args.max_wall_sec,
-            parallel_librarian_verifier=args.parallel_librarian_verifier,
-            stop_on_rejection=args.stop_on_rejection,
-            session_resume=args.session_resume,
-            write_on_stop=args.write_on_stop,
-            write_report=args.write_report,
-            write_console=args.write_console,
-            executor=_executor_for(args),
-        )
+        try:
+            with _workflow_termination_guard():
+                result = run_workflow(
+                    store,
+                    steps=args.steps,
+                    execute=not args.dry_run,
+                    max_context_chars=args.max_context_chars,
+                    model_profile=args.model_profile,
+                    model=_resolve_model_for_backend(args),
+                    reasoning_effort=args.reasoning_effort,
+                    codex_bin=args.codex_bin,
+                    sandbox=args.sandbox,
+                    web_search=args.web_search,
+                    research_mode=args.research_mode,
+                    timeout_sec=args.timeout_sec,
+                    max_wall_seconds=args.max_wall_sec,
+                    parallel_librarian_verifier=args.parallel_librarian_verifier,
+                    parallel_branches=args.parallel_branches,
+                    stop_on_rejection=args.stop_on_rejection,
+                    session_resume=args.session_resume,
+                    write_on_stop=args.write_on_stop,
+                    write_report=args.write_report,
+                    write_console=args.write_console,
+                    executor=_executor_for(args),
+                )
+        except _WorkflowTerminationSignal as exc:
+            raise SystemExit(128 + exc.signum) from None
         if dashboard:
             result["dashboard"] = dashboard
         _print(result)
@@ -271,6 +373,33 @@ def main(argv: list[str] | None = None) -> None:
             _print({"path": str(write_run_console(store))})
         else:
             print(build_run_console(store))
+    elif args.command == "pause":
+        result = store.request_pause(reason=args.reason, source="cli")
+        result["note"] = (
+            "Soft pause: the workflow finishes the current child session, then sets run_status=paused "
+            "before dispatching any new action. This pauses the Albilich run itself; the dashboard "
+            "pause button only freezes the display."
+        )
+        result["run_timing"] = store.get_run_timing()
+        _print(result)
+    elif args.command == "resume":
+        result = store.resume_run(reason=args.reason, source="cli")
+        result["note"] = (
+            f"Run resumed at proof-state revision {store.get_revision()}; the workflow continues from "
+            "the latest accepted revision. If no workflow process is active, relaunch `run`/`attempt`."
+        )
+        result["run_timing"] = store.get_run_timing()
+        _print(result)
+    elif args.command == "stop":
+        result = store.request_stop(hard=args.hard, reason=args.reason, source="cli")
+        result["note"] = (
+            "Hard stop: the active child session is terminated by the workflow's run-control watcher "
+            "and an interruption event artifact was recorded."
+            if args.hard
+            else "Soft stop: the workflow finishes the current child session, then exits before the next dispatch."
+        )
+        result["run_timing"] = store.get_run_timing()
+        _print(result)
     elif args.command == "formal-handoff":
         _print({"path": str(write_formalization_manifest(store, claim_id=args.claim_id, route_id=args.route_id))})
     elif args.command == "monitor":
@@ -283,6 +412,55 @@ def main(argv: list[str] | None = None) -> None:
             poll_ms=max(500, int(args.interval * 1000)),
             open_browser=args.open_browser,
         )
+
+
+def _add_parallel_branches_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--parallel-branches",
+        dest="parallel_branches",
+        type=int,
+        choices=[0, 2, 3, 4, 5],
+        default=DEFAULT_MULTI_BRANCH_WORKERS,
+        help=(
+            "multi_branch_research mode: plan up to N (2-5) simultaneous branch-scoped researcher/villain "
+            f"workers per step window (default {DEFAULT_MULTI_BRANCH_WORKERS}; use 0 to disable); "
+            "the worker count and mode name are recorded on problem_state"
+        ),
+    )
+
+
+def _add_completion_policy_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--completion-policy",
+        dest="completion_policy",
+        choices=sorted(COMPLETION_POLICIES),
+        default=None,
+        help=(
+            f"run-level completion policy persisted on problem_state (default {DEFAULT_COMPLETION_POLICY}): "
+            "full_proof_first stops once the certified final proof exists; publication_ready additionally "
+            "runs the post-proof paper/editor gate; partial_ok/exploratory explicitly accept partial results. "
+            "Soft wording in the problem file never changes this by itself."
+        ),
+    )
+
+
+def _apply_completion_policy(store: ProofStateStore, args: argparse.Namespace) -> None:
+    """Persist an explicitly requested completion policy (TODO 7).
+
+    Only the explicit flag changes the persisted policy; commands without the
+    flag (or with it unset) leave the stored policy untouched.
+    """
+    policy = getattr(args, "completion_policy", None)
+    if not policy:
+        return
+    try:
+        store.set_completion_policy(policy, reason="explicit --completion-policy flag", source="cli")
+    except ValueError:
+        # Uninitialized problem state: nothing to persist onto yet.
+        return
+    # Keep the recorded root-intent note in sync with the explicit policy
+    # (record_root_intent_resolution dedupes when nothing changed).
+    record_root_intent_resolution(store, completion_policy=policy)
 
 
 def _add_backend_args(parser: argparse.ArgumentParser) -> None:
@@ -478,7 +656,9 @@ def _ensure_initialized_if_problem_file(
             kwargs["reserved_verification_budget"] = reserved_verification_budget
         if max_reduction_depth is not None:
             kwargs["max_reduction_depth"] = max_reduction_depth
-        store.init_problem(_read_root_statement(problem), **kwargs)
+        root_statement = _read_root_statement(problem)
+        store.init_problem(root_statement, **kwargs)
+        record_root_intent_resolution(store, markdown=root_statement)
 
 
 def _print(payload: Any) -> None:

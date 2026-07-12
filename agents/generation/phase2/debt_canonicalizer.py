@@ -37,26 +37,26 @@ _STOPWORDS = {
 }
 
 _ANCHOR_TERMS = {
-    "chained",
+    "alcoved",
     "bridge",
     "class",
     "compatibility",
     "construction",
     "crown",
-    "rank",
+    "dhr",
     "extension",
-    "bridge",
+    "frattini",
     "hd",
-    "hinv",
+    "hstar",
     "interior",
     "lemma",
     "local",
-    "combinatorial",
+    "matroid",
     "maximal",
-    "seq",
+    "msss",
     "nonsplit",
     "non-split",
-    "toy",
+    "postnikov",
     "pure",
     "rank",
     "stars",
@@ -205,10 +205,10 @@ def _cluster_card(cluster: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
 
 def _keywords(text: str) -> set[str]:
     compact = (
-        text.replace("hinv", "hinv")
-        .replace("hinv", "hinv")
-        .replace("hinv", "hinv")
-        .replace("hinv", "hinv")
+        text.replace("h^*", "hstar")
+        .replace("h-*", "hstar")
+        .replace("h-star", "hstar")
+        .replace("h star", "hstar")
         .replace("h_d", "hd")
         .replace("h d", "hd")
         .replace("non split", "nonsplit")

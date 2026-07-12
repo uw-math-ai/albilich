@@ -9,6 +9,17 @@ from .store import ProofStateStore
 SOLVED_RELATIONS = {"exact", "equivalent", "stronger"}
 PARTIAL_RELATIONS = {"weaker", "conditional", "partial", "method", "background", "orthogonal", "unknown"}
 
+# Report-facing outcome vocabulary (2026-07-09 TODO 7): the final report must
+# distinguish these five outcomes (plus in_progress while the run is live).
+REPORT_CLASSIFICATIONS = {
+    "full_theorem_solved",
+    "weaker_theorem_proved",
+    "conditional_proof",
+    "partial_progress",
+    "statement_likely_false",
+    "in_progress",
+}
+
 
 def classify_result(store: ProofStateStore) -> Dict[str, Any]:
     """Classify public progress without weakening the root theorem."""
@@ -53,11 +64,29 @@ def classify_state(state: Mapping[str, Any]) -> Dict[str, Any]:
         "target_statement": problem["root_statement"],
         "proved_statement": proved_statement,
         "summary": summary,
+        "report_classification": _report_classification(public_status, root, partials),
         "final_artifact_id": final_artifact.get("artifact_id", "") if final_artifact else "",
         "integration_artifact_id": integration.get("artifact_id", "") if integration else "",
         "certified_partial_results": partials,
         "remaining_obligations": _remaining_obligations(state, public_status),
     }
+
+
+def _report_classification(public_status: str, root: Mapping[str, Any], partials: list[Dict[str, Any]]) -> str:
+    """Five-way report outcome (TODO 7): full theorem solved, weaker theorem
+    proved, conditional proof, partial progress, or statement likely false."""
+    if str(root.get("validation_status") or "") == "refuted":
+        return "statement_likely_false"
+    if public_status in {"solved", "solved_pending_final_writer"}:
+        return "full_theorem_solved"
+    if partials:
+        relations = {str(row.get("relation_to_target") or "") for row in partials}
+        if "weaker" in relations:
+            return "weaker_theorem_proved"
+        if relations and relations <= {"conditional"}:
+            return "conditional_proof"
+        return "partial_progress"
+    return "in_progress"
 
 
 def root_alignment_from_metadata(metadata: Mapping[str, Any]) -> Dict[str, Any]:

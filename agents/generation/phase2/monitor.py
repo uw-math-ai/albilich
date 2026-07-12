@@ -29,13 +29,26 @@ from typing import Any, Dict, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .console import build_run_console_payload
-from .models import utc_now
+from .graph_policy import claim_is_retired, supersession_index
+from .models import statement_is_interrogative_problem, utc_now
 from .scheduler import bottleneck_frontier_summary, proof_spine_summary, route_verifier_readiness
+from .research_strategy import strategy_observability
 from .store import ProofStateStore
 from . import steering
 
 _LIVE_STATUSES = {"running", "started", "heartbeat", "planned"}
 _LIVE_TELEMETRY_STALE_SECONDS = 180.0
+MONITOR_REFRESH_INTERVAL_ENV = "ALBILICH_MONITOR_REFRESH_INTERVAL_SECONDS"
+DEFAULT_MONITOR_REFRESH_INTERVAL_SECONDS = 60.0
+
+
+def _monitor_refresh_interval_seconds(poll_ms: int) -> float:
+    raw = os.environ.get(MONITOR_REFRESH_INTERVAL_ENV, "").strip()
+    try:
+        configured = float(raw) if raw else DEFAULT_MONITOR_REFRESH_INTERVAL_SECONDS
+    except ValueError:
+        configured = DEFAULT_MONITOR_REFRESH_INTERVAL_SECONDS
+    return max(float(poll_ms) / 1000.0, configured, 5.0)
 
 
 def _html_escape(text: str) -> str:
@@ -62,6 +75,72 @@ def _json_list(value: Any) -> list[Any]:
     return []
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return dict(decoded) if isinstance(decoded, Mapping) else {}
+
+
+def _report_has_items(value: Any) -> bool:
+    if isinstance(value, (list, tuple, set)):
+        return any(str(item or "").strip() for item in value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return normalized not in {"", "[]", "none", "null", "false"}
+    return bool(value)
+
+
+def _claim_verification_history(
+    state: Mapping[str, Any], *, artifact_target_overrides: Mapping[str, str] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Summarize strict reports even when legacy patches left claims `untested`."""
+    run_targets = {
+        str(run.get("run_id") or ""): str(run.get("target_id") or "")
+        for run in state.get("runs", [])
+        if str(run.get("run_id") or "")
+    }
+    history: dict[str, dict[str, Any]] = {}
+    target_overrides = artifact_target_overrides or {}
+    for artifact in state.get("artifacts", []):
+        if str(artifact.get("artifact_type") or "") != "verification_report":
+            continue
+        metadata = _json_object(artifact.get("metadata_json"))
+        target_id = str(
+            metadata.get("target_id")
+            or metadata.get("claim_id")
+            or target_overrides.get(str(artifact.get("artifact_id") or ""), "")
+            or run_targets.get(str(artifact.get("run_id") or ""), "")
+            or ""
+        )
+        if not target_id:
+            continue
+        report = _json_object(metadata.get("verification_report"))
+        blocking = bool(metadata.get("blocking_gap") or report.get("blocking_gap"))
+        blocking = blocking or _report_has_items(metadata.get("critical_errors"))
+        blocking = blocking or _report_has_items(metadata.get("gaps"))
+        blocking = blocking or _report_has_items(report.get("critical_errors"))
+        blocking = blocking or _report_has_items(report.get("gaps"))
+        revision = int(artifact.get("state_revision") or 0)
+        current = history.get(target_id)
+        if current and int(current.get("latest_state_revision") or 0) > revision:
+            current["report_count"] = int(current.get("report_count") or 0) + 1
+            continue
+        history[target_id] = {
+            "report_count": int(current.get("report_count") or 0) + 1 if current else 1,
+            "latest_state_revision": revision,
+            "latest_artifact_id": str(artifact.get("artifact_id") or ""),
+            "latest_verdict": str(metadata.get("verdict") or report.get("verdict") or ""),
+            "blocking_gap": blocking,
+        }
+    return history
+
+
 def _short_text(value: Any, limit: int = 220) -> str:
     text = " ".join(str(value or "").split())
     if len(text) <= limit:
@@ -82,13 +161,13 @@ def _producer_role_code(role: str) -> str:
     }.get(normalized, "".join(part[:1].upper() for part in normalized.split("_") if part)[:2] or "A")
 
 
-def _proof_graph_payload(store: ProofStateStore) -> Dict[str, Any]:
+def _proof_graph_payload(store: ProofStateStore, *, state: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Build a compact graph view from the current proof state.
 
     This is deliberately derived, not persisted: the dashboard should reveal the
     live proof frontier without introducing another graph store to keep in sync.
     """
-    state = store.get_state()
+    state = state if state is not None else store.get_state()
     claims = {str(row.get("claim_id") or ""): row for row in state.get("claims", [])}
     routes = {str(row.get("route_id") or ""): row for row in state.get("routes", [])}
     inferences = {str(row.get("inference_id") or ""): row for row in state.get("inferences", [])}
@@ -134,8 +213,9 @@ def _proof_graph_payload(store: ProofStateStore) -> Dict[str, Any]:
             nodes.append(node)
 
     def add_edge(source: str, target: str, relation: str, strength: str = "normal") -> None:
-        if source and target and source != target:
-            edges.append({"source": source, "target": target, "relation": relation, "strength": strength})
+        edge = {"source": source, "target": target, "relation": relation, "strength": strength}
+        if source and target and source != target and edge not in edges:
+            edges.append(edge)
 
     for claim_id, claim in sorted(
         claims.items(),
@@ -158,7 +238,7 @@ def _proof_graph_payload(store: ProofStateStore) -> Dict[str, Any]:
         )
         for parent_id in _json_list(claim.get("parent_ids_json")):
             if str(parent_id) in claims:
-                add_edge(f"claim:{parent_id}", f"claim:{claim_id}", "parent")
+                add_edge(f"claim:{parent_id}", f"claim:{claim_id}", "contains subclaim")
 
     for route_id, route in sorted(routes.items()):
         inf_count = inference_counts_by_route.get(route_id, 0)
@@ -206,6 +286,9 @@ def _proof_graph_payload(store: ProofStateStore) -> Dict[str, Any]:
         for premise_id in inf.get("premise_claim_ids") or []:
             if str(premise_id) in claims:
                 add_edge(f"claim:{premise_id}", f"inference:{inference_id}", "premise")
+                conclusion_id = str(inf.get("conclusion_claim_id") or "")
+                if conclusion_id in claims:
+                    add_edge(f"claim:{premise_id}", f"claim:{conclusion_id}", "supports claim", "strong")
 
     for debt in sorted(debts, key=lambda row: (0 if str(row.get("severity") or "") == "blocking" else 1, str(row.get("debt_id") or "")))[:30]:
         debt_id = str(debt.get("debt_id") or "")
@@ -314,7 +397,8 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
     live token usage are overlaid from the ``albilich_run_console.json`` the
     running workflow maintains, since those come from its in-memory history.
     """
-    payload = build_run_console_payload(store)
+    state = store.get_state()
+    payload = build_run_console_payload(store, state=state)
     source = "store"
     console_json = store.state_dir / "albilich_run_console.json"
     file_payload: Dict[str, Any] | None = None
@@ -334,25 +418,108 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
             payload.setdefault("usage_summary", {})["active_live_children"] = live_children
     # All claims (statement only), verified ones marked — the headline output ledger.
     try:
-        claims = store.get_state().get("claims", [])
+        claims = state.get("claims", [])
         verified_statuses = {"informally_verified", "formally_verified"}
+        artifact_target_overrides: dict[str, str] = {}
+        try:
+            with store.connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT p.target_id,
+                           json_extract(op.value, '$.artifact_id') AS artifact_id
+                    FROM patches p, json_each(p.operations_json) AS op
+                    WHERE p.actor_role = 'strict_informal_verifier'
+                      AND json_extract(op.value, '$.artifact_type') = 'verification_report'
+                    """
+                ).fetchall()
+            artifact_target_overrides = {
+                str(row["artifact_id"] or ""): str(row["target_id"] or "")
+                for row in rows
+                if str(row["artifact_id"] or "") and str(row["target_id"] or "")
+            }
+        except Exception:
+            artifact_target_overrides = {}
+        verification_history = _claim_verification_history(
+            state, artifact_target_overrides=artifact_target_overrides
+        )
+        supersession = supersession_index(state)
+        supersession_by_claim = {
+            str(row.get("claim_id") or ""): row
+            for row in supersession.get("claims", [])
+        }
+        claim_ids = {str(c.get("claim_id") or "") for c in claims}
+        subclaim_of: dict[str, set[str]] = {claim_id: set() for claim_id in claim_ids}
+        contains_subclaims: dict[str, set[str]] = {claim_id: set() for claim_id in claim_ids}
+        supports_claims: dict[str, set[str]] = {claim_id: set() for claim_id in claim_ids}
+        supported_by_claims: dict[str, set[str]] = {claim_id: set() for claim_id in claim_ids}
+        for claim in claims:
+            claim_id = str(claim.get("claim_id") or "")
+            for parent_id in _json_list(claim.get("parent_ids_json")):
+                parent_id = str(parent_id or "")
+                if parent_id in claim_ids and parent_id != claim_id:
+                    subclaim_of[claim_id].add(parent_id)
+                    contains_subclaims[parent_id].add(claim_id)
+        for inference in state.get("inferences", []):
+            conclusion_id = str(inference.get("conclusion_claim_id") or "")
+            if conclusion_id not in claim_ids:
+                continue
+            for premise_id in inference.get("premise_claim_ids") or []:
+                premise_id = str(premise_id or "")
+                if premise_id in claim_ids and premise_id != conclusion_id:
+                    supports_claims[premise_id].add(conclusion_id)
+                    supported_by_claims[conclusion_id].add(premise_id)
 
         def _is_verified(c: Mapping[str, Any]) -> bool:
             return (
-                str(c.get("validation_status") or "") in verified_statuses
-                or str(c.get("lifecycle_status") or "") == "integrated"
+                not claim_is_retired(c)
+                and (
+                    str(c.get("validation_status") or "") in verified_statuses
+                    or str(c.get("lifecycle_status") or "") == "integrated"
+                )
             )
 
-        rows = [
-            {
+        rows = []
+        for c in claims:
+            claim_id = str(c.get("claim_id") or "")
+            persisted_status = str(c.get("validation_status") or "")
+            lifecycle_status = str(c.get("lifecycle_status") or "")
+            report = verification_history.get(claim_id, {})
+            superseded = supersession_by_claim.get(claim_id, {})
+            display_status = persisted_status
+            if lifecycle_status in {"superseded", "abandoned", "blocked"}:
+                # Lifecycle retirement takes precedence over stale validation
+                # labels such as "untested" in the claims ledger.
+                display_status = lifecycle_status
+            elif (
+                claim_id == "root"
+                and lifecycle_status == "active"
+                and statement_is_interrogative_problem(str(c.get("statement") or ""))
+            ):
+                display_status = "active_question"
+            elif persisted_status in {"untested", "plausible", "challenged"} and report:
+                display_status = "challenged" if report.get("blocking_gap") else "checked_pending_transition"
+            rows.append({
                 "claim_id": str(c.get("claim_id") or ""),
                 "statement": str(c.get("statement") or ""),
-                "validation_status": str(c.get("validation_status") or ""),
-                "lifecycle_status": str(c.get("lifecycle_status") or ""),
+                "validation_status": persisted_status,
+                "display_validation_status": display_status,
+                "lifecycle_status": lifecycle_status,
                 "verified": _is_verified(c),
-            }
-            for c in claims
-        ]
+                "retired": claim_is_retired(c),
+                "verification_report_count": int(report.get("report_count") or 0),
+                "latest_verification_revision": int(report.get("latest_state_revision") or 0),
+                "latest_verification_artifact_id": str(report.get("latest_artifact_id") or ""),
+                "reduction_depth": int(c.get("reduction_depth") or 0),
+                "root_impact": float(c.get("root_impact") or 0.0),
+                "subclaim_of_claim_ids": sorted(subclaim_of.get(claim_id, set())),
+                "contains_subclaim_ids": sorted(contains_subclaims.get(claim_id, set())),
+                "supports_claim_ids": sorted(supports_claims.get(claim_id, set())),
+                "supported_by_claim_ids": sorted(supported_by_claims.get(claim_id, set())),
+                "superseded_by_claim_ids": sorted(
+                    str(item) for item in superseded.get("replacement_claim_ids", []) if str(item)
+                ),
+                "retirement_reason": str(superseded.get("reason") or ""),
+            })
         # Verified first, then the rest; stable within each group.
         rows.sort(key=lambda r: 0 if r["verified"] else 1)
         payload["claims"] = rows
@@ -361,17 +528,34 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
         payload["claims"] = []
         payload["verified_claim_total"] = 0
     try:
-        payload["proof_graph"] = _proof_graph_payload(store)
+        payload["proof_graph"] = _proof_graph_payload(store, state=state)
     except Exception:
         payload["proof_graph"] = {"nodes": [], "edges": [], "summary": {}}
     try:
-        payload["bottleneck_frontier"] = bottleneck_frontier_summary(store.get_scheduler_state())
+        scheduler_state = store.get_scheduler_state()
+    except Exception:
+        scheduler_state = {}
+    try:
+        payload["bottleneck_frontier"] = bottleneck_frontier_summary(scheduler_state)
     except Exception:
         payload["bottleneck_frontier"] = {}
     try:
-        payload["proof_spine_status"] = proof_spine_summary(store.get_scheduler_state())
+        payload["proof_spine_status"] = proof_spine_summary(scheduler_state)
+        root_claim = next(
+            (claim for claim in state.get("claims", []) if str(claim.get("claim_id") or "") == "root"),
+            {},
+        )
+        if (
+            str(root_claim.get("lifecycle_status") or "") == "active"
+            and statement_is_interrogative_problem(str(root_claim.get("statement") or ""))
+        ):
+            payload["proof_spine_status"]["root_status"] = "active_question"
     except Exception:
         payload["proof_spine_status"] = {}
+    try:
+        payload["research_strategy"] = strategy_observability(scheduler_state)
+    except Exception:
+        payload["research_strategy"] = {}
     live = _has_live_child(payload)
     # Robust liveness from real write-activity (survives the run process dying: when
     # it exits no new files are written, so this goes stale and the dashboard says
@@ -551,6 +735,94 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
     index_html = INDEX_HTML.replace("__POLL_MS__", str(poll_ms)).replace(
         "__PROBLEM_ID__", _html_escape(store.problem_id)
     )
+    # Building the full console payload is intentionally authoritative but can
+    # take a couple of seconds for a long run. Multiple open dashboard tabs used
+    # to start overlapping rebuilds every poll, saturating the monitor and
+    # leaving every tab on "Connecting…". Serialize rebuilds and share one
+    # short-lived JSON body across clients.
+    console_cache_lock = threading.Lock()
+    console_cache_body = b""
+    console_cache_at = 0.0
+    console_refreshing = False
+    # A full authoritative rebuild is CPU-heavy on mature proof databases.
+    # The page may poll more frequently, but proof-state panels only need a
+    # rebuild every few polls; live tails remain available through /api/tail.
+    console_cache_ttl = _monitor_refresh_interval_seconds(poll_ms)
+
+    def _persisted_console_body() -> bytes:
+        """Cheap initial response while the authoritative rebuild runs."""
+
+        path = store.state_dir / "albilich_run_console.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return b""
+        if not isinstance(payload, dict):
+            return b""
+        live = _has_live_child(payload)
+        seconds_since_activity, run_state = _run_activity_state(store)
+        if live and run_state in {"stalled", "stopped"}:
+            run_state = "running"
+        try:
+            console_mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+        except OSError:
+            console_mtime = ""
+        payload["_monitor"] = {
+            "served_at": utc_now(),
+            "source": "console-fallback",
+            "console_mtime": console_mtime,
+            "live": live,
+            "seconds_since_activity": seconds_since_activity,
+            "run_state": run_state,
+            "problem_id": store.problem_id,
+            "state_dir": str(store.state_dir),
+        }
+        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    def _refresh_console_body() -> None:
+        nonlocal console_cache_body, console_cache_at, console_refreshing
+        try:
+            payload = build_monitor_payload(store)
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            with console_cache_lock:
+                console_cache_body = body
+                console_cache_at = time.monotonic()
+        except Exception:
+            # Keep serving the last valid body; the next poll will retry.
+            pass
+        finally:
+            with console_cache_lock:
+                console_refreshing = False
+
+    def _console_body() -> bytes:
+        nonlocal console_cache_body, console_cache_at, console_refreshing
+        start_refresh = False
+        with console_cache_lock:
+            now = time.monotonic()
+            if console_cache_body and now - console_cache_at < console_cache_ttl:
+                return console_cache_body
+            if not console_cache_body:
+                console_cache_body = _persisted_console_body()
+                console_cache_at = now
+            if console_cache_body:
+                if not console_refreshing:
+                    console_refreshing = True
+                    start_refresh = True
+                body = console_cache_body
+            else:
+                # Fresh stores used by tests and first-run dashboards have no
+                # persisted console yet; one synchronous build is unavoidable.
+                payload = build_monitor_payload(store)
+                console_cache_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                console_cache_at = time.monotonic()
+                return console_cache_body
+        if start_refresh:
+            threading.Thread(
+                target=_refresh_console_body,
+                name=f"albilich-monitor-refresh-{store.problem_id}",
+                daemon=True,
+            ).start()
+        return body
 
     class Handler(BaseHTTPRequestHandler):
         # Silence default stderr request logging; keep the console clean.
@@ -558,12 +830,18 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
             return
 
         def _send(self, code: int, body: bytes, content_type: str) -> None:
-            self.send_response(code)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                # A polling tab can disappear while an authoritative payload is
+                # being built. That is a normal client disconnect, not a server
+                # error and must not trigger a second attempted response.
+                return
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
@@ -598,8 +876,7 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
                 return
             if path == "/api/console":
                 try:
-                    payload = build_monitor_payload(store)
-                    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    body = _console_body()
                     self._send(200, body, "application/json; charset=utf-8")
                 except Exception as exc:  # pragma: no cover - defensive
                     err = json.dumps({"error": str(exc)}).encode("utf-8")
@@ -948,12 +1225,42 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .steerinput:focus { outline: none; border-color: var(--accent); }
   .steeractions { display: flex; align-items: center; gap: 9px; margin-top: 8px; flex-wrap: wrap; }
 
-  /* Verified claims */
-  .vclaim { border: 1px solid var(--border); border-left: 3px solid var(--good); border-radius: var(--radius-sm); background: var(--surface-2); padding: 12px 15px; margin-bottom: 11px; }
-  .vclaim.unverified { border-left-color: var(--border-strong); }
+  /* Claim tree */
+  .claim-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 16px; padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
+  .claim-legend .label { color: var(--faint); font-size: 10px; font-weight: 700; letter-spacing: .7px; text-transform: uppercase; margin-right: 2px; }
+  .claim-section + .claim-section { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--border); }
+  .claim-section-title { display: flex; align-items: center; gap: 9px; margin: 0 0 12px; color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .65px; text-transform: uppercase; }
+  .claim-section-title::before { content: ""; width: 8px; height: 8px; border-radius: 3px; background: var(--uw-purple); }
+  .claim-section.retired .claim-section-title::before { background: var(--muted); }
+  .claim-section-title .count { margin-left: auto; color: var(--faint); font-family: var(--mono); font-size: 10px; font-weight: 500; letter-spacing: 0; text-transform: none; }
+  .claim-tree-node { position: relative; }
+  .claim-tree-children { position: relative; margin: -2px 0 11px 20px; padding-left: 18px; border-left: 1px solid color-mix(in srgb, var(--uw-purple) 32%, var(--border)); }
+  .claim-tree-children > .claim-tree-node::before { content: ""; position: absolute; top: 22px; left: -18px; width: 13px; border-top: 1px solid color-mix(in srgb, var(--uw-purple) 32%, var(--border)); }
+  .claim-tree-children .claim-tree-children { margin-left: 14px; padding-left: 16px; }
+  .retired-claims { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 10px; }
+  .retired-claims .vclaim { margin-bottom: 0; }
+  @media (max-width: 720px) {
+    .claim-tree-children, .claim-tree-children .claim-tree-children { margin-left: 8px; padding-left: 12px; }
+    .claim-tree-children > .claim-tree-node::before { left: -12px; width: 9px; }
+    .retired-claims { grid-template-columns: 1fr; }
+  }
+  .vclaim { border: 1px solid var(--border); border-left: 4px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface-2); padding: 12px 15px; margin-bottom: 11px; box-shadow: 0 1px 0 color-mix(in srgb, var(--border) 65%, transparent); }
+  .vclaim.status-integrated, .vclaim.status-verified { border-left-color: var(--good); background: color-mix(in srgb, var(--good) 4%, var(--surface-2)); }
+  .vclaim.status-active { border-left-color: var(--uw-purple); background: color-mix(in srgb, var(--uw-purple) 7%, var(--surface-2)); }
+  .vclaim.status-plausible { border-left-color: var(--warn); background: color-mix(in srgb, var(--warn) 9%, var(--surface-2)); }
+  .vclaim.status-challenged, .vclaim.status-blocked { border-left-color: var(--bad); background: color-mix(in srgb, var(--bad) 7%, var(--surface-2)); }
+  .vclaim.status-superseded, .vclaim.status-abandoned { border-left-color: var(--muted); background: color-mix(in srgb, var(--muted) 7%, var(--surface-2)); opacity: .88; }
+  .vclaim.status-refuted { border-left-color: var(--bad); background: color-mix(in srgb, var(--bad) 11%, var(--surface-2)); }
+  .vclaim.status-superseded .vstmt, .vclaim.status-abandoned .vstmt { color: var(--muted); }
   .vclaim:last-child { margin-bottom: 0; }
   .vclaim .vhead { display: flex; align-items: center; gap: 9px; margin-bottom: 7px; flex-wrap: wrap; }
   .vclaim .vstmt { font-size: 13.5px; line-height: 1.55; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+  .vclaim .vrel { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+  .vclaim .vrel .pill { max-width: min(100%, 560px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge.plausible { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); border-color: color-mix(in srgb, var(--warn) 38%, transparent); }
+  .badge.active { color: var(--uw-purple); background: var(--accent-soft); border-color: color-mix(in srgb, var(--uw-purple) 38%, transparent); }
+  .badge.superseded { color: var(--muted); background: color-mix(in srgb, var(--muted) 14%, transparent); border-color: var(--border-strong); }
+  .integration-health { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--border); background: var(--surface-2); font-size: 11px; color: var(--muted); }
   .badge.integrated { color: #fff; background: var(--good); border-color: var(--good); }
   [data-theme="dark"] .badge.integrated { color: #08130d; }
 
@@ -1114,7 +1421,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <span class="badge mut" id="revBadge">rev —</span>
       <span class="live"><span class="dot" id="liveDot"></span><span id="liveText">connecting…</span></span>
       <button class="btn" id="themeBtn" title="Toggle theme">◐ Auto</button>
-      <button class="btn primary" id="pauseBtn">⏸ Pause</button>
+      <button class="btn primary" id="pauseBtn" title="Display-only: freezes dashboard refreshes. The Albilich run keeps running. To pause the run itself: python -m agents.generation.phase2.cli pause <problem>">⏸ Pause dashboard</button>
       <button class="btn" id="refreshBtn">↻</button>
       <span class="updated" id="updated"></span>
     </div>
@@ -1283,7 +1590,8 @@ function kpiCard(label, value, sub, bar){
   return `<div class="kpi"><div class="label">${esc(label)}</div><div class="value">${value}</div>${sub?`<div class="sub">${sub}</div>`:""}${bar!=null?`<div class="bar"><i style="width:${Math.max(0,Math.min(100,bar))}%"></i></div>`:""}</div>`;
 }
 function renderKpis(snap){
-  const claimTot = snap.claim_count||0, claimV = snap.verified_claim_count||0;
+  const claimTot = snap.current_claim_count ?? snap.claim_count ?? 0, claimV = snap.verified_claim_count||0;
+  const retiredClaims = snap.retired_claim_count||0;
   const openCases = snap.open_case_count ?? snap.active_debt_count ?? 0;
   const openBlocking = snap.open_blocking_case_count ?? snap.blocking_debt_count ?? 0;
   const ledgerActive = snap.ledger_active_debt_count ?? snap.active_debt_count ?? 0;
@@ -1295,7 +1603,7 @@ function renderKpis(snap){
   $("kpis").innerHTML = [
     kpiCard("Status", `<span class="badge ${STATUS_CLASS(snap.public_status)}">${esc(snap.public_status||"—")}</span>`,
             esc(snap.relation_to_target||"") + (snap.result_kind?` · ${esc(snap.result_kind)}`:"")),
-    kpiCard("Claims verified", `${num(claimV)}<small>/${num(claimTot)}</small>`, `${num(snap.integrated_claim_count||0)} integrated`, claimTot?claimV/claimTot*100:0),
+    kpiCard("Claims verified", `${num(claimV)}<small>/${num(claimTot)}</small>`, `${num(snap.integrated_claim_count||0)} integrated${retiredClaims?` · ${num(retiredClaims)} retired`:""}`, claimTot?claimV/claimTot*100:0),
     kpiCard("Root progress", `${num(snap.root_progress_score||0)}`, `${num(snap.verified_root_adjacent_claim_count||0)} near-root verified · ${num(snap.root_local_blocking_debt_count||0)} blockers`),
     kpiCard("Routes active", `${num(snap.active_route_count||0)}<small>/${num(snap.route_count||0)}</small>`, "proof trunks"),
     kpiCard("Open cases", `${num(openCases)}`, openCaseSub),
@@ -1315,8 +1623,9 @@ function renderTokens(snap, usage){
   const inflight = Number(live.total_tokens)||0;
   const liveRuns = Number(live.run_count)||0;
   const processed = Number(tot.total_tokens)||0;       // full tokens incl cached
+  const input = Number(tot.input_tokens)||0;
   const cached = Number(tot.cached_input_tokens)||0;
-  const cacheRatio = processed ? (cached/processed*100) : 0;
+  const cacheRatio = input ? (cached/input*100) : 0;
   const pctSpent = total ? (spent/total*100) : 0;
   const pctInflight = total ? Math.min(100-pctSpent, inflight/total*100) : 0;
   const runs = tot.run_count||0;
@@ -1733,15 +2042,34 @@ function renderSignals(rows){
 }
 
 function renderTimeline(rows){
-  rows = (rows||[]).slice(-14).reverse();
+  const allRows = rows || [];
+  const integrationRows = allRows.filter(r => r.actor_role === "integration_verifier" && r.mode === "integrate");
+  const integrationFailures = integrationRows.filter(r => ["patch_rejected","failed","no_patch"].includes(String(r.status||"")));
+  const recoveredFailures = integrationFailures.filter(r => r.failure_recovered);
+  const unresolvedFailures = integrationFailures.length - recoveredFailures.length;
+  const latestIntegration = integrationRows.length ? integrationRows[integrationRows.length - 1] : null;
+  rows = allRows.slice(-14).reverse();
   $("timelineCount").textContent = rows.length ? `${rows.length}` : "";
   if (!rows.length){ $("timeline").innerHTML = `<div class="empty">No recorded runs yet.</div>`; return; }
-  let h = `<table><thead><tr><th>Run</th><th>Actor</th><th>Mode</th><th>Status</th><th class="num">Tokens</th><th class="num">Wall</th></tr></thead><tbody>`;
+  let h = "";
+  if (integrationRows.length){
+    const latestOK = latestIntegration && latestIntegration.status === "completed";
+    h += `<div class="integration-health"><b>Recent integration verifier</b>
+      <span class="pill ${latestOK?"good":"warn"}">latest ${esc(latestIntegration.status||"")}</span>
+      <span>${integrationRows.filter(r => r.status === "completed").length} completed</span>
+      <span>${integrationFailures.length} failed/rejected</span>
+      ${recoveredFailures.length?`<span class="pill info">${recoveredFailures.length} recovered later</span>`:""}
+      ${unresolvedFailures?`<span class="pill bad">${unresolvedFailures} unresolved</span>`:""}</div>`;
+  }
+  h += `<table><thead><tr><th>Run</th><th>Actor</th><th>Mode</th><th>Status</th><th class="num" title="Provider-reported input plus output; budget spend excludes cached input and includes reasoning.">Processed</th><th class="num">Wall</th></tr></thead><tbody>`;
   for (const r of rows){
+    const recovered = Boolean(r.failure_recovered);
+    const statusText = `${r.status||""}${recovered?" · recovered":""}`;
+    const statusTitle = recovered ? `Recovered by later integration ${r.recovered_by_run_id||""}` : "";
     h += `<tr><td class="mid" title="${esc(r.run_id)}">${esc(String(r.run_id||"").replace(/^v1_/,""))}</td>
       <td><span class="pill ${PILL(r.actor_role)}">${esc(r.actor_role||"")}</span></td>
       <td class="mono" style="font-size:11px">${esc(r.mode||"")}</td>
-      <td><span class="pill ${PILL(r.status)}">${esc(r.status||"")}</span></td>
+      <td><span class="pill ${recovered?"info":PILL(r.status)}" title="${esc(statusTitle)}">${esc(statusText)}</span></td>
       <td class="num">${num(r.total_tokens||0)}</td><td class="num">${fmtSec(r.wall_time_seconds)}</td></tr>`;
   }
   $("timeline").innerHTML = h + `</tbody></table>`;
@@ -1767,21 +2095,107 @@ function renderClaims(rows){
   const card = $("verifiedCard");
   if (!rows.length){ card.style.display = "none"; return; }
   card.style.display = "";
-  const nver = rows.filter(c => c.verified).length;
-  $("verifiedCount").textContent = `${nver}/${rows.length} verified`;
-  let h = "";
-  for (const c of rows){
+  const relationPill = (label, ids) => {
+    ids = ids || [];
+    if (!ids.length) return "";
+    const shown = ids.slice(0,2).join(", ");
+    const extra = ids.length > 2 ? ` +${ids.length-2}` : "";
+    return `<span class="pill info" title="${esc(ids.join(", "))}">${esc(label)} ${esc(shown)}${esc(extra)}</span>`;
+  };
+  const visualStatus = c => {
     const integrated = String(c.lifecycle_status||"").toLowerCase() === "integrated";
-    const vs = String(c.validation_status||"").toLowerCase();
+    const vs = String(c.display_validation_status||c.validation_status||"").toLowerCase();
+    const lifecycle = String(c.lifecycle_status||"").toLowerCase();
+    if (vs === "refuted") return "refuted";
+    if (["superseded","abandoned"].includes(lifecycle)) return lifecycle;
+    if (integrated) return "integrated";
+    if (vs === "plausible") return "plausible";
+    if (vs === "challenged") return "challenged";
+    if (vs === "blocked") return "blocked";
+    if (lifecycle === "active" || vs === "active_question") return "active";
+    if (c.verified) return "verified";
+    return "untested";
+  };
+  const claimBadge = c => {
+    const integrated = String(c.lifecycle_status||"").toLowerCase() === "integrated";
+    const lifecycle = String(c.lifecycle_status||"").toLowerCase();
+    const vs = String(c.display_validation_status||c.validation_status||"").toLowerCase();
     let badge;
-    if (integrated) badge = `<span class="badge integrated">integrated</span>`;
-    else if (c.verified) badge = `<span class="badge good">✓ ${esc(c.validation_status||"verified")}</span>`;
+    if (vs === "superseded") badge = `<span class="badge superseded">superseded · stronger result</span>`;
+    else if (vs === "abandoned") badge = `<span class="badge mut">abandoned</span>`;
+    else if (vs === "blocked") badge = `<span class="badge warn">blocked</span>`;
     else if (vs === "refuted") badge = `<span class="badge bad">refuted</span>`;
+    else if (integrated) badge = `<span class="badge integrated">integrated</span>`;
+    else if (c.verified) badge = `<span class="badge good">✓ ${esc(c.validation_status||"verified")}</span>`;
+    else if (vs === "challenged" && Number(c.verification_report_count||0) > 0)
+      badge = `<span class="badge bad" title="strict verification report at revision ${num(c.latest_verification_revision||0)}">tested · gaps</span>`;
+    else if (vs === "plausible") badge = `<span class="badge plausible">plausible</span>`;
+    else if (vs === "active_question") badge = `<span class="badge active">active question</span>`;
+    else if (lifecycle === "active") badge = `<span class="badge active">active · ${esc(c.validation_status||"untested")}</span>`;
+    else if (vs === "checked_pending_transition") badge = `<span class="badge info">tested · status pending</span>`;
     else badge = `<span class="badge mut">${esc(c.validation_status||"unverified")}</span>`;
-    h += `<div class="vclaim${c.verified?"":" unverified"}">
+    return badge;
+  };
+  const renderClaimCard = c => {
+    const badge = claimBadge(c);
+    const relations = [
+      relationPill("subclaim of", c.subclaim_of_claim_ids),
+      relationPill("supports", c.supports_claim_ids),
+      relationPill("supported by", c.supported_by_claim_ids),
+      relationPill("contains", c.contains_subclaim_ids),
+      relationPill("superseded by", c.superseded_by_claim_ids),
+    ].filter(Boolean).join("");
+    const status = visualStatus(c);
+    return `<div class="vclaim status-${esc(status)}${c.verified?"":" unverified"}" data-claim-id="${esc(c.claim_id)}" data-claim-status="${esc(status)}">
       <div class="vhead">${badge}<span class="mid" title="${esc(c.claim_id)}">${esc(c.claim_id)}</span></div>
       <div class="vstmt">${esc(c.statement||"(no statement)")}</div>
+      ${relations?`<div class="vrel">${relations}</div>`:""}
     </div>`;
+  };
+  const retiredStatuses = new Set(["superseded","abandoned","refuted"]);
+  const retiredRows = rows.filter(c => retiredStatuses.has(visualStatus(c)));
+  const currentRows = rows.filter(c => !retiredStatuses.has(visualStatus(c)));
+  const nver = currentRows.filter(c => c.verified).length;
+  $("verifiedCount").textContent = `${nver}/${currentRows.length} current verified · ${retiredRows.length} retired`;
+  const currentMap = new Map(currentRows.map(c => [String(c.claim_id||""), c]));
+  const children = new Map(currentRows.map(c => [String(c.claim_id||""), []]));
+  const roots = [];
+  const parentFor = c => {
+    const parents = (c.subclaim_of_claim_ids||[]).map(id => currentMap.get(String(id))).filter(Boolean);
+    if (!parents.length) return null;
+    const depth = Number(c.reduction_depth||0);
+    const nearer = parents.filter(p => Number(p.reduction_depth||0) < depth)
+      .sort((a,b) => Number(b.reduction_depth||0)-Number(a.reduction_depth||0) || String(a.claim_id).localeCompare(String(b.claim_id)));
+    return nearer[0] || parents.find(p => p.claim_id === "root") || parents[0];
+  };
+  for (const c of currentRows){
+    const parent = parentFor(c);
+    if (parent && parent.claim_id !== c.claim_id) children.get(String(parent.claim_id)).push(c);
+    else roots.push(c);
+  }
+  const rank = c => {
+    if (c.claim_id === "root") return -10;
+    return ({active:0, plausible:1, challenged:2, blocked:3, verified:4, integrated:5, untested:6})[visualStatus(c)] ?? 7;
+  };
+  const sortClaims = list => list.sort((a,b) => rank(a)-rank(b) || Number(b.root_impact||0)-Number(a.root_impact||0) || String(a.claim_id).localeCompare(String(b.claim_id)));
+  const visited = new Set();
+  const renderTreeNode = c => {
+    const claimId = String(c.claim_id||"");
+    if (visited.has(claimId)) return "";
+    visited.add(claimId);
+    const nested = sortClaims(children.get(claimId)||[]).map(renderTreeNode).join("");
+    return `<div class="claim-tree-node" data-tree-claim-id="${esc(claimId)}">${renderClaimCard(c)}${nested?`<div class="claim-tree-children">${nested}</div>`:""}</div>`;
+  };
+  let treeHtml = sortClaims(roots).map(renderTreeNode).join("");
+  treeHtml += sortClaims(currentRows.filter(c => !visited.has(String(c.claim_id||"")))).map(renderTreeNode).join("");
+  const legend = `<div class="claim-legend"><span class="label">status colors</span>
+    <span class="badge active">active</span><span class="badge plausible">plausible</span>
+    <span class="badge bad">challenged / refuted</span><span class="badge integrated">integrated</span>
+    <span class="badge superseded">superseded</span></div>`;
+  let h = `${legend}<section class="claim-section current"><div class="claim-section-title">Current proof tree <span class="count">${currentRows.length} claims</span></div>${treeHtml}</section>`;
+  if (retiredRows.length){
+    const retiredHtml = sortClaims(retiredRows).map(renderClaimCard).join("");
+    h += `<section class="claim-section retired"><div class="claim-section-title">Retired / superseded / falsified claims <span class="count">${retiredRows.length} claims</span></div><div class="retired-claims">${retiredHtml}</div></section>`;
   }
   $("verified").innerHTML = h;
 }
@@ -2039,10 +2453,19 @@ async function tick(){
   } finally { $("updated").textContent = ago(); }
 }
 
+// Dashboard pause is DISPLAY-ONLY: it freezes browser refreshes and never
+// touches the backend. A true run pause goes through the CLI:
+//   python -m agents.generation.phase2.cli pause <problem>   (soft pause)
+//   python -m agents.generation.phase2.cli stop --hard <problem>
 $("pauseBtn").addEventListener("click", () => {
   paused = !paused;
-  $("pauseBtn").textContent = paused ? "▶ Resume" : "⏸ Pause";
-  if (!paused) tick();
+  $("pauseBtn").textContent = paused ? "▶ Resume dashboard" : "⏸ Pause dashboard";
+  if (paused){
+    const rb = $("runbar"); rb.className = "runbar stalled";
+    rb.innerHTML = `<span class="rdot"></span><span>⏸ DASHBOARD PAUSED</span><span class="rsub">Dashboard paused; Albilich run is still active. Display refresh only — to pause the run itself use: python -m agents.generation.phase2.cli pause &lt;problem&gt;</span>`;
+  } else {
+    tick();
+  }
 });
 $("refreshBtn").addEventListener("click", tick);
 setInterval(() => $("updated").textContent = ago(), 1000);

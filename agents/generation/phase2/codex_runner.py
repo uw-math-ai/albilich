@@ -12,12 +12,29 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
+from .audit import (
+    AUDIT_CLAIM_STATUSES,
+    AUDIT_STATUS_TO_VALIDATION,
+    AUDIT_WARNING_LINE,
+    PAPER_CLAIM_TAG,
+    PROPOSED_REPAIR_ARTIFACT_TYPE,
+    is_paper_audit_mode,
+)
 from .budget import parse_token_usage
+from .completion_policy import (
+    ADVISOR_PARTIAL_TRANSITION_CODE_KEY,
+    ADVISOR_PARTIAL_TRANSITION_KEY,
+    ADVISOR_PARTIAL_TRANSITION_REASON_KEY,
+    CANONICAL_STOP_REASON_CODES,
+    LANGUAGE_DEBT_TYPES,
+)
 from .context_builder import build_context_manifest, build_resume_delta_manifest, manifest_hash, render_manifest
 from .models import sha256_text, utc_now
 from .patches import preflight_patch_errors
 from .role_capabilities import role_can_use_cas, session_cas_enabled
 from .store import ProofStateStore
+from .writing.paper_contract import EDITOR_DIRECTIVE, PAPER_CONTRACT, PAPER_STANDARD_FOR_CRITICS
+from .writing.rubric import load_rubric, rules_for_critic
 
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "xhigh"
@@ -36,6 +53,11 @@ DEFAULT_CODEX_CHILD_RUST_LOG = (
     "codex_rollout::list=error,codex_rollout::state_db=error"
 )
 CODEX_CHILD_USE_USER_CONFIG_ENV = "ALBILICH_CODEX_CHILD_USE_USER_CONFIG"
+CODEX_BIN_FALLBACK_ENV = "ALBILICH_CODEX_BIN_FALLBACK"
+DEFAULT_CODEX_BIN_FALLBACKS = (
+    Path("~/.local/bin/codex").expanduser(),
+    Path("/Applications/Codex.app/Contents/Resources/codex"),
+)
 DEFAULT_CODEX_CHILD_EXEC_ARGS = ("--ignore-user-config",)
 DEFAULT_CODEX_CHILD_DISABLED_FEATURES = (
     "apps",
@@ -66,6 +88,16 @@ STALE_RETRY_LOG_FRAGMENTS = (
     "stream disconnected - retrying sampling request",
     "retrying sampling request",
 )
+# Writing-review subsystem: rubric source of truth and lens roster. The rubric
+# lives outside the package (math-writing-harness/) and is parsed by the
+# deterministic writing stage (phase2/writing/rubric.py).
+WRITING_RUBRIC_DIR = Path(__file__).resolve().parents[3] / "math-writing-harness" / "rubric"
+# "editor" is the single lens the scheduler dispatches; the legacy three-lens
+# vocabulary stays accepted so historical review artifacts still parse.
+WRITING_CRITIC_LENSES = ("editor", "confused_reader", "skeptical_editor", "provenance_auditor")
+WRITING_CRITIC_RULE_LINE_CAP = 120
+WRITING_CRITIC_RULE_STATEMENT_CHARS = 160
+_WRITING_RUBRIC_CACHE: dict[str, tuple] = {}
 ProgressCallback = Callable[[Mapping[str, Any]], None]
 _SESSION_PATH_CACHE: dict[str, Optional[Path]] = {}
 
@@ -93,6 +125,8 @@ def actor_role_for_action(action: Mapping[str, Any]) -> str:
         return "villain"
     if mode == "write":
         return "writer"
+    if mode == "review_writing":
+        return "writing_critic"
     if mode == "prove" and (route_id or action.get("citation_certification_required") or action.get("citation_triage_required")):
         return "strict_informal_verifier"
     if mode in {"reduce", "weaken", "strengthen"} and action.get("debt_id"):
@@ -120,8 +154,8 @@ def build_session_prompt(*, context_path: Path, action: Mapping[str, Any], actor
         ]
     if session_cas_enabled(actor_role, action):
         cas_guidance = [
-            "If manifest.cas_tooling is present, you may read, run, and query the listed CAS/data assets through tool calls (run a Macaulay2 .m2 file with M2, a Julia .jl script with julia, and query a .jsonl/.csv invariant-vector dataset with jq/julia/python) for bounded computations and example/counterexample search, even though their directory is otherwise excluded; filter large datasets rather than loading them whole, and attach a cas_experiment_report when the computation matters.",
-            "Use CAS lifecycle tools for CAS computations when available. Do not start unbounded shell computations, and never use broad process-control commands such as pkill, killall, or pattern-based kill to manage stuck work; stop only CAS sessions you started via cas_stop, or abandon a failed shell probe and record the obstruction. Do not assume optional Python packages such as sympy are installed; if plain Python is enough, use the standard library.",
+            "If manifest.cas_tooling is present, you may read, run, and query the listed CAS/data assets through tool calls (run a Macaulay2 .m2 file with M2, a Julia .jl script with julia, and query a .jsonl/.csv h*-vector dataset with jq/julia/python) for bounded computations and example/counterexample search, even though their directory is otherwise excluded; filter large datasets rather than loading them whole, and attach a cas_experiment_report when the computation matters.",
+            "Use CAS lifecycle tools for CAS computations when available. Never launch an interactive CAS REPL with no finite input; run a bounded script or provide finite stdin that exits explicitly. Do not start unbounded shell computations, and never use broad process-control commands such as pkill, killall, or pattern-based kill to manage stuck work; stop only CAS sessions you started via cas_stop, or abandon a failed shell probe and record the obstruction. Do not assume optional Python packages such as sympy are installed; if plain Python is enough, use the standard library.",
         ]
     elif actor_role in {"researcher", "villain"}:
         cas_guidance = [
@@ -137,7 +171,7 @@ def build_session_prompt(*, context_path: Path, action: Mapping[str, Any], actor
             "Return only one JSON object, with no markdown fence and no prose.",
             "It must be an Albilich v1 patch with schema_version=1, the manifest problem_id, the manifest state_revision as base_revision, this exact actor_role, target_id, and a nonempty operations list.",
             "Do not set producer_role on artifacts; the workflow records it from actor_role and rejects spoofing.",
-            "For add_debt/update_debt, owner_id must be a concrete claim_id, route_id, or inference_id from the manifest or same patch; never use role names like researcher, phd_advisor, advisor, verifier, or literature_researcher as graph owners.",
+            "For add_debt/update_debt, owner_id must be a concrete claim_id, route_id, or inference_id from the manifest or same patch (writing debts alone use owner_type='artifact' with the reviewed final_proof artifact_id); never use role names like researcher, phd_advisor, advisor, verifier, or literature_researcher as graph owners.",
             "Use manifest.patch_contract for patch shape; do not inspect framework source, schemas, tests, or README just to learn patch syntax.",
             "Do not add a new active sufficient route concluding an already integrated claim; closed branches should feed root synthesis by updating an existing inference with genuinely new evidence or by attacking the next root-level gap.",
             "Do not call tool_search, plugin discovery, connector discovery, plugin installation, browser/app/thread tools, or memory tools. "
@@ -239,8 +273,334 @@ def _villain_work_mode_guidance(action: Mapping[str, Any]) -> str:
     )
 
 
+def _writing_rubric_rule_block(lens: str, *, extra_critics: tuple[str, ...] = ()) -> str:
+    """Compact rubric block for one critic lens: LLM-checkable rules only.
+
+    ``extra_critics`` folds another owner critic's LLM rules into the block
+    (paper reviews route the pedant's judgement-tier rules through the
+    skeptical_editor, since the pedant has no lens of its own). The rubric is
+    parsed once per process from math-writing-harness/rubric/ and cached;
+    statements are truncated and the whole block is capped so critic prompts
+    stay bounded even as the rubric grows.
+    """
+    if "rules" not in _WRITING_RUBRIC_CACHE:
+        try:
+            _WRITING_RUBRIC_CACHE["rules"] = tuple(load_rubric(WRITING_RUBRIC_DIR))
+        except Exception:
+            _WRITING_RUBRIC_CACHE["rules"] = ()
+    all_rules = list(_WRITING_RUBRIC_CACHE["rules"])
+    rules = [
+        rule
+        for critic in (lens, *extra_critics)
+        for rule in rules_for_critic(all_rules, critic)
+        if rule.checkability == "llm"
+    ]
+    lines: list[str] = []
+    for rule in rules[:WRITING_CRITIC_RULE_LINE_CAP]:
+        statement = rule.statement.strip()
+        if len(statement) > WRITING_CRITIC_RULE_STATEMENT_CHARS:
+            statement = statement[: WRITING_CRITIC_RULE_STATEMENT_CHARS - 3].rstrip() + "..."
+        lines.append(f"- {rule.rule_id} [{rule.severity}] {statement}")
+    if not lines:
+        return ""
+    return "Rubric rules for this lens (report findings under these rule ids): " + " ".join(lines) + " "
+
+
+def _writing_debt_lines(action: Mapping[str, Any]) -> str:
+    debts = action.get("writing_debts")
+    if not isinstance(debts, (list, tuple)) or not debts:
+        return ""
+    lines: list[str] = []
+    for debt in debts:
+        if not isinstance(debt, Mapping):
+            continue
+        debt_id = str(debt.get("debt_id") or "")
+        severity = str(debt.get("severity") or "")
+        obligation = str(debt.get("obligation") or "").strip()
+        if len(obligation) > 300:
+            obligation = obligation[:297].rstrip() + "..."
+        lines.append(f"- {debt_id} [{severity}] {obligation}")
+    if not lines:
+        return ""
+    return "Open writing debts to resolve in this revision: " + " ".join(lines) + " "
+
+
+# Path-based final_paper delivery contract shared by the paper-authoring and
+# paper-revision writer directives: authoring the LaTeX as a real file and
+# attaching by path eliminates the JSON-escaping channel that repeatedly burned
+# whole authoring sessions on over-escaped backslashes.
+_WRITER_PAPER_PATH_ATTACH_CONTRACT = (
+    "LATEX DELIVERY: (a) write the COMPLETE standalone LaTeX source to a staging file under the proof-state dir via "
+    "shell — the recommended path pattern is <state_dir>/artifacts/staging/<artifact_id>.tex (the exact staging_dir "
+    "is given in manifest.writing_paper_packet.staging_dir or manifest.writing_revision_packet.staging_dir and is "
+    "listed in manifest.local_search_policy.allowed_local_evidence_paths; mkdir -p it first); (b) attach it with "
+    '{"op":"attach_artifact","artifact_type":"final_paper","artifact_id":...,"path":"<staging path>"} and NO '
+    "content field — this avoids all JSON escaping of LaTeX; the store loads the staged file, runs the usual paper "
+    "guards on it, and copies it under its artifacts dir. FALLBACK ONLY: inline content is still accepted; if you "
+    "must inline, use STANDARD JSON string escaping so that AFTER JSON parsing the content reads as normal LaTeX "
+    "with single-backslash commands (if the parsed content would contain \\\\documentclass instead of "
+    "\\documentclass, you over-escaped; tabular row breaks are the one construct that stays a double backslash in "
+    "the parsed LaTeX). "
+)
+
+
+def _writer_writing_revision_guidance(action: Mapping[str, Any]) -> str:
+    if not action.get("writing_revision"):
+        return ""
+    if action.get("paper_revision"):
+        revised_id = str(action.get("revision_of_artifact_id") or "the current final_paper")
+        return (
+            f"PAPER REVISION PASS: a final_paper already exists ({revised_id}) and the writing gate found open writing "
+            "debts against it. Revise the existing article DIFF-MINIMALLY and voice-preservingly: keep the structure, "
+            "notation, and prose voice of the current LaTeX, and change only what the listed writing debts require. Do "
+            "not restructure sections, do not rewrite passages the debts do not touch, and keep the bibliography intact. "
+            + _writing_debt_lines(action)
+            + "Address exactly these open writing debts: fix each one in the text, then resolve each via an update_debt "
+            "operation with debt_id, status='resolved', a one-line resolution_note saying what changed, and "
+            "resolution_evidence_artifact_ids naming the revised final_paper artifact you attach in this patch. "
+            "Attach exactly one revised final_paper artifact (a NEW artifact_id): the artifact you attach must be the "
+            "COMPLETE revised LaTeX source (artifact_type final_paper), not a diff or an excerpt, and it must still "
+            "compile standalone with pdflatex. "
+            + _WRITER_PAPER_PATH_ATTACH_CONTRACT
+            + "Do not weaken or change mathematical content, certification labels, or "
+            "claim statuses while revising prose. "
+        )
+    revised_id = str(action.get("revision_of_artifact_id") or "the current final_proof")
+    return (
+        f"WRITING REVISION PASS: a final_proof already exists ({revised_id}) and the writing gate found open writing "
+        "debts against it. Revise the existing final proof DIFF-MINIMALLY and voice-preservingly: keep the structure, "
+        "notation, and prose voice of the current text, and change only what the listed writing debts require. Do not "
+        "restructure sections, do not rewrite passages the debts do not touch, and keep the References section intact "
+        "(the existing writer reference guards still apply). "
+        + _writing_debt_lines(action)
+        + "Address exactly these open writing debts: fix each one in the text, then resolve each via an update_debt "
+        "operation with debt_id, status='resolved', a one-line resolution_note saying what changed, and "
+        "resolution_evidence_artifact_ids naming the revised final_proof artifact you attach in this patch. "
+        "Attach exactly one revised final_proof artifact (a NEW artifact_id) with the full revised text and the same "
+        "metadata contract as the original (claim_id='root', route_id, proof_status, result_kind, proved_statement, "
+        "relation_to_target, source_artifact_ids). Do not weaken or change mathematical content, certification labels, "
+        "or claim statuses while revising prose. "
+    )
+
+
+def _writer_paper_authoring_guidance(action: Mapping[str, Any]) -> str:
+    """Writer directive for a paper-authoring pass: the paper contract plus the
+    op contract (attach_artifact(final_paper) / update_debt / record_run_metrics)."""
+    certificate_id = str(action.get("certificate_artifact_id") or "the latest final_proof")
+    return (
+        "PAPER AUTHORING PASS: the certificate stage of the writing gate is complete and this pass produces the "
+        f"public deliverable. Read manifest.writing_paper_packet: certificate.content ({certificate_id}) is the "
+        "internal certificate and your sole source of mathematical truth; literature lists the only works you may "
+        "cite; claim_route_summary maps what was established at which certification level. "
+        + PAPER_CONTRACT
+        + " OP CONTRACT: return one Albilich v1 patch whose operations are exactly: one attach_artifact with "
+        "artifact_type='final_paper' attached BY PATH (metadata may carry certificate_artifact_id and "
+        "source_artifact_ids); update_debt only when a paper-revision packet names open writing debts; "
+        "record_run_metrics as usual. "
+        + _WRITER_PAPER_PATH_ATTACH_CONTRACT
+        + "Do not attach any other artifact type, do not verify, refute, or integrate, "
+        "and do not restate the certificate's internal bookkeeping anywhere outside Appendix A's Run archive paragraph."
+    )
+
+
+def _writing_critic_guidance(action: Mapping[str, Any]) -> str:
+    lens = str(action.get("critic_lens") or "").strip() or "editor"
+    paper_review = bool(action.get("paper_review"))
+    reviewed_kind = "final paper" if paper_review else "final proof"
+    artifact_reviewed = str(action.get("artifact_reviewed") or f"the current {reviewed_kind} artifact")
+    common_head = (
+        f"Act as the {lens.replace('_', ' ')} writing critic for the finished {reviewed_kind}. This is a bounded writing "
+        "REVIEW pass, not a proof-search, verification, or rewriting pass. Read "
+        "manifest.writing_review_packet.final_proof.content — that text is the paper under review "
+        f"(artifact {artifact_reviewed}). Never edit the paper, never attach a final_proof, final_paper, or any writer "
+        "artifact, and never propose claim/inference/route status transitions. "
+    )
+    if lens == "editor":
+        # The one lens the lightweight gate dispatches: exposition only,
+        # correctness assumed, one pass, at most 12 located actionable findings.
+        return (
+            common_head
+            + EDITOR_DIRECTIVE
+            + " CONTEXT: manifest.writing_review_packet carries the paper; manifest.retrieval_cards and "
+            "manifest.theorem_library are the literature ledger for checking that bibliography entries are real, "
+            "cited works (a bibliography entry absent from the ledger and not a standard, unambiguously identifiable "
+            "reference is a finding). "
+            + _writing_rubric_rule_block("skeptical_editor", extra_critics=("pedant",))
+            + "MECHANICS: each finding is exactly one add_debt operation with owner_type='artifact', owner_id set to "
+            "the reviewed final_paper artifact id, debt_type='writing', severity blocking|major|minor, and an "
+            "obligation formatted '<rule_id>: <location> — <what is wrong> — suggested rewrite: <replacement text>'. "
+            "At most 12 findings, ranked by importance. On pass, attach exactly one writing_review artifact with "
+            "metadata {verdict:'pass', lens:'editor', artifact_reviewed, state_revision_reviewed}; on fail you may "
+            "additionally attach one writing_review with verdict='fail' (same metadata shape) summarizing the "
+            "findings. writing_review is the only artifact type you may attach."
+        )
+    if lens == "confused_reader":
+        lens_body = (
+            f"CONTEXT ISOLATION: you receive ONLY the {reviewed_kind} text — no proof-state manifest, no claim graph, no "
+            "internal artifacts. That is deliberate: judge whether a competent mathematician could reconstruct the "
+            "argument from the paper alone. Hunt for stranded-reader failures: undefined notation or terms used before "
+            "definition, hypotheses that appear from nowhere, quantifier ambiguity, steps that do not follow from what "
+            "was stated, case analyses that do not visibly cover all cases, and forward references that cannot be "
+            "resolved from the text itself. Do not speculate about what the proof-state graph might contain; if the "
+            "paper does not say it, the reader does not have it. "
+        )
+    elif lens == "skeptical_editor":
+        lens_body = (
+            f"CONTEXT ISOLATION: you receive the {reviewed_kind} text plus a brief claim/route summary "
+            "(manifest.writing_review_packet.claim_route_summary) — nothing else. Review honesty of framing and "
+            "structure: does the paper claim exactly what was proved, at the certification level actually reached? "
+            "Flag overselling (a partial/conditional result framed as full), buried caveats, a theorem statement that "
+            "drifts from the recorded claim, missing limitations, and structural failures (redundant sections, missing "
+            "roadmap, proofs that belong elsewhere). Do not re-verify the mathematics; the strict verifier already ran. "
+        )
+    else:
+        lens_body = (
+            f"CONTEXT ISOLATION: you receive the {reviewed_kind} text plus the citation/artifact ledger "
+            "(manifest.retrieval_cards, manifest.theorem_library, and manifest.writing_review_packet.artifact_ledger"
+            + (
+                ") together with the internal certificate (manifest.writing_review_packet.certificate.content). "
+                "You are the ONLY critic permitted to compare the paper against its sources. Audit provenance both "
+                "ways: every bibliography entry and citation must be a real, locatable work drawn from the ledger "
+                "(flag invented, embellished, or unverifiable references), and every mathematical claim in the paper "
+                "must be supported by the certificate or a cited work — flag claims stronger than what the "
+                "certificate establishes, silently strengthened cited theorems, misattributed statements, and "
+                "generation residue. "
+                if paper_review
+                else "). "
+                "You are the ONLY critic permitted to compare the paper against its sources. Audit provenance: every "
+                "external citation must name a locatable source with an exact theorem/page location matching the "
+                "ledger; every claimed hypothesis check must exist in the cited card; flag citations to sources "
+                "absent from the ledger, misattributed statements, silently strengthened cited theorems, and "
+                "generation residue. "
+            )
+        )
+    # Paper reviews fold the pedant's judgement-tier (llm) rules into the
+    # skeptical_editor block: the pedant owns most register/typography rules
+    # but has no lens of its own.
+    extra_critics = ("pedant",) if paper_review and lens == "skeptical_editor" else ()
+    paper_standard = f"PAPER STANDARD: {PAPER_STANDARD_FOR_CRITICS} " if paper_review else ""
+    return (
+        common_head
+        + lens_body
+        + paper_standard
+        + _writing_rubric_rule_block(lens, extra_critics=extra_critics)
+        + "Report only genuine findings. For each finding, emit exactly one add_debt operation with "
+        f"owner_type='artifact', owner_id set to the reviewed {reviewed_kind.replace(' ', '_')} artifact id, debt_type='writing', "
+        "severity blocking|major|minor (map rubric blocker->blocking, major->major, minor/nit->minor), and an "
+        "obligation formatted '<rule_id>: <finding> (line N)' that quotes a short excerpt from the paper. Do not "
+        "restate debts already listed in manifest.writing_review_packet.open_writing_debts. You may use update_debt "
+        "only on debts you opened in this same session. "
+        "If you find nothing at blocker/major severity and at most stylistic nits, the paper PASSES this lens: attach "
+        "exactly one writing_review artifact with metadata {verdict:'pass', lens:'" + lens + "', artifact_reviewed, "
+        "state_revision_reviewed} and a short content note; false positives are penalized, so do not invent findings "
+        "to look thorough. If you report blocker/major findings, you may additionally attach a writing_review artifact "
+        "with verdict='fail' (same metadata shape) summarizing them. writing_review is the only artifact type you may "
+        "attach."
+    )
+
+
+def _advisor_completion_policy_directive() -> str:
+    """Advisor contract for the full-proof-first completion policy (TODO 7)."""
+    return (
+        "COMPLETION POLICY (full-proof-first): the root theorem stays the target even when the problem file "
+        "contains soft wording such as 'possible partial results' or 'try to find'; soft wording never "
+        "authorizes stopping early (see manifest.completion_policy). Transitioning the run from full-proof "
+        "pursuit to partial-report mode requires YOUR explicit justification: attach an advisor_report whose "
+        f"metadata sets {ADVISOR_PARTIAL_TRANSITION_KEY}=true, {ADVISOR_PARTIAL_TRANSITION_REASON_KEY} (one "
+        f"or two sentences naming the exhausted route families or the decisive obstruction), and "
+        f"{ADVISOR_PARTIAL_TRANSITION_CODE_KEY} set to exactly one of "
+        + "|".join(sorted(CANONICAL_STOP_REASON_CODES - {"user_partial_mode"}))
+        + ". Do this only when no active plausible route, verifier-ready route, narrowed actionable blocker, "
+        "productive branch, or untried high-score route remains worth its budget; the scheduler records the "
+        "artifact and only then allows a partial stop. Language or formulation problems in the user's "
+        "statement (ambiguity, over-broad scope, missing quantifiers, root scope mismatch) become precise "
+        "debts with debt_type "
+        + "|".join(sorted(LANGUAGE_DEBT_TYPES))
+        + " — they trigger root-alignment clarification, never a silently weakened target. "
+    )
+
+
+def _paper_audit_guidance(actor_role: str, action: Mapping[str, Any]) -> str:
+    """Conservative referee directives for paper_solution_audit (TODO 6).
+
+    Prefixed onto every role's guidance in audit mode: the run audits the
+    submitted document (manifest.paper_audit.audit_subject_artifact_id); it
+    never solves a different problem or rewrites the author's proof.
+    """
+    if not is_paper_audit_mode(str(action.get("research_mode") or "")):
+        return ""
+    status_map = ", ".join(f"{status}->{AUDIT_STATUS_TO_VALIDATION[status]}" for status in AUDIT_CLAIM_STATUSES)
+    common = (
+        "PAPER SOLUTION AUDIT MODE: this run is a conservative referee check of the submitted proof "
+        "document (see manifest.paper_audit; the document is the audit_subject artifact). Preserve the "
+        "author's intended argument: audit it as written, do not solve a different problem, do not invent "
+        "a new proof, and do not silently rewrite an invalid step into a different argument. Decompose the "
+        f"document into paper claims: ordinary claims tagged '{PAPER_CLAIM_TAG}' plus "
+        "'audit_status:<status>' and 'source_location:<section/theorem number/paragraph>' tags (a metadata "
+        "convention on existing claims, one claim per theorem/lemma/decisive proof step). Audit status "
+        f"vocabulary: {', '.join(AUDIT_CLAIM_STATUSES)}; map onto validation_status as {status_map}. "
+        "CONSERVATIVE DEFAULTS: check local implications first, one theorem or proof segment at a time; no "
+        "claim ever becomes 'checked' merely because the global proof sounds plausible — 'checked' requires "
+        "the local step to be verified against its stated premises. Any repair you suggest is a PROPOSAL: "
+        f"attach it as a {PROPOSED_REPAIR_ARTIFACT_TYPE} artifact, clearly separated from the audit verdict, "
+        "and never fold it into the author's checked proof. "
+        + AUDIT_WARNING_LINE
+        + " "
+    )
+    if actor_role == "villain":
+        return common + (
+            "As the audit villain, hunt the submitted argument adversarially: hidden hypotheses the author "
+            "silently uses, boundary/degenerate cases the proof skips, notation mismatches between sections, "
+            "and concrete counterexamples to intermediate claims. Record each finding against the exact "
+            "paper claim and source location it threatens (audit_status gap, overclaim, or "
+            "false_or_counterexample_risk). "
+        )
+    if actor_role == "literature_researcher":
+        return common + (
+            "As the audit librarian, check citations exactly: for every external theorem the paper uses as a "
+            "proof input, locate the exact source, theorem/proposition number or page/section, and hypotheses "
+            "via retrieval cards, and verify the cited statement actually implies the step it supports with "
+            "matching definitions. A citation that cannot be located exactly, or whose hypotheses do not "
+            "match, marks the dependent paper claim citation_needed (or overclaim). "
+        )
+    if actor_role in {"strict_informal_verifier", "integration_verifier", "counterexample_validator"}:
+        return common + (
+            "As the audit verifier, work in small bounded packets: one paper claim or one proof segment at a "
+            "time. Verify the local implication from the claim's stated premises exactly as the author wrote "
+            "it; mark the claim checked only on a complete local check, needs_detail/gap otherwise, with the "
+            "precise missing step recorded as a debt at the exact source location. "
+        )
+    if actor_role == "writer":
+        return common + (
+            "As the audit writer, the deliverable is a REFEREE-STYLE AUDIT REPORT, not a polished proof and "
+            "not a research paper. Attach one referee_report artifact whose content contains: (1) a claim map "
+            "(numbering, statement summary, dependencies, audit status per claim); (2) a gap list with exact "
+            "locations, severity, why each step does not follow, and what would fix it; (3) a citation audit "
+            "(source, theorem number/page, hypotheses, whether it implies the cited step); (4) an overclaim "
+            "report; (5) a local correctness report of genuinely checked steps; (6) optional proposed repairs "
+            "in a clearly separated section labeled as proposals; and (7) a conservative confidence summary: "
+            "exactly one of appears_correct_modulo_minor_details | major_gaps | not_verified | likely_false. "
+            f"Begin the report with the literal warning line: {AUDIT_WARNING_LINE} "
+            "Do not write a final_proof or final_paper in this mode. "
+        )
+    return common + (
+        "Work only on auditing the submitted document: decompose it, check local steps, sharpen audit "
+        "statuses, and route citation/counterexample checks to the right role. Do not open new proof routes "
+        "toward proving the paper's theorem independently unless a bounded local check requires it. "
+    )
+
+
 def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[Mapping[str, Any]] = None) -> str:
     action = action or {}
+    audit_prefix = _paper_audit_guidance(actor_role, action)
+    if audit_prefix:
+        return audit_prefix + _base_mode_guidance(mode, actor_role, route_id, action)
+    return _base_mode_guidance(mode, actor_role, route_id, action)
+
+
+def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mapping[str, Any]) -> str:
+    if actor_role == "writing_critic":
+        return _writing_critic_guidance(action)
     if actor_role == "strict_informal_verifier":
         route_text = f"route {route_id}" if route_id else "the selected route"
         citation_guidance = ""
@@ -302,7 +662,15 @@ def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[M
             "If the action has root_alignment_audit=true, perform an audit only: attach a root_alignment_audit artifact with "
             "metadata relation_to_root, target_statement, current_route_statement, missing_alignment_evidence, hidden_assumptions, "
             "extra_assumptions, and recommended_next_action. Do not integrate unless all ordinary integration gates are also met. "
-            "Never integrate a weaker, conditional, or nearby partial theorem as solved. If and only if integration is valid, "
+            "Never integrate a weaker, conditional, or nearby partial theorem as solved. WEAKER-STATEMENT DISCIPLINE: a weaker "
+        "statement can count toward the root ONLY after an explicit implication check from the weaker statement to the root "
+        "theorem, written out and verified step by step (record it in root_alignment with implication_verified=true and the "
+        "exact implication argument in the report body). If that weaker-to-root implication is absent or unchecked, the root "
+        "remains unsolved: leave the result as certified partial progress and add one precise debt naming the missing "
+        "implication. Language or formulation problems in the root statement (ambiguity, over-broad scope, missing "
+        "quantifiers, root scope mismatch) are debts, never permission to weaken the target: record them with debt_type "
+        + "|".join(sorted(LANGUAGE_DEBT_TYPES))
+        + " while alignment keeps targeting the strongest corrected reading. If and only if integration is valid, "
             "attach an integration_report artifact with concise metadata integrates=true, route_id, claim_id, missing, outcome, resolved_debt_ids, "
             "and root_alignment={relation_to_root: exact|equivalent|stronger, target_statement, proved_statement, "
             "implication_verified: true, hidden_assumptions: false, extra_assumptions: []}; then propose lifecycle integrated "
@@ -315,12 +683,21 @@ def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[M
             "or produced by this session. Otherwise add a formalization debt or handoff artifact; do not pretend informal reasoning is formal."
         )
     if actor_role == "counterexample_validator":
+        if action.get("root_is_interrogative_problem"):
+            return (
+                "Validate the candidate independently. The root is an interrogative problem, not a declarative theorem, so a checked "
+                "example may answer or constrain the problem without refuting the root. Attach confirmed_counterexample with metadata "
+                "naming the exact narrower hypothesis it falsifies, but do not propose refuted for root; keep the root active."
+            )
         return (
             "Validate candidate counterexamples independently. Only attach confirmed_counterexample and propose refuted if the counterexample is fully checked."
         )
     if actor_role == "writer":
+        if action.get("paper_authoring"):
+            return _writer_paper_authoring_guidance(action)
         return (
-            "Act as a mathematically careful proof-writing agent, not a ledger dumper. Write polished, LaTeX-friendly mathematical "
+            _writer_writing_revision_guidance(action)
+            + "Act as a mathematically careful proof-writing agent, not a ledger dumper. Write polished, LaTeX-friendly mathematical "
             "exposition: distinguish prose from formulas, put genuine formulas and mathematical objects in inline/display LaTeX math, "
             "use theorem/lemma/proof-style paragraphs when appropriate, and separate certified facts from conjectural, plausible, failed, "
             "or unresolved material. Make the main body read as mathematics: statement, proof, certification status, and references. "
@@ -356,6 +733,12 @@ def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[M
             "a final_proof unless the root is already integrated. Instead attach exactly one stop_summary_report or partial_proof_report "
             "artifact recording the stop reason, public result kind, strongest verified/integrated claims, exact statements proved so far, "
             "source artifact ids/paths, relation to the original target, unresolved debts/gaps, and the shortest honest route outline. "
+            "ANTI-PREMATURE-PARTIAL DISCIPLINE: never present a partial proof as the final answer unless the stop reason is explicit "
+            "and recorded — quote workflow_action.stop_reason and workflow_action.stop_reason_code (one of "
+            + "|".join(sorted(CANONICAL_STOP_REASON_CODES))
+            + ") verbatim in the report, and classify the outcome explicitly as exactly one of: full theorem solved, weaker theorem "
+            "proved (with the weaker-to-root implication status), conditional proof, partial progress, or statement likely false. "
+            "Soft or exploratory wording in the original problem file is never by itself a reason to stop at a partial result. "
             "For stop-writer reports, keep the artifact content compact and JSON-safe: use plain prose where possible, avoid display math and "
             "unnecessary backslashes, do not paste long artifact excerpts, and keep content under roughly 8000 characters. "
             "If the result is partial or unresolved, copy every manifest.partial_result_receipt.verified_side_lemmas item into a "
@@ -485,6 +868,13 @@ def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[M
                 "If manifest.workflow_action.post_integration_compression_required=true, compress the newly integrated fact into the shortest "
                 "current proof spine, state exactly what remains to finish the root theorem, and hand the next role one theorem-level task "
                 "rather than a route inventory. "
+                "If manifest.workflow_action.advisor_global_synthesis_required=true, switch from tactical triage to periodic global synthesis. "
+                "Follow manifest.advisor_synthesis_contract exactly. Attach advisor_synthesis with metadata.strategy_schema_version=1 and a nested "
+                "metadata.advisor_synthesis object using every required key verbatim; do not flatten or rename keys such as exact_root_status, "
+                "evidence_that_would_change_strategy, recommended_next_actions, budget_distribution, or synthesis_confidence. Include "
+                "supersedes_synthesis_id at metadata level when a prior synthesis exists. "
+                "The newest synthesis replaces stale directives. You may authorize definition or auxiliary-object invention only by a separate "
+                "invention_authorization artifact when every condition in manifest.research_strategy is met; cap it at two candidates and two passes. "
                 "When you decide one bottleneck is decisive for the root, say so explicitly in advisor_report metadata with "
                 "advisor_followup_required=true, bottleneck_obligation, next_decisive_task, next_role, next_target_id, route_decisions, "
                 "recommended_next_action, and triage_status=decisive_root_bottleneck. The scheduler treats that as executive steering, so "
@@ -503,7 +893,8 @@ def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[M
                 "not from a mathematical refutation. Do not summarize the infrastructure problem as proof evidence. Instead, preserve the current "
                 "mathematical state, choose the smallest next proof obligation or route repair, and hand the researcher one compact task with "
                 "clear acceptance criteria. "
-                "Keep at most three serious root-local proof trunks active. For stalled or low-yield routes, either abandon the route, add "
+                + _advisor_completion_policy_directive()
+                + "Keep at most three serious root-local proof trunks active. For stalled or low-yield routes, either abandon the route, add "
                 "one precise obstruction debt, or attach a route_triage_report explaining why it should pause. Prefer preserving routes with "
                 "verified inferences, high root impact, small root distance, exact citation candidates, clear next verifier actions, or "
                 "active blocking debts whose owner or suggested_next_target is the route or its conclusion claim. Do not abandon those "
@@ -547,7 +938,8 @@ def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[M
             "source synthesis, regulator decision, or abandonment of a low-yield route. "
             "If a computation would clarify a route, do not run it yourself; ask researcher or villain for one bounded CAS check with backend/task, "
             "finite scope, expected decisive output, and stop condition. "
-            "If the current debt is already far from the target theorem or mainly about bookkeeping, stop decomposing: attach "
+            + _advisor_completion_policy_directive()
+            + "If the current debt is already far from the target theorem or mainly about bookkeeping, stop decomposing: attach "
             "a concise advisor_report artifact summarizing the useful partial mathematical result, its relation to the original target "
             "(exact, stronger, equivalent, partial, conditional, or unrelated), and the nearest remaining mathematical obstruction; then "
             "add at most one blocking proof debt pointing back to that obstruction. Do not verify, refute, or integrate anything."
@@ -594,6 +986,13 @@ def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[M
             "whose branches naturally assemble the target. Write real mathematics in the proof_dossier: definitions in local notation, lemmas used, "
             "proof attempt, obstruction, examples, source translations, and a self-check of hidden assumptions. Prefer advancing the manifest graph "
             "frontier: root, target, local route premises, active mathematical debts, and claims with small root_distance. "
+            "The root theorem is the target even if the problem file uses soft wording ('possible partial results', 'try to find', "
+            "'any indication'): such wording is never permission to settle for a weaker statement or an early partial report. If the "
+            "statement itself has a language or formulation problem (ambiguous hypothesis, over-broad scope, missing quantifier, root "
+            "scope mismatch), convert it into one precise debt with debt_type "
+            + "|".join(sorted(LANGUAGE_DEBT_TYPES))
+            + " (or that prefix on the obligation) and keep attacking the strongest corrected version of the statement. A weaker or "
+            "conditional result only counts toward the root once the weaker-to-root implication is explicitly written and verified. "
             "If workflow_action.checkpointed_synthesis_required=true, preserve one natural mathematical checkpoint before the pass can be lost: "
             "attach a proof_dossier/proof_blueprint/route_obstruction/construction_failure/source_adaptation_notes/cas_experiment_report whose metadata "
             "includes checkpoint_kind, global_context_summary, local_obligation, what_changed, and next_decisive_action. This checkpoint is not an "
@@ -616,6 +1015,24 @@ def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[M
             "sub-bridge, or verifier-ready route/inference. If the output is an obstruction, construction_failure, or sharper sub-bridge "
             "rather than a verifier-ready proof, also include an update_debt for workflow_action.central_debt_id or one new precise "
             "blocking add_debt so the next workbench targets the narrowed obligation instead of repeating this pass. "
+            "If workflow_action.bidirectional_bridge_search_required=true, do not improvise an unlimited lemma list. Build the verified forward "
+            "frontier and backward root obligations from manifest.workflow_action.bridge_search_context, propose at most three exact bridge statements, "
+            "temporarily assume each one, list every hidden obligation, reject restatements/duplicates/gap-moving statements, and attach one "
+            "bridge_lemma_search artifact (strategy_schema_version=1) selecting at most two candidates by root leverage and sufficiency. "
+            "If workflow_action.experiment_workflow_required=true or workflow_action.researcher_work_mode='cas', use the precise obstruction -> "
+            "discriminating experiment -> structured observations -> candidate pattern -> counterexample search -> sharpened conjecture -> proof-attempt "
+            "loop. Follow manifest.cas_experiment_contract exactly when stamping experiment_workflow_version=1: include mathematical_question, "
+            "competing_hypotheses, finite_scope, backend_or_manual_method, code_or_calculation, expected_decisive_outputs, observations, counterexamples, "
+            "interpretation, next_proof_move, and decision_changed. Raw output is not progress and cannot certify an infinite statement. "
+            "If workflow_action.proof_compression_operation_required=true, follow manifest.proof_compression_contract exactly. Attach proof_compression "
+            "with metadata.strategy_schema_version=1, metadata.history_preserved=true, and every required key nested under "
+            "metadata.minimal_proof_skeleton; do not flatten or rename keys such as essential_verified_facts, essential_routes, conditional_steps, "
+            "unused_or_low_value_branches, shortest_known_route, or weakest_sufficient_new_statement. essential_verified_facts must be a list of existing "
+            "claim ids and may be empty when the state has no verified claims. "
+            "If workflow_action.definition_invention_required=true, use only the named live authorization and its strict candidate/pass/token caps. "
+            "Reject a merely renamed, unevaluable, proof-irrelevant, or theorem-equivalent object; only an adopted candidate with an exact root-relevant "
+            "bridge theorem may enter proof search. If workflow_action.deep_session_required=true, stay on the one root-critical branch for a coherent "
+            "session and attach deep_session_report with every required deliverable field; ordinary patch and verifier gates still apply. "
             "If workflow_action.closure_pressure_required=true, do not request another "
             "broad search; prove the bridge, refute it, or make a strictly narrower theorem/case split. Consult manifest.negative_result_ledger "
             "before reusing an old idea. Use manifest.proof_architecture_templates only when a template matches the domain. "
@@ -744,6 +1161,36 @@ def _codex_config(key: str, value: Any) -> str:
     return f"{key}={json.dumps(value)}"
 
 
+def resolve_codex_executable(codex_bin: str = "codex") -> str:
+    """Resolve a runnable Codex CLI, tolerating desktop-app upgrades/removal.
+
+    Long-lived launchd jobs can retain the absolute path of an app-bundled CLI
+    after the application is replaced. Prefer the requested executable when it
+    still exists, then use PATH, an operator override, or the normal standalone
+    installation. Returning the original value preserves the useful launch
+    error when no candidate is available.
+    """
+
+    requested = str(codex_bin or "codex")
+    expanded = str(Path(requested).expanduser())
+    resolved = shutil.which(expanded)
+    if resolved:
+        return resolved
+
+    candidates = [
+        os.environ.get(CODEX_BIN_FALLBACK_ENV, "").strip(),
+        shutil.which("codex") or "",
+        *(str(path) for path in DEFAULT_CODEX_BIN_FALLBACKS),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        fallback = shutil.which(str(Path(candidate).expanduser()))
+        if fallback:
+            return fallback
+    return expanded
+
+
 def build_codex_command(
     *,
     context_path: Path,
@@ -768,7 +1215,7 @@ def build_codex_command(
     context) instead of cold-starting.
     """
     prompt = prompt or f"Use the Albilich v1 context in {context_path} and return a structured Albilich v1 patch for mode={mode}."
-    argv = [codex_bin, "exec"]
+    argv = [resolve_codex_executable(codex_bin), "exec"]
     if resume_session_id:
         argv.extend(["resume", resume_session_id])
     if codex_workdir is not None:
@@ -852,7 +1299,11 @@ def prepare_session(
     context_hash = manifest_hash(manifest)
     path = _context_path(store, action, context_hash)
     path.parent.mkdir(parents=True, exist_ok=True)
-    capsule = _materialize_evidence_capsule(manifest, path)
+    capsule = _materialize_evidence_capsule(
+        manifest,
+        path,
+        project_agents_dir=store.generation_root / ".agents",
+    )
     manifest_for_child = capsule["manifest"]
     path = capsule["context_path"]
     path.write_text(render_manifest(manifest_for_child), encoding="utf-8")
@@ -890,11 +1341,21 @@ def prepare_session(
     }
 
 
-def _materialize_evidence_capsule(manifest: Mapping[str, Any], context_path: Path) -> Dict[str, Any]:
+def _materialize_evidence_capsule(
+    manifest: Mapping[str, Any],
+    context_path: Path,
+    *,
+    project_agents_dir: Path | None = None,
+) -> Dict[str, Any]:
     """Copy manifest-listed local evidence into a per-context child workspace."""
     capsule_dir = context_path.with_suffix("")
     evidence_dir = capsule_dir / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
+    if project_agents_dir is not None and project_agents_dir.is_dir():
+        # Codex discovers the generation-root AGENTS.md while running inside
+        # this capsule. Keep its relative .agents/skills references valid
+        # without widening the manifest's mathematical evidence boundary.
+        shutil.copytree(project_agents_dir, capsule_dir / ".agents", dirs_exist_ok=True)
     child_manifest = json.loads(json.dumps(manifest))
     path_map: dict[str, str] = {}
 
@@ -918,6 +1379,11 @@ def _materialize_evidence_capsule(manifest: Mapping[str, Any], context_path: Pat
     artifacts = child_manifest.get("artifacts", [])
     if isinstance(artifacts, list):
         for artifact in artifacts:
+            if isinstance(artifact, dict) and artifact.get("path"):
+                artifact["path"] = capsule_path_for(str(artifact["path"]))
+    negative_result_ledger = child_manifest.get("negative_result_ledger", [])
+    if isinstance(negative_result_ledger, list):
+        for artifact in negative_result_ledger:
             if isinstance(artifact, dict) and artifact.get("path"):
                 artifact["path"] = capsule_path_for(str(artifact["path"]))
     policy = child_manifest.get("local_search_policy")
@@ -960,6 +1426,11 @@ def _model_routing_hint(action: Mapping[str, Any], actor_role: str) -> Dict[str,
             "tier": "writing",
             "reason": "proof exposition uses verified artifacts and should prioritize clarity over exploration",
         }
+    if actor_role == "writing_critic":
+        return {
+            "tier": "writing",
+            "reason": "writing review reads the same exposition the writer produced and shares the writer's tier",
+        }
     return {
         "tier": "default",
         "reason": "no special model routing requested",
@@ -980,6 +1451,10 @@ def _context_char_budget_for_action(max_context_chars: int, action: Mapping[str,
         return max(max_context_chars, 30_000)
     if actor_role == "phd_advisor":
         return max(max_context_chars, 30_000)
+    if actor_role == "writing_critic":
+        return max(max_context_chars, 60_000)
+    if actor_role == "writer" and (action.get("writing_revision") or action.get("paper_authoring")):
+        return max(max_context_chars, 60_000)
     return max_context_chars
 
 
@@ -1000,6 +1475,7 @@ def execute_session(
     progress_callback: ProgressCallback | None = None,
     stop_event: threading.Event | None = None,
 ) -> Dict[str, Any]:
+    codex_bin = resolve_codex_executable(codex_bin)
     actor_role = str(session_plan.get("actor_role") or actor_role_for_action(action))
     mode = str(action.get("mode") or "step")
     target_id = str(action.get("target_id") or "root")
@@ -1093,7 +1569,11 @@ def execute_session(
                 process = subprocess.Popen(
                     command,
                     cwd=workdir,
-                    env=_codex_child_env(actor_role=actor_role, cas_enabled=session_cas_enabled(actor_role, action)),
+                    env=_codex_child_env(
+                        actor_role=actor_role,
+                        cas_enabled=session_cas_enabled(actor_role, action),
+                        codex_bin=codex_bin,
+                    ),
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -1209,13 +1689,18 @@ def execute_session(
     usage = resolve_cli_usage(parse_log, session_id=session_id)
 
     # Pre-flight contract check with one in-session repair: when the returned
-    # patch would certainly be rejected by the workflow guards (e.g. a verifier
-    # proposing informally_verified while its own report lists gaps), resume the
-    # same session once with the violations and let it re-emit a corrected
-    # patch, instead of losing the whole step to a rejection.
+    # output is malformed JSON or the parsed patch would certainly be rejected
+    # by the workflow guards (e.g. a verifier proposing informally_verified
+    # while its own report lists gaps), resume the same session once with the
+    # violations and let it re-emit a corrected patch instead of losing the
+    # whole step.
     preflight_repair: Dict[str, Any] = {}
-    if patch is not None and status == "completed":
-        preflight_errors = preflight_patch_errors(patch, actor_role)
+    if status == "completed":
+        preflight_errors = (
+            preflight_patch_errors(patch, actor_role)
+            if patch is not None
+            else [f"returned output is not valid Albilich patch JSON: {patch_error or 'no JSON object found'}"]
+        )
         repair_window = max(1, timeout_sec) - (time.monotonic() - started)
         if preflight_errors and session_id and repair_window > 180:
             repair_prompt = "\n".join(
@@ -1227,6 +1712,8 @@ def execute_session(
                     "Keep your verification_report/evidence artifacts. If the report honestly lists critical errors or "
                     "gaps, do NOT propose a verified status: attach the report, add one precise debt per gap, and leave "
                     "the status transitions out.",
+                    "Return strict JSON: escape every backslash inside a JSON string as two backslashes, or use plain "
+                    "text without LaTeX backslash commands.",
                     "Return only the JSON object, with no markdown fence and no prose.",
                 ]
             )
@@ -1253,7 +1740,11 @@ def execute_session(
                 repair_process = subprocess.Popen(
                     repair_command,
                     cwd=workdir,
-                    env=_codex_child_env(actor_role=actor_role, cas_enabled=session_cas_enabled(actor_role, action)),
+                    env=_codex_child_env(
+                        actor_role=actor_role,
+                        cas_enabled=session_cas_enabled(actor_role, action),
+                        codex_bin=codex_bin,
+                    ),
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -1270,7 +1761,9 @@ def execute_session(
                 repaired_text = final_path.read_text(encoding="utf-8") if final_path.exists() else ""
                 repaired_patch, repaired_error = extract_patch_from_text(repaired_text)
                 errors_after = (
-                    preflight_patch_errors(repaired_patch, actor_role) if repaired_patch is not None else preflight_errors
+                    preflight_patch_errors(repaired_patch, actor_role)
+                    if repaired_patch is not None
+                    else [f"repair output is not valid Albilich patch JSON: {repaired_error or 'no JSON object found'}"]
                 )
                 preflight_repair = {
                     "attempted": True,
@@ -1343,7 +1836,11 @@ def _last_nonempty_line(text: str) -> str:
     return ""
 
 
-def _codex_child_env(actor_role: str = "", cas_enabled: Optional[bool] = None) -> Dict[str, str]:
+def _codex_child_env(
+    actor_role: str = "",
+    cas_enabled: Optional[bool] = None,
+    codex_bin: str = "",
+) -> Dict[str, str]:
     env = os.environ.copy()
     tmp_root = Path(env.get("ALBILICH_CODEX_TMPDIR") or DEFAULT_CODEX_CHILD_TMPDIR).expanduser()
     pycache_root = tmp_root / "pycache"
@@ -1366,12 +1863,38 @@ def _codex_child_env(actor_role: str = "", cas_enabled: Optional[bool] = None) -
     env["ALBILICH_CAS_ENABLED"] = "1" if cas_enabled else "0"
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("RUST_LOG", DEFAULT_CODEX_CHILD_RUST_LOG)
+    _install_codex_tool_dir(env, codex_bin)
     _install_gap_no_history_wrapper(env, tmp_root)
     return env
 
 
+def _install_codex_tool_dir(env: Dict[str, str], codex_bin: str) -> None:
+    """Expose tools bundled beside an explicitly selected Codex binary."""
+    if not codex_bin:
+        return
+    codex_path = Path(codex_bin).expanduser()
+    if not codex_path.is_absolute():
+        resolved = shutil.which(codex_bin, path=env.get("PATH"))
+        if not resolved:
+            return
+        codex_path = Path(resolved)
+    tool_dir = codex_path.parent
+    if not (tool_dir / "rg").is_file():
+        return
+    current = env.get("PATH", "")
+    entries = current.split(os.pathsep) if current else []
+    if str(tool_dir) not in entries:
+        env["PATH"] = str(tool_dir) + (os.pathsep + current if current else "")
+
+
 def _install_gap_no_history_wrapper(env: Dict[str, str], tmp_root: Path) -> None:
-    real_gap = env.get("ALBILICH_REAL_GAP_BIN") or env.get("GAP_BIN")
+    real_gap = (
+        env.get("ALBILICH_REAL_GAP_BIN")
+        or env.get("ALBILICH_GAP_PATH")
+        or env.get("GAP_BIN")
+        or env.get("GAP_PATH")
+        or env.get("GAP_EXECUTABLE")
+    )
     if not real_gap:
         real_gap = shutil.which("gap", path=env.get("PATH"))
     if not real_gap:
@@ -1644,13 +2167,77 @@ def extract_patch_from_text(text: str) -> Tuple[Optional[Dict[str, Any]], str]:
         except json.JSONDecodeError as exc:
             if not first_decode_error:
                 first_decode_error = f"invalid JSON patch near character {index + exc.pos}: {exc.msg}"
-            obj = _repair_extra_object_close_before_array(candidate, exc, decoder)
+            obj = _repair_invalid_json_escapes(candidate, exc, decoder)
+            if obj is None:
+                obj = _repair_extra_object_close_before_array(candidate, exc, decoder)
             if obj is None:
                 continue
             return obj, ""
         if isinstance(obj, dict) and obj.get("schema_version") == 1 and isinstance(obj.get("operations"), list):
             return obj, ""
     return None, first_decode_error or "no Albilich v1 patch JSON object found"
+
+
+_LATEX_COMMANDS_WITH_JSON_ESCAPE_PREFIX = (
+    "backslash",
+    "begin",
+    "beta",
+    "bigcap",
+    "bigcup",
+    "bigl",
+    "bigr",
+    "bigwedge",
+    "frac",
+    "nabla",
+    "neq",
+    "nolimits",
+    "not",
+    "rho",
+    "right",
+    "tau",
+    "text",
+    "theta",
+    "times",
+    "underbrace",
+    "underline",
+    "uparrow",
+    "upsilon",
+)
+
+
+def _repair_invalid_json_escapes(
+    candidate: str,
+    exc: json.JSONDecodeError,
+    decoder: json.JSONDecoder,
+) -> Optional[Dict[str, Any]]:
+    """Recover model JSON containing unescaped LaTeX backslashes in strings."""
+    if exc.msg != "Invalid \\escape":
+        return None
+    command_pattern = "|".join(re.escape(command) for command in _LATEX_COMMANDS_WITH_JSON_ESCAPE_PREFIX)
+    repaired = re.sub(
+        rf"(?<!\\)\\({command_pattern})(?![A-Za-z])",
+        lambda match: "\\\\" + match.group(1),
+        candidate,
+    )
+    # Each repair doubles one backslash that was already present in the model
+    # response, so the original backslash count is a natural upper bound.  A
+    # fixed cap of 64 discarded otherwise valid proof patches containing many
+    # inline LaTeX delimiters (for example, 70-130 unescaped ``\(``/``\)``
+    # occurrences).  Keep a generous defensive ceiling for pathological input.
+    max_repairs = min(4096, candidate.count("\\") + 1)
+    for _ in range(max_repairs):
+        try:
+            obj, _ = decoder.raw_decode(repaired)
+        except json.JSONDecodeError as repair_exc:
+            pos = repair_exc.pos
+            if repair_exc.msg != "Invalid \\escape" or pos < 0 or pos >= len(repaired) or repaired[pos] != "\\":
+                return None
+            repaired = repaired[:pos] + "\\" + repaired[pos:]
+            continue
+        if isinstance(obj, dict) and obj.get("schema_version") == 1 and isinstance(obj.get("operations"), list):
+            return obj
+        return None
+    return None
 
 
 def _persist_normalized_final_patch(final_path: Path, final_text: str, patch: Mapping[str, Any] | None) -> None:

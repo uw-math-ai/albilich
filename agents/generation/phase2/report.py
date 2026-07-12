@@ -4,10 +4,14 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+from .audit import build_referee_report_lines, is_audit_state
+from .branch_summary import build_branch_workbenches, render_branch_workbench
+from .fact_graph import DERIVED_EDGE_TYPES, EDGE_TYPES, STUB_EDGE_TYPES, build_fact_graph
 from .graph_policy import claim_type_label, proof_trunk_maturity, root_distance_for_claim_id, route_scoreboard
 from .metrics import compute_metrics
 from .result_status import classify_state
 from .research_policy import theorem_matching_confidence
+from .research_strategy import strategy_observability
 from .store import ProofStateStore
 
 
@@ -23,20 +27,26 @@ def build_markdown_report(store: ProofStateStore) -> str:
     debt_label = "Active debts"
     if result["public_status"] in {"solved", "solved_pending_final_writer"}:
         debt_label = "Active debts (ledger only)"
+    timing = metrics.get("run_timing", {})
     lines = [
         f"# Albilich v1 Report: {store.problem_id}",
         "",
         f"- Outcome: {_outcome_label(metrics, root, final_artifact)}",
         f"- Public status: {result['public_status']}",
         f"- Result kind: {result['result_kind']}",
+        f"- Result classification: {result.get('report_classification', 'in_progress')}",
         f"- Relation to target: {result['relation_to_target']}",
         f"- Result summary: {result['summary']}",
+        f"- Completion policy: {problem.get('completion_policy', 'full_proof_first')}",
         f"- Revision: {metrics['revision']}",
         f"- Claims: {metrics['claim_count']} total, {metrics['verified_claim_count']} verified, {metrics['integrated_claim_count']} integrated",
         f"- Routes: {metrics['route_count']} total, {metrics['active_route_count']} active",
         f"- {debt_label}: {metrics['active_debt_count']} total, {metrics['blocking_debt_count']} blocking",
         f"- Tokens: {metrics['token_budget']['spent_reported']} reported spent, {metrics['token_budget']['remaining']} remaining, {metrics['token_budget']['reserved_verification']} reserved",
-        f"- Recorded child wall time: {_format_seconds(metrics['runs'].get('wall_time_seconds', 0))}",
+        f"- Run status: {timing.get('run_status', 'running')}",
+        f"- Wall-clock elapsed since run start: {_format_seconds(timing.get('wall_clock_seconds', 0))}",
+        f"- Active backend compute (child-session wall time): {_format_seconds(timing.get('active_compute_seconds', metrics['runs'].get('wall_time_seconds', 0)))}",
+        f"- Paused time (excluded from active compute): {_format_seconds(timing.get('paused_seconds', 0))} across {int(timing.get('pause_count', 0) or 0)} pause interval(s)",
         f"- Peak recorded child memory: {_format_memory(metrics['runs'].get('peak_memory_mb', 0))}",
         f"- Stored memory artifacts: {_format_bytes(storage.get('stored_memory_artifacts_bytes', 0))}",
         f"- Native result directory: {_format_bytes(storage.get('native_result_dir_bytes', 0))}",
@@ -54,8 +64,10 @@ def build_markdown_report(store: ProofStateStore) -> str:
             "| Quantity | Albilich v1 benchmark run |",
             "| --- | ---: |",
             f"| Iterations / generator calls | {metrics['runs'].get('run_count', 0)} |",
-            f"| Wall time (seconds) | {float(metrics['runs'].get('wall_time_seconds', 0) or 0):.3f} |",
-            f"| Wall time (hours) | {float(metrics['runs'].get('wall_time_seconds', 0) or 0) / 3600.0:.2f} |",
+            f"| Wall-clock elapsed (seconds) | {float(timing.get('wall_clock_seconds', 0) or 0):.3f} |",
+            f"| Active compute wall time (seconds) | {float(metrics['runs'].get('wall_time_seconds', 0) or 0):.3f} |",
+            f"| Active compute wall time (hours) | {float(metrics['runs'].get('wall_time_seconds', 0) or 0) / 3600.0:.2f} |",
+            f"| Paused time (seconds) | {float(timing.get('paused_seconds', 0) or 0):.3f} |",
             f"| Reported tokens | {metrics['runs'].get('total_tokens', 0)} |",
             f"| Search / theorem-retrieval calls | {run_counts['search_retrieval']} |",
             f"| Verifier-call estimate | {run_counts['verifier']} |",
@@ -66,8 +78,18 @@ def build_markdown_report(store: ProofStateStore) -> str:
             "",
             "Memory in this table follows the legacy benchmark convention: stored artifact/source directory size, not peak process RSS. Peak RSS is reported separately when the runner can sample it.",
             "",
+            "Timing convention: wall-clock elapsed runs from problem init to the last recorded activity; "
+            "active compute is the recorded child-session wall time; paused time covers explicit run-pause "
+            "intervals and is excluded from active compute.",
+            "",
         ]
     )
+    lines.extend(_run_control_event_lines(timing))
+    if is_audit_state(state):
+        # paper_solution_audit (TODO 6): referee-style audit sections with the
+        # AI-audit warning line; rendered before proof sections so the audit
+        # verdict is never confused with a solved-proof deliverable.
+        lines.extend(build_referee_report_lines(state))
     if final_artifact:
         lines.extend(["## Final Proof", ""])
         proof_text = _artifact_text(final_artifact)
@@ -106,6 +128,26 @@ def build_markdown_report(store: ProofStateStore) -> str:
                 f"root_distance={route['root_distance']} verified={route['verified_inference_count']}/{route['inference_count']}{reason}"
             )
     lines.append("")
+    # Compact all-branches report (TODOs 1+2): one workbench block per active
+    # branch — what is proved, what is blocked, the next nearby lemma, the
+    # last useful delta/stale count, and the continue-or-rotate adjudication.
+    branch_workbenches = build_branch_workbenches(store, state=state, limit=5)
+    if branch_workbenches:
+        lines.extend(["## Branches", ""])
+        parallel_workers = int(problem.get("parallel_branches") or 0)
+        if parallel_workers:
+            lines.append(
+                f"- Parallel branch mode: `{problem.get('research_parallel_mode') or 'multi_branch_research'}` "
+                f"with up to {parallel_workers} simultaneous branch workers"
+            )
+            lines.append("")
+        for workbench in branch_workbenches:
+            lines.append("```text")
+            lines.append(render_branch_workbench(workbench))
+            lines.append("```")
+            lines.append("")
+    lines.extend(_research_strategy_lines(state))
+    lines.extend(_fact_graph_lines(store, state))
     retrieval_cards = state.get("retrieval_cards", [])
     if retrieval_cards:
         lines.extend(["## Retrieval Cards", ""])
@@ -135,6 +177,7 @@ def build_markdown_report(store: ProofStateStore) -> str:
                 f"{title}, {location}: {entry['statement']}"
             )
         lines.append("")
+    lines.extend(_writing_review_lines(state))
     lines.extend(["## Claims", ""])
     for claim in sorted(state["claims"], key=lambda row: (int(row.get("reduction_depth", 0)), row["claim_id"])):
         maturity = proof_trunk_maturity(state, claim["claim_id"])
@@ -152,6 +195,187 @@ def build_markdown_report(store: ProofStateStore) -> str:
         for debt in active_debts:
             lines.append(f"- `{debt['debt_id']}` `{debt['severity']}` on `{debt['owner_id']}`: {debt['obligation']}")
     return "\n".join(lines) + "\n"
+
+
+def _research_strategy_lines(state: Dict[str, Any]) -> list[str]:
+    strategy = strategy_observability(state)
+    if not any(
+        strategy.get(key)
+        for key in (
+            "latest_advisor_synthesis_artifact_id",
+            "latest_proof_compression_artifact_id",
+            "latest_bridge_search_artifact_id",
+            "latest_conjecture_portfolio_artifact_id",
+            "active_invention_authorization_artifact_id",
+        )
+    ):
+        return []
+    trigger = strategy.get("advisor_synthesis_trigger") or {}
+    lines = [
+        "## Research Strategy",
+        "",
+        "Strategic artifacts are persisted proof-state context, not verified mathematical evidence.",
+        "",
+        f"- Latest global advisor synthesis: `{strategy.get('latest_advisor_synthesis_artifact_id') or 'none'}`",
+        f"- Latest active proof compression: `{strategy.get('latest_proof_compression_artifact_id') or 'none'}`",
+        f"- Bridge search: `{strategy.get('latest_bridge_search_artifact_id') or 'none'}`; "
+        f"candidates={strategy.get('bridge_candidate_count', 0)}, selected=`{strategy.get('selected_bridge_id') or 'none'}`",
+    ]
+    if strategy.get("selected_bridge_reason"):
+        lines.append(f"  - Selection reason: {strategy['selected_bridge_reason']}")
+    lines.extend(
+        [
+            f"- Conjecture portfolio: `{strategy.get('latest_conjecture_portfolio_artifact_id') or 'none'}`; "
+            f"candidates={strategy.get('conjecture_candidate_count', 0)}, selected=`{strategy.get('selected_conjecture_id') or 'none'}`",
+            f"- Active invention authorization: `{strategy.get('active_invention_authorization_artifact_id') or 'none'}`",
+            f"- Global synthesis due: `{bool(trigger.get('due'))}`; reasons={trigger.get('reasons', [])}",
+            "- Information-gain policy: scheduler exposes closing, refuting, root-progress, information, reuse, duplication, token, wall-time, and verification-cost components on each action; speculative work never consumes the protected verification reserve.",
+            "- Method library policy: developer-curated structural method cards are advisory only and are kept separate from verified facts, external theorem cards, and private speculation.",
+            "",
+        ]
+    )
+    return lines
+
+
+def _fact_graph_lines(store: ProofStateStore, state: Dict[str, Any]) -> list[str]:
+    """"Fact Graph" health section (2026-07-09 TODO 3 pilot): node counts by
+    type, edge counts by type (deriving vs stubbed), and the per-branch
+    deep/shallow/blocked/converging depth report. The graph is a generated,
+    read-only view over the proof state — never a second store."""
+    graph = build_fact_graph(store, state=state)
+    node_counts = graph.node_counts_by_type()
+    if not any(node_counts.values()):
+        return []
+    edge_counts = graph.edge_counts_by_type()
+    lines = [
+        "## Fact Graph",
+        "",
+        "Read-only graph view generated from claims, routes, inferences, debts, and sources.",
+        "",
+        "- Nodes: " + ", ".join(f"{label}={count}" for label, count in node_counts.items()),
+        "- Edges: "
+        + ", ".join(f"{edge_type}={edge_counts.get(edge_type, 0)}" for edge_type in EDGE_TYPES if edge_type in DERIVED_EDGE_TYPES),
+        "- Edge types awaiting a data source (not derived): " + ", ".join(sorted(STUB_EDGE_TYPES)),
+    ]
+    depth_report = graph.branch_depth_report()
+    if depth_report:
+        lines.append("- Branch depth report:")
+        for row in depth_report:
+            flags = "".join(
+                f", {flag}" for flag, present in (("blocked", row["blocked"]), ("converging", row["converging"])) if present
+            )
+            lines.append(
+                f"  - `{row['branch_id']}` {row['classification']} (depth={row['depth']}, "
+                f"verified={row['verified_fact_count']}, candidate={row['candidate_fact_count']}, "
+                f"active_obstructions={row['active_obstruction_count']}{flags})"
+            )
+    lines.append("")
+    return lines
+
+
+def _run_control_event_lines(timing: Dict[str, Any]) -> list[str]:
+    """Pause/resume/stop/interruption ledger so benchmark comparisons can see
+    exactly when the run was live versus paused or interrupted."""
+    events = timing.get("run_control_events") or []
+    if not events:
+        return []
+    lines = ["## Run Control Events", ""]
+    for event in events:
+        if str(event.get("event_type") or "") == "run_interrupted":
+            lines.append(f"- `{event.get('at', '')}` interruption recorded: {event.get('reason', '')}")
+            continue
+        hard = " (hard)" if event.get("hard") else ""
+        lines.append(
+            f"- `{event.get('at', '')}` `{event.get('from', '?')} -> {event.get('to', '?')}`{hard} "
+            f"[{event.get('source', '')}] {event.get('reason', '')}"
+        )
+    lines.append("")
+    return lines
+
+
+def _writing_review_lines(state: Dict[str, Any]) -> list[str]:
+    """"Writing review" section: lens verdicts per reviewed document revision
+    (naming the reviewed artifact's type: final_proof certificate or shipped
+    final_paper), the shipped final_paper's compile status, writing-debt counts
+    by severity, and the unresolved list (present whenever the gate opened on
+    budget exhaustion with debts still recorded)."""
+    reviews = [row for row in state.get("artifacts", []) if row.get("artifact_type") == "writing_review"]
+    writing_debts = [row for row in state.get("debts", []) if str(row.get("debt_type") or "") == "writing"]
+    if not reviews and not writing_debts:
+        return []
+    artifact_types = {
+        str(row.get("artifact_id") or ""): str(row.get("artifact_type") or "")
+        for row in state.get("artifacts", [])
+    }
+    lines = ["## Writing Review", ""]
+    if reviews:
+        for review in sorted(reviews, key=lambda row: str(row.get("created_at") or "")):
+            metadata = json.loads(review.get("metadata_json") or "{}")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            lens = metadata.get("lens", "unknown_lens")
+            verdict = metadata.get("verdict", "unknown")
+            reviewed = metadata.get("artifact_reviewed", "unknown")
+            reviewed_type = artifact_types.get(str(reviewed), "unknown_type")
+            revision = metadata.get("state_revision_reviewed", "?")
+            lines.append(f"- `{lens}` `{verdict}` on `{reviewed}` (`{reviewed_type}`, state revision {revision})")
+    else:
+        lines.append("No writing_review artifacts recorded.")
+    lines.append("")
+    final_paper = _latest_final_paper(state)
+    if final_paper is not None:
+        paper_metadata = json.loads(final_paper.get("metadata_json") or "{}")
+        if not isinstance(paper_metadata, dict):
+            paper_metadata = {}
+        paper_status = str(paper_metadata.get("pdf_status") or "no compile status recorded")
+        lines.append(f"- Final paper: `{final_paper.get('artifact_id', '')}` ({paper_status})")
+        lines.append("")
+    compile_status = _shipped_final_proof_compile_status(state)
+    if compile_status:
+        lines.append(f"- Shipped final_proof LaTeX compile status: `{compile_status}`")
+        lines.append("")
+    open_debts = [row for row in writing_debts if row.get("status") == "active"]
+    resolved_debts = [row for row in writing_debts if row.get("status") == "resolved"]
+    lines.append(
+        "- Open writing debts: "
+        f"{len(open_debts)} ({_writing_debt_severity_counts(open_debts)}); "
+        f"resolved: {len(resolved_debts)} ({_writing_debt_severity_counts(resolved_debts)})"
+    )
+    if open_debts:
+        lines.extend(["", "Unresolved writing debts:", ""])
+        for debt in open_debts:
+            lines.append(f"- `{debt['debt_id']}` `{debt['severity']}` on `{debt['owner_id']}`: {debt['obligation']}")
+    lines.append("")
+    return lines
+
+
+def _latest_final_paper(state: Dict[str, Any]) -> Dict[str, Any] | None:
+    papers = [row for row in state.get("artifacts", []) if row.get("artifact_type") == "final_paper"]
+    if not papers:
+        return None
+    return max(papers, key=lambda row: (int(row.get("state_revision") or 0), str(row.get("created_at") or "")))
+
+
+def _shipped_final_proof_compile_status(state: Dict[str, Any]) -> str:
+    """pdf_status of the most recent final_proof (persisted by the writer at
+    attach time); empty if none recorded (e.g. no writer sidecar)."""
+    finals = [row for row in state.get("artifacts", []) if row.get("artifact_type") == "final_proof"]
+    if not finals:
+        return ""
+    latest = max(finals, key=lambda row: (int(row.get("state_revision") or 0), str(row.get("created_at") or "")))
+    metadata = json.loads(latest.get("metadata_json") or "{}")
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("pdf_status") or "")
+
+
+def _writing_debt_severity_counts(debts: list[Dict[str, Any]]) -> str:
+    counts = {"blocking": 0, "major": 0, "minor": 0}
+    for debt in debts:
+        severity = str(debt.get("severity") or "")
+        if severity in counts:
+            counts[severity] += 1
+    return ", ".join(f"{severity} {count}" for severity, count in counts.items())
 
 
 def write_markdown_report(store: ProofStateStore) -> Path:

@@ -24,6 +24,24 @@ ROUTE_STATUSES = {"active", "blocked", "abandoned", "integrated", "superseded"}
 INFERENCE_STATUSES = VALIDATION_STATUSES
 DEBT_SEVERITIES = {"blocking", "major", "minor", "discarded"}
 DEBT_STATUSES = {"active", "resolved", "discarded"}
+# Persisted whole-run control states (problem_state.run_status).
+# dashboard_paused is reserved for a display-only dashboard freeze and never
+# blocks the workflow; pause_requested/stopping are transient request states.
+RUN_STATUSES = {
+    "running",
+    "dashboard_paused",
+    "pause_requested",
+    "paused",
+    "stopping",
+    "stopped",
+    "completed",
+}
+# Run-level completion policy (problem_state.completion_policy, 2026-07-09
+# TODO 7). full_proof_first is the default for theorem-solving problem files;
+# publication_ready explicitly opts into post-proof paper authoring/review, and
+# only partial_ok/exploratory select a partial deliverable.
+COMPLETION_POLICIES = {"full_proof_first", "publication_ready", "partial_ok", "exploratory"}
+DEFAULT_COMPLETION_POLICY = "full_proof_first"
 RUN_MODES = {
     "prove",
     "refute",
@@ -38,6 +56,7 @@ RUN_MODES = {
     "integrate",
     "formalize",
     "write",
+    "review_writing",
     "stop_with_partial_results",
     "stop_solved",
 }
@@ -51,6 +70,7 @@ NON_VERIFYING_ROLES = {
     "phd_advisor",
     "advisor",
     "writer",
+    "writing_critic",
 }
 
 JSONDict = Dict[str, Any]
@@ -76,6 +96,19 @@ def json_loads(value: Optional[str], default: Any = None) -> Any:
 def normalize_text(text: str) -> str:
     normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
     return " ".join(normalized.split())
+
+
+def statement_is_interrogative_problem(text: str) -> bool:
+    """Return whether a root statement asks for an answer rather than asserts one."""
+    plain = re.sub(r"[#*_`]+", " ", str(text or ""))
+    if "?" in plain:
+        return True
+    return bool(
+        re.search(
+            r"(?im)^\s*(?:\d+[.)]\s*)?(?:does|do|is|are|can|find|determine|decide|classify|what|which|whether)\b",
+            plain,
+        )
+    )
 
 
 def fingerprint_text(text: str, *, length: int = 16) -> str:

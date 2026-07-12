@@ -95,6 +95,8 @@ def validate_conn(conn: sqlite3.Connection) -> List[str]:
             errors.append(f"debt {debt['debt_id']} has dangling route owner")
         if owner_type == "inference" and owner_id not in inference_ids:
             errors.append(f"debt {debt['debt_id']} has dangling inference owner")
+        if owner_type == "artifact" and owner_id not in artifact_ids:
+            errors.append(f"debt {debt['debt_id']} has dangling artifact owner")
         for aid in json_loads(debt["source_artifact_ids_json"]):
             if aid not in artifact_ids:
                 errors.append(f"debt {debt['debt_id']} has dangling source artifact {aid}")
