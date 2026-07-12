@@ -13,8 +13,7 @@ statement, never because a proof sounded plausible or a source looked relevant.
 ## Current release
 
 This release brings the standalone package up to date with the current
-Albilich research workflow. It is a consolidated framework update rather than
-a collection of historical run files.
+Albilich research workflow. It is a consolidated framework update.
 
 - **Multi-branch research by default.** Hard-problem runs use three research
   branches, sharing compact branch summaries and negative evidence while
