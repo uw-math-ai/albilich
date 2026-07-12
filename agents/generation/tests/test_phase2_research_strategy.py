@@ -236,6 +236,43 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
             )
             self.assertTrue(accepted.accepted, accepted.errors)
 
+    def test_manifest_viable_bridge_status_is_accepted_by_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-bridge-viable-status")
+            manifest = build_context_manifest(
+                store,
+                target_id="root",
+                max_chars=30_000,
+                action={
+                    "mode": "reduce",
+                    "target_id": "root",
+                    "bidirectional_bridge_search_required": True,
+                },
+            )
+            status_contract = manifest["bridge_lemma_search_contract"]["metadata_shape"]["bridge_candidates"][0]["status"]
+            self.assertIn("viable", status_contract.split("|"))
+
+            selected = _bridge_candidate(
+                "bridge-selected",
+                "The selected route-closing bridge theorem.",
+                leverage=0.9,
+            )
+            runner_up = _bridge_candidate(
+                "bridge-runner-up",
+                "A distinct viable bridge theorem.",
+                status="viable",
+                closes=False,
+                leverage=0.3,
+            )
+            accepted = self._attach(
+                store,
+                "researcher",
+                "bridge-with-viable-runner-up",
+                "bridge_lemma_search",
+                _bridge_metadata(selected, runner_up),
+            )
+            self.assertTrue(accepted.accepted, accepted.errors)
+
     def test_duplicate_active_bridge_must_be_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(tmpdir, "strategy-bridge-duplicate")

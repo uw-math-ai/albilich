@@ -20,7 +20,7 @@ STRATEGIC_ARTIFACT_TYPES = {
     "proof_compression",
 }
 STRATEGIC_MARKDOWN_ARTIFACT_TYPES = set(STRATEGIC_ARTIFACT_TYPES)
-BRIDGE_STATUSES = {"proposed", "prechecked", "selected", "rejected", "proved", "refuted"}
+BRIDGE_STATUSES = {"proposed", "prechecked", "selected", "viable", "rejected", "proved", "refuted"}
 CONJECTURE_STATUSES = {"candidate", "selected", "archived", "proved", "refuted"}
 CONJECTURE_CATEGORIES = {
     "bridge_conjecture",

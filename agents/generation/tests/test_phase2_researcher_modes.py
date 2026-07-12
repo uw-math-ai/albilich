@@ -201,6 +201,50 @@ class ResearcherWorkModeDecisionTest(unittest.TestCase):
         )
         self.assertEqual(offline_decision["work_mode"], "offline")
 
+    def test_repeated_structural_cas_recommendation_yields_to_proof_cooldown(self) -> None:
+        completed_cas = {
+            "run_id": "cas-finished",
+            "actor_role": "researcher",
+            "researcher_work_mode": "cas",
+            "work_mode_source": "structural",
+            "state_revision": 8,
+            "status": "completed",
+        }
+        state = {"recent_runs": [completed_cas], "research_artifacts": []}
+        action = {
+            "mode": "prove",
+            "cas_check_recommended": True,
+            "bottleneck_lock_required": True,
+        }
+
+        cooldown = researcher_work_mode_decision(
+            state,
+            action,
+            research_mode="hard_problem",
+            web_search="live",
+        )
+
+        self.assertEqual(cooldown["work_mode"], "offline")
+        self.assertEqual(cooldown["source"], "structural")
+
+        state["recent_runs"] = [
+            {
+                **completed_cas,
+                "run_id": f"proof-{index}",
+                "researcher_work_mode": "offline",
+                "state_revision": 9 + index,
+            }
+            for index in range(3)
+        ] + [completed_cas]
+        refreshed = researcher_work_mode_decision(
+            state,
+            action,
+            research_mode="hard_problem",
+            web_search="live",
+        )
+        self.assertEqual(refreshed["work_mode"], "cas")
+        self.assertEqual(refreshed["source"], "structural")
+
     def test_weak_bias_yields_to_rotation_after_staleness_window(self) -> None:
         def offline_run(index: int) -> dict[str, Any]:
             return {

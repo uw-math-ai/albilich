@@ -392,14 +392,25 @@ def researcher_work_mode_decision(
             or f"PhD advisor directed the researcher to work in {directed} mode",
             "advisor_mode_directive_artifact_id": str(directive.get("artifact_id") or ""),
         }
-    if action.get("cas_check_recommended"):
+    cycle = [m for m in RESEARCHER_WORK_MODE_CYCLE if m != "online" or online_allowed]
+    history = _researcher_work_mode_history(state)
+    recent_completed = [
+        item["work_mode"]
+        for item in history
+        if item.get("status") == "completed"
+    ][:ROTATION_STALENESS_WINDOW]
+    # Central-obstruction workbenches keep cas_check_recommended stamped while
+    # the same theorem remains open. Treat that flag as a periodic probe, not a
+    # standing CAS lock: after one completed CAS pass, give proof/search work a
+    # short window to use the evidence before computing again. Explicit advisor
+    # directives and assigned parallel CAS companions are handled above and
+    # intentionally remain authoritative.
+    if action.get("cas_check_recommended") and "cas" not in recent_completed:
         return {
             "work_mode": "cas",
             "source": "structural",
             "reason": "the scheduled action recommends a bounded CAS computation",
         }
-    cycle = [m for m in RESEARCHER_WORK_MODE_CYCLE if m != "online" or online_allowed]
-    history = _researcher_work_mode_history(state)
     strong_flags = [flag for flag in STRONG_OFFLINE_BIAS_ACTION_FLAGS if action.get(flag)]
     if strong_flags:
         return {
