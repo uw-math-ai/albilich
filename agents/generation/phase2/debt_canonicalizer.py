@@ -47,7 +47,7 @@ _ANCHOR_TERMS = {
     "extension",
     "frattini",
     "hd",
-    "hstar",
+    "hvector",
     "interior",
     "lemma",
     "local",
@@ -205,10 +205,10 @@ def _cluster_card(cluster: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
 
 def _keywords(text: str) -> set[str]:
     compact = (
-        text.replace("h^*", "hstar")
-        .replace("h-*", "hstar")
-        .replace("h-star", "hstar")
-        .replace("h star", "hstar")
+        text.replace("h^*", "hvector")
+        .replace("h-*", "hvector")
+        .replace("h-star", "hvector")
+        .replace("h star", "hvector")
         .replace("h_d", "hd")
         .replace("h d", "hd")
         .replace("non split", "nonsplit")

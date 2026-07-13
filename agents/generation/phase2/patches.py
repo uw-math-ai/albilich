@@ -3456,7 +3456,7 @@ def _root_alignment_target_matches(target_statement: str, root_statement: str) -
     candidates = {root_norm}
     if first_paragraph:
         candidates.add(first_paragraph)
-    # Kourovka-style problem files start with an H1 title, making the
+    # Notebook-style problem files often start with an H1 title, making the
     # first-paragraph candidate just the title line; accept the '## Problem'
     # section body and its question paragraph verbatim as well.
     problem_section = _markdown_sections(root_statement).get("problem", "")

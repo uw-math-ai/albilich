@@ -408,8 +408,8 @@ def execute_claude_session(
         max_turns=max_turns,
         effort=effort,
         # Do NOT pass --add-dir for the repo root: Claude indexes the whole tree
-        # at startup, and this repo has ~28k files (.venv, results/, experiment
-        # data/), which stalls every session past its timeout with zero output.
+        # at startup, and a working checkout can hold tens of thousands of files
+        # (virtualenvs, run outputs), stalling sessions past their timeout.
         # cwd=workdir already grants read access to everything under the repo.
         add_dirs=None,
         disallowed_tools=None if session_web_search == "live" else ("WebSearch", "WebFetch"),

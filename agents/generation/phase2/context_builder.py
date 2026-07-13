@@ -1468,11 +1468,11 @@ def _proof_architecture_templates(
                 ],
             }
         )
-    if any(term in text for term in ("matroid", "hstar", "h-vector", "ehrhart", "alcoved", "dhr", "msss", "postnikov")):
+    if any(term in text for term in ("matroid", "hvector", "h-vector", "ehrhart", "alcoved", "dhr", "msss", "postnikov")):
         templates.append(
             {
-                "template_id": "matroid-hstar-bridge-patterns",
-                "domain": "matroid_hstar",
+                "template_id": "matroid-hvector-bridge-patterns",
+                "domain": "matroid_hvector",
                 "when_to_use": "DHR/Ehrhart/alcoved or h*-vector bridge lemmas",
                 "moves": [
                     "separate convention checks such as P versus -P before using computations",
@@ -1530,8 +1530,7 @@ def _local_search_policy(
         "exclude_by_default": [
             "agents/generation/results/**",
             "agents/generation/downloads/** unless explicitly problem-relevant under download_scope_rule",
-            "experiments/**",
-            "experiment data/**",
+            "experiment output and raw data directories",
             "logs/**",
             "raw_run_logs/**",
             "older benchmark output packets",

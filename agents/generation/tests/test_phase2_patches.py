@@ -4624,7 +4624,7 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
 class Phase2StatusTransitionGraphIdAliasTest(unittest.TestCase):
     """propose_status_transition must accept concrete graph-id fields as target aliases.
 
-    Observed live (2026-07-03, problem 20.2): the integration verifier emitted
+    Observed in a live integration run: the integration verifier emitted
     claim_id/route_id instead of target_id and the whole integrate patch was
     rejected for a missing target.
     """
@@ -4709,11 +4709,11 @@ class Phase2StatusTransitionGraphIdAliasTest(unittest.TestCase):
 
 class Phase2RootAlignmentMatcherTest(unittest.TestCase):
     ROOT = (
-        "# Problem 20.2: Totally 3-closed nonabelian simple groups of Lie type\n\n"
+        "# Problem 1.1: Perfectly 5-covered connected graphs of prime order\n\n"
         "## Problem\n\n"
-        "Let G be a permutation group; define the k-closure as usual.\n\n"
-        "**Question (Problem 20.2).** Are there any nonabelian simple groups of Lie type\n"
-        "which are totally 3-closed?\n\n"
+        "Let G be a finite graph; define the k-cover as usual.\n\n"
+        "**Question (Problem 1.1).** Are there any connected graphs of prime order\n"
+        "which are perfectly 5-covered?\n\n"
         "## Instructions\n\n"
         "Treat this as a serious research problem.\n"
     )
@@ -4722,17 +4722,17 @@ class Phase2RootAlignmentMatcherTest(unittest.TestCase):
         from agents.generation.phase2.patches import _root_alignment_target_matches
 
         self.assertTrue(_root_alignment_target_matches(self.ROOT, self.ROOT))
-        question = "**Question (Problem 20.2).** Are there any nonabelian simple groups of Lie type\nwhich are totally 3-closed?"
+        question = "**Question (Problem 1.1).** Are there any connected graphs of prime order\nwhich are perfectly 5-covered?"
         self.assertTrue(_root_alignment_target_matches(question, self.ROOT))
-        section = "Let G be a permutation group; define the k-closure as usual.\n\n" + question
+        section = "Let G be a finite graph; define the k-cover as usual.\n\n" + question
         self.assertTrue(_root_alignment_target_matches(section, self.ROOT))
         self.assertTrue(
-            _root_alignment_target_matches("Problem 20.2: Totally 3-closed nonabelian simple groups of Lie type", self.ROOT)
+            _root_alignment_target_matches("Problem 1.1: Perfectly 5-covered connected graphs of prime order", self.ROOT)
         )
         # Paraphrases still fail.
         self.assertFalse(
             _root_alignment_target_matches(
-                "Does there exist a totally 3-closed nonabelian simple group of Lie type?", self.ROOT
+                "Does there exist a perfectly 5-covered connected graph of prime order?", self.ROOT
             )
         )
 

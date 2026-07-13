@@ -183,7 +183,7 @@ class Phase2CentralObstructionTest(unittest.TestCase):
         )
         self.assertIn("proof_architecture_templates", manifest)
         self.assertIn(
-            "matroid-hstar-bridge-patterns",
+            "matroid-hvector-bridge-patterns",
             {row["template_id"] for row in manifest["proof_architecture_templates"]},
         )
         self.assertIn("cas_trigger_policy", manifest)

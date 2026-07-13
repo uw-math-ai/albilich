@@ -2,7 +2,6 @@
 
 Covers the preamble rewrite (bad preamble -> house preamble, author packages
 kept, hyperref last, \\numberwithin after theorem declarations), idempotence
-(including the hand-typeset PSL(2,11) reference paper as a fixed point),
 piped-table -> booktabs conversion, the three collapse artifacts, and a real
 pdflatex compile of the normalized output.
 """
@@ -22,13 +21,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from agents.generation.phase2.receipt import compile_latex_artifact
 from agents.generation.phase2.writing.latex_template import normalize_paper_template
-
-REFERENCE_TYPESET_PAPER = (
-    REPO_ROOT
-    / "experiments"
-    / "kourovka_20_2_paper_v2_20260709"
-    / "PSL211_paper_final_typeset.tex"
-)
 
 # A compilable article with a non-house preamble (author kept graphicx and a
 # macro) and a fully piped table — what a non-compliant writer ships.
@@ -127,14 +119,6 @@ class PreambleNormalizationTest(unittest.TestCase):
     def test_normalization_is_idempotent(self) -> None:
         once = normalize_paper_template(BAD_PREAMBLE_PAPER)
         self.assertEqual(once, normalize_paper_template(once))
-
-    def test_reference_typeset_paper_is_a_fixed_point(self) -> None:
-        # The hand-typeset PSL(2,11) paper IS the reference output: the
-        # normalizer must leave it byte-identical.
-        if not REFERENCE_TYPESET_PAPER.is_file():
-            self.skipTest("reference typeset paper not present in this checkout")
-        reference = REFERENCE_TYPESET_PAPER.read_text(encoding="utf-8")
-        self.assertEqual(reference, normalize_paper_template(reference))
 
     def test_document_without_documentclass_is_untouched(self) -> None:
         fragment = "Just prose with a \\usepackage{tikz} mention.\n"

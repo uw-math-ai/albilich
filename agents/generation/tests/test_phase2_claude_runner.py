@@ -92,11 +92,11 @@ class ClaudeRunnerTest(unittest.TestCase):
         stream = "\n".join([
             json.dumps({"type": "assistant", "message": {"content": [
                 {"type": "text", "text": "Let me compute the h-vector."},
-                {"type": "tool_use", "name": "Bash", "input": {"command": "M2 hStarMat.m2"}}]}}),
+                {"type": "tool_use", "name": "Bash", "input": {"command": "M2 helper.m2"}}]}}),
         ])
         tail = stream_activity_tail(stream)
         self.assertIn("Let me compute", tail)
-        self.assertIn("⏵ Bash: M2 hStarMat.m2", tail)
+        self.assertIn("⏵ Bash: M2 helper.m2", tail)
 
     def test_parse_stream_salvages_last_assistant_on_no_result(self) -> None:
         # Simulates a session killed at the timeout before the result event.
@@ -205,9 +205,9 @@ class CasToolingManifestTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("cas-tooling-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("Prove the root theorem.")
-            asset = "experiment data/eur_matroid_h_vectors/bibliography/hStar Matroid Upload.m2"
+            asset = "sample data/sample_project/bibliography/Sample Helper Upload.m2"
             prev = os.environ.get("ALBILICH_CAS_ASSETS")
-            os.environ["ALBILICH_CAS_ASSETS"] = f"{asset}::Eur h* matroid Macaulay2 helper"
+            os.environ["ALBILICH_CAS_ASSETS"] = f"{asset}::Sample Macaulay2 helper"
             try:
                 # Large budget so advisory blocks (local_search_policy) are not trimmed.
                 manifest = build_context_manifest(

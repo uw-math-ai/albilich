@@ -60,7 +60,7 @@ in mathematics "robust", "key", "crucial" have legitimate sparse uses — flag b
   paragraph-filler pattern, "the proof rests on three points", "we record the following".
 - Why: the model narrates its own generation process. A paper explains mathematics; it does not
   live-blog its assembly. Fix per HOUSE 32: replace checklist transitions with the mathematical
-  implication ("Since every constituent is 3-closed, it suffices to compare pairs" beats "We now
+  implication ("Since every factor is abelian, it suffices to compare pairs" beats "We now
   turn to the pair analysis").
 
 ## 6. Formatting tells (mostly covered by L5-PAPER lint)

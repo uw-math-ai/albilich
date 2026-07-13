@@ -7,10 +7,9 @@ It is applied in patches._attach_artifact right after the escaping repair, so
 the stored ``.tex`` (and everything downstream — the compile sidecar, the
 lint sync, the editor packet) always sees the normalized document.
 
-Reference output: ``experiments/kourovka_20_2_paper_v2_20260709/``
-``PSL211_paper_final_typeset.tex`` (the hand-typeset PSL(2,11) paper); the
-normalizer maps a non-house document onto that layout and leaves an
-already-house document unchanged (idempotent).
+The normalizer maps a non-house document onto the house layout and leaves
+an already-house document unchanged (idempotent); a hand-typeset
+house-style paper is a fixed point.
 
 Two passes:
 
