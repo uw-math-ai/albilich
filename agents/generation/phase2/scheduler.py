@@ -5,7 +5,14 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-from .audit import is_paper_audit_mode
+from .audit import (
+    PAPER_AUDIT_DOCUMENT_INTEGRATION_MARKER,
+    PAPER_AUDIT_DOCUMENT_REVIEW_MARKER,
+    PAPER_AUDIT_REFEREE_REPORT_MARKER,
+    REFEREE_REPORT_ARTIFACT_TYPE,
+    audit_subject_artifact,
+    is_paper_audit_mode,
+)
 from .branch_summary import (
     branch_cluster_claim_ids,
     branch_rotation_decision,
@@ -401,6 +408,8 @@ def next_action(
         web_search=web_search,
         allow_integration=allow_integration,
     )
+    if action.get("paper_audit_verification_only"):
+        return action
     # The research-strategy layer is a deterministic view over persisted proof
     # state. It may preempt ordinary mature-run rotation for a due compression,
     # global PhD-advisor synthesis, a sufficiency-prechecked bridge/conjecture,
@@ -467,6 +476,146 @@ def _research_strategy_operation_action(
     )
 
 
+def _paper_audit_verification_only_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Finish a submitted-paper audit with three bounded review sessions.
+
+    The audit subject is already the researcher's immutable output.  Asking
+    general proof-search roles to repair, strengthen, or re-prove it only
+    delays the referee deliverable and risks changing the argument under
+    review.  The terminal audit path is therefore deliberately linear:
+
+      audit subject -> strict local review -> integration review -> report.
+
+    Stage artifacts carry explicit metadata markers so ordinary route-level
+    verifier reports from older or parallel work cannot accidentally advance
+    this pipeline.
+    """
+    if not is_paper_audit_mode(research_mode):
+        return None
+    subject = audit_subject_artifact(state)
+    if subject is None:
+        return None
+    subject_id = str(subject.get("artifact_id") or "")
+    if not subject_id:
+        return None
+
+    strict_report = _latest_paper_audit_stage_artifact(
+        state,
+        artifact_type="verification_report",
+        marker=PAPER_AUDIT_DOCUMENT_REVIEW_MARKER,
+    )
+    if strict_report is None:
+        return _action(
+            "prove",
+            "root",
+            "",
+            "paper audit: strict verifier reviews the submitted statements and proofs directly; no proof repair or alternative argument",
+            plan_step_budget(problem, "prove", requested_tokens),
+            research_mode=research_mode,
+            paper_audit_verification_only=True,
+            paper_audit_document_review_required=True,
+            paper_audit_source_artifact_ids=[subject_id],
+            strict_verifier_no_fresh_evidence=True,
+            strict_verifier_no_cas=True,
+            search_intent="paper_audit_document_review",
+        )
+
+    strict_id = str(strict_report.get("artifact_id") or "")
+    integration_report = _latest_paper_audit_stage_artifact(
+        state,
+        artifact_type="integration_report",
+        marker=PAPER_AUDIT_DOCUMENT_INTEGRATION_MARKER,
+        required_metadata={"strict_report_artifact_id": strict_id},
+    )
+    if integration_report is None:
+        return _action(
+            "integrate",
+            "root",
+            "",
+            "paper audit: integration verifier checks the strict report against the paper's complete dependency chain",
+            plan_step_budget(problem, "integrate", requested_tokens),
+            research_mode=research_mode,
+            paper_audit_verification_only=True,
+            paper_audit_document_integration_required=True,
+            paper_audit_source_artifact_ids=[subject_id, strict_id],
+            strict_report_artifact_id=strict_id,
+            search_intent="paper_audit_document_integration",
+        )
+
+    integration_id = str(integration_report.get("artifact_id") or "")
+    referee_report = _latest_paper_audit_stage_artifact(
+        state,
+        artifact_type=REFEREE_REPORT_ARTIFACT_TYPE,
+        marker=PAPER_AUDIT_REFEREE_REPORT_MARKER,
+        required_metadata={
+            "strict_report_artifact_id": strict_id,
+            "integration_report_artifact_id": integration_id,
+        },
+    )
+    if referee_report is None:
+        return _action(
+            "write",
+            "root",
+            "",
+            "paper audit: compose the final referee report from the strict and integration verifier reports",
+            plan_step_budget(problem, "write", requested_tokens),
+            research_mode=research_mode,
+            paper_audit_verification_only=True,
+            paper_audit_referee_report_required=True,
+            paper_audit_source_artifact_ids=[subject_id, strict_id, integration_id],
+            strict_report_artifact_id=strict_id,
+            integration_report_artifact_id=integration_id,
+            search_intent="paper_audit_referee_report",
+        )
+
+    return _action(
+        "stop_solved",
+        "root",
+        "",
+        "paper audit complete: strict verification, integration review, and referee report are recorded",
+        plan_step_budget(problem, "stop_solved", 0),
+        research_mode=research_mode,
+        paper_audit_verification_only=True,
+        terminal_classification="paper_audit_complete",
+        final_artifact_id=str(referee_report.get("artifact_id") or ""),
+    )
+
+
+def _latest_paper_audit_stage_artifact(
+    state: Mapping[str, Any],
+    *,
+    artifact_type: str,
+    marker: str,
+    required_metadata: Optional[Mapping[str, str]] = None,
+) -> Optional[Mapping[str, Any]]:
+    required_metadata = required_metadata or {}
+    rows: list[Mapping[str, Any]] = []
+    artifacts = list(state.get("artifacts", [])) + list(state.get("audit_artifacts", []))
+    for artifact in artifacts:
+        if str(artifact.get("artifact_type") or "") != artifact_type:
+            continue
+        metadata = _json_object(artifact.get("metadata_json"))
+        if metadata.get(marker) is not True:
+            continue
+        if any(str(metadata.get(key) or "") != value for key, value in required_metadata.items()):
+            continue
+        rows.append(artifact)
+    rows.sort(
+        key=lambda artifact: (
+            _revision_number(artifact.get("state_revision")),
+            str(artifact.get("created_at") or ""),
+        ),
+        reverse=True,
+    )
+    return rows[0] if rows else None
+
+
 def _plan_next_action(
     store: ProofStateStore,
     *,
@@ -493,6 +642,15 @@ def _plan_next_action(
             stop_reason_code="state_invariant_violation",
             completion_policy=str(problem.get("completion_policy") or "full_proof_first"),
         )
+
+    paper_audit_terminal = _paper_audit_verification_only_action(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    if paper_audit_terminal:
+        return paper_audit_terminal
 
     root = _claim(state, "root")
     if root and root["lifecycle_status"] == "integrated":
@@ -1291,6 +1449,8 @@ def parallel_companion_actions(
     research_mode: str | None = DEFAULT_RESEARCH_MODE,
     web_search: str | None = DEFAULT_WEB_SEARCH,
 ) -> list[Dict[str, Any]]:
+    if primary_action.get("paper_audit_verification_only"):
+        return []
     companions = _plan_parallel_companion_actions(
         store,
         primary_action,
@@ -1418,6 +1578,8 @@ def _plan_parallel_companion_actions(
     web_search: str | None = DEFAULT_WEB_SEARCH,
 ) -> list[Dict[str, Any]]:
     """Plan safe companion actions for literature/research/verifier overlap."""
+    if primary_action.get("paper_audit_verification_only"):
+        return []
     mode = str(primary_action.get("mode") or "")
     if mode in {"stop_with_partial_results", "stop_solved", "integrate", "write", "review_writing"}:
         return []
@@ -2424,9 +2586,13 @@ def _executive_advisor_bottleneck_action(
     debt = _first_active_debt_by_ids(state, debt_ids)
     explicit_target_id = _explicit_advisor_next_target_id(state, metadata)
     target_id = explicit_target_id or (str(_claim_target_for_debt(state, debt)) if debt else "")
-    if not target_id or not _claim(state, target_id):
+    target_claim = _claim(state, target_id) if target_id else None
+    if target_claim and str(target_claim.get("validation_status") or "") == "refuted":
+        return None
+    if not target_claim or str(target_claim.get("lifecycle_status") or "") != "active":
         target_id = _target_id_from_metadata(state, metadata, fallback="root")
-    if not _claim(state, target_id):
+    target_claim = _claim(state, target_id)
+    if not target_claim or str(target_claim.get("lifecycle_status") or "") != "active":
         target_id = "root"
     route_id = _route_for_debt(state, debt, target_id) if debt else _advisor_followup_route_id(
         state,
@@ -2727,6 +2893,9 @@ def _advisor_followup_research_action(
     metadata = _json_object(report.get("metadata_json"))
     explicit_target_id = _explicit_advisor_next_target_id(state, metadata)
     target_id = explicit_target_id or _target_id_from_metadata(state, metadata, fallback="root")
+    target_claim = _claim(state, target_id)
+    if target_claim and str(target_claim.get("validation_status") or "") == "refuted":
+        return None
     route_id = _advisor_followup_route_id(
         state,
         metadata,
@@ -2872,7 +3041,8 @@ def _advisor_followup_report(state: Mapping[str, Any]) -> Optional[Mapping[str, 
 def _explicit_advisor_next_target_id(state: Mapping[str, Any], metadata: Mapping[str, Any]) -> str:
     for key in ("next_target_id", "next_claim_id", "recommended_target_id"):
         candidate = str(metadata.get(key) or "")
-        if candidate and _claim(state, candidate):
+        claim = _claim(state, candidate) if candidate else None
+        if claim and str(claim.get("lifecycle_status") or "") == "active":
             return candidate
     return ""
 
@@ -4134,6 +4304,8 @@ def _bottleneck_lock_debt_candidates(state: Mapping[str, Any]) -> list[Mapping[s
     artifact_index = _artifact_index(state)
     for debt in state.get("debts", []):
         if str(debt.get("status") or "") != "active" or str(debt.get("severity") or "") != "blocking":
+            continue
+        if _debt_points_to_retired_graph(state, debt):
             continue
         if _debt_covered_by_integrated_claim(state, debt):
             continue
@@ -5682,6 +5854,49 @@ def _counterexample_validation_action(
                 ref_text = str(ref or "")
                 if ref_text:
                     durably_confirmed_candidate_refs.add(ref_text)
+    # A mathematically successful validator patch may omit the status
+    # transition. Do not permanently suppress the candidate merely because a
+    # confirmed artifact exists while its declarative target remains
+    # challenged; reconcile the status using the already checked evidence.
+    unreconciled_confirmations: list[tuple[str, Mapping[str, Any]]] = []
+    for confirmed in confirmed_rows:
+        if str(confirmed.get("artifact_type") or "") != "confirmed_counterexample":
+            continue
+        metadata = _json_object(confirmed.get("metadata_json"))
+        target = str(metadata.get("target_claim_id") or metadata.get("target_id") or "")
+        claim = _claim(state, target) if target else None
+        if not claim or str(claim.get("validation_status") or "") in {
+            "refuted",
+            "informally_verified",
+            "formally_verified",
+        }:
+            continue
+        if target == "root" and statement_is_interrogative_problem(str(claim.get("statement") or "")):
+            continue
+        unreconciled_confirmations.append((target, confirmed))
+    if unreconciled_confirmations:
+        unreconciled_confirmations.sort(
+            key=lambda item: (
+                0 if item[0] == "root" else 1,
+                -_revision_number(item[1].get("state_revision")),
+            )
+        )
+        target, confirmed = unreconciled_confirmations[0]
+        artifact_id = str(confirmed.get("artifact_id") or "")
+        return _action(
+            "validate_counterexample",
+            target,
+            "",
+            "a confirmed counterexample already exists, but the falsified declarative claim is still not marked refuted; reconcile the status using the existing confirmation",
+            plan_step_budget(problem, "validate_counterexample", requested_tokens),
+            research_mode=research_mode,
+            counterexample_validation_required=True,
+            counterexample_status_reconciliation_required=True,
+            candidate_counterexample_artifact_id=artifact_id,
+            confirmed_counterexample_artifact_id=artifact_id,
+            validation_evidence_artifact_ids=[artifact_id],
+            search_intent="counterexample_status_reconciliation",
+        )
     pending: list = []
     for art in state.get("research_artifacts", []):
         if not _candidate_counterexample_requires_validation(art):
@@ -5781,6 +5996,9 @@ def _advisor_requested_validation_action(
     )
     if not _claim(state, target_id):
         target_id = "root"
+    target_claim = _claim(state, target_id)
+    if target_claim and str(target_claim.get("validation_status") or "") == "refuted":
+        return None
     report_id = str(report.get("artifact_id") or "")
     advisor_debt_ids = set(_advisor_referenced_debt_ids(metadata))
     candidate_rows: list[tuple[int, str, Mapping[str, Any]]] = []
@@ -6021,6 +6239,8 @@ def _unrouted_proof_claim_action(
     for claim in state.get("claims", []):
         cid = str(claim.get("claim_id") or "")
         if not cid or cid not in dossier_claims:
+            continue
+        if str(claim.get("lifecycle_status") or "") != "active":
             continue
         if str(claim.get("validation_status") or "") in {"informally_verified", "formally_verified", "refuted"}:
             continue
@@ -6397,6 +6617,8 @@ def multi_branch_research_actions(
     workers = normalize_parallel_branches(parallel_branches)
     if not workers:
         return []
+    if primary_action.get("paper_audit_verification_only"):
+        return []
     primary_mode = str(primary_action.get("mode") or "")
     if primary_mode in {"stop_with_partial_results", "stop_solved", "write", "review_writing"}:
         return []
@@ -6499,7 +6721,16 @@ def _branch_packet_card(state: Mapping[str, Any], route_id: str, target_id: str,
     claim_ids = branch_cluster_claim_ids(state, route_id) if route_id else []
     if target_id and target_id not in claim_ids:
         claim_ids = [target_id, *claim_ids]
-    owners = set(claim_ids) | ({route_id} if route_id else set())
+    inference_ids = [
+        str(row.get("inference_id") or "")
+        for row in state.get("inferences", [])
+        if (
+            (route_id and str(row.get("route_id") or "") == route_id)
+            or (not route_id and str(row.get("conclusion_claim_id") or "") == target_id)
+        )
+        and str(row.get("inference_id") or "")
+    ]
+    owners = set(claim_ids) | set(inference_ids) | ({route_id} if route_id else set())
     debt_ids: list[str] = []
     incoming_debt_ids: list[str] = []
     for debt in state.get("debts", []):
@@ -6514,6 +6745,7 @@ def _branch_packet_card(state: Mapping[str, Any], route_id: str, target_id: str,
         "branch_id": route_id or target_id,
         "worker": worker,
         "claim_ids": claim_ids,
+        "inference_ids": sorted(inference_ids),
         "debt_ids": sorted(debt_ids),
         "incoming_debt_ids": sorted(incoming_debt_ids),
     }
@@ -7675,11 +7907,55 @@ def _claim_target_for_debt(state: Mapping[str, Any], debt: Mapping[str, Any]) ->
     return target_id
 
 
+def _debt_points_to_retired_graph(state: Mapping[str, Any], debt: Mapping[str, Any]) -> bool:
+    """Return whether an active-looking debt belongs only to retired proof work."""
+    retired = {"superseded", "abandoned"}
+    owner_type = str(debt.get("owner_type") or "")
+    owner_id = str(debt.get("owner_id") or "")
+    suggested = str(debt.get("suggested_next_target") or "")
+
+    for candidate in (owner_id, suggested):
+        claim = _claim(state, candidate) if candidate else None
+        if claim and (
+            str(claim.get("lifecycle_status") or "") in retired
+            or str(claim.get("validation_status") or "") == "refuted"
+        ):
+            return True
+        route = next(
+            (row for row in state.get("routes", []) if str(row.get("route_id") or "") == candidate),
+            None,
+        ) if candidate else None
+        if route and str(route.get("status") or "") in retired:
+            return True
+
+    if owner_type == "inference":
+        inference = next(
+            (row for row in state.get("inferences", []) if str(row.get("inference_id") or "") == owner_id),
+            None,
+        )
+        if inference:
+            conclusion = _claim(state, str(inference.get("conclusion_claim_id") or ""))
+            inference_route_id = str(inference.get("route_id") or "")
+            route = next(
+                (row for row in state.get("routes", []) if str(row.get("route_id") or "") == inference_route_id),
+                None,
+            )
+            if conclusion and (
+                str(conclusion.get("lifecycle_status") or "") in retired
+                or str(conclusion.get("validation_status") or "") == "refuted"
+            ):
+                return True
+            if route and str(route.get("status") or "") in retired:
+                return True
+    return False
+
+
 def _first_blocking_debt(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     debts = [
         row for row in state["debts"]
         if row["status"] == "active"
         and row["severity"] == "blocking"
+        and not _debt_points_to_retired_graph(state, row)
         and not _debt_covered_by_integrated_claim(state, row)
     ]
     claim_depth = {

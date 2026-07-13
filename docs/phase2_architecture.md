@@ -35,6 +35,20 @@ PYTHONDONTWRITEBYTECODE=1 agents/verification/.venv/bin/python -m agents.generat
 
 The standard mode is `balanced`: a claim-driven literature researcher may search first, but proof, verification, and integration sessions then run with search disabled. `independent` disables live search for every session. `citation_pass` waits for an integrated root claim and a final proof artifact, then lets the literature researcher collect references as a separate pass, so benchmark reports can distinguish independent solving from citation behavior through `runs.search_intent`. The literature researcher is tiered by retrieval depth: cheap `scout` search finds candidates, `reader` extracts theorem cards, and `research_librarian` is reserved for hard theorem matching, hypothesis translation, and source-to-target implication checks.
 
+### Paper solution audit pipeline
+
+`audit-paper` / `paper_solution_audit` uses the same verification authority as an ordinary proof run. The submitted document remains an immutable `audit_subject`, but its theorem and proof segments are transcribed by the researcher into ordinary proof-state objects:
+
+```text
+author statement + author proof
+  researcher proof_dossier + paper claim + sufficient route + inference
+  strict informal verifier checks the bounded author-text packet
+  integration verifier checks verified premises and dependency closure
+  referee report shows both validation and integration status
+```
+
+Explicit hypotheses and ambient assumptions are represented as premise claims, so a paper inference never bypasses the graph with an empty premise list. Proposed repairs stay in separate `proposed_repair` artifacts and are forbidden as evidence that the submitted proof passed. A failed local proof remains unverified; an integration report may record `integrates=false` and the exact missing dependency rather than rewriting the author's argument.
+
 The terminal ladder is explicit. An integrated root without a `final_proof` artifact schedules `write`; it is not treated as a partial result. A run stops as `stop_solved` only after the final proof artifact exists. `stop_with_partial_results` is reserved for exhausted budget, invariant failure, repeated execution failure, unresolved blocking debt, or external step limits.
 
 Public result classification is explicit in CLI and report output. The workflow distinguishes `solved`, `solved_pending_final_writer`, `certified_partial_progress`, `unresolved_with_debt`, and `in_progress`. Certified partial progress lists exact verified non-root statements and their relation to the target; it never downgrades the target theorem itself.

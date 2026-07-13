@@ -138,11 +138,23 @@ def build_context_manifest(
     if target is None:
         raise ValueError(f"unknown target claim: {target_id}")
 
-    selected_route = routes.get(route_id) if route_id else _best_route_for_target(routes.values(), target_id)
+    verification_only_audit = bool(action and action.get("paper_audit_verification_only"))
+    if verification_only_audit:
+        selected_route = routes.get(route_id) if route_id else None
+    else:
+        selected_route = routes.get(route_id) if route_id else _best_route_for_target(routes.values(), target_id)
     selected_claim_ids = _select_claim_ids(state, target_id, selected_route)
     selected_inferences = _select_inferences(state, selected_claim_ids, selected_route)
-    selected_debts = _select_debts(state, selected_claim_ids, selected_route)
     branch_focus = str((action or {}).get("branch_focus") or "")
+    preferred_debt_ids = _branch_packet_debt_ids(action)
+    selected_debts = _select_debts(
+        state,
+        selected_claim_ids,
+        selected_route,
+        inference_ids={str(row.get("inference_id") or "") for row in selected_inferences},
+        preferred_debt_ids=preferred_debt_ids,
+    )
+    paper_audit_strict_packet = _is_paper_audit_strict_packet(state, action)
     if branch_focus:
         # Branch packet isolation (TODO 2): a branch-focused worker receives
         # only branch-relevant claims (Batch-1 _branch_relevant_claim_ids),
@@ -153,7 +165,13 @@ def build_context_manifest(
         )
         selected_claim_ids = [cid for cid in selected_claim_ids if cid in branch_ids]
         selected_inferences = _select_inferences(state, selected_claim_ids, selected_route)
-        selected_debts = _select_debts(state, selected_claim_ids, selected_route)
+        selected_debts = _select_debts(
+            state,
+            selected_claim_ids,
+            selected_route,
+            inference_ids={str(row.get("inference_id") or "") for row in selected_inferences},
+            preferred_debt_ids=preferred_debt_ids,
+        )
     active_compression: Dict[str, Any] = {}
     if not branch_focus and str((action or {}).get("mode") or "") in {"prove", "reduce", "weaken", "strengthen", "triage_routes", "regulate_decomposition"}:
         selected_claim_ids, active_compression = apply_active_compression(
@@ -162,7 +180,21 @@ def build_context_manifest(
             target_id=target_id,
         )
         selected_inferences = _select_inferences(state, selected_claim_ids, selected_route)
-        selected_debts = _select_debts(state, selected_claim_ids, selected_route)
+        selected_debts = _select_debts(
+            state,
+            selected_claim_ids,
+            selected_route,
+            inference_ids={str(row.get("inference_id") or "") for row in selected_inferences},
+        )
+    if paper_audit_strict_packet:
+        # Apply this after branch/compression reselection: those general context
+        # layers may legitimately pull root-level sibling debts back in.
+        selected_debts = _paper_audit_packet_debts(
+            selected_debts,
+            target_id=target_id,
+            selected_route=selected_route,
+            selected_inferences=selected_inferences,
+        )
     selected_artifacts = _select_artifacts(
         state,
         selected_claim_ids,
@@ -173,6 +205,12 @@ def build_context_manifest(
         action=action,
         include_stop_writer_artifacts=bool(action and action.get("write_existing_proofs_on_stop")),
     )
+    if paper_audit_strict_packet:
+        selected_artifacts = _paper_audit_packet_artifacts(
+            state,
+            selected_artifacts,
+            action=action,
+        )
     role_policy = _role_context_policy(action)
     patch_contract = _patch_contract(action, role_policy)
     parallel_exchange = _parallel_exchange_card(store)
@@ -206,6 +244,12 @@ def build_context_manifest(
         _theorem_library_entry(row)
         for row in _rank_theorem_library_entries(state.get("theorem_library_entries", []), target_id)[: role_policy["theorem_library_limit"]]
     ]
+    if paper_audit_strict_packet:
+        # Strict verification is deliberately local: no retrieval card or
+        # theorem-library item may supplement the author's submitted proof.
+        retrieval_cards = []
+        duplicate_retrieval_cards = []
+        theorem_library = []
     local_search_policy = _local_search_policy(
         cas_tooling,
         selected_artifacts=selected_artifacts,
@@ -301,12 +345,25 @@ def build_context_manifest(
     paper_audit_card = paper_audit_context_card(state)
     if paper_audit_card:
         manifest["paper_audit"] = paper_audit_card
+        # The immutable audit subject is the source document every audit role
+        # is explicitly asked to inspect.  Keep its exact path inside the
+        # evidence boundary even before the researcher has created the first
+        # paper claim/route; otherwise the first proof-packet patch is rejected
+        # merely for reading the ingested document.
+        subject_path = str(paper_audit_card.get("audit_subject_path") or "").strip()
+        allowed_paths = manifest["local_search_policy"].get("allowed_local_evidence_paths")
+        allowed_paths = list(allowed_paths) if isinstance(allowed_paths, list) else []
+        if subject_path and subject_path not in allowed_paths:
+            allowed_paths.append(subject_path)
+        manifest["local_search_policy"]["allowed_local_evidence_paths"] = allowed_paths
         manifest["instructions"].append(
             "manifest.paper_audit: this problem is a paper_solution_audit run — a conservative referee check of "
-            "the submitted audit_subject document. Decompose it into paper_claim-tagged claims with "
-            "audit_status:<status> and source_location:<...> tags, check local implications first, audit "
-            "citations exactly, keep repairs as separate proposed_repair artifacts, and never rewrite the "
-            "author's proof into a different proof. This is an AI audit, not a formal proof."
+            "the submitted audit_subject document. Follow manifest.paper_audit.verification_pipeline: the "
+            "researcher must turn each author statement/proof segment into a proof_dossier-backed paper claim, "
+            "sufficient route, and terminal inference; the strict verifier checks that local packet; the "
+            "integration verifier checks its verified dependencies. Keep repairs as separate proposed_repair "
+            "artifacts, and never rewrite the author's proof into a different proof. This is an AI audit, not a "
+            "formal proof."
         )
     if branch_summaries:
         manifest["branch_summaries"] = branch_summaries
@@ -404,6 +461,14 @@ def build_context_manifest(
             "Run bidirectional bridge-lemma search now: use the verified forward frontier and backward root obligations, propose at most three candidates, temporarily assume each candidate, expose hidden obligations, reject gap-moving or duplicate statements, and attach one strategy_schema_version=1 bridge_lemma_search artifact selecting at most two candidates. Follow manifest.bridge_lemma_search_contract exactly; bridge_candidates must be nested directly under metadata."
         )
     if action and action.get("advisor_global_synthesis_required"):
+        synthesis_trigger = (
+            action.get("synthesis_trigger")
+            if isinstance(action.get("synthesis_trigger"), Mapping)
+            else {}
+        )
+        latest_synthesis_id = str(
+            synthesis_trigger.get("latest_synthesis_artifact_id") or ""
+        )
         manifest["advisor_synthesis_contract"] = {
             "artifact_type": "advisor_synthesis",
             "metadata_shape": {
@@ -425,7 +490,10 @@ def build_context_manifest(
                     "budget_distribution": {"workstream": 1.0},
                     "synthesis_confidence": 0.0,
                 },
-                "supersedes_synthesis_id": "required when workflow_action.synthesis_trigger.latest_synthesis_artifact_id is nonempty",
+                "supersedes_synthesis_id": (
+                    latest_synthesis_id
+                    or "omit only when workflow_action.synthesis_trigger.latest_synthesis_artifact_id is empty"
+                ),
             },
             "required_advisor_synthesis_fields": list(ADVISOR_SYNTHESIS_REQUIRED_FIELDS),
             "nesting_rule": "Put every required field under metadata.advisor_synthesis; do not rename or flatten these keys.",
@@ -433,6 +501,11 @@ def build_context_manifest(
         manifest["instructions"].append(
             "This is the PhD advisor's global-synthesis mode, not tactical steering. Follow manifest.advisor_synthesis_contract exactly: attach one strategy_schema_version=1 advisor_synthesis artifact, put every required field under metadata.advisor_synthesis without renaming keys, supersede the latest synthesis id, identify one decisive missing statement, and pause or abandon stagnant routes through ordinary patch operations."
         )
+        if latest_synthesis_id:
+            manifest["instructions"].append(
+                "Set metadata.supersedes_synthesis_id exactly to "
+                f"{latest_synthesis_id}."
+            )
     if action and action.get("proof_compression_operation_required"):
         manifest["proof_compression_contract"] = {
             "artifact_type": "proof_compression",
@@ -495,7 +568,7 @@ def build_context_manifest(
         )
     if action and action.get("deep_session_required"):
         manifest["instructions"].append(
-            "This eligible root-critical branch receives one coherent deep session. End with a strategy_schema_version=1 deep_session_report containing every required deliverable field, plus ordinary patch operations; the session has no verification authority and may not inspect unrelated prior runs."
+            "This eligible root-critical branch receives one coherent deep session. End with a strategy_schema_version=1 deep_session_report containing every required deliverable field, plus ordinary patch operations. Follow workflow_action.deep_session.required_deliverable.field_rules exactly: candidate_lemmas must be a nonempty list containing at least one exact local lemma, hypothesis, or falsifiable subclaim; never emit candidate_lemmas=[]. The session has no verification authority and may not inspect unrelated prior runs."
         )
     context_role = str(role_policy.get("context_role") or "")
     work_mode = str((action or {}).get("researcher_work_mode") or "")
@@ -554,6 +627,8 @@ def build_context_manifest(
         manifest["instructions"].append(
             "Strict local verification must use manifest.verification_packet; do not certify a route from compact graph summaries alone."
         )
+    if paper_audit_strict_packet:
+        _apply_paper_audit_strict_packet_isolation(manifest)
     researcher_packet = _researcher_packet(
         state,
         target=target,
@@ -628,6 +703,8 @@ def build_context_manifest(
             "and every item in partial_result_receipt.other_claims; do not omit claims from the receipt ledger. "
             "For verified side lemmas, include the proof_artifacts material as the proof dossier, not merely the artifact ids."
         )
+    if action and action.get("paper_audit_verification_only"):
+        _apply_paper_audit_verification_only_isolation(manifest)
     manifest = _scrub_raw_log_references(manifest, _raw_log_artifact_ids(state))
     return _fit_manifest(manifest, max_chars=max_chars)
 
@@ -837,7 +914,23 @@ def _compact_researcher_mode_state(summary: Mapping[str, Any]) -> Dict[str, Any]
 
 def _role_context_policy(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     mode = str((action or {}).get("mode") or "")
+    if mode == "validate_counterexample":
+        return {
+            "context_role": "counterexample_validator",
+            "retrieval_card_limit": 0,
+            "theorem_library_limit": 0,
+            "authoritative_packet": "candidate counterexample plus validation evidence",
+            "summary": "independently validate one concrete counterexample and record the resulting refutation",
+        }
     if mode == "prove":
+        if (action or {}).get("paper_audit_document_review_required"):
+            return {
+                "context_role": "strict_verifier",
+                "retrieval_card_limit": 0,
+                "theorem_library_limit": 0,
+                "authoritative_packet": "immutable audit_subject document",
+                "summary": "review the complete submitted paper directly without proof search or repair",
+            }
         if not (action or {}).get("route_id") and not (action or {}).get("citation_certification_required") and not (action or {}).get("citation_triage_required"):
             return {
                 "context_role": "researcher",
@@ -894,6 +987,14 @@ def _role_context_policy(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
             "summary": "synthesize proof evidence, steer one concrete next research action, and supervise the researcher work-mode loop",
         }
     if mode == "integrate":
+        if (action or {}).get("paper_audit_document_integration_required"):
+            return {
+                "context_role": "integration_verifier",
+                "retrieval_card_limit": 0,
+                "theorem_library_limit": 0,
+                "authoritative_packet": "audit_subject plus strict document verification report",
+                "summary": "check global dependency closure without repairing the submitted proof",
+            }
         return {
             "context_role": "integration_verifier",
             "retrieval_card_limit": 3,
@@ -902,6 +1003,14 @@ def _role_context_policy(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
             "summary": "integrate only after checking verified route evidence and root alignment",
         }
     if mode == "write":
+        if (action or {}).get("paper_audit_referee_report_required"):
+            return {
+                "context_role": "writer",
+                "retrieval_card_limit": 0,
+                "theorem_library_limit": 0,
+                "authoritative_packet": "audit_subject plus strict and integration verifier reports",
+                "summary": "compose the final verifier-only referee report",
+            }
         return {
             "context_role": "writer",
             "retrieval_card_limit": 8,
@@ -955,7 +1064,7 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
     contracts: dict[str, list[dict[str, Any]]] = {
         "researcher": [
             {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type=proof_dossier|research_notebook|research_diagnostic|literature_search_request|decomposition_plan|cas_experiment_report|bridge_lemma_search|conjecture_portfolio|proof_compression|deep_session_report|definition_candidate", "content", "metadata(optional)"]},
-            {"op": "add_claim", "fields": ["claim_id", "kind=lemma|theorem|obstruction|counterexample|reference", "statement", "validation_status=untested|plausible|challenged", "parent_ids", "root_impact", "reduction_depth", "evidence_artifact_ids"]},
+            {"op": "add_claim", "fields": ["claim_id", "kind=lemma|theorem|definition|hypothesis|obstruction|counterexample|reference", "statement", "validation_status=untested|plausible|challenged", "parent_ids", "root_impact", "reduction_depth", "evidence_artifact_ids"]},
             {"op": "add_route", "fields": ["route_id", "conclusion_claim_id", "label", "strategy", "relation_to_parent=sufficient|necessary|diagnostic|variant", "evidence_artifact_ids"]},
             {"op": "add_inference", "fields": ["inference_id", "route_id", "conclusion_claim_id", "premise_claim_ids", "validation_status=untested|plausible|challenged", "explanation", "evidence_artifact_ids"]},
             {"op": "update_inference", "fields": ["inference_id", "add_evidence_artifact_ids", "explanation_append"], "rule": "Append route evidence or explanation only; this does not change validation status."},
@@ -982,6 +1091,19 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
             {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type=verification_report", "content", "metadata"]},
             {"op": "add_debt", "fields": ["debt_id", "owner_type", "owner_id", "debt_type=missing_reference|missing_hypothesis", "severity", "status=active", "obligation"]},
         ],
+        "counterexample_validator": [
+            {
+                "op": "attach_artifact",
+                "fields": ["artifact_id", "artifact_type=confirmed_counterexample", "content", "metadata.confirmed=true", "metadata.target_claim_id", "metadata.validation_result=confirmed"],
+                "rule": "Attach only after independently checking the concrete object, hypotheses, and failed conclusion.",
+            },
+            {
+                "op": "propose_status_transition",
+                "fields": ["target_type=claim", "target_id", "status_type=validation", "new_status=refuted", "evidence_artifact_ids=<same-patch confirmed_counterexample id>"],
+                "rule": "A fully confirmed declarative counterexample must record refuted in the same patch; do not leave the claim merely challenged.",
+            },
+            {"op": "add_debt", "fields": ["debt_id", "owner_type=claim", "owner_id", "debt_type=counterexample_validation", "severity=blocking", "status=active", "obligation"], "rule": "Use only when validation remains incomplete; do not attach confirmed_counterexample."},
+        ],
         "writer": [
             {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type=final_proof|partial_proof_report|stop_summary_report|proof_compression_report|writer_report", "content", "metadata"]},
             {"op": "update_debt", "fields": ["debt_id", "status=resolved", "resolution_note", "resolution_evidence_artifact_ids"], "rule": "Writing-revision passes only: resolve exactly the open writing debts named in manifest.writing_revision_packet, citing the revised final_proof artifact."},
@@ -1003,6 +1125,59 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
             {"op": "add_debt", "fields": ["debt_id", "owner_type", "owner_id", "debt_type", "severity", "status=active", "obligation"]},
         ],
     }
+    if action.get("paper_audit_document_review_required"):
+        contracts["strict_verifier"] = [
+            {
+                "op": "attach_artifact",
+                "fields": [
+                    "artifact_id",
+                    "artifact_type=verification_report",
+                    "content=<complete source-located document review>",
+                    "metadata.paper_audit_document_review=true",
+                    "metadata.audit_subject_artifact_id",
+                    "metadata.verdict=verified|major_gaps|likely_false|not_verified",
+                    "metadata.verification_report.summary",
+                    "metadata.verification_report.checked_items",
+                    "metadata.verification_report.critical_errors",
+                    "metadata.verification_report.gaps",
+                    "metadata.verification_report.blocking_gap",
+                ],
+                "rule": "Attach exactly one whole-document strict report; do not add graph operations, debts, or repairs.",
+            }
+        ]
+    if action.get("paper_audit_document_integration_required"):
+        contracts["integration_verifier"] = [
+            {
+                "op": "attach_artifact",
+                "fields": [
+                    "artifact_id",
+                    "artifact_type=integration_report",
+                    "content=<complete dependency-closure review>",
+                    "metadata.paper_audit_document_integration=true",
+                    "metadata.strict_report_artifact_id",
+                    "metadata.integrates=true|false",
+                    "metadata.outcome=integrates|does_not_integrate",
+                    "metadata.missing",
+                ],
+                "rule": "Attach exactly one integration report; do not transition lifecycle, add debts, or repair the proof.",
+            }
+        ]
+    if action.get("paper_audit_referee_report_required"):
+        contracts["writer"] = [
+            {
+                "op": "attach_artifact",
+                "fields": [
+                    "artifact_id",
+                    "artifact_type=referee_report",
+                    "content=<complete final referee report>",
+                    "metadata.paper_audit_referee_report=true",
+                    "metadata.strict_report_artifact_id",
+                    "metadata.integration_report_artifact_id",
+                    "metadata.source_artifact_ids",
+                ],
+                "rule": "Attach exactly one verifier-only referee report with no proposed repairs or other operations.",
+            }
+        ]
     if mode == "write" and (action.get("paper_authoring") or action.get("paper_revision")):
         contracts["writer"] = [
             {
@@ -1027,7 +1202,7 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
             },
             {"op": "record_run_metrics", "fields": ["run_id", "mode", "target_id", "status"]},
         ]
-    if mode == "integrate":
+    if mode == "integrate" and not action.get("paper_audit_document_integration_required"):
         context_role = "integration_verifier"
         contracts["integration_verifier"] = [
             {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type=integration_report", "content", "metadata.integrates", "metadata.root_alignment"]},
@@ -1665,17 +1840,45 @@ def _select_inferences(
     return [_inference_card(row) for row in rows[:12]]
 
 
-def _select_debts(state: Mapping[str, Any], claim_ids: List[str], route: Optional[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+def _select_debts(
+    state: Mapping[str, Any],
+    claim_ids: List[str],
+    route: Optional[Mapping[str, Any]],
+    *,
+    inference_ids: Optional[set[str]] = None,
+    preferred_debt_ids: Optional[set[str]] = None,
+) -> List[Dict[str, Any]]:
     owners = set(claim_ids)
     if route:
         owners.add(route["route_id"])
+    owners.update(inference_id for inference_id in (inference_ids or set()) if inference_id)
     rows = [
         row for row in state["debts"]
         if row["status"] == "active"
         and (row["owner_id"] in owners or row.get("suggested_next_target") in owners)
     ]
-    rows.sort(key=lambda row: (row["severity"] != "blocking", -int(row.get("repeated_count", 0)), row["debt_id"]))
+    preferred = preferred_debt_ids or set()
+    rows.sort(
+        key=lambda row: (
+            str(row.get("debt_id") or "") not in preferred,
+            row["severity"] != "blocking",
+            -int(row.get("repeated_count", 0)),
+            row["debt_id"],
+        )
+    )
     return [_debt_card(row) for row in rows[:12]]
+
+
+def _branch_packet_debt_ids(action: Optional[Mapping[str, Any]]) -> set[str]:
+    branch_packet = (action or {}).get("branch_packet")
+    if not isinstance(branch_packet, Mapping):
+        return set()
+    return {
+        str(debt_id)
+        for key in ("debt_ids", "incoming_debt_ids")
+        for debt_id in branch_packet.get(key) or []
+        if str(debt_id)
+    }
 
 
 def _branch_relevant_claim_ids(
@@ -1720,6 +1923,274 @@ def _branch_relevant_claim_ids(
         relevant.add(str(debt.get("suggested_next_target") or ""))
     relevant.discard("")
     return relevant
+
+
+def _is_paper_audit_strict_packet(
+    state: Mapping[str, Any],
+    action: Optional[Mapping[str, Any]],
+) -> bool:
+    """Whether this action is the bounded strict-verifier stage of an audit.
+
+    The ordinary strict verifier can legitimately see route-local obstruction
+    evidence.  A paper audit is narrower: the object being adjudicated is the
+    researcher's transcription of one author statement/proof segment.
+    """
+    if not paper_audit_context_card(state) or not action:
+        return False
+    if action.get("paper_audit_document_review_required"):
+        return True
+    return bool(
+        str(action.get("mode") or "") == "prove"
+        and str(action.get("route_id") or "")
+        and (
+            action.get("strict_verifier_no_fresh_evidence")
+            or action.get("verify_ready_route_policy")
+            or str(action.get("strict_verifier_scope") or "") == "single_route_verification_packet"
+        )
+    )
+
+
+def _paper_audit_packet_owner_ids(
+    *,
+    target_id: str,
+    selected_route: Optional[Mapping[str, Any]],
+    selected_inferences: Iterable[Mapping[str, Any]],
+) -> set[str]:
+    owner_ids = {str(target_id or "")}
+    if selected_route:
+        owner_ids.add(str(selected_route.get("route_id") or ""))
+        owner_ids.add(str(selected_route.get("conclusion_claim_id") or ""))
+    for inference in selected_inferences:
+        owner_ids.add(str(inference.get("inference_id") or ""))
+        owner_ids.add(str(inference.get("conclusion_claim_id") or ""))
+        owner_ids.update(_string_list(inference.get("premise_claim_ids")))
+        owner_ids.update(_string_list(inference.get("condition_claim_ids")))
+    owner_ids.discard("")
+    return owner_ids
+
+
+def _paper_audit_packet_debts(
+    debts: Iterable[Mapping[str, Any]],
+    *,
+    target_id: str,
+    selected_route: Optional[Mapping[str, Any]],
+    selected_inferences: Iterable[Mapping[str, Any]],
+) -> List[Mapping[str, Any]]:
+    owner_ids = _paper_audit_packet_owner_ids(
+        target_id=target_id,
+        selected_route=selected_route,
+        selected_inferences=selected_inferences,
+    )
+    return [debt for debt in debts if str(debt.get("owner_id") or "") in owner_ids]
+
+
+def _paper_audit_packet_artifacts(
+    state: Mapping[str, Any],
+    selected_artifacts: Iterable[Mapping[str, Any]],
+    *,
+    action: Optional[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep only the exact researcher dossier and immutable audit subject."""
+    action = action or {}
+    allowed_ids = set(_string_list(action.get("verifier_evidence_artifact_ids")))
+    audit_card = paper_audit_context_card(state)
+    subject_id = str(audit_card.get("audit_subject_artifact_id") or "")
+    if subject_id:
+        allowed_ids.add(subject_id)
+
+    cards = [dict(card) for card in selected_artifacts if str(card.get("artifact_id") or "") in allowed_ids]
+    present = {str(card.get("artifact_id") or "") for card in cards}
+    if subject_id and subject_id not in present:
+        subject = next(
+            (row for row in state.get("artifacts", []) if str(row.get("artifact_id") or "") == subject_id),
+            None,
+        )
+        if subject is not None and not artifact_is_raw_log(subject):
+            current_revision = int(state.get("problem_state", {}).get("current_revision") or 0)
+            cards.append(
+                {
+                    "artifact_id": subject["artifact_id"],
+                    "artifact_type": subject["artifact_type"],
+                    "producer_role": subject["producer_role"],
+                    "state_revision": subject["state_revision"],
+                    "memory_status": artifact_memory_status(subject, current_revision=current_revision),
+                    "content_summary": _compact_text(subject["content_summary"], 700),
+                    "sha256": subject["sha256"],
+                    "path": subject["path"],
+                }
+            )
+    return cards
+
+
+def _apply_paper_audit_strict_packet_isolation(manifest: Dict[str, Any]) -> None:
+    """Remove sibling audit evidence from a strict local verification lens."""
+    action = manifest.get("workflow_action")
+    action = action if isinstance(action, Mapping) else {}
+    exact_evidence_ids = set(_string_list(action.get("verifier_evidence_artifact_ids")))
+    paper_audit = manifest.get("paper_audit")
+    paper_audit = paper_audit if isinstance(paper_audit, Mapping) else {}
+    subject_id = str(paper_audit.get("audit_subject_artifact_id") or "")
+    allowed_manifest_ids = set(exact_evidence_ids)
+    if subject_id:
+        allowed_manifest_ids.add(subject_id)
+
+    artifacts = manifest.get("artifacts")
+    if isinstance(artifacts, list):
+        manifest["artifacts"] = [
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, Mapping)
+            and str(artifact.get("artifact_id") or "") in allowed_manifest_ids
+        ]
+
+    relevant_claim_ids = {str(manifest.get("target_id") or "")}
+    routes = manifest.get("routes")
+    if isinstance(routes, list):
+        for route in routes:
+            if isinstance(route, Mapping):
+                relevant_claim_ids.add(str(route.get("conclusion_claim_id") or ""))
+    for inference in manifest.get("inferences", []):
+        if not isinstance(inference, Mapping):
+            continue
+        relevant_claim_ids.add(str(inference.get("conclusion_claim_id") or ""))
+        relevant_claim_ids.update(_string_list(inference.get("premise_claim_ids")))
+        relevant_claim_ids.update(_string_list(inference.get("condition_claim_ids")))
+    relevant_claim_ids.discard("")
+    claims = manifest.get("claims")
+    if isinstance(claims, list):
+        manifest["claims"] = [
+            claim
+            for claim in claims
+            if isinstance(claim, Mapping) and str(claim.get("claim_id") or "") in relevant_claim_ids
+        ]
+
+    relevant_owner_ids = set(relevant_claim_ids)
+    relevant_owner_ids.add(str(manifest.get("route_id") or ""))
+    for inference in manifest.get("inferences", []):
+        if not isinstance(inference, Mapping):
+            continue
+        relevant_owner_ids.add(str(inference.get("inference_id") or ""))
+    relevant_owner_ids.discard("")
+
+    debts = manifest.get("debts")
+    if isinstance(debts, list):
+        manifest["debts"] = [
+            debt
+            for debt in debts
+            if isinstance(debt, Mapping) and str(debt.get("owner_id") or "") in relevant_owner_ids
+        ]
+
+    packet = manifest.get("verification_packet")
+    if isinstance(packet, dict):
+        packet["active_debts"] = [
+            debt
+            for debt in packet.get("active_debts", [])
+            if isinstance(debt, Mapping) and str(debt.get("owner_id") or "") in relevant_owner_ids
+        ]
+        packet["proof_artifacts"] = [
+            artifact
+            for artifact in packet.get("proof_artifacts", [])
+            if isinstance(artifact, Mapping)
+            and str(artifact.get("artifact_id") or "") in exact_evidence_ids
+        ]
+
+    parallel_exchange = manifest.get("parallel_exchange")
+    if isinstance(parallel_exchange, dict):
+        parallel_exchange["recent_signals"] = [
+            signal
+            for signal in parallel_exchange.get("recent_signals", [])
+            if isinstance(signal, Mapping) and str(signal.get("target_id") or "") in relevant_claim_ids
+        ]
+
+    proof_spine = manifest.get("proof_spine")
+    if isinstance(proof_spine, dict):
+        proof_spine["current_bottlenecks"] = [
+            debt
+            for debt in proof_spine.get("current_bottlenecks", [])
+            if isinstance(debt, Mapping) and str(debt.get("owner_id") or "") in relevant_owner_ids
+        ]
+
+    graph_focus = manifest.get("graph_focus")
+    if isinstance(graph_focus, dict):
+        graph_focus["frontier_claim_ids"] = [
+            claim_id for claim_id in graph_focus.get("frontier_claim_ids", []) if str(claim_id) in relevant_claim_ids
+        ]
+        pressure = graph_focus.get("frontier_pressure")
+        if isinstance(pressure, dict):
+            pressure["sample_claim_ids"] = [
+                claim_id for claim_id in pressure.get("sample_claim_ids", []) if str(claim_id) in relevant_claim_ids
+            ]
+
+    manifest["retrieval_cards"] = []
+    manifest["theorem_library"] = []
+    manifest.pop("negative_result_ledger", None)
+    policy = manifest.get("local_search_policy")
+    if isinstance(policy, dict):
+        allowed_paths = [
+            str(artifact.get("path") or "")
+            for artifact in manifest.get("artifacts", [])
+            if isinstance(artifact, Mapping) and str(artifact.get("path") or "")
+        ]
+        subject_path = str(paper_audit.get("audit_subject_path") or "")
+        if subject_path and subject_path not in allowed_paths:
+            allowed_paths.append(subject_path)
+        policy["allowed_local_evidence_paths"] = allowed_paths
+    manifest["instructions"].append(
+        "Paper-audit strict-packet isolation is active: only the immutable audit_subject and the exact "
+        "workflow_action.verifier_evidence_artifact_ids are readable evidence; sibling findings, proposed repairs, "
+        "retrieval cards, theorem-library entries, and unrelated debts are excluded from this adjudication."
+    )
+
+
+def _apply_paper_audit_verification_only_isolation(manifest: Dict[str, Any]) -> None:
+    """Expose only the immutable submission and prior verifier-stage reports."""
+    action = manifest.get("workflow_action")
+    action = action if isinstance(action, Mapping) else {}
+    allowed_ids = set(_string_list(action.get("paper_audit_source_artifact_ids")))
+    paper_audit = manifest.get("paper_audit")
+    paper_audit = paper_audit if isinstance(paper_audit, Mapping) else {}
+    subject_id = str(paper_audit.get("audit_subject_artifact_id") or "")
+    if subject_id:
+        allowed_ids.add(subject_id)
+
+    manifest["artifacts"] = [
+        artifact
+        for artifact in manifest.get("artifacts", [])
+        if isinstance(artifact, Mapping)
+        and str(artifact.get("artifact_id") or "") in allowed_ids
+    ]
+    manifest["claims"] = [
+        claim
+        for claim in manifest.get("claims", [])
+        if isinstance(claim, Mapping) and str(claim.get("claim_id") or "") == "root"
+    ]
+    manifest["routes"] = []
+    manifest["inferences"] = []
+    manifest["debts"] = []
+    manifest["retrieval_cards"] = []
+    manifest["theorem_library"] = []
+    manifest.pop("negative_result_ledger", None)
+    manifest.pop("researcher_packet", None)
+    manifest.pop("verification_packet", None)
+    manifest.pop("branch_summaries", None)
+
+    parallel_exchange = manifest.get("parallel_exchange")
+    if isinstance(parallel_exchange, dict):
+        parallel_exchange["recent_signals"] = []
+
+    policy = manifest.get("local_search_policy")
+    if isinstance(policy, dict):
+        policy["allowed_local_evidence_paths"] = [
+            str(artifact.get("path") or "")
+            for artifact in manifest["artifacts"]
+            if str(artifact.get("path") or "")
+        ]
+    manifest["instructions"].append(
+        "Verifier-only paper-audit isolation is active: the audit_subject and the exact prior-stage reports "
+        "listed in workflow_action.paper_audit_source_artifact_ids are the complete evidence boundary. Do not "
+        "read or use researcher, villain, advisor, literature, proposed-repair, prior-run, errata, or correction "
+        "material. Produce only the report artifact required by workflow_action."
+    )
 
 
 def _select_artifacts(
@@ -1971,6 +2442,7 @@ def _researcher_packet(
         "selected_route": dict(selected_route) if selected_route else {},
         "current_inferences": [dict(row) for row in selected_inferences],
         "active_debts": [dict(row) for row in selected_debts],
+        "protected_debt_ids": sorted(_branch_packet_debt_ids(action)),
         "proof_dossier_artifacts": proof_dossier_artifacts,
         "source_adaptation_artifacts": [
             _artifact_reference_card(row)
@@ -2958,6 +3430,8 @@ def _workflow_action_card(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]
         "counterexample_search_required",
         "counterexample_validation_required",
         "candidate_counterexample_artifact_id",
+        "confirmed_counterexample_artifact_id",
+        "counterexample_status_reconciliation_required",
         "validation_evidence_artifact_ids",
         "validation_acceptance_criteria",
         "advisor_requested_validation",
@@ -3008,6 +3482,13 @@ def _workflow_action_card(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]
         "verifier_evidence_state_revision",
         "strict_verifier_no_fresh_evidence",
         "strict_verifier_no_cas",
+        "paper_audit_verification_only",
+        "paper_audit_document_review_required",
+        "paper_audit_document_integration_required",
+        "paper_audit_referee_report_required",
+        "paper_audit_source_artifact_ids",
+        "strict_report_artifact_id",
+        "integration_report_artifact_id",
         "parallel_wave_summary",
         "no_result_search_synthesis_required",
         "no_result_search_cluster",
@@ -3538,6 +4019,7 @@ def _default_operation_names(context_role: str) -> list[str]:
         "integration_verifier": ["attach_artifact", "propose_status_transition", "add_debt"],
         "strict_verifier": ["attach_artifact", "propose_status_transition", "add_debt"],
         "citation_verifier": ["certify_external_citation", "attach_artifact", "add_debt"],
+        "counterexample_validator": ["attach_artifact", "propose_status_transition", "add_debt"],
         "literature_researcher": ["cache_retrieval_card", "attach_artifact", "add_debt"],
         "phd_advisor": ["attach_artifact", "add_debt", "update_debt"],
         "writer": ["attach_artifact"],
@@ -3581,14 +4063,37 @@ def _trim_packet_contents(packet: Dict[str, Any]) -> bool:
             packet.pop(verbose_key, None)
             return True
     active_debts = packet.get("active_debts")
+    protected_debt_ids = set(_string_list(packet.get("protected_debt_ids")))
     if isinstance(active_debts, list) and len(active_debts) > 8:
-        packet["active_debts"] = active_debts[:8]
+        protected = [row for row in active_debts if str(row.get("debt_id") or "") in protected_debt_ids]
+        unprotected = [row for row in active_debts if str(row.get("debt_id") or "") not in protected_debt_ids]
+        packet["active_debts"] = [*protected, *unprotected][:8]
         packet["active_debts_trimmed"] = True
         return True
     if isinstance(active_debts, list) and active_debts:
-        active_debts.pop()
-        packet["active_debts_trimmed"] = True
-        return True
+        for index in range(len(active_debts) - 1, -1, -1):
+            row = active_debts[index]
+            if str(row.get("debt_id") or "") in protected_debt_ids:
+                continue
+            active_debts.pop(index)
+            packet["active_debts_trimmed"] = True
+            return True
+        for index, row in enumerate(active_debts):
+            if not isinstance(row, Mapping) or row.get("compact"):
+                continue
+            active_debts[index] = {
+                "compact": True,
+                "debt_id": str(row.get("debt_id") or ""),
+                "owner_type": str(row.get("owner_type") or ""),
+                "owner_id": str(row.get("owner_id") or ""),
+                "debt_type": str(row.get("debt_type") or ""),
+                "severity": str(row.get("severity") or ""),
+                "status": str(row.get("status") or ""),
+                "obligation": _compact_text(str(row.get("obligation") or ""), 500),
+                "suggested_next_target": str(row.get("suggested_next_target") or ""),
+            }
+            packet["active_debts_trimmed"] = True
+            return True
     for key in ("proof_artifacts", "proof_dossier_artifacts", "source_adaptation_artifacts", "decomposition_artifacts", "cas_experiment_artifacts"):
         rows = packet.get(key)
         if not isinstance(rows, list) or not rows:

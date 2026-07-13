@@ -713,6 +713,13 @@ def _deep_session_context(state: Mapping[str, Any], action: Mapping[str, Any]) -
                 "next_decisive_step",
                 "state_patch_operations",
             ],
+            "field_rules": {
+                "candidate_lemmas": "nonempty list; include at least one exact local lemma, hypothesis, or falsifiable subclaim from this session",
+                "failed_approaches": "nonempty list",
+                "new_obstructions": "nonempty list",
+                "source_adaptations": "list; may be empty in an offline session",
+                "state_patch_operations": "nonempty list",
+            },
         },
         "verification_authority": False,
         "unrelated_result_directories_forbidden": True,

@@ -272,7 +272,6 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
                 _bridge_metadata(selected, runner_up),
             )
             self.assertTrue(accepted.accepted, accepted.errors)
-
     def test_duplicate_active_bridge_must_be_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(tmpdir, "strategy-bridge-duplicate")
@@ -503,6 +502,51 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
             self.assertTrue(second.accepted, second.errors)
             latest = latest_active_advisor_synthesis(store.get_state())
             self.assertEqual(latest["artifact_id"], "synthesis-2")
+
+    def test_old_latest_synthesis_stays_in_scheduler_snapshot_and_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-synthesis-sticky-snapshot")
+            first = self._attach(
+                store,
+                "phd_advisor",
+                "synthesis-old-but-latest",
+                "advisor_synthesis",
+                _advisor_synthesis_metadata(base_revision=0),
+            )
+            self.assertTrue(first.accepted, first.errors)
+            for index in range(50):
+                outcome = self._attach(
+                    store,
+                    "researcher",
+                    f"newer-notebook-{index}",
+                    "research_notebook",
+                    {"target_id": "root", "index": index},
+                )
+                self.assertTrue(outcome.accepted, outcome.errors)
+
+            state = store.get_scheduler_state()
+            artifact_ids = {
+                str(row.get("artifact_id") or "")
+                for row in state["research_artifacts"]
+            }
+            trigger = advisor_synthesis_trigger(state)
+            action = {
+                "mode": "triage_routes",
+                "target_id": "root",
+                "advisor_global_synthesis_required": True,
+                "synthesis_trigger": trigger,
+            }
+            manifest = build_context_manifest(store, action=action)
+
+        self.assertIn("synthesis-old-but-latest", artifact_ids)
+        self.assertEqual(
+            trigger["latest_synthesis_artifact_id"],
+            "synthesis-old-but-latest",
+        )
+        self.assertEqual(
+            manifest["advisor_synthesis_contract"]["metadata_shape"]["supersedes_synthesis_id"],
+            "synthesis-old-but-latest",
+        )
 
     def test_invention_requires_full_advisor_authorization_and_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -746,6 +790,10 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         self.assertEqual(deep["deep_session"]["required_deliverable"]["strategy_schema_version"], 1)
         self.assertIn("strategy_schema_version", deep["deep_session"]["required_deliverable"]["fields"])
         self.assertIn("state_patch_operations", deep["deep_session"]["required_deliverable"]["fields"])
+        self.assertIn(
+            "nonempty list",
+            deep["deep_session"]["required_deliverable"]["field_rules"]["candidate_lemmas"],
+        )
         routine = enrich_action(
             state,
             {

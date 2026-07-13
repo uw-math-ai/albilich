@@ -1053,10 +1053,19 @@ def _near_integrated_claim_restatement(
     if len(shared) < 12:
         return False
     novel_tokens = new_tokens - existing_tokens - CLAIM_RESTATEMENT_NOVELTY_STOPWORDS
-    if len(novel_tokens) >= 4:
-        return False
     new_coverage = len(shared) / max(1, len(new_tokens))
+    existing_coverage = len(shared) / max(1, len(existing_tokens))
     size_ratio = len(existing_tokens) / max(1, len(new_tokens))
+    # Short closing qualifications such as "in the proper ... branch" can add a
+    # handful of surface tokens without changing the theorem.  Permit that only
+    # when the two signatures otherwise have strong bidirectional overlap; this
+    # keeps genuinely strengthened statements out of the duplicate guard.
+    if len(novel_tokens) >= 4 and not (
+        len(novel_tokens) <= 5
+        and new_coverage >= 0.75
+        and existing_coverage >= 0.75
+    ):
+        return False
     return new_coverage >= 0.62 and size_ratio <= 2.75
 
 

@@ -127,7 +127,12 @@ def actor_role_for_action(action: Mapping[str, Any]) -> str:
         return "writer"
     if mode == "review_writing":
         return "writing_critic"
-    if mode == "prove" and (route_id or action.get("citation_certification_required") or action.get("citation_triage_required")):
+    if mode == "prove" and (
+        route_id
+        or action.get("citation_certification_required")
+        or action.get("citation_triage_required")
+        or action.get("paper_audit_document_review_required")
+    ):
         return "strict_informal_verifier"
     if mode in {"reduce", "weaken", "strengthen"} and action.get("debt_id"):
         if route_id or action.get("proof_repair_required") or action.get("research_diagnostic_required"):
@@ -563,14 +568,67 @@ def _paper_audit_guidance(actor_role: str, action: Mapping[str, Any]) -> str:
             "matching definitions. A citation that cannot be located exactly, or whose hypotheses do not "
             "match, marks the dependent paper claim citation_needed (or overclaim). "
         )
-    if actor_role in {"strict_informal_verifier", "integration_verifier", "counterexample_validator"}:
+    if actor_role == "strict_informal_verifier":
+        if action.get("paper_audit_document_review_required"):
+            return common + (
+                "VERIFIER-ONLY DOCUMENT REVIEW: the immutable audit_subject is already the researcher's submitted "
+                "output. Read it directly and review the entire paper as written; do not request proof_dossier "
+                "packaging, do not ask a researcher to repair a step, and do not invent an alternative proof. "
+                "Attach exactly one verification_report and no status transitions or debts. Its content must give "
+                "a source-located claim/lemma/theorem map, a local correctness verdict for every substantive proof "
+                "step, and explicit critical errors or gaps. Metadata must set paper_audit_document_review=true, "
+                "audit_subject_artifact_id to the manifest's audit subject id, verdict to one of verified | "
+                "major_gaps | likely_false | not_verified, and verification_report with summary, checked_items, "
+                "critical_errors, gaps, and blocking_gap. Do not use errata, correction notices, external "
+                "paper-specific correction material, sibling run artifacts, or proposed repairs. "
+            )
         return common + (
-            "As the audit verifier, work in small bounded packets: one paper claim or one proof segment at a "
-            "time. Verify the local implication from the claim's stated premises exactly as the author wrote "
-            "it; mark the claim checked only on a complete local check, needs_detail/gap otherwise, with the "
-            "precise missing step recorded as a debt at the exact source location. "
+            "As the audit strict verifier, treat manifest.verification_packet as the authoritative author-proof "
+            "packet. Verify one paper claim at a time from the proof_dossier attached by the researcher, checking "
+            "the exact statement, hypotheses, author-written proof, terminal inference, and cited dependencies. "
+            "Never use proposed_repair artifacts as evidence that the submitted proof is correct. Mark the claim "
+            "and terminal inference informally_verified only after a zero-gap local check; otherwise attach a "
+            "verification_report and record the precise gap at the paper source location. "
+        )
+    if actor_role == "integration_verifier":
+        if action.get("paper_audit_document_integration_required"):
+            return common + (
+                "VERIFIER-ONLY DEPENDENCY REVIEW: read only the immutable audit_subject and the strict verification "
+                "report named by workflow_action.strict_report_artifact_id. Independently check whether the local "
+                "claims reviewed there assemble into the paper's stated conclusions: hypotheses must propagate, "
+                "citations must be used only as stated in the submission, cases must be exhaustive, and no circular "
+                "or missing dependency may be hidden. Attach exactly one integration_report and no lifecycle "
+                "transition or debt. Metadata must set paper_audit_document_integration=true, "
+                "strict_report_artifact_id to the supplied id, integrates to the actual Boolean result, outcome to "
+                "integrates | does_not_integrate, and missing to a concrete list. Do not repair or rewrite any "
+                "argument and do not use errata or external paper-specific correction material. "
+            )
+        return common + (
+            "As the audit integration verifier, run only after strict local verification. Check the complete "
+            "paper dependency route: every terminal inference must be strictly verified, every cited premise "
+            "claim must be verified, and the assembled conclusion must be exactly the paper claim being audited. "
+            "Attach an integration_report with integrates=true only when the dependency graph closes. Otherwise "
+            "attach integrates=false with the exact missing, circular, mismatched, or unverified dependency and "
+            "leave the paper claim unintegrated. Integration never repairs or rewrites the author's proof. "
+        )
+    if actor_role == "counterexample_validator":
+        return common + (
+            "As the audit counterexample validator, independently test the exact paper claim and its hypotheses. "
+            "A confirmed counterexample refutes the submitted claim; any corrected scope remains a separate "
+            "proposed repair. "
         )
     if actor_role == "writer":
+        if action.get("paper_audit_referee_report_required"):
+            return common + (
+                "VERIFIER-ONLY FINAL REPORT: use only the immutable audit_subject, the strict verification report, "
+                "and the integration report named in workflow_action. Do not repair the argument, propose a new "
+                "proof, or include old researcher/advisor material. Attach exactly one referee_report with metadata "
+                "paper_audit_referee_report=true, strict_report_artifact_id, integration_report_artifact_id, and "
+                "source_artifact_ids. The report must state the overall verdict first, then give a source-located "
+                "claim map, local verification findings, dependency/integration findings, fatal errors, lesser "
+                "issues, and a concise recommendation. Include no proposed-repair section. "
+                f"Begin with the literal warning line: {AUDIT_WARNING_LINE} "
+            )
         return common + (
             "As the audit writer, the deliverable is a REFEREE-STYLE AUDIT REPORT, not a polished proof and "
             "not a research paper. Attach one referee_report artifact whose content contains: (1) a claim map "
@@ -580,8 +638,26 @@ def _paper_audit_guidance(actor_role: str, action: Mapping[str, Any]) -> str:
             "report; (5) a local correctness report of genuinely checked steps; (6) optional proposed repairs "
             "in a clearly separated section labeled as proposals; and (7) a conservative confidence summary: "
             "exactly one of appears_correct_modulo_minor_details | major_gaps | not_verified | likely_false. "
+            "For every paper claim, show both the strict-verifier validation status and the integration-verifier "
+            "lifecycle/dependency status; researcher or referee labels alone are not verification. "
             f"Begin the report with the literal warning line: {AUDIT_WARNING_LINE} "
             "Do not write a final_proof or final_paper in this mode. "
+        )
+    if actor_role == "researcher":
+        return common + (
+            "Treat the submitted statements and proofs as researcher proof outputs that must pass the ordinary "
+            "verification pipeline. For each theorem, lemma, or decisive proof segment you extract, do all four "
+            "operations in one patch: (1) attach one proof_dossier containing the author statement and author "
+            "proof as written, with metadata paper_audit_packet=true, audit_subject_artifact_id, claim_id, "
+            "route_id, and source_location; (2) add the paper_claim; (3) add one active sufficient route concluding "
+            "that claim; and (4) add a terminal plausible inference whose evidence_artifact_ids contains that exact "
+            "proof_dossier. Put cited paper claims and explicit hypothesis/definition claims in premise_claim_ids "
+            "so the integration verifier can check the dependency graph; a terminal inference must never have an "
+            "empty premise list, so even an otherwise direct theorem records its declared ambient hypotheses as "
+            "paper premise claims. Do not put proposed repairs, newly invented arguments, or referee reconstruction "
+            "inside the proof_dossier; those belong only in separate proposed_repair artifacts. Once a packet is "
+            "verifier-ready, stop researching that segment and let the strict verifier and integration verifier "
+            "adjudicate it. "
         )
     return common + (
         "Work only on auditing the submitted document: decompose it, check local steps, sharpen audit "
@@ -602,6 +678,13 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
     if actor_role == "writing_critic":
         return _writing_critic_guidance(action)
     if actor_role == "strict_informal_verifier":
+        if action.get("paper_audit_document_review_required"):
+            return (
+                "Treat manifest.artifacts[artifact_type=audit_subject] as the complete submitted researcher output. "
+                "Read the full file, audit it claim by claim, and return exactly one verification_report artifact. "
+                "Do not add claims, routes, inferences, debts, or status transitions, and do not search for or suggest "
+                "repairs."
+            )
         route_text = f"route {route_id}" if route_id else "the selected route"
         citation_guidance = ""
         if mode == "prove" and not route_id:
@@ -652,6 +735,13 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             + citation_guidance
         )
     if actor_role == "integration_verifier":
+        if action.get("paper_audit_document_integration_required"):
+            return (
+                "Treat the audit_subject and the named strict verification_report as the complete evidence packet. "
+                "Check global dependency closure and statement alignment across the submitted paper, then attach "
+                "exactly one integration_report. Do not propose lifecycle transitions, debts, repairs, or new proof "
+                "material."
+            )
         return (
             "Check that the selected sufficient route has verified inferences, verified premises, a verified conclusion claim, "
             "and no unresolved active blocking debt. For root integration, also perform statement alignment: the proved statement must be "
@@ -683,6 +773,13 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "or produced by this session. Otherwise add a formalization debt or handoff artifact; do not pretend informal reasoning is formal."
         )
     if actor_role == "counterexample_validator":
+        if action.get("counterexample_status_reconciliation_required"):
+            return (
+                "The candidate was already independently confirmed, but its claim status was not recorded. Reuse "
+                "workflow_action.confirmed_counterexample_artifact_id as the evidence for one validation_status=refuted "
+                "transition on the target claim. Do not attach a duplicate confirmed_counterexample and do not leave the "
+                "claim challenged."
+            )
         if action.get("root_is_interrogative_problem"):
             return (
                 "Validate the candidate independently. The root is an interrogative problem, not a declarative theorem, so a checked "
@@ -690,9 +787,19 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
                 "naming the exact narrower hypothesis it falsifies, but do not propose refuted for root; keep the root active."
             )
         return (
-            "Validate candidate counterexamples independently. Only attach confirmed_counterexample and propose refuted if the counterexample is fully checked."
+            "Validate candidate counterexamples independently. If the counterexample is fully checked, attach one "
+            "confirmed_counterexample and propose validation_status=refuted for the falsified claim in the same patch, "
+            "using that exact artifact as evidence; do not leave a confirmed falsification merely challenged. If validation "
+            "is incomplete, attach no confirmed_counterexample and add one precise blocking validation debt instead."
         )
     if actor_role == "writer":
+        if action.get("paper_audit_referee_report_required"):
+            return (
+                "Read the three manifest-listed source artifacts (audit_subject, strict verification_report, and "
+                "integration_report) and attach exactly one referee_report. Do not attach final_proof, final_paper, "
+                "partial_proof_report, stop_summary_report, writer_report, debts, or status transitions. Preserve "
+                "the verifiers' verdicts and source locations; do not repair the submitted argument."
+            )
         if action.get("paper_authoring"):
             return _writer_paper_authoring_guidance(action)
         return (
@@ -1017,7 +1124,8 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "blocking add_debt so the next workbench targets the narrowed obligation instead of repeating this pass. "
             "If workflow_action.bidirectional_bridge_search_required=true, do not improvise an unlimited lemma list. Build the verified forward "
             "frontier and backward root obligations from manifest.workflow_action.bridge_search_context, propose at most three exact bridge statements, "
-            "temporarily assume each one, list every hidden obligation, reject restatements/duplicates/gap-moving statements, and attach one "
+            "temporarily assume each one, list every hidden obligation, and give every candidate a nonempty forward_support list naming the "
+            "concrete current claim or inference that motivates it; never emit forward_support=[]. Reject restatements/duplicates/gap-moving statements, and attach one "
             "bridge_lemma_search artifact (strategy_schema_version=1) selecting at most two candidates by root leverage and sufficiency. "
             "If workflow_action.experiment_workflow_required=true or workflow_action.researcher_work_mode='cas', use the precise obstruction -> "
             "discriminating experiment -> structured observations -> candidate pattern -> counterexample search -> sharpened conjecture -> proof-attempt "
@@ -1032,7 +1140,9 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "If workflow_action.definition_invention_required=true, use only the named live authorization and its strict candidate/pass/token caps. "
             "Reject a merely renamed, unevaluable, proof-irrelevant, or theorem-equivalent object; only an adopted candidate with an exact root-relevant "
             "bridge theorem may enter proof search. If workflow_action.deep_session_required=true, stay on the one root-critical branch for a coherent "
-            "session and attach deep_session_report with every required deliverable field; ordinary patch and verifier gates still apply. "
+            "session and attach deep_session_report with every required deliverable field. In particular, metadata.candidate_lemmas must be a nonempty "
+            "list containing at least one exact local lemma, hypothesis, or falsifiable subclaim from the session; never emit candidate_lemmas=[]. "
+            "Ordinary patch and verifier gates still apply. "
             "If workflow_action.closure_pressure_required=true, do not request another "
             "broad search; prove the bridge, refute it, or make a strictly narrower theorem/case split. Consult manifest.negative_result_ledger "
             "before reusing an old idea. Use manifest.proof_architecture_templates only when a template matches the domain. "
@@ -1439,6 +1549,8 @@ def _model_routing_hint(action: Mapping[str, Any], actor_role: str) -> Dict[str,
 
 def _context_char_budget_for_action(max_context_chars: int, action: Mapping[str, Any], actor_role: str) -> int:
     mode = str(action.get("mode") or "")
+    if action.get("paper_audit_verification_only"):
+        return max(max_context_chars, 60_000)
     if actor_role == "strict_informal_verifier" and (action.get("route_id") or action.get("proof_repair_verification_required")):
         return max(max_context_chars, 60_000)
     if actor_role == "researcher" and action.get("creative_proof_attack_required"):

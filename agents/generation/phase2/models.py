@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 SCHEMA_VERSION = 1
 
-CLAIM_KINDS = {"theorem", "lemma", "definition", "obstruction", "counterexample", "reference"}
+CLAIM_KINDS = {"theorem", "lemma", "definition", "hypothesis", "obstruction", "counterexample", "reference"}
 VALIDATION_STATUSES = {
     "untested",
     "plausible",

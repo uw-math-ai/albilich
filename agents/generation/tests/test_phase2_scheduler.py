@@ -18,7 +18,7 @@ from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.patches import apply_patch
 from agents.generation.phase2.receipt import build_partial_receipt_inventory, format_partial_receipt_appendix
 from agents.generation.phase2.research_policy import DEFAULT_RESEARCH_MODE, normalize_research_mode, theorem_matching_confidence
-from agents.generation.phase2.scheduler import _active_main_trunk_pressure, _active_route_for_claim, _advisor_followup_report, _advisor_requested_validation_action, _advisor_requested_villain_action, _bottleneck_lock_action, _bottleneck_lock_debt_candidates, _claim_target_for_debt, _cooldown_proof_action, _executive_advisor_bottleneck_action, _first_blocking_debt, _frontier_pressure_action, _is_exact_citation_debt, _near_solution_spine_synthesis_action, _next_unverified_claim, _proof_architecture_pressure_action, _recursive_meta_drift, _root_refinement_signals, _route_without_inference, _unrouted_proof_candidate, bottleneck_frontier_summary, next_action, parallel_companion_actions, proof_spine_summary, route_verifier_readiness, verifier_ready_route_summaries
+from agents.generation.phase2.scheduler import _active_main_trunk_pressure, _active_route_for_claim, _advisor_followup_report, _advisor_requested_validation_action, _advisor_requested_villain_action, _bottleneck_lock_action, _bottleneck_lock_debt_candidates, _branch_packet_card, _claim_target_for_debt, _cooldown_proof_action, _executive_advisor_bottleneck_action, _first_blocking_debt, _frontier_pressure_action, _is_exact_citation_debt, _near_solution_spine_synthesis_action, _next_unverified_claim, _proof_architecture_pressure_action, _recursive_meta_drift, _root_refinement_signals, _route_without_inference, _unrouted_proof_candidate, _unrouted_proof_claim_action, bottleneck_frontier_summary, next_action, parallel_companion_actions, proof_spine_summary, route_verifier_readiness, verifier_ready_route_summaries
 from agents.generation.phase2.store import ProofStateStore
 from agents.generation.phase2.workflow import _evidence_boundary_errors, _stop_writer_action, _stop_writer_safety_blocker
 
@@ -2185,7 +2185,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
 
             action = next_action(store, research_mode="balanced", web_search="disabled")
 
-            manifest = build_context_manifest(store, action=action)
+            manifest = build_context_manifest(store, action=action, max_chars=40_000)
 
         self.assertEqual(action["mode"], "validate_counterexample")
         self.assertEqual(action["target_id"], "root")
@@ -2194,6 +2194,14 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(action["candidate_counterexample_artifact_id"], "villain-concrete-counterexample")
         self.assertEqual(actor_role_for_action(action), "counterexample_validator")
         self.assertTrue(manifest["workflow_action"]["counterexample_validation_required"])
+        self.assertEqual("counterexample_validator", manifest["role_context_policy"]["context_role"])
+        operation_templates = manifest["patch_contract"]["operation_templates"]
+        self.assertTrue(
+            any(
+                template["op"] == "propose_status_transition" and "new_status=refuted" in template["fields"]
+                for template in operation_templates
+            )
+        )
         self.assertEqual(
             manifest["workflow_action"]["candidate_counterexample_artifact_id"],
             "villain-concrete-counterexample",
@@ -2285,6 +2293,57 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertFalse(action["allow_root_refutation"])
         self.assertIn("keep the root question active", action["reason"])
         self.assertNotIn("propose refuted", action["reason"])
+
+    def test_confirmed_counterexample_without_refuted_status_schedules_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore(
+                "scheduler-counterexample-reconciliation-test",
+                generation_root=Path(tmpdir) / "generation",
+            )
+            store.init_problem("Every finite widget is blue.")
+            outcome = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "counterexample_validator",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "confirmed-red-widget",
+                            "artifact_type": "confirmed_counterexample",
+                            "content": "A checked finite red widget falsifies the root.",
+                            "metadata": {
+                                "target_claim_id": "root",
+                                "validation_result": "confirmed",
+                                "confirmed": True,
+                            },
+                        }
+                    ],
+                    "rationale": "simulate a confirmation whose status transition was omitted",
+                },
+            )
+            self.assertTrue(outcome.accepted, outcome.errors)
+
+            action = next_action(store, research_mode="balanced", web_search="disabled")
+            manifest = build_context_manifest(store, action=action, max_chars=12_000)
+
+        self.assertEqual("validate_counterexample", action["mode"])
+        self.assertEqual("counterexample_status_reconciliation", action["search_intent"])
+        self.assertTrue(action["counterexample_status_reconciliation_required"])
+        self.assertEqual("confirmed-red-widget", action["confirmed_counterexample_artifact_id"])
+        self.assertEqual(["confirmed-red-widget"], action["validation_evidence_artifact_ids"])
+        self.assertTrue(manifest["workflow_action"]["counterexample_status_reconciliation_required"])
+        self.assertIn(
+            "propose_status_transition",
+            manifest["patch_contract"].get("allowed_operation_names", []),
+        )
+        self.assertIn(
+            "confirmed-red-widget",
+            {artifact["artifact_id"] for artifact in manifest["artifacts"]},
+        )
 
     def test_failed_validation_does_not_suppress_candidate_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3038,6 +3097,108 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertIn("allowed_local_evidence_paths", prompt)
         self.assertIn("never run `find .`", prompt.lower())
         self.assertIn("Never construct artifact paths", prompt)
+
+    def test_branch_packet_debt_survives_global_debt_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("scheduler-branch-debt-priority-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("Target theorem.")
+            operations = [
+                {
+                    "op": "add_claim",
+                    "claim_id": "branch-claim",
+                    "kind": "lemma",
+                    "statement": "A branch theorem needing one exact hypothesis repair.",
+                    "parent_ids": ["root"],
+                },
+                {
+                    "op": "add_route",
+                    "route_id": "branch-route",
+                    "conclusion_claim_id": "branch-claim",
+                    "strategy": "repair the exact branch theorem",
+                },
+                {
+                    "op": "add_inference",
+                    "inference_id": "branch-inference",
+                    "route_id": "branch-route",
+                    "conclusion_claim_id": "branch-claim",
+                    "validation_status": "challenged",
+                    "explanation": "The branch proof needs an exact equivariance repair.",
+                },
+            ]
+            for index in range(13):
+                operations.append(
+                    {
+                        "op": "add_debt",
+                        "debt_id": f"root-debt-{index:02d}",
+                        "owner_type": "claim",
+                        "owner_id": "root",
+                        "debt_type": "gap",
+                        "severity": "blocking",
+                        "status": "active",
+                        "obligation": f"Unrelated root obligation {index}.",
+                    }
+                )
+            operations.append(
+                {
+                    "op": "add_debt",
+                    "debt_id": "branch-repair-debt",
+                    "owner_type": "claim",
+                    "owner_id": "branch-claim",
+                    "debt_type": "missing_hypothesis",
+                    "severity": "blocking",
+                    "status": "active",
+                    "obligation": "Add the missing nonzero-source hypothesis before retrying the branch.",
+                    "suggested_next_target": "branch-claim",
+                }
+            )
+            operations.append(
+                {
+                    "op": "add_debt",
+                    "debt_id": "branch-inference-debt",
+                    "owner_type": "inference",
+                    "owner_id": "branch-inference",
+                    "debt_type": "missing_hypothesis",
+                    "severity": "blocking",
+                    "status": "active",
+                    "obligation": "Prove the action is equivariant before using the inference.",
+                    "suggested_next_target": "branch-inference",
+                }
+            )
+            outcome = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": operations,
+                    "rationale": "seed a branch repair hidden behind many root debts",
+                },
+            )
+            self.assertTrue(outcome.accepted, outcome.errors)
+            branch_packet = _branch_packet_card(
+                store.get_scheduler_state(),
+                "branch-route",
+                "branch-claim",
+                "spine",
+            )
+            action = {
+                "mode": "reduce",
+                "target_id": "branch-claim",
+                "route_id": "branch-route",
+                "branch_focus": "branch-route",
+                "parallel_companion": True,
+                "branch_packet": branch_packet,
+            }
+            manifest = build_context_manifest(store, action=action, max_chars=12_000)
+
+        packet_debt_ids = [row["debt_id"] for row in manifest["researcher_packet"]["active_debts"]]
+        self.assertIn("branch-repair-debt", packet_debt_ids)
+        self.assertIn("branch-inference-debt", packet_debt_ids)
+        self.assertIn("branch-repair-debt", manifest["researcher_packet"]["protected_debt_ids"])
+        self.assertIn("branch-inference-debt", manifest["researcher_packet"]["protected_debt_ids"])
+        self.assertIn("branch-inference", branch_packet["inference_ids"])
 
     def test_evidence_boundary_rejects_unlisted_download_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7138,6 +7299,37 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             "closed-psl2-branch",
         )
 
+    def test_integrated_claim_closing_qualification_is_duplicate(self) -> None:
+        existing = [
+            {
+                "claim_id": "proper-two-anchor",
+                "statement": (
+                    "Let G be a finite group, let A be normal in G, let M<G, let D be normal in M, and put K=AD. "
+                    "Let C<=M and let X be normal in G, with C<=X, G=MX, and X/C a nonzero irreducible M-module. "
+                    "Assume K is M-normal and N_G(K)=M. If x is in X and m is in M, writing y=x^m, and if "
+                    "xC!=yC and [d,y][d,x]^(-1) lies in A for every d in D, then K^x=K^y and N_G(K)=G, "
+                    "contradicting N_G(K)=M. Thus no such x,m occur."
+                ),
+                "fingerprint": "",
+                "validation_status": "informally_verified",
+                "lifecycle_status": "integrated",
+            }
+        ]
+
+        self.assertEqual(
+            obvious_duplicate_claim_id(
+                existing,
+                statement=(
+                    "Let G be a finite group, let A be normal in G, let M<G, let D be normal in M, and put K=AD. "
+                    "Let C<=M and X be normal in G, with C<=X, G=MX, and X/C a nonzero irreducible M-module. "
+                    "Assume K is M-normal and N_G(K)=M. If x is in X and m is in M, writing y=x^m, and if "
+                    "xC!=yC and [d,y][d,x]^(-1) lies in A for every d in D, then K^x=K^y and N_G(K)=G!=M. "
+                    "Thus no such x,m can occur in the proper restricted-normalizer branch."
+                ),
+            ),
+            "proper-two-anchor",
+        )
+
     def test_near_restatement_of_active_claim_is_not_duplicate(self) -> None:
         existing = [
             {
@@ -7594,6 +7786,211 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertTrue(action["executive_advisor_lock_required"])
         self.assertTrue(action["hard_theorem_attack_required"])
         self.assertEqual(action["budget"]["policy"], "hard_theorem_workbench")
+
+    def test_superseded_claim_is_not_reassembled_from_old_dossier(self) -> None:
+        state = {
+            "problem_state": {"remaining_token_budget": 10_000_000, "reserved_verification_budget": 0},
+            "claims": [
+                claim("root", 0, root_impact=1.0),
+                claim(
+                    "stale-wording",
+                    1,
+                    lifecycle_status="superseded",
+                    validation_status="challenged",
+                    parent_ids=["root"],
+                ),
+                claim(
+                    "refuted-wording",
+                    1,
+                    lifecycle_status="active",
+                    validation_status="refuted",
+                    parent_ids=["root"],
+                ),
+            ],
+            "routes": [route("route-stale-wording", conclusion_claim_id="stale-wording", status="superseded")],
+            "inferences": [
+                {
+                    **inference(
+                        "inf-stale-wording",
+                        route_id="route-stale-wording",
+                        conclusion_claim_id="stale-wording",
+                        validation_status="challenged",
+                    ),
+                    "evidence_artifact_ids_json": json.dumps(["old-proof-dossier"]),
+                }
+            ],
+            "debts": [],
+            "recent_runs": [],
+        }
+
+        action = _unrouted_proof_claim_action(
+            None,
+            state,
+            problem=state["problem_state"],
+            requested_tokens=None,
+            research_mode="hard_problem",
+        )
+
+        self.assertIsNone(action)
+
+    def test_executive_advisor_lock_falls_back_from_superseded_target(self) -> None:
+        state = {
+            "problem_state": {"remaining_token_budget": 10_000_000, "reserved_verification_budget": 0},
+            "claims": [
+                claim("root", 0, root_impact=1.0),
+                claim(
+                    "stale-wording",
+                    1,
+                    lifecycle_status="superseded",
+                    validation_status="challenged",
+                    parent_ids=["root"],
+                ),
+            ],
+            "routes": [route("route-stale-wording", conclusion_claim_id="stale-wording", status="superseded")],
+            "inferences": [],
+            "debts": [],
+            "research_artifacts": [
+                {
+                    "artifact_id": "advisor-stale-lock",
+                    "artifact_type": "advisor_report",
+                    "producer_role": "phd_advisor",
+                    "state_revision": 10,
+                    "created_at": "2026-01-04T00:02:00+00:00",
+                    "content_summary": "Retire the stale wording and continue the root theorem.",
+                    "metadata_json": json.dumps(
+                        {
+                            "advisor_followup_required": True,
+                            "triage_status": "decisive_root_bottleneck",
+                            "bottleneck_obligation": "Continue the root theorem after retiring stale wording.",
+                            "next_decisive_task": "Work the remaining root bottleneck.",
+                            "next_role": "researcher",
+                            "next_target_id": "stale-wording",
+                            "recommended_next_action": "Do not reactivate the superseded claim.",
+                        }
+                    ),
+                }
+            ],
+            "recent_runs": [],
+            "retrieval_cards": [],
+            "theorem_library_entries": [],
+        }
+
+        action = _executive_advisor_bottleneck_action(
+            state,
+            problem=state["problem_state"],
+            requested_tokens=None,
+            research_mode="hard_problem",
+        )
+
+        assert action is not None
+        self.assertEqual(action["target_id"], "root")
+        self.assertEqual(action["route_id"], "")
+
+    def test_executive_advisor_lock_does_not_reopen_refuted_target(self) -> None:
+        state = {
+            "problem_state": {"remaining_token_budget": 10_000_000, "reserved_verification_budget": 0},
+            "claims": [
+                claim("root", 0, root_impact=1.0),
+                claim(
+                    "refuted-paper-claim",
+                    1,
+                    lifecycle_status="active",
+                    validation_status="refuted",
+                    parent_ids=["root"],
+                ),
+            ],
+            "routes": [route("route-refuted-paper-claim", conclusion_claim_id="refuted-paper-claim")],
+            "inferences": [],
+            "debts": [
+                debt(
+                    "debt-refuted-paper-claim",
+                    owner_id="refuted-paper-claim",
+                    obligation="Old debt superseded by a confirmed counterexample.",
+                )
+            ],
+            "research_artifacts": [
+                {
+                    "artifact_id": "advisor-stale-refuted-lock",
+                    "artifact_type": "advisor_report",
+                    "producer_role": "phd_advisor",
+                    "state_revision": 10,
+                    "created_at": "2026-01-04T00:02:00+00:00",
+                    "content_summary": "Verify the paper claim before the counterexample was confirmed.",
+                    "metadata_json": json.dumps(
+                        {
+                            "advisor_followup_required": True,
+                            "triage_status": "decisive_root_bottleneck",
+                            "bottleneck_obligation": "Adjudicate the paper claim.",
+                            "next_decisive_task": "Prove the old paper route.",
+                            "next_role": "researcher",
+                            "next_target_id": "refuted-paper-claim",
+                            "obstruction_debts": ["debt-refuted-paper-claim"],
+                        }
+                    ),
+                }
+            ],
+            "recent_runs": [],
+            "retrieval_cards": [],
+            "theorem_library_entries": [],
+        }
+
+        action = _executive_advisor_bottleneck_action(
+            state,
+            problem=state["problem_state"],
+            requested_tokens=None,
+            research_mode="paper_solution_audit",
+        )
+
+        self.assertIsNone(action)
+
+    def test_blocking_debt_selector_skips_retired_graph_debts(self) -> None:
+        state = {
+            "problem_state": {"max_reduction_depth": 8},
+            "claims": [
+                claim("root", 0, root_impact=1.0),
+                claim(
+                    "stale-wording",
+                    1,
+                    lifecycle_status="superseded",
+                    validation_status="challenged",
+                    parent_ids=["root"],
+                ),
+            ],
+            "routes": [route("route-stale-wording", conclusion_claim_id="stale-wording", status="superseded")],
+            "inferences": [
+                inference(
+                    "inf-stale-wording",
+                    route_id="route-stale-wording",
+                    conclusion_claim_id="stale-wording",
+                    validation_status="challenged",
+                )
+            ],
+            "debts": [
+                debt(
+                    "stale-inference-debt",
+                    owner_type="inference",
+                    owner_id="inf-stale-wording",
+                    suggested_next_target="inf-stale-wording",
+                ),
+                debt(
+                    "refuted-claim-debt",
+                    owner_type="claim",
+                    owner_id="refuted-wording",
+                    suggested_next_target="refuted-wording",
+                ),
+                debt("live-root-debt", owner_type="claim", owner_id="root", suggested_next_target="root"),
+            ],
+            "research_artifacts": [],
+        }
+
+        selected = _first_blocking_debt(state)
+
+        assert selected is not None
+        self.assertEqual(selected["debt_id"], "live-root-debt")
+        self.assertEqual(
+            [row["debt_id"] for row in _bottleneck_lock_debt_candidates(state)],
+            ["live-root-debt"],
+        )
 
     def test_advisor_requested_candidate_validation_preempts_more_proving(self) -> None:
         state = {
@@ -8224,6 +8621,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertIn("include an update_debt for workflow_action.central_debt_id", prompt)
         self.assertIn("one new precise blocking add_debt", prompt)
         self.assertIn("narrowed obligation instead of repeating this pass", prompt)
+        self.assertIn("never emit forward_support=[]", prompt)
 
     def test_researcher_prompt_enforces_bottleneck_lock_contract(self) -> None:
         prompt = build_session_prompt(
@@ -8275,6 +8673,34 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertIn("CAS tools", prompt)
         self.assertIn("cas_experiment_report", prompt)
         self.assertIn("bounded adversarial", prompt)
+
+    def test_counterexample_validator_prompt_requires_same_patch_refutation(self) -> None:
+        prompt = build_session_prompt(
+            context_path=Path("/tmp/context.json"),
+            action={"mode": "validate_counterexample", "target_id": "claim-candidate"},
+            actor_role="counterexample_validator",
+        )
+
+        self.assertIn("confirmed_counterexample", prompt)
+        self.assertIn("validation_status=refuted", prompt)
+        self.assertIn("in the same patch", prompt)
+        self.assertIn("do not leave a confirmed falsification merely challenged", prompt)
+
+    def test_counterexample_reconciliation_prompt_reuses_confirmation(self) -> None:
+        prompt = build_session_prompt(
+            context_path=Path("/tmp/context.json"),
+            action={
+                "mode": "validate_counterexample",
+                "target_id": "claim-candidate",
+                "counterexample_status_reconciliation_required": True,
+                "confirmed_counterexample_artifact_id": "confirmed-candidate",
+            },
+            actor_role="counterexample_validator",
+        )
+
+        self.assertIn("Reuse workflow_action.confirmed_counterexample_artifact_id", prompt)
+        self.assertIn("Do not attach a duplicate", prompt)
+        self.assertIn("validation_status=refuted", prompt)
 
     def test_session_prompt_forbids_broad_process_control_and_sympy_assumption(self) -> None:
         prompt = build_session_prompt(

@@ -469,6 +469,25 @@ class ProofStateStore:
                     """
                 ).fetchall()
             ]
+            # Global synthesis is intentionally infrequent, so its latest
+            # artifact can fall outside the recent-artifact window.  Keep it
+            # in scheduler state: the next advisor must see the exact artifact
+            # id that the database lineage guard requires it to supersede.
+            latest_advisor_synthesis = conn.execute(
+                """
+                SELECT artifact_id, artifact_type, producer_role, state_revision,
+                       content_summary, metadata_json, path, created_at
+                FROM artifacts
+                WHERE artifact_type = 'advisor_synthesis'
+                ORDER BY state_revision DESC, created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if latest_advisor_synthesis and not any(
+                row["artifact_id"] == latest_advisor_synthesis["artifact_id"]
+                for row in research_artifacts
+            ):
+                research_artifacts.append(compact_dict(latest_advisor_synthesis))
             confirmed_counterexamples = [
                 compact_dict(row)
                 for row in conn.execute(
@@ -477,6 +496,20 @@ class ProofStateStore:
                            content_summary, metadata_json, path, created_at
                     FROM artifacts
                     WHERE artifact_type = 'confirmed_counterexample'
+                    ORDER BY state_revision DESC, created_at DESC
+                    """
+                ).fetchall()
+            ]
+            audit_artifacts = [
+                compact_dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT artifact_id, artifact_type, producer_role, state_revision,
+                           content_summary, metadata_json, path, created_at
+                    FROM artifacts
+                    WHERE artifact_type IN (
+                        'audit_subject', 'verification_report', 'integration_report', 'referee_report'
+                    )
                     ORDER BY state_revision DESC, created_at DESC
                     """
                 ).fetchall()
@@ -523,6 +556,7 @@ class ProofStateStore:
             "final_artifacts": final_artifacts,
             "research_artifacts": research_artifacts,
             "confirmed_counterexamples": confirmed_counterexamples,
+            "audit_artifacts": audit_artifacts,
         }
 
     def get_revision(self, conn: Optional[sqlite3.Connection] = None) -> int:

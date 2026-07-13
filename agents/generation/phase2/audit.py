@@ -26,6 +26,14 @@ Claim metadata convention (no schema change — tags on existing claims):
 Repairs are PROPOSED, clearly separated from the audit verdict: repair
 artifacts use artifact_type ``proposed_repair`` and are rendered in their own
 report section, never merged into the claim map.
+
+Verification pipeline: the researcher transcribes each submitted
+statement/proof pair into an immutable ``proof_dossier`` packet and creates a
+paper claim, a sufficient route, and a terminal inference backed by that
+packet.  The ordinary strict informal verifier then checks the author's local
+argument, and the integration verifier checks the verified dependency route.
+This keeps paper auditing on the same verification gates as ordinary Albilich
+research instead of treating referee labels as verification authority.
 """
 
 from pathlib import Path
@@ -39,6 +47,13 @@ AUDIT_SUBJECT_ARTIFACT_ID = "audit_subject_root"
 PROPOSED_REPAIR_ARTIFACT_TYPE = "proposed_repair"
 REFEREE_REPORT_ARTIFACT_TYPE = "referee_report"
 PAPER_AUDIT_INGESTED_EVENT = "paper_audit_ingested"
+
+# Metadata markers for the short, verifier-only terminal audit pipeline.  The
+# submitted document itself is treated as the researcher's immutable output;
+# no proof-repair or alternative-proof pass is needed before these reviews.
+PAPER_AUDIT_DOCUMENT_REVIEW_MARKER = "paper_audit_document_review"
+PAPER_AUDIT_DOCUMENT_INTEGRATION_MARKER = "paper_audit_document_integration"
+PAPER_AUDIT_REFEREE_REPORT_MARKER = "paper_audit_referee_report"
 
 PAPER_CLAIM_TAG = "paper_claim"
 AUDIT_STATUS_TAG_PREFIX = "audit_status:"
@@ -86,7 +101,11 @@ def is_paper_audit_mode(research_mode: str | None) -> bool:
 
 def audit_subject_artifact(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     """The submitted document under audit, if this problem is an audit run."""
-    rows = list(state.get("artifacts", [])) + list(state.get("research_artifacts", []))
+    rows = (
+        list(state.get("artifacts", []))
+        + list(state.get("research_artifacts", []))
+        + list(state.get("audit_artifacts", []))
+    )
     for artifact in rows:
         if str(artifact.get("artifact_type") or "") == AUDIT_SUBJECT_ARTIFACT_TYPE:
             return artifact
@@ -239,6 +258,7 @@ def paper_claims(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "audit_status": audit_status_for_claim(claim),
                 "source_location": source_location_for_claim(claim),
                 "validation_status": str(claim.get("validation_status") or ""),
+                "lifecycle_status": str(claim.get("lifecycle_status") or ""),
             }
         )
     rows.sort(key=lambda row: (row["source_location"], row["claim_id"]))
@@ -260,16 +280,27 @@ def proposed_repairs(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
 
 def audit_confidence_summary(state: Mapping[str, Any]) -> str:
-    """Conservative overall classification of the submitted proof."""
+    """Conservative overall classification of the submitted proof.
+
+    Researcher-authored audit tags are diagnostic labels, not verification
+    authority.  A positive global classification requires the same two gates
+    as ordinary Albilich proof state: strict validation and integration.
+    """
     claims = paper_claims(state)
     if not claims:
         return "not_verified"
     statuses = {row["audit_status"] for row in claims}
-    if "false_or_counterexample_risk" in statuses:
+    validation_statuses = {row["validation_status"] for row in claims}
+    if "refuted" in validation_statuses or "false_or_counterexample_risk" in statuses:
         return "likely_false"
-    if "gap" in statuses or "overclaim" in statuses:
+    if "challenged" in validation_statuses or "gap" in statuses or "overclaim" in statuses:
         return "major_gaps"
-    if "checked" in statuses:
+    in_scope = [row for row in claims if row["audit_status"] != "out_of_scope"]
+    if in_scope and all(
+        row["validation_status"] in {"informally_verified", "formally_verified"}
+        and row["lifecycle_status"] == "integrated"
+        for row in in_scope
+    ):
         return "appears_correct_modulo_minor_details"
     return "not_verified"
 
@@ -294,6 +325,25 @@ def paper_audit_context_card(state: Mapping[str, Any]) -> Dict[str, Any]:
             "No claim becomes checked from global plausibility; check local implications first; "
             "repairs are PROPOSED (artifact_type proposed_repair) and stay separate from the audit verdict."
         ),
+        "verification_pipeline": {
+            "stages": ["researcher_packet", "strict_informal_verifier", "integration_verifier"],
+            "researcher_packet": (
+                "For each theorem, lemma, or decisive proof segment, attach one proof_dossier containing the "
+                "author's statement and proof as written; add a paper_claim, a sufficient route concluding it, "
+                "and a terminal inference whose evidence_artifact_ids contains that dossier. Represent the "
+                "paper's explicit hypotheses/ambient assumptions as premise claims; terminal inferences never "
+                "use an empty premise list."
+            ),
+            "strict_informal_verifier": (
+                "Verify the bounded author-text proof packet only. A proposed_repair is never evidence that the "
+                "submitted proof is correct."
+            ),
+            "integration_verifier": (
+                "After strict verification, check that the claim's sufficient route has verified terminal "
+                "inferences and verified dependency claims; record integrates=false and exact missing links "
+                "when the paper dependency graph does not close."
+            ),
+        },
         "deliverable": "referee-style audit report, not a polished proof",
         "warning": AUDIT_WARNING_LINE,
     }
@@ -309,6 +359,34 @@ def build_referee_report_lines(state: Mapping[str, Any]) -> List[str]:
         metadata = json_loads(metadata, {})
     if not isinstance(metadata, Mapping):
         metadata = {}
+    final_report = _latest_marked_artifact(
+        state,
+        artifact_type=REFEREE_REPORT_ARTIFACT_TYPE,
+        marker=PAPER_AUDIT_REFEREE_REPORT_MARKER,
+    )
+    if final_report is not None:
+        content = _artifact_content(final_report)
+        lines = [
+            "## Referee Audit Report",
+            "",
+            AUDIT_WARNING_LINE,
+            "",
+            f"- Audit subject: `{subject.get('artifact_id', '')}` ({metadata.get('title', 'untitled submission')})",
+            f"- Confidence summary (conservative): `{audit_confidence_summary(state)}`",
+            "- Review path: submitted document -> strict verifier -> integration verifier -> referee report",
+            "",
+        ]
+        if content:
+            lines.extend(content.rstrip().splitlines())
+            lines.append("")
+        else:
+            lines.extend(
+                [
+                    "The verifier-only referee report artifact was recorded, but its content file is unavailable.",
+                    "",
+                ]
+            )
+        return lines
     claims = paper_claims(state)
     lines = [
         "## Referee Audit Report",
@@ -325,7 +403,12 @@ def build_referee_report_lines(state: Mapping[str, Any]) -> List[str]:
         for row in claims:
             location = row["source_location"] or "location not recorded"
             status = row["audit_status"] or "unaudited"
-            lines.append(f"- `{row['claim_id']}` `{status}` ({location}): {row['statement']}")
+            validation = row["validation_status"] or "untested"
+            lifecycle = row["lifecycle_status"] or "active"
+            lines.append(
+                f"- `{row['claim_id']}` `{status}` strict=`{validation}` integration=`{lifecycle}` "
+                f"({location}): {row['statement']}"
+            )
     else:
         lines.append("No paper claims recorded yet; the audit decomposition has not run.")
     lines.append("")
@@ -372,3 +455,42 @@ def build_referee_report_lines(state: Mapping[str, Any]) -> List[str]:
         lines.append("No repairs proposed.")
     lines.append("")
     return lines
+
+
+def _artifact_metadata(artifact: Mapping[str, Any]) -> Dict[str, Any]:
+    metadata = artifact.get("metadata_json", {})
+    if isinstance(metadata, str):
+        metadata = json_loads(metadata, {})
+    return dict(metadata) if isinstance(metadata, Mapping) else {}
+
+
+def _latest_marked_artifact(
+    state: Mapping[str, Any],
+    *,
+    artifact_type: str,
+    marker: str,
+) -> Optional[Mapping[str, Any]]:
+    rows = [
+        artifact
+        for artifact in state.get("artifacts", [])
+        if str(artifact.get("artifact_type") or "") == artifact_type
+        and _artifact_metadata(artifact).get(marker) is True
+    ]
+    rows.sort(
+        key=lambda artifact: (
+            int(artifact.get("state_revision") or 0),
+            str(artifact.get("created_at") or ""),
+        ),
+        reverse=True,
+    )
+    return rows[0] if rows else None
+
+
+def _artifact_content(artifact: Mapping[str, Any]) -> str:
+    path = str(artifact.get("path") or "").strip()
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
