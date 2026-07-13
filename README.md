@@ -42,6 +42,10 @@ Albilich research workflow. It is a consolidated framework update.
   experiment-conjecture-proof contract, configured GAP paths reach child
   sessions, and the optional writing gate uses deterministic normalization,
   separate revision budgets, stronger templates, and hard output checks.
+- **Stronger audits and branch discipline.** Paper audits run through the
+  verification pipeline with isolated packets and verifier reports, branch
+  work packets carry their repair debts, and section-substantiality checks
+  gate the writing harness.
 - **Expanded regression coverage.** The scheduler, proof store, parallel
   workflow, verifiers, dashboard, recovery paths, research strategy, and
   writing gate are covered by the public test suite included in this release.
@@ -286,7 +290,7 @@ Role prompts are assembled in `agents/generation/phase2/codex_runner.py`.
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s agents/generation/tests -t .
 ```
 
-The 750-test stdlib `unittest` suite covers the scheduler, patch validator,
+The 807-test stdlib `unittest` suite covers the scheduler, patch validator,
 proof store, parallel workflow, runners, dashboard, research strategy,
 work-mode loops, verification gates, recovery paths, and paper-writing checks.
 
