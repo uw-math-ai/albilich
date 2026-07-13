@@ -13,8 +13,9 @@ Two entry points mirror the rubric's cost-ordering contract:
 - :func:`run_all` — both, deduplicated and sorted by (severity, line).
 - :func:`run_slop_lint` — the anti-slop/house-rules layer (L4-SLOP-01..12
   deterministic subset + L4-HOUSE-03 + the hard house rules L4-HOUSE-07
-  section openers and L4-HOUSE-08 "we" collocations, both major); gate
-  debts, never attach-rejections.
+  section openers, L4-HOUSE-08 "we" collocations, L4-HOUSE-09 stub sections,
+  and L4-HOUSE-10 fragmentation, all major, plus L4-HOUSE-11 bullet
+  narration, minor); gate debts, never attach-rejections.
 - :func:`run_paper_lint` — final_paper-only paper-register blockers.
 """
 
@@ -421,7 +422,7 @@ def run_paper_lint(text: str) -> List[Finding]:
     return _dedupe_sort(findings)
 
 
-# --- anti-slop lint (L4-SLOP-01..12 deterministic subset + L4-HOUSE-03) ------
+# --- anti-slop lint (L4-SLOP-01..12 deterministic subset + L4-HOUSE-03/07..11)
 
 # Rubric section "AI-pattern slop & house anti-choreography" (rubric/L4-style.md,
 # sources references/fetched/AI-SLOP.md + HOUSE.md): deterministic hunts for the
@@ -521,15 +522,72 @@ _SLOP_COPULA_PATTERNS: List[re.Pattern[str]] = [
     re.compile(r"\bboasts?\b", re.IGNORECASE),
 ]
 
-# L4-SLOP-04 (minor): negative-parallelism drama.
+# L4-SLOP-04 (major — it gates): the rhetorical-reversal family ("negative
+# parallelism", AI-SLOP §4). Two arms. The single-sentence arm below flags the
+# not-A-but-B reversal in every punctuation costume; each pattern caps its
+# middle run at [^.!?] so a match never crosses a sentence boundary, and all
+# run case-insensitively on math-stripped, comment-blanked prose. The generic
+# "not X" patterns exclude "only"/"because" after "not" so the dedicated
+# "not only"/"not because" patterns own those phrases (one finding each).
 _SLOP_PARALLELISM_PATTERNS: List[re.Pattern[str]] = [
-    # "not only ... but also" within one sentence (<= 120 chars, no period).
-    re.compile(r"\bnot only\b[^.]{0,120}\bbut also\b", re.IGNORECASE),
-    # "not X, but rather Y" within one clause run (<= 60 chars, no period).
-    re.compile(r"\bnot \w+[^.]{0,60}, but rather\b", re.IGNORECASE),
-    # The sentence pair "It is not X. It is Y." (capitalized: sentence starts).
-    re.compile(r"\bIt is not [^.]+\. It is "),
+    # "not only X but also Y" within one sentence (<= 120 chars between).
+    re.compile(r"\bnot only\b[^.!?]{0,120}\bbut also\b", re.IGNORECASE),
+    # "not X, but rather Y": comma + "but rather" within one sentence.
+    re.compile(r"\bnot (?!only\b|because\b)\w+[^.!?]{0,60}, but rather\b", re.IGNORECASE),
+    # "not X — but Y": the em-dash costume — a unicode em dash or LaTeX "---"
+    # (exactly three hyphens, so en dashes "--" never match); non-greedy run so
+    # the FIRST dash after the negation anchors the match.
+    re.compile(r"\bnot (?!only\b|because\b)\w+[^.!?]{0,60}?(?:—|(?<!-)---(?!-))\s*but\b", re.IGNORECASE),
+    # "not X; it is Y": the semicolon costume; [^.!?;] anchors the first
+    # semicolon after the negation, then a positive "it is"/"it's" resumption.
+    re.compile(r"\bnot (?!only\b|because\b)\w+[^.!?;]{0,60}; (?:it is|it['’]s)\b", re.IGNORECASE),
+    # "not because X(,) but because Y" (the optional comma sits inside [^.!?]).
+    re.compile(r"\bnot because\b[^.!?]{0,80}\bbut because\b", re.IGNORECASE),
 ]
+
+# L4-SLOP-04 cross-sentence arm (major): flagged ONLY when the false-positive
+# risk is low. Sentence 1 must OPEN with a rhetorical framing subject —
+# It/This/That or "The point/question/issue/answer/key/goal/idea/reason/
+# problem/result" — followed by a copular negation; concrete mathematical
+# subjects ("The group is not abelian.", "G is not simple.") never match:
+# that framing-subject requirement is the false-positive boundary.
+_SLOP_FRAMING_SUBJECT = (
+    r"(?:It|This|That|The\s+(?:point|question|issue|answer|key|goal|idea|reason|problem|result))"
+)
+# Copular negation: "is not"/"isn't"/"was not"/"wasn't"/"is no"/"are not"/
+# "aren't" (apostrophes optional so "isnt" typos still count).
+_SLOP_COPULAR_NEGATION = r"(?:is\s+not|isn'?t|was\s+not|wasn'?t|is\s+no|are\s+not|aren'?t)"
+# Sentence 1 of a cross-sentence reversal, matched only AT a sentence start:
+# framing subject + copular negation, the rest of the sentence (no internal
+# sentence-ending mark, <= 160 chars), its closing mark, and the gap.
+_SLOP_REVERSAL_FIRST_RE = re.compile(
+    rf"{_SLOP_FRAMING_SUBJECT}\s+{_SLOP_COPULAR_NEGATION}\b[^.!?]{{0,160}}[.!?]\s+",
+    re.IGNORECASE,
+)
+# Sentence 2 opener: a matching pronoun/framing subject + POSITIVE copula
+# ("It is"/"It's"/"This is"/"That is", with an optional "Rather,"/"Instead,"
+# lead-in before "it is"). "It's" requires its apostrophe so possessive "Its"
+# never matches; the lookahead rejects "not"/"no" after the copula — a second
+# negation is the negative-listing arm's business, not a reversal.
+_SLOP_REVERSAL_SECOND_RE = re.compile(
+    r"(?:(?:Rather|Instead),\s+it\s+is|It\s+is|It['’]s|This\s+is|That\s+is)"
+    r"(?!\s+(?:not|no)\b)\b",
+    re.IGNORECASE,
+)
+# L4-SLOP-04 negative-listing arm (major): one framing-subject copular-negation
+# sentence, with trailing whitespace consumed so consecutive matches chain.
+_SLOP_NEG_LIST_SENTENCE_RE = re.compile(
+    rf"{_SLOP_FRAMING_SUBJECT}\s+{_SLOP_COPULAR_NEGATION}\b[^.!?]{{0,160}}[.!?]\s*",
+    re.IGNORECASE,
+)
+# Negative-listing closer: a positive copular sentence of the same subject
+# class ("It was Z."); the lookahead again rejects a further negation.
+_SLOP_NEG_LIST_CLOSE_RE = re.compile(
+    rf"(?:{_SLOP_FRAMING_SUBJECT}\s+(?:is|was|are)|It['’]s)(?!\s+(?:not|no)\b)\b",
+    re.IGNORECASE,
+)
+# Negative listing needs at least this many consecutive negated sentences.
+_SLOP_NEG_LIST_MIN_NEGATIONS = 2
 
 # L4-SLOP-05 (major): paragraph-initial recap openers. Paragraph-initial means
 # document start, a line start after a blank line, or right after \par.
@@ -594,6 +652,15 @@ _SLOP_VAGUE_OPENER_RE = re.compile(
     r"(?:is|are|was|shows|means|suggests|implies|demonstrates|follows|gives|yields|establishes|highlights)\b)"
 )
 
+# \label/\ref-family, \cite-family, \url/\href/\path, sectioning + \title:
+# their braced arguments hold keys, URLs, and headings — not prose. Shared by
+# the L4-HOUSE-03 masking and the L4-HOUSE-09..11 prose word counter.
+_KEY_ARG_COMMAND_RE = re.compile(
+    r"\\(?:label|ref|eqref|cref|Cref|autoref|nameref|pageref|hyperref|vref"
+    r"|cite[a-zA-Z]*|url|href|path"
+    r"|section|subsection|subsubsection|paragraph|subparagraph|title)"
+    r"\*?(?:\[[^\]]*\])?\{[^}]*\}"
+)
 # L4-HOUSE-03 (minor): colon/semicolon in prose. Masked before scanning
 # (generous, per HOUSE 15: better under-flag than false-positive):
 # bibliography blocks, and the arguments of label/ref/cite-like, url/href, and
@@ -601,14 +668,7 @@ _SLOP_VAGUE_OPENER_RE = re.compile(
 _HOUSE03_MASK_RES: List[re.Pattern[str]] = [
     # The bibliography block is exempt wholesale.
     re.compile(r"\\begin\{thebibliography\}.*?\\end\{thebibliography\}", re.DOTALL),
-    # \label/\ref-family, \cite-family, \url/\href/\path, sectioning + \title:
-    # their braced arguments hold keys, URLs, and headings — not prose.
-    re.compile(
-        r"\\(?:label|ref|eqref|cref|Cref|autoref|nameref|pageref|hyperref|vref"
-        r"|cite[a-zA-Z]*|url|href|path"
-        r"|section|subsection|subsubsection|paragraph|subparagraph|title)"
-        r"\*?(?:\[[^\]]*\])?\{[^}]*\}"
-    ),
+    _KEY_ARG_COMMAND_RE,
 ]
 # L4-HOUSE-03: "Case 1:"-style labels (also Step/Subcase) are legitimate.
 _HOUSE03_CASE_LABEL_RE = re.compile(r"\b(?:Case|Step|Subcase)[ ~]+[^\s:;]{1,20}$")
@@ -635,6 +695,50 @@ _HOUSE08_WE_COLLOCATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# L4-HOUSE-09 (major, HARD RULE): a \section whose prose body carries fewer
+# than this many words is a stub — a heading over one or two short paragraphs.
+STUB_SECTION_MIN_WORDS = 120
+# L4-HOUSE-10 (major): this many stub sections in the main body (before
+# \appendix) is document-level fragmentation.
+FRAGMENTATION_MIN_STUB_SECTIONS = 2
+# L4-HOUSE-10 (major): main-body sections per 1000 prose words above this
+# ratio is fragmentation even when no single section is a stub.
+FRAGMENTATION_MAX_SECTIONS_PER_1000_WORDS = 2.5
+# L4-HOUSE-11 (minor): a list is bullet narration at >= this many items ...
+BULLET_NARRATION_MIN_ITEMS = 4
+# L4-HOUSE-11 (minor): ... when EVERY item carries >= this many prose words.
+BULLET_NARRATION_MIN_ITEM_WORDS = 15
+# L4-HOUSE-11 density arm: more than one list per two sections is flagged.
+LIST_DENSITY_MAX_LISTS_PER_SECTION = 0.5
+
+# L4-HOUSE-09/10: a section's prose body ends at the next sectioning command
+# (subsections stay inside their parent's body: a \section is judged with all
+# of its content, and \subsection titles are masked out of the word count).
+_SECTION_BODY_END_RE = re.compile(
+    r"\\section\*?\{|\\appendix\b|\\begin\{thebibliography\}|\\end\{document\}"
+)
+# L4-HOUSE-09..11 word counting: environments whose content is data or code,
+# not prose — tables/figures/floats, bibliographies, verbatim — are blanked.
+_NON_PROSE_ENV_RE = re.compile(
+    r"\\begin\{(?P<npenv>table|figure|tabular|tabularx|longtable|thebibliography|verbatim|lstlisting|Verbatim)\*?\}"
+    r".*?\\end\{(?P=npenv)\*?\}",
+    re.DOTALL,
+)
+# Word counting: a prose word is a letter run; hyphen/apostrophe compounds
+# ("well-defined", "Zorn's") count once.
+_PROSE_WORD_RE = re.compile(r"[A-Za-z]+(?:['’\-][A-Za-z]+)*")
+# Word counting: any residual command token is dropped, but the braced prose
+# argument of formatting commands (\emph{...}) still counts as words.
+_LATEX_COMMAND_TOKEN_RE = re.compile(r"\\[a-zA-Z@]+\*?|\\.")
+# L4-HOUSE-11: itemize/enumerate lists. Non-greedy with a backreference: a
+# nested list of the SAME environment name mismatches (rare; conservative).
+_LIST_ENV_RE = re.compile(
+    r"\\begin\{(?P<listenv>itemize|enumerate)\*?\}(?P<listbody>.*?)\\end\{(?P=listenv)\*?\}",
+    re.DOTALL,
+)
+# L4-HOUSE-11: item boundaries within a list body (optional [label] skipped).
+_ITEM_SPLIT_RE = re.compile(r"\\item\b(?:\[[^\]]*\])?")
+
 
 def _blank_preserving_newlines(text: str) -> str:
     """Replace every non-newline character with a space (offsets survive)."""
@@ -649,7 +753,7 @@ def _mask_regions(text: str, patterns: Iterable[re.Pattern[str]]) -> str:
 
 def run_slop_lint(text: str) -> List[Finding]:
     """Deterministic anti-slop lint (rubric L4-SLOP-* subset + L4-HOUSE-03
-    + the hard house rules L4-HOUSE-07/08).
+    + the hard house rules L4-HOUSE-07/08/09/10 + L4-HOUSE-11).
 
     LaTeX-aware: math is stripped to placeholders first (math-mode content is
     never scanned) and comments are blanked. Complements :func:`run_lint`; the
@@ -665,9 +769,11 @@ def run_slop_lint(text: str) -> List[Finding]:
     inflation_spans = _check_slop_inflation(prose, index, lines, findings)
     findings += _check_slop_copulas(prose, index, lines, inflation_spans)
     for pattern in _SLOP_PARALLELISM_PATTERNS:
-        findings += _scan(prose, index, lines, pattern, "L4-SLOP-04", "minor",
-                          "negative-parallelism drama; state the positive claim directly",
+        findings += _scan(prose, index, lines, pattern, "L4-SLOP-04", "major",
+                          "negative-parallelism drama (rhetorical reversal); "
+                          "state the positive claim directly",
                           include_match=True)
+    findings += _check_slop_reversal_sentences(prose, index, lines)
     for match in _SLOP_RECAP_RE.finditer(prose):
         line = index.line_of(match.start("opener"))
         findings.append(Finding("L4-SLOP-05", "major", line, _excerpt(lines, line),
@@ -690,6 +796,8 @@ def run_slop_lint(text: str) -> List[Finding]:
     findings += _scan(prose, index, lines, _HOUSE08_WE_COLLOCATION_RE, "L4-HOUSE-08", "major",
                       'habitual "we" collocation (HARD RULE, HOUSE 25); state the mathematical '
                       "fact directly or name the genuinely novel authorial act", include_match=True)
+    findings += _check_section_substantiality(text, lines)
+    findings += _check_bullet_narration(prose, index, lines)
     return _dedupe_sort(findings)
 
 
@@ -743,18 +851,84 @@ def _check_slop_copulas(
     return findings
 
 
+def _sentence_starts(prose: str) -> List[int]:
+    """Offsets where a sentence can begin: after a sentence boundary, at a
+    paragraph start, and at the document's first non-whitespace character."""
+    starts = {match.end() for match in _SENTENCE_BOUNDARY_RE.finditer(prose)}
+    starts |= {match.end() for match in _PARAGRAPH_START_RE.finditer(prose)}
+    starts.add(len(prose) - len(prose.lstrip()))
+    return sorted(starts)
+
+
+def _check_slop_reversal_sentences(
+    prose: str, index: _LineIndex, lines: List[str]
+) -> List[Finding]:
+    """L4-SLOP-04 (major), the two cross-sentence arms. Both anchor sentence 1
+    at a computed sentence start, so a mid-sentence "it is not ..." never
+    opens a match and concrete mathematical subjects ("The group is not
+    abelian. Its center is trivial."; "G is not simple. It is solvable.")
+    stay unflagged.
+
+    - Negative listing: >= _SLOP_NEG_LIST_MIN_NEGATIONS consecutive
+      framing-subject copular-negation sentences followed by a positive
+      copular sentence of the same subject class ("It was not X. It was not
+      Y. It was Z.") — one finding per listing, at its first sentence.
+    - Cross-sentence reversal: a framing-subject copular-negation sentence
+      whose NEXT sentence opens with a matching pronoun/framing subject and a
+      positive copula ("It is not a coincidence. It is a theorem."). Reversal
+      pairs inside an already-flagged listing are not double-reported.
+    """
+    findings: List[Finding] = []
+    starts = _sentence_starts(prose)
+    listing_spans: List[Tuple[int, int]] = []
+    for start in starts:
+        if any(span_start <= start < span_end for span_start, span_end in listing_spans):
+            continue  # inside a flagged listing: no sub-listing findings
+        negations = 0
+        pos = start
+        while True:
+            match = _SLOP_NEG_LIST_SENTENCE_RE.match(prose, pos)
+            if match is None:
+                break
+            negations += 1
+            pos = match.end()
+        if negations < _SLOP_NEG_LIST_MIN_NEGATIONS:
+            continue
+        if _SLOP_NEG_LIST_CLOSE_RE.match(prose, pos) is None:
+            continue
+        listing_spans.append((start, pos))
+        line = index.line_of(start)
+        snippet = " ".join(prose[start : start + 80].split())
+        findings.append(Finding(
+            "L4-SLOP-04", "major", line, _excerpt(lines, line),
+            f"negative listing ({negations} copular negations before the positive); "
+            f"state the positive claim directly: {snippet!r}"))
+    for start in starts:
+        if any(span_start <= start < span_end for span_start, span_end in listing_spans):
+            continue  # the listing finding already covers this construct
+        first = _SLOP_REVERSAL_FIRST_RE.match(prose, start)
+        if first is None:
+            continue
+        if _SLOP_REVERSAL_SECOND_RE.match(prose, first.end()) is None:
+            continue
+        line = index.line_of(start)
+        snippet = " ".join(prose[start : first.end() + 24].split())
+        findings.append(Finding(
+            "L4-SLOP-04", "major", line, _excerpt(lines, line),
+            "cross-sentence rhetorical reversal (It-is-not-A-It-is-B); "
+            f"state the positive claim directly: {snippet!r}"))
+    return findings
+
+
 def _check_slop_connector_chains(
     prose: str, index: _LineIndex, lines: List[str]
 ) -> List[Finding]:
     """L4-SLOP-06: two or more consecutive sentences (or paragraph openings)
     starting with Moreover/Furthermore/Additionally/Also; the second and later
     openers are flagged."""
-    starts = {match.end() for match in _SENTENCE_BOUNDARY_RE.finditer(prose)}
-    starts |= {match.end() for match in _PARAGRAPH_START_RE.finditer(prose)}
-    starts.add(len(prose) - len(prose.lstrip()))
     findings: List[Finding] = []
     previous_was_connector = False
-    for start in sorted(starts):
+    for start in _sentence_starts(prose):
         match = _SLOP_CONNECTOR_RE.match(prose, start)
         if match is not None and previous_was_connector:
             line = index.line_of(start)
@@ -894,6 +1068,124 @@ def _check_house_section_openers(text: str, lines: List[str]) -> List[Finding]:
         findings.append(Finding("L4-HOUSE-07", "major", line, _excerpt(lines, line),
                                 f'section {title!r} does not open with a sentence beginning '
                                 f'"{wanted} ..." in its first paragraph (HARD RULE, HOUSE 19)'))
+    return findings
+
+
+def _prose_word_count(segment: str) -> int:
+    """Count prose words in a LaTeX segment. Excluded from the count: math
+    (inline and display), comments, non-prose environments (tables, figures,
+    floats, bibliographies, verbatim), key-carrying command arguments
+    (labels/refs/cites/URLs/headings), and command tokens themselves — the
+    braced prose argument of formatting commands (\\emph{...}) still counts.
+    Idempotent on already math-stripped text (placeholders are removed)."""
+    stripped, _regions = _strip_math(segment)
+    text = _mask_regions(stripped, [_LATEX_COMMENT_RE, _NON_PROSE_ENV_RE, _KEY_ARG_COMMAND_RE])
+    text = text.replace(INLINE_MATH_PLACEHOLDER, " ").replace(DISPLAY_MATH_PLACEHOLDER, " ")
+    text = _LATEX_COMMAND_TOKEN_RE.sub(" ", text)
+    return len(_PROSE_WORD_RE.findall(text))
+
+
+def _check_section_substantiality(text: str, lines: List[str]) -> List[Finding]:
+    """L4-HOUSE-09 (HARD RULE) + L4-HOUSE-10: sections are substantial units.
+
+    - ``L4-HOUSE-09`` (major): a \\section (main body or appendix) whose prose
+      body — the text between its heading and the next sectioning command —
+      has fewer than STUB_SECTION_MIN_WORDS words is a stub. Math, displays,
+      tables, and figures never count, so a section that is mostly displays
+      with thin connecting prose is still a stub.
+      References/Acknowledgment/bibliography sections are exempt.
+    - ``L4-HOUSE-10`` (major, document-level): the main body (before
+      \\appendix) fragments when it has FRAGMENTATION_MIN_STUB_SECTIONS or
+      more stub sections, or more than
+      FRAGMENTATION_MAX_SECTIONS_PER_1000_WORDS sections per 1000 prose
+      words. Fragmentation is a plurality defect: the check needs at least
+      two main-body sections.
+
+    Scans the raw text with comments blanked (titles must stay readable for
+    the finding messages); word counts strip math per body.
+    """
+    masked = _mask_regions(text, [_LATEX_COMMENT_RE])
+    index = _LineIndex(masked)
+    appendix_match = _HOUSE07_APPENDIX_RE.search(masked)
+    appendix_start = appendix_match.start() if appendix_match else len(masked)
+    findings: List[Finding] = []
+    main_sections = 0
+    main_stubs = 0
+    first_section_line: int | None = None
+    for section in _HOUSE07_SECTION_RE.finditer(masked):
+        title = " ".join(section.group("title").split())
+        if _HOUSE07_EXEMPT_TITLE_RE.search(title):
+            continue  # References/Acknowledgment(s)/bibliography sections
+        end_match = _SECTION_BODY_END_RE.search(masked, section.end())
+        body = masked[section.end() : end_match.start() if end_match else len(masked)]
+        line = index.line_of(section.start())
+        in_main = section.start() < appendix_start
+        if in_main:
+            main_sections += 1
+            if first_section_line is None:
+                first_section_line = line
+        words = _prose_word_count(body)
+        if words < STUB_SECTION_MIN_WORDS:
+            if in_main:
+                main_stubs += 1
+            findings.append(Finding(
+                "L4-HOUSE-09", "major", line, _excerpt(lines, line),
+                f"stub section: {title!r} has {words} prose words "
+                f"(fewer than {STUB_SECTION_MIN_WORDS}); merge it into a neighboring section "
+                "or develop it into several full paragraphs (HARD RULE)"))
+    if main_sections >= 2:
+        body_match = _BEGIN_DOCUMENT_RE.search(masked)
+        body_start = body_match.end() if body_match else 0
+        main_words = _prose_word_count(masked[body_start:appendix_start])
+        # Sections per 1000 prose words; max(1) guards the all-math degenerate case.
+        ratio = main_sections * 1000.0 / max(main_words, 1)
+        over_ratio = ratio > FRAGMENTATION_MAX_SECTIONS_PER_1000_WORDS
+        if main_stubs >= FRAGMENTATION_MIN_STUB_SECTIONS or over_ratio:
+            detail = (
+                f"{main_stubs} stub sections"
+                if main_stubs >= FRAGMENTATION_MIN_STUB_SECTIONS
+                else f"{ratio:.1f} sections per 1000 prose words "
+                     f"(max {FRAGMENTATION_MAX_SECTIONS_PER_1000_WORDS})"
+            )
+            line = first_section_line or 1
+            findings.append(Finding(
+                "L4-HOUSE-10", "major", line, _excerpt(lines, line),
+                f"fragmentation: the main body has {main_sections} sections with {detail}; "
+                "merge thin sections into fewer substantial, cohesive sections of developed prose"))
+    return findings
+
+
+def _check_bullet_narration(prose: str, index: _LineIndex, lines: List[str]) -> List[Finding]:
+    """L4-HOUSE-11 (minor): itemized narrative and list density.
+
+    A list whose items are developed prose (BULLET_NARRATION_MIN_ITEMS or
+    more items of BULLET_NARRATION_MIN_ITEM_WORDS or more words each) is
+    narrative masquerading as bullets; genuine short enumerations (case
+    labels, short conditions) pass. The density arm flags more than
+    LIST_DENSITY_MAX_LISTS_PER_SECTION lists per section (one per two
+    sections) as one document-level finding.
+    """
+    findings: List[Finding] = []
+    lists = list(_LIST_ENV_RE.finditer(prose))
+    for match in lists:
+        # Drop the chunk before the first \item (the list's lead-in, if any).
+        items = _ITEM_SPLIT_RE.split(match.group("listbody"))[1:]
+        if len(items) < BULLET_NARRATION_MIN_ITEMS:
+            continue
+        if all(_prose_word_count(item) >= BULLET_NARRATION_MIN_ITEM_WORDS for item in items):
+            line = index.line_of(match.start())
+            findings.append(Finding(
+                "L4-HOUSE-11", "minor", line, _excerpt(lines, line),
+                f"bullet narration: {match.group('listenv')} with {len(items)} prose items of "
+                f"{BULLET_NARRATION_MIN_ITEM_WORDS}+ words each is narrative masquerading as "
+                "bullets; convert to cohesive prose"))
+    section_count = sum(1 for _ in _HOUSE07_SECTION_RE.finditer(prose))
+    if lists and len(lists) > LIST_DENSITY_MAX_LISTS_PER_SECTION * section_count:
+        line = index.line_of(lists[0].start())
+        findings.append(Finding(
+            "L4-HOUSE-11", "minor", line, _excerpt(lines, line),
+            f"list density: {len(lists)} itemize/enumerate lists across {section_count} "
+            "sections (max 1 per 2 sections); fold most lists into prose"))
     return findings
 
 

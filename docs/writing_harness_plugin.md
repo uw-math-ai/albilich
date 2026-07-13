@@ -26,14 +26,19 @@ compile) and the single editor session has been spent.
   `run_residue_scan(text)` (the always-blocker generation-residue scan, rule
   `L1-CITE-03`), `run_all(text)` (every deterministic rule),
   `run_slop_lint(text)` (the anti-slop/house-rules layer: the deterministic
-  subset of `L4-SLOP-01..12` plus `L4-HOUSE-03` plus the two HARD house rules
+  subset of `L4-SLOP-01..12` plus `L4-HOUSE-03` plus the HARD house rules
   `L4-HOUSE-07` (section openers: every section's first paragraph carries a
   sentence beginning "In this section, we" / "In this appendix, we";
-  References/Acknowledgment/bibliography exempt) and `L4-HOUSE-08` (banned
+  References/Acknowledgment/bibliography exempt), `L4-HOUSE-08` (banned
   habitual "we" collocations: we recall / we record / we now show / we now
   prove / we now turn / we begin by / we start by / we note that / we observe
-  that), both `major` so they force the deterministic revision through debts —
-  never attach-rejections; LaTeX-aware — math-mode
+  that), `L4-HOUSE-09` (stub sections: a `\section` with fewer than 120 prose
+  words — math/displays/tables/figures excluded from the count), and
+  `L4-HOUSE-10` (fragmentation: >= 2 main-body stub sections or > 2.5 sections
+  per 1000 prose words), all `major` so they force the deterministic revision
+  through debts — never attach-rejections; plus `L4-HOUSE-11` (bullet
+  narration: itemize/enumerate lists of 4+ prose items of 15+ words each, and
+  list density above 1 list per 2 sections; `minor`); LaTeX-aware — math-mode
   content is never scanned; sources `AI-SLOP` + `HOUSE` in
   `math-writing-harness/references/fetched/`), and
   `run_paper_lint(text)` (the `final_paper`-only paper-register rules

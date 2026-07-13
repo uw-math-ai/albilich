@@ -81,6 +81,21 @@ class WritingRubricLoadTest(unittest.TestCase):
             self.assertEqual(rule.owner_critic, "pedant")
             self.assertIn(fragment, rule.statement)
 
+    def test_section_substantiality_rules_l4_house_09_10_11(self) -> None:
+        # Stub sections and fragmentation are major lint rules; bullet
+        # narration is a minor lint rule. All three are pedant-owned.
+        for rule_id, severity, fragment in (
+            ("L4-HOUSE-09", "major", "120 words"),
+            ("L4-HOUSE-10", "major", "fragment"),
+            ("L4-HOUSE-11", "minor", "bullet"),
+        ):
+            rule = self.by_id[rule_id]
+            self.assertEqual(rule.layer, "L4")
+            self.assertEqual(rule.checkability, "lint")
+            self.assertEqual(rule.severity, severity)
+            self.assertEqual(rule.owner_critic, "pedant")
+            self.assertIn(fragment, rule.statement.lower())
+
     def test_layer_defaults_applied(self) -> None:
         # No explicit severity marker: falls back to the layer default.
         self.assertEqual(self.by_id["L1-FAITH-04"].severity, "blocker")

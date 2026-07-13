@@ -52,11 +52,14 @@ The reference list is empty; this report was written by the Albilich writer from
 """
 
 # A compact but complete amsart article that passes every deterministic paper
-# check (L5-PAPER-01/02/03 + residue scan + the anti-slop layer) and compiles
-# standalone with pdflatex; the attach-time sidecar really compiles it in the
-# guard tests. (The Run archive sentence avoids a prose colon: L4-HOUSE-03.)
-# The preamble is the PAPER_CONTRACT's mandatory template (geometry, newpx
-# fonts, microtype, booktabs, dark-blue hyperref links loaded last).
+# check (L5-PAPER-01/02/03 + residue scan + the anti-slop layer, including the
+# section-substantiality rules L4-HOUSE-09/10/11: every section carries 120+
+# prose words and the main body stays under 2.5 sections per 1000 words) and
+# compiles standalone with pdflatex; the attach-time sidecar really compiles it
+# in the guard tests. (The Run archive sentence avoids a prose colon:
+# L4-HOUSE-03.) The preamble is the PAPER_CONTRACT's mandatory template
+# (geometry, newpx fonts, microtype, booktabs, dark-blue hyperref links loaded
+# last).
 CLEAN_FINAL_PAPER = r"""\documentclass[11pt]{amsart}
 \usepackage[margin=1.25in]{geometry}
 \usepackage{amsmath,amssymb,amsthm}
@@ -77,23 +80,24 @@ CLEAN_FINAL_PAPER = r"""\documentclass[11pt]{amsart}
 \keywords{trivial group}
 \begin{document}
 \begin{abstract}
-A group is trivial when its underlying set is a singleton. We prove that the trivial group has exactly one element, answering a warm-up exercise.
+A group is trivial when its underlying set is a singleton. We prove that the trivial group has exactly one element, answering a warm-up exercise from the classical literature on groups of small order. The proof is elementary and rests entirely on the definition of a group, and the paper explains in full how the singleton hypothesis forces both the existence and the uniqueness of the identity element.
 \end{abstract}
 \maketitle
 \section{Introduction}
-In this section, we state the main theorem. We prove the following result, recorded in the classical literature~\cite{zorn}.
+In this section, we state the main theorem. Groups of very small order occupy a special place in elementary algebra, because complete classifications are available at those orders and because every claim about them can be checked directly from the axioms. The smallest conceivable order is one, and a group of order one is called trivial. Every textbook mentions the trivial group in its opening pages, yet the humble statement that it has exactly one element still deserves a careful written proof, if only as an exercise in reading a definition closely. We prove the following result, recorded in the classical literature~\cite{zorn}.
 \begin{theorem}\label{thm:main}
 The trivial group has exactly one element.
 \end{theorem}
+The statement of Theorem~\ref{thm:main} bundles two separate assertions. The first assertion says that the trivial group is nonempty, which holds because the group axioms demand an identity element. The second assertion says that no element other than the identity can occur, which holds because the underlying set of the trivial group is a singleton by definition. Each assertion receives its own sentence of justification in the proof below, and the proof given in the next section supplies both justifications in order. The reader who prefers a purely set-theoretic formulation may replace the group by its underlying set throughout, since the multiplication carries no additional information when only one element is present. A short remark on conventions is perhaps in order as well. Early authors occasionally allowed the empty set as a degenerate group, and under that convention the theorem below would be false. The modern axioms exclude the empty group, because the identity element is required to exist, and the modern convention is the one adopted here. The bibliography lists one classical source for the surrounding material, and the certification appendix describes the finite check that accompanies the mathematical argument. Readers may wonder why an automated system should bother with so small a question. The answer is that small questions make good calibration targets, since a fully written treatment can be compared line by line with the informal argument that mathematicians usually leave unwritten. The comparison shows exactly which steps of the folklore proof consume the group axioms and which steps consume the singleton hypothesis, and that bookkeeping is the real content of the present note. No originality is claimed for the result itself, and the interest of the note lies in the standard of care applied to a statement usually dismissed in half a line.
 \section{Proof of the main theorem}
-In this section, we prove Theorem~\ref{thm:main} directly from the definition.
+In this section, we prove Theorem~\ref{thm:main} directly from the definition of a group of order one. Before the formal proof it is worth spelling out the two definitions involved. A group is a set together with an associative multiplication that admits an identity element and inverses. A group is called trivial when its underlying set has cardinality one. Having cardinality one means precisely that the set is nonempty and that its elements are pairwise equal, so the whole argument amounts to unwinding these conditions in the presence of the group axioms.
 \begin{proof}
-By definition, the trivial group consists of the identity element alone. This proves Theorem~\ref{thm:main}.
+Let $G$ be the trivial group and let $e$ denote its identity element, which exists by the group axioms. The element $e$ witnesses that $G$ is nonempty, so $G$ has at least one element. Suppose next that $x$ is an element of $G$. The underlying set of $G$ is a singleton by the definition of triviality, and both $x$ and $e$ belong to that singleton, so $x$ and $e$ are equal. Every element of $G$ therefore coincides with $e$, and $G$ has at most one element. Combining the lower and upper bounds shows that $G$ has exactly one element. This proves Theorem~\ref{thm:main}.
 \end{proof}
+Two remarks complete the discussion. The uniqueness half of the proof never used the multiplication of $G$, because a singleton admits no distinct pair of elements whatever additional structure it carries. The existence half, by contrast, used the group axioms in an essential way, since an empty set would satisfy the singleton bound vacuously while failing to contain an identity. The same pattern of argument establishes the corresponding statement for trivial monoids and for trivial rings, and the interested reader can adapt the wording without change. A more general lesson can be drawn from the exercise. Counting arguments about finite algebraic structures often split into a lower bound supplied by an axiom and an upper bound supplied by a hypothesis on the underlying set, and the present proof is the simplest instance of that division of labor. The division also suggests a small exercise for the reader. Fix a set with two elements and ask which parts of the argument above break down. The uniqueness step fails immediately, because the two elements are distinct, while the existence step survives untouched, and working through the failure clarifies where the singleton hypothesis actually enters the proof.
 \appendix
 \section{Certification}
-In this appendix, we describe the finite verification. The finite verification enumerates the single element of the trivial group.
-The run archive certifies the enumeration from internal artifact records.
+In this appendix, we describe the finite verification that accompanies the proof. The verification enumerates the underlying set of the trivial group, confirms that the enumeration visits exactly one element, and checks that the multiplication table on that element is associative and unital. The whole computation touches a single element and a single product, so it completes immediately and its transcript fits in one line. Independent reverification is straightforward. A reader who wishes to repeat the check can construct the one-element group in a computer algebra system, list its elements, and confirm that the list has length one. No randomness, no floating-point arithmetic, and no external data enter the computation, so the outcome is reproducible on every platform. The run archive certifies the enumeration from internal artifact records.
 \begin{thebibliography}{9}
 \bibitem{zorn} M. Zorn, A remark on method in transfinite algebra, Bull. Amer. Math. Soc. 41 (1935), 667--670.
 \end{thebibliography}
@@ -915,6 +919,45 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
                 debts,
             )
 
+    def test_rhetorical_reversal_syncs_major_debt_and_dispatches_deterministic_revision(self) -> None:
+        # L4-SLOP-04 is major and gates: the cross-sentence reversal
+        # "It is not a coincidence. It is a theorem." becomes a major writing
+        # debt through the lint sync and forces the deterministic revision.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = make_solved_store(Path(tmpdir), "writing-gate-reversal-test")
+            attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
+            insert_final_paper(
+                store,
+                "final-paper-reversal",
+                CLEAN_FINAL_PAPER.replace(
+                    "We prove the following result, recorded in the classical literature~\\cite{zorn}.",
+                    "It is not a coincidence. It is a theorem. We prove the following result, "
+                    "recorded in the classical literature~\\cite{zorn}.",
+                ),
+            )
+
+            action = next_action(store, web_search="disabled")
+
+            self.assertEqual("write", action["mode"], action)
+            self.assertTrue(action.get("writing_revision"))
+            self.assertTrue(action.get("paper_revision"))
+            self.assertEqual("final-paper-reversal", action["revision_of_artifact_id"])
+            self.assertEqual(WRITING_GATE_DETERMINISTIC_REVISION_INTENT, action["search_intent"])
+            self.assertTrue(
+                any(d["rule_id"] == "L4-SLOP-04" and d["severity"] == "major" for d in action["writing_debts"]),
+                action["writing_debts"],
+            )
+            debts = active_writing_debts(store)
+            self.assertTrue(
+                any(
+                    d["severity"] == "major"
+                    and d["obligation"].startswith("L4-SLOP-04:")
+                    and "rhetorical reversal" in d["obligation"]
+                    for d in debts
+                ),
+                debts,
+            )
+
     def test_missing_section_opener_syncs_major_debts_and_dispatches_deterministic_revision(self) -> None:
         # HARD RULE L4-HOUSE-07: a final_paper whose sections lack the
         # "In this section, we ..." opener gets major writing debts through the
@@ -974,6 +1017,53 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertTrue(
                 any(d["rule_id"] == "L4-HOUSE-08" and d["severity"] == "major" for d in action["writing_debts"]),
                 action["writing_debts"],
+            )
+
+    def test_stub_sections_sync_major_debts_and_dispatch_deterministic_revision(self) -> None:
+        # HARD RULE L4-HOUSE-09/10: a final_paper fragmented into stub sections
+        # gets a major stub debt per thin section plus the document-level
+        # fragmentation debt, forcing the deterministic revision.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = make_solved_store(Path(tmpdir), "writing-gate-stub-section-test")
+            attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
+            insert_final_paper(
+                store,
+                "final-paper-stubs",
+                CLEAN_FINAL_PAPER.replace(
+                    "\\appendix",
+                    "\\section{Remarks}\nIn this section, we add a remark. The remark is brief and complete.\n"
+                    "\\section{Outlook}\nIn this section, we sketch an outlook. The outlook is short and modest.\n"
+                    "\\appendix",
+                ),
+            )
+
+            action = next_action(store, web_search="disabled")
+
+            self.assertEqual("write", action["mode"], action)
+            self.assertTrue(action.get("writing_revision"))
+            self.assertTrue(action.get("paper_revision"))
+            self.assertEqual("final-paper-stubs", action["revision_of_artifact_id"])
+            self.assertEqual(WRITING_GATE_DETERMINISTIC_REVISION_INTENT, action["search_intent"])
+            stub_debts = [d for d in action["writing_debts"] if d["rule_id"] == "L4-HOUSE-09"]
+            self.assertEqual(2, len(stub_debts), action["writing_debts"])
+            self.assertTrue(all(d["severity"] == "major" for d in stub_debts))
+            self.assertTrue(
+                any(d["rule_id"] == "L4-HOUSE-10" and d["severity"] == "major" for d in action["writing_debts"]),
+                action["writing_debts"],
+            )
+            debts = active_writing_debts(store)
+            self.assertTrue(
+                any(
+                    d["severity"] == "major"
+                    and d["obligation"].startswith("L4-HOUSE-09:")
+                    and "Remarks" in d["obligation"]
+                    for d in debts
+                ),
+                debts,
+            )
+            self.assertTrue(
+                any(d["obligation"].startswith("L4-HOUSE-10:") and "merge" in d["obligation"] for d in debts),
+                debts,
             )
 
     def test_stale_paper_lint_debts_close_when_no_longer_reproduced(self) -> None:
@@ -1310,11 +1400,9 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
     def test_final_paper_missing_abstract_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(Path(tmpdir), "paper-structure-guard-test")
-            broken = CLEAN_FINAL_PAPER.replace(
-                "\\begin{abstract}\nA group is trivial when its underlying set is a singleton. "
-                "We prove that the trivial group has exactly one element, answering a warm-up exercise.\n\\end{abstract}\n",
-                "",
-            )
+            head, _, tail = CLEAN_FINAL_PAPER.partition("\\begin{abstract}\n")
+            _, _, tail = tail.partition("\\end{abstract}\n")
+            broken = head + tail
             self.assertNotIn("abstract", broken)
             outcome = self._patch(
                 store,

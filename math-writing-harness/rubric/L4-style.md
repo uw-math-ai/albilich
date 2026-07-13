@@ -264,9 +264,12 @@ defects before any LLM budget is spent.
 - `L4-SLOP-03` [lint] **No copula avoidance:** "serves as", "stands as", "boasts", "features"
   (verb), "offers" where plain "is/are/has" is meant. severity: `minor`. autofix: safe.
   (`AI-SLOP` 3)
-- `L4-SLOP-04` [lint] **No negative-parallelism drama:** "not only … but also", "not X, but
-  rather Y", "It is not X. It is Y." — state Y directly. severity: `minor`. autofix: assisted.
-  (`AI-SLOP` 4)
+- `L4-SLOP-04` [lint] **No negative-parallelism drama — the rhetorical-reversal family:**
+  not-A-but-B in any punctuation clothing ("not only … but also", "not X, but rather Y",
+  "not X — but Y", "not X; it is Y", "not because X but because Y"), the cross-sentence
+  It-is-not-A-It-is-B pair ("It is not a coincidence. It is a theorem."), and negative listing
+  ("It was not X. It was not Y. It was Z.") — state B directly. severity: `major`. autofix:
+  assisted. (`AI-SLOP` 4)
 - `L4-SLOP-05` [lint] **No section-recap openers:** paragraphs starting "In summary,",
   "Overall,", "In conclusion,", "Taken together,", "To summarize,". Math papers do not recap
   sections. severity: `major`. autofix: safe (delete the recap). (`AI-SLOP` 4)
@@ -325,6 +328,25 @@ defects before any LLM budget is spent.
   (case-insensitive, math stripped); the judgment remainder of the "we" discipline stays
   with L4-HOUSE-02. Deterministically enforced — violations block the paper. severity:
   `major`. autofix: assisted. (`HOUSE` 25)
+- `L4-HOUSE-09` [lint] **Stub sections (HARD RULE): every section is a substantial unit —
+  a \section (main body or appendix) whose prose body carries fewer than 120 words is a
+  stub,** where the prose body is the text between the heading and the next sectioning
+  command with math, displays, tables, and figures excluded from the word count (a section
+  that is mostly displays over thin connecting prose is still a stub);
+  References/Acknowledgment/bibliography sections are exempt. Merge a stub into its
+  neighbor or develop it into several full paragraphs. Deterministically enforced —
+  violations block the paper. severity: `major`. autofix: assisted. (`HOUSE`, stop-slop)
+- `L4-HOUSE-10` [lint] **No fragmentation: the main body (before \appendix) must not
+  splinter into point-by-point mini-sections** — flagged (one document-level finding) when
+  it has two or more stub sections, or more than 2.5 sections per 1000 prose words; plan a
+  few substantial sections (typically four to six for a short article) and merge the thin
+  ones. severity: `major`. autofix: assisted. (`HOUSE`, stop-slop)
+- `L4-HOUSE-11` [lint] **No bullet narration: an itemize/enumerate whose items are
+  developed prose (four or more items of fifteen or more words each) is narrative
+  masquerading as bullets** — convert it to cohesive prose; genuine short enumerations
+  (case labels, short conditions, hypothesis lists) pass. List density above one list per
+  two sections is likewise flagged. severity: `minor`. autofix: assisted. (`HOUSE`,
+  `AI-SLOP`)
 
 ---
 
