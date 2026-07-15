@@ -388,6 +388,39 @@ def _proof_graph_payload(store: ProofStateStore, *, state: Dict[str, Any] | None
 _LIVE_OVERLAY_KEYS = ("live_logs", "current_invocation")
 
 
+def _reconcile_live_logs_with_runs(
+    live_logs: Any,
+    runs: Any,
+) -> list[Dict[str, Any]]:
+    """Let durable run outcomes override stale in-memory live statuses.
+
+    Parallel children can finish while another child is still writing the
+    rolling console snapshot.  In that race the snapshot may retain an old
+    ``running`` heartbeat even though the completed run has already been
+    recorded in SQLite.  The monitor must not advertise that historical child
+    as active.
+    """
+    if not isinstance(live_logs, list):
+        return []
+    persisted_statuses = {
+        str(row.get("run_id") or ""): str(row.get("status") or "")
+        for row in runs or []
+        if isinstance(row, Mapping) and str(row.get("run_id") or "")
+    }
+    reconciled: list[Dict[str, Any]] = []
+    for entry in live_logs:
+        if not isinstance(entry, Mapping):
+            continue
+        row = dict(entry)
+        persisted = persisted_statuses.get(str(row.get("run_id") or ""), "")
+        if persisted and persisted.lower() not in _LIVE_STATUSES:
+            row["status"] = persisted
+            if str(row.get("phase") or "").lower() in _LIVE_STATUSES:
+                row["phase"] = persisted
+        reconciled.append(row)
+    return reconciled
+
+
 def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
     """Return the console payload plus monitor metadata (source, live flag).
 
@@ -411,6 +444,8 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
         source = "store+console"
         for key in _LIVE_OVERLAY_KEYS:
             value = file_payload.get(key)
+            if key == "live_logs":
+                value = _reconcile_live_logs_with_runs(value, state.get("runs", []))
             if value:
                 payload[key] = value
         live_children = (file_payload.get("usage_summary") or {}).get("active_live_children")
@@ -1676,9 +1711,15 @@ const PIPE = [
 function liveStatus(s){
   return ["running","started","heartbeat","planned"].includes(String(s||"").toLowerCase());
 }
+function liveUpdateRecent(s){
+  const raw = String((s&&s.updated_at)||"").trim();
+  if (!raw) return true;
+  const stamp = Date.parse(raw);
+  return Number.isNaN(stamp) || (Date.now() - stamp) <= 180000;
+}
 function activeStep(payload){
-  const ll = payload.live_logs || [];
-  const active = ll.filter(l => liveStatus(l.status));
+  const ll = latestInvocationSessions(payload);
+  const active = ll.filter(l => liveStatus(l.status) && liveUpdateRecent(l));
   if (active.length){
     const s = active[active.length-1];
     return {role:s.actor_role, mode:s.mode, work_mode:s.researcher_work_mode||"", target:s.target_id, elapsed:s.elapsed_seconds, live:true, active_roles:new Set(active.map(x => String(x.actor_role||"")))};
@@ -1907,7 +1948,7 @@ function latestInvocationSessions(payload){
 }
 function selectDefaultSession(sessions){
   if (!sessions.length) return null;
-  const running = sessions.filter(s => liveStatus(s.status));
+  const running = sessions.filter(s => liveStatus(s.status) && liveUpdateRecent(s));
   return (running.length ? running[running.length-1] : sessions[sessions.length-1]);
 }
 function renderSessionCards(sessions, activeKey){
@@ -1937,7 +1978,7 @@ function renderSession(payload){
   for (const l of logs){ const t = String(l.log_tail||"").trim(); if (t) sessTail[sessionKey(l)] = t; }
   const sessions = latestInvocationSessions(payload);
   for (const l of sessions){ const t = String(l.log_tail||"").trim(); if (t) sessTail[sessionKey(l)] = t; }
-  const liveN = sessions.filter(s => liveStatus(s.status)).length;
+  const liveN = sessions.filter(s => liveStatus(s.status) && liveUpdateRecent(s)).length;
   $("sessCount").textContent = sessions.length ? `${liveN}/${sessions.length} live` : (lastMetaHTML ? "idle" : "");
 
   if (selectedSessionKey && !sessions.some(s => sessionKey(s) === selectedSessionKey)){

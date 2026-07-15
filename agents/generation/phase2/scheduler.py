@@ -48,7 +48,7 @@ from .graph_policy import (
     route_scoreboard,
     root_distance_for_claim_id,
 )
-from .invariants import validate_conn
+from .invariants import ZERO_GAP_VERIFICATION_VERDICTS, validate_conn
 from .research_policy import (
     DEFAULT_RESEARCH_MODE,
     DEFAULT_WEB_SEARCH,
@@ -9126,6 +9126,78 @@ def _integration_candidate(state: Mapping[str, Any]) -> Optional[Mapping[str, An
     return candidates[0] if candidates else None
 
 
+def _latest_clean_verification_at_from_state(
+    state: Mapping[str, Any],
+    entity: Mapping[str, Any],
+) -> str:
+    """Return the newest zero-gap strict-verifier certificate on an entity."""
+    evidence_ids = {
+        str(item)
+        for item in _json_list(entity.get("evidence_artifact_ids_json"))
+        if str(item)
+    }
+    if not evidence_ids:
+        return ""
+    latest = ""
+    artifacts = {
+        str(artifact.get("artifact_id") or ""): artifact
+        for artifact in [
+            *state.get("artifacts", []),
+            *state.get("audit_artifacts", []),
+        ]
+        if str(artifact.get("artifact_id") or "")
+    }
+    for artifact in artifacts.values():
+        if str(artifact.get("artifact_id") or "") not in evidence_ids:
+            continue
+        artifact_type = str(artifact.get("artifact_type") or "")
+        producer_role = str(artifact.get("producer_role") or "")
+        if artifact_type == "formal_backend_result" and producer_role == "formal_backend":
+            latest = max(latest, str(artifact.get("created_at") or ""))
+            continue
+        if artifact_type != "verification_report" or producer_role != "strict_informal_verifier":
+            continue
+        metadata = _json_object(artifact.get("metadata_json"))
+        report = metadata.get("verification_report", {})
+        if not isinstance(report, Mapping):
+            report = {}
+        verdict = str(metadata.get("verdict") or report.get("verdict") or "").strip().lower()
+        if (
+            verdict in ZERO_GAP_VERIFICATION_VERDICTS
+            and not report.get("critical_errors")
+            and not report.get("gaps")
+            and not report.get("blocking_gap")
+        ):
+            latest = max(latest, str(artifact.get("created_at") or ""))
+    return latest
+
+
+def _debt_blocks_integration_candidate(
+    debt: Mapping[str, Any],
+    *,
+    claim_id: str,
+    clean_verification_by_owner: Mapping[str, str],
+) -> bool:
+    """Mirror the integration patch gate when screening scheduler candidates."""
+    owner_type = str(debt.get("owner_type") or "")
+    owner_id = str(debt.get("owner_id") or "")
+    clean_verification_at = str(clean_verification_by_owner.get(owner_id) or "")
+    if (
+        owner_type in {"claim", "inference"}
+        and clean_verification_at
+        and clean_verification_at > str(debt.get("last_seen") or "")
+    ):
+        return False
+    if owner_type != "claim" or owner_id != claim_id:
+        return True
+    debt_type = str(debt.get("debt_type") or "")
+    if debt_type == "missing_proof_or_counterexample":
+        return False
+    if debt_type == "blocking_bridge" and _looks_like_downstream_claim_debt(debt):
+        return False
+    return True
+
+
 def _integration_candidates(
     state: Mapping[str, Any],
     *,
@@ -9144,7 +9216,8 @@ def _integration_candidates(
     inferences_by_route: dict[str, list[Mapping[str, Any]]] = {}
     for inf in state["inferences"]:
         inferences_by_route.setdefault(inf["route_id"], []).append(inf)
-    claim_status = {row["claim_id"]: row["validation_status"] for row in state["claims"]}
+    claim_by_id = {row["claim_id"]: row for row in state["claims"]}
+    claim_status = {claim_id: row["validation_status"] for claim_id, row in claim_by_id.items()}
     excluded_routes = {str(item) for item in (exclude_route_ids or set()) if str(item)}
     excluded_claims = {str(item) for item in (exclude_claim_ids or set()) if str(item)}
     candidates: list[Mapping[str, Any]] = []
@@ -9165,6 +9238,41 @@ def _integration_candidates(
             and all(claim_status.get(premise_id) in verified for premise_id in inf.get("premise_claim_ids", []))
         ]
         if not terminal_inferences:
+            continue
+        route_inferences = inferences_by_route.get(route_id, [])
+        blocker_owner_ids = {
+            route_id,
+            conclusion_id,
+            *[str(inf.get("inference_id") or "") for inf in route_inferences],
+        }
+        clean_verification_by_owner = {
+            conclusion_id: _latest_clean_verification_at_from_state(
+                state,
+                claim_by_id[conclusion_id],
+            )
+        }
+        clean_verification_by_owner.update(
+            {
+                str(inf.get("inference_id") or ""): _latest_clean_verification_at_from_state(
+                    state,
+                    inf,
+                )
+                for inf in route_inferences
+            }
+        )
+        blockers = [
+            debt
+            for debt in state.get("debts", [])
+            if str(debt.get("status") or "") == "active"
+            and str(debt.get("severity") or "") == "blocking"
+            and str(debt.get("owner_id") or "") in blocker_owner_ids
+            and _debt_blocks_integration_candidate(
+                debt,
+                claim_id=conclusion_id,
+                clean_verification_by_owner=clean_verification_by_owner,
+            )
+        ]
+        if blockers:
             continue
         candidate = dict(route)
         candidate["integration_terminal_inference_ids"] = sorted(

@@ -2643,7 +2643,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             self.assertEqual(root["lifecycle_status"], "integrated")
             self.assertEqual(route_row["status"], "integrated")
 
-    def test_older_claim_debt_does_not_block_after_clean_verification(self) -> None:
+    def test_clean_verification_resolves_older_claim_and_inference_debts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("integration-downstream-debt-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("Target theorem.")
@@ -2697,6 +2697,17 @@ class Phase2ExternalCitationTest(unittest.TestCase):
                             "status": "active",
                             "obligation": "Prove the exact side bridge without hidden assumptions.",
                             "suggested_next_target": "side-bridge",
+                        },
+                        {
+                            "op": "add_debt",
+                            "debt_id": "inference-debt-before-side-bridge-verification",
+                            "owner_type": "inference",
+                            "owner_id": "inf-side-bridge",
+                            "debt_type": "proof_gap",
+                            "severity": "blocking",
+                            "status": "active",
+                            "obligation": "Supply the missing local inference argument.",
+                            "suggested_next_target": "inf-side-bridge",
                         },
                     ],
                     "rationale": "seed side-bridge candidate plus downstream debt",
@@ -2789,13 +2800,25 @@ class Phase2ExternalCitationTest(unittest.TestCase):
                 conn.row_factory = sqlite3.Row
                 claim = conn.execute("SELECT lifecycle_status FROM claims WHERE claim_id = 'side-bridge'").fetchone()
                 route = conn.execute("SELECT status FROM routes WHERE route_id = 'route-side-bridge'").fetchone()
-                debt = conn.execute(
-                    "SELECT status FROM debts WHERE debt_id = 'debt-before-side-bridge-verification'"
-                ).fetchone()
+                debts = list(
+                    conn.execute(
+                        """
+                        SELECT debt_id, status, resolution_evidence_json FROM debts
+                        WHERE debt_id IN (
+                            'debt-before-side-bridge-verification',
+                            'inference-debt-before-side-bridge-verification'
+                        )
+                        ORDER BY debt_id
+                        """
+                    )
+                )
 
         self.assertEqual(claim["lifecycle_status"], "integrated")
         self.assertEqual(route["status"], "integrated")
-        self.assertEqual(debt["status"], "active")
+        self.assertEqual([row["status"] for row in debts], ["resolved", "resolved"])
+        self.assertTrue(
+            all("superseded_by_later_clean_verification" in row["resolution_evidence_json"] for row in debts)
+        )
 
     def test_rejects_new_active_sufficient_route_to_integrated_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4663,19 +4686,8 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
                             "explanation": "The dossier proves the lemma.",
                             "evidence_artifact_ids": ["dossier-lemma-integrate"],
                         },
-                        {
-                            "op": "add_debt",
-                            "debt_id": "debt-inf-lemma-integrate",
-                            "owner_type": "inference",
-                            "owner_id": "inf-lemma-integrate",
-                            "debt_type": "missing_reference",
-                            "severity": "blocking",
-                            "status": "active",
-                            "obligation": "Certify the route-local reference before integration.",
-                            "suggested_next_target": "inf-lemma-integrate",
-                        },
                     ],
-                    "rationale": "seed an integration route with an inference-owned blocker",
+                    "rationale": "seed an integration route",
                 },
             )
             self.assertTrue(setup.accepted, setup.errors)
@@ -4719,10 +4731,36 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
                             "evidence_artifact_ids": ["verification-lemma-integrate"],
                         },
                     ],
-                    "rationale": "verify the route while leaving its explicit debt unresolved",
+                    "rationale": "verify the route",
                 },
             )
             self.assertTrue(verified.accepted, verified.errors)
+
+            fresh_debt = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "strict_informal_verifier",
+                    "target_id": "inf-lemma-integrate",
+                    "operations": [
+                        {
+                            "op": "add_debt",
+                            "debt_id": "debt-inf-lemma-integrate",
+                            "owner_type": "inference",
+                            "owner_id": "inf-lemma-integrate",
+                            "debt_type": "missing_reference",
+                            "severity": "blocking",
+                            "status": "active",
+                            "obligation": "A later audit found an uncertified route-local reference.",
+                            "suggested_next_target": "inf-lemma-integrate",
+                        }
+                    ],
+                    "rationale": "record a blocker discovered after clean verification",
+                },
+            )
+            self.assertTrue(fresh_debt.accepted, fresh_debt.errors)
 
             rejected = apply_patch(
                 store,

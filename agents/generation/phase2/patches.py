@@ -543,6 +543,7 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
 
         try:
             conn.execute("BEGIN IMMEDIATE")
+            verification_debt_reconciliations = _resolve_stale_verified_entity_debts(conn)
             pending_owners = _owners_created_by_patch(patch["operations"])
             for op in patch["operations"]:
                 _apply_operation(conn, store, patch, op, pending_owners=pending_owners)
@@ -550,6 +551,8 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
             # No-hanging-proofs invariant: every proven claim is kept verifier-ready.
             _ensure_proven_claims_routed(conn)
             _ensure_verified_statement_repairs_supersede_stale_work(conn)
+            verification_debt_reconciliations.extend(_resolve_stale_verified_entity_debts(conn))
+            integration_reconciliations = _reconcile_invalid_integrations(conn)
 
             invariant_errors = validate_conn(conn)
             if invariant_errors:
@@ -584,6 +587,20 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
                 ),
             )
             store.write_event(conn, new_revision, "patch_applied", {"patch_id": patch_id, "actor_role": patch["actor_role"]})
+            if integration_reconciliations:
+                store.write_event(
+                    conn,
+                    new_revision,
+                    "integration_invalidated",
+                    {"changes": integration_reconciliations},
+                )
+            if verification_debt_reconciliations:
+                store.write_event(
+                    conn,
+                    new_revision,
+                    "stale_verification_debt_resolved",
+                    {"changes": verification_debt_reconciliations},
+                )
             conn.commit()
         except PatchRejected as exc:
             conn.rollback()
@@ -597,6 +614,82 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
     if store.auto_snapshot:
         store.write_snapshot()
     return PatchOutcome(True, new_revision, patch_id, [])
+
+
+def reconcile_integrated_claims(store: ProofStateStore) -> Dict[str, Any]:
+    """Repair legacy verification debt and integration lifecycle state.
+
+    Normal patch application performs the same reconciliation automatically.
+    This explicit entry point exists for proof databases created before that
+    behavior was introduced, so a paused run can be repaired without inventing
+    a synthetic mathematical patch.
+    """
+
+    patch_id = f"integration-reconcile-{uuid.uuid4().hex[:12]}"
+    with store.connect() as conn:
+        current_revision = store.get_revision(conn)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            changes = _resolve_stale_verified_entity_debts(conn)
+            changes.extend(_reconcile_invalid_integrations(conn))
+            if not changes:
+                conn.rollback()
+                return {
+                    "changed": False,
+                    "revision": current_revision,
+                    "patch_id": "",
+                    "changes": [],
+                }
+
+            invariant_errors = validate_conn(conn)
+            if invariant_errors:
+                raise PatchRejected(invariant_errors)
+
+            new_revision = current_revision + 1
+            now = utc_now()
+            conn.execute(
+                "UPDATE problem_state SET current_revision = ?, updated_at = ? WHERE problem_id = ?",
+                (new_revision, now, store.problem_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO patches(
+                    patch_id, schema_version, problem_id, base_revision, actor_role,
+                    target_id, operations_json, evidence_artifact_ids_json, rationale,
+                    status, rejection_reason, created_at, applied_revision
+                ) VALUES (?, ?, ?, ?, 'system', 'integration_reconciliation', ?, '[]', ?,
+                          'applied', '', ?, ?)
+                """,
+                (
+                    patch_id,
+                    SCHEMA_VERSION,
+                    store.problem_id,
+                    current_revision,
+                    json_dumps(changes),
+                    "reconcile stale verification debt and integration lifecycle with current proof obligations",
+                    now,
+                    new_revision,
+                ),
+            )
+            store.write_event(
+                conn,
+                new_revision,
+                "integration_reconciled",
+                {"patch_id": patch_id, "changes": changes},
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    if store.auto_snapshot:
+        store.write_snapshot()
+    return {
+        "changed": True,
+        "revision": new_revision,
+        "patch_id": patch_id,
+        "changes": changes,
+    }
 
 
 def _safe_revision(store: ProofStateStore) -> int:
@@ -2668,10 +2761,7 @@ def _guard_integration(
         raise PatchRejected(["integration route conclusion does not match target claim"])
     if route["relation_to_parent"] != "sufficient":
         raise PatchRejected(["only sufficient routes can support integration"])
-    conclusion = conn.execute(
-        "SELECT validation_status, evidence_artifact_ids_json FROM claims WHERE claim_id = ?",
-        (claim_id,),
-    ).fetchone()
+    conclusion = conn.execute("SELECT * FROM claims WHERE claim_id = ?", (claim_id,)).fetchone()
     if conclusion is None or conclusion["validation_status"] not in VERIFIED_STATUSES:
         raise PatchRejected([f"claim {claim_id} is not verified"])
     integration_errors = _integration_report_errors(conn, evidence_ids, claim_id=claim_id, route=route, producer_role="integration_verifier")
@@ -2689,15 +2779,12 @@ def _guard_integration(
         )
     )
     resolved = set(resolved_debt_ids)
-    clean_verification_at = _latest_clean_claim_verification_at(
-        conn,
-        json_loads(conclusion["evidence_artifact_ids_json"], []),
-    )
+    clean_verification_by_owner = _clean_verification_times_for_route(conn, conclusion, inferences)
     if any(
         _debt_blocks_integration(
             row,
             claim_id=claim_id,
-            clean_verification_at=clean_verification_at,
+            clean_verification_by_owner=clean_verification_by_owner,
         )
         for row in blockers
         if row["debt_id"] not in resolved
@@ -2789,7 +2876,7 @@ def _latest_clean_claim_verification_at(
     conn: sqlite3.Connection,
     evidence_ids: Sequence[str],
 ) -> str:
-    """Timestamp of the newest clean verifier/formal certificate on a claim."""
+    """Timestamp of the newest clean verifier/formal certificate on an entity."""
     latest = ""
     for artifact_id in evidence_ids:
         row = conn.execute(
@@ -2817,14 +2904,113 @@ def _latest_clean_claim_verification_at(
     return latest
 
 
+def _clean_verification_times_for_route(
+    conn: sqlite3.Connection,
+    claim: sqlite3.Row | None,
+    inferences: Sequence[sqlite3.Row],
+) -> Dict[str, str]:
+    times: Dict[str, str] = {}
+    if claim is not None:
+        times[str(claim["claim_id"] or "")] = _latest_clean_claim_verification_at(
+            conn,
+            json_loads(claim["evidence_artifact_ids_json"], []),
+        )
+    for inference in inferences:
+        times[str(inference["inference_id"] or "")] = _latest_clean_claim_verification_at(
+            conn,
+            json_loads(inference["evidence_artifact_ids_json"], []),
+        )
+    return times
+
+
+def _resolve_stale_verified_entity_debts(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Resolve blockers superseded by a later zero-gap entity verification.
+
+    Claim and inference verification are entity-local.  They may supersede an
+    older blocker owned by that exact entity, but never route-level assembly or
+    source-to-target bridge debt.
+    """
+
+    changes: List[Dict[str, Any]] = []
+    for owner_type, table, id_column in (
+        ("claim", "claims", "claim_id"),
+        ("inference", "inferences", "inference_id"),
+    ):
+        rows = conn.execute(
+            f"""
+            SELECT {id_column} AS entity_id, evidence_artifact_ids_json
+            FROM {table}
+            WHERE validation_status IN ('informally_verified', 'formally_verified')
+            """
+        )
+        for row in rows:
+            entity_id = str(row["entity_id"] or "")
+            clean_verification_at = _latest_clean_claim_verification_at(
+                conn,
+                json_loads(row["evidence_artifact_ids_json"], []),
+            )
+            if not clean_verification_at:
+                continue
+            debts = list(
+                conn.execute(
+                    """
+                    SELECT * FROM debts
+                    WHERE owner_type = ?
+                      AND owner_id = ?
+                      AND status = 'active'
+                      AND severity = 'blocking'
+                      AND last_seen < ?
+                    """,
+                    (owner_type, entity_id, clean_verification_at),
+                )
+            )
+            for debt in debts:
+                evidence = json_loads(debt["resolution_evidence_json"], {})
+                if not isinstance(evidence, dict):
+                    evidence = {}
+                evidence.update(
+                    {
+                        "resolved_by": "system",
+                        "resolution_status": "superseded_by_later_clean_verification",
+                        "owner_type": owner_type,
+                        "owner_id": entity_id,
+                        "verification_at": clean_verification_at,
+                    }
+                )
+                conn.execute(
+                    "UPDATE debts SET status = 'resolved', resolution_evidence_json = ? WHERE debt_id = ?",
+                    (json_dumps(evidence), debt["debt_id"]),
+                )
+                changes.append(
+                    {
+                        "entity_type": "debt",
+                        "entity_id": str(debt["debt_id"] or ""),
+                        "owner_type": owner_type,
+                        "owner_id": entity_id,
+                        "from_status": "active",
+                        "to_status": "resolved",
+                        "reason": "superseded by later clean verification of the same entity",
+                        "verification_at": clean_verification_at,
+                    }
+                )
+    return changes
+
+
 def _debt_blocks_integration(
     debt: sqlite3.Row,
     *,
     claim_id: str,
-    clean_verification_at: str = "",
+    clean_verification_by_owner: Mapping[str, str] | None = None,
 ) -> bool:
     owner_type = str(debt["owner_type"] or "")
     owner_id = str(debt["owner_id"] or "")
+    clean_verification_at = str((clean_verification_by_owner or {}).get(owner_id) or "")
+    if (
+        owner_type in {"claim", "inference"}
+        and clean_verification_at
+        and clean_verification_at > str(debt["last_seen"] or "")
+    ):
+        return False
     if owner_type != "claim" or owner_id != claim_id:
         return True
     debt_type = str(debt["debt_type"] or "")
@@ -2837,9 +3023,204 @@ def _debt_blocks_integration(
     # downstream root work, but it must not trap the already verified claim in
     # an endless integration-rejection loop.  Any blocker added or refreshed
     # after the certificate remains binding.
-    if clean_verification_at and clean_verification_at > str(debt["last_seen"] or ""):
-        return False
     return True
+
+
+def _route_integration_health(conn: sqlite3.Connection, route: sqlite3.Row) -> Dict[str, Any]:
+    """Return the current structural integration verdict for one route."""
+
+    route_id = str(route["route_id"] or "")
+    claim_id = str(route["conclusion_claim_id"] or "")
+    issues: List[str] = []
+    if str(route["relation_to_parent"] or "") != "sufficient":
+        issues.append("route is not sufficient")
+
+    claim = conn.execute("SELECT * FROM claims WHERE claim_id = ?", (claim_id,)).fetchone()
+    if claim is None:
+        issues.append("conclusion claim is missing")
+    else:
+        if str(claim["validation_status"] or "") not in VERIFIED_STATUSES:
+            issues.append("conclusion claim is not verified")
+
+    inferences = list(conn.execute("SELECT * FROM inferences WHERE route_id = ?", (route_id,)))
+    if not inferences:
+        issues.append("route has no inferences")
+
+    verified_terminal_ids: List[str] = []
+    for inference in inferences:
+        if (
+            str(inference["conclusion_claim_id"] or "") != claim_id
+            or str(inference["validation_status"] or "") not in VERIFIED_STATUSES
+        ):
+            continue
+        premises_verified = True
+        for premise in conn.execute(
+            "SELECT premise_claim_id FROM inference_premises WHERE inference_id = ?",
+            (inference["inference_id"],),
+        ):
+            premise_claim = conn.execute(
+                "SELECT validation_status FROM claims WHERE claim_id = ?",
+                (premise["premise_claim_id"],),
+            ).fetchone()
+            if premise_claim is None or str(premise_claim["validation_status"] or "") not in VERIFIED_STATUSES:
+                premises_verified = False
+                break
+        if premises_verified:
+            verified_terminal_ids.append(str(inference["inference_id"] or ""))
+    if not verified_terminal_ids:
+        issues.append("route has no verified terminal inference with verified premises")
+
+    owner_ids = {claim_id, route_id, *[str(row["inference_id"] or "") for row in inferences]}
+    clean_verification_by_owner = _clean_verification_times_for_route(conn, claim, inferences)
+    blocking_debt_ids = [
+        str(debt["debt_id"] or "")
+        for debt in conn.execute(
+            "SELECT * FROM debts WHERE status = 'active' AND severity = 'blocking'"
+        )
+        if str(debt["owner_id"] or "") in owner_ids
+        and _debt_blocks_integration(
+            debt,
+            claim_id=claim_id,
+            clean_verification_by_owner=clean_verification_by_owner,
+        )
+    ]
+    if blocking_debt_ids:
+        issues.append("active blocking debt")
+
+    return {
+        "route_id": route_id,
+        "claim_id": claim_id,
+        "valid": not issues,
+        "issues": issues,
+        "blocking_debt_ids": sorted(blocking_debt_ids),
+        "verified_terminal_inference_ids": sorted(verified_terminal_ids),
+    }
+
+
+def _reconcile_invalid_integrations(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Demote integrated routes and claims invalidated by later proof-state changes."""
+
+    now = utc_now()
+    changes: List[Dict[str, Any]] = []
+    invalidated_claim_modes: Dict[str, str] = {}
+    integrated_routes = list(conn.execute("SELECT * FROM routes WHERE status = 'integrated'"))
+    for route in integrated_routes:
+        health = _route_integration_health(conn, route)
+        claim = conn.execute(
+            "SELECT lifecycle_status FROM claims WHERE claim_id = ?",
+            (health["claim_id"],),
+        ).fetchone()
+        if claim is None or str(claim["lifecycle_status"] or "") != "integrated":
+            health["valid"] = False
+            health["issues"] = [*health["issues"], "conclusion claim is not integrated"]
+        if health["valid"]:
+            continue
+
+        new_route_status = "blocked" if health["blocking_debt_ids"] else "active"
+        conn.execute(
+            "UPDATE routes SET status = ?, updated_at = ? WHERE route_id = ?",
+            (new_route_status, now, health["route_id"]),
+        )
+        if health["claim_id"]:
+            previous = invalidated_claim_modes.get(health["claim_id"], "active")
+            invalidated_claim_modes[health["claim_id"]] = (
+                "blocked" if new_route_status == "blocked" or previous == "blocked" else "active"
+            )
+        changes.append(
+            {
+                "entity_type": "route",
+                "entity_id": health["route_id"],
+                "claim_id": health["claim_id"],
+                "from_status": "integrated",
+                "to_status": new_route_status,
+                "reasons": health["issues"],
+                "blocking_debt_ids": health["blocking_debt_ids"],
+            }
+        )
+
+    integrated_claims = list(conn.execute("SELECT * FROM claims WHERE lifecycle_status = 'integrated'"))
+    for claim in integrated_claims:
+        claim_id = str(claim["claim_id"] or "")
+        remaining = conn.execute(
+            """
+            SELECT 1 FROM routes
+            WHERE conclusion_claim_id = ?
+              AND relation_to_parent = 'sufficient'
+              AND status = 'integrated'
+            LIMIT 1
+            """,
+            (claim_id,),
+        ).fetchone()
+        if remaining:
+            continue
+        new_claim_status = invalidated_claim_modes.get(claim_id, "active")
+        conn.execute(
+            "UPDATE claims SET lifecycle_status = ?, updated_at = ? WHERE claim_id = ?",
+            (new_claim_status, now, claim_id),
+        )
+        changes.append(
+            {
+                "entity_type": "claim",
+                "entity_id": claim_id,
+                "from_status": "integrated",
+                "to_status": new_claim_status,
+                "reasons": ["no currently valid integrated sufficient route"],
+            }
+        )
+
+    reactivated_claim_ids: set[str] = set()
+    for route in list(
+        conn.execute(
+            "SELECT * FROM routes WHERE status = 'blocked' AND relation_to_parent = 'sufficient'"
+        )
+    ):
+        health = _route_integration_health(conn, route)
+        if not health["valid"]:
+            continue
+        claim = conn.execute(
+            "SELECT lifecycle_status FROM claims WHERE claim_id = ?",
+            (health["claim_id"],),
+        ).fetchone()
+        if claim is None or str(claim["lifecycle_status"] or "") == "integrated":
+            continue
+        conn.execute(
+            "UPDATE routes SET status = 'active', updated_at = ? WHERE route_id = ?",
+            (now, health["route_id"]),
+        )
+        reactivated_claim_ids.add(health["claim_id"])
+        changes.append(
+            {
+                "entity_type": "route",
+                "entity_id": health["route_id"],
+                "claim_id": health["claim_id"],
+                "from_status": "blocked",
+                "to_status": "active",
+                "reasons": ["blocking obligations cleared; integration verification may be retried"],
+            }
+        )
+
+    for claim_id in sorted(reactivated_claim_ids):
+        claim = conn.execute(
+            "SELECT lifecycle_status FROM claims WHERE claim_id = ?",
+            (claim_id,),
+        ).fetchone()
+        if claim is None or str(claim["lifecycle_status"] or "") != "blocked":
+            continue
+        conn.execute(
+            "UPDATE claims SET lifecycle_status = 'active', updated_at = ? WHERE claim_id = ?",
+            (now, claim_id),
+        )
+        changes.append(
+            {
+                "entity_type": "claim",
+                "entity_id": claim_id,
+                "from_status": "blocked",
+                "to_status": "active",
+                "reasons": ["a sufficient route is verification-ready again"],
+            }
+        )
+
+    return changes
 
 
 def _looks_like_downstream_claim_debt(debt: sqlite3.Row) -> bool:

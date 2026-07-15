@@ -406,6 +406,69 @@ class MonitorTest(unittest.TestCase):
         self.assertTrue(payload["_monitor"]["live"])
         self.assertEqual(payload["_monitor"]["run_state"], "running")
 
+    def test_durable_run_status_reconciles_stale_running_live_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            now = utc_now()
+            with store.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO runs(
+                        run_id, actor_role, mode, target_id, route_id, state_revision,
+                        context_revision, session_id, model_profile, model, reasoning_effort,
+                        search_setting, search_intent, sandbox_setting, budget_requested,
+                        input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens,
+                        total_tokens, wall_time_seconds, peak_memory_mb, status,
+                        prompt_context_hash, output_artifact_ids_json, error_artifact_id,
+                        created_at, researcher_work_mode, work_mode_source, failure_kind
+                    ) VALUES (
+                        'finished-integration', 'integration_verifier', 'integrate', 'claim-a',
+                        'route-a', 1, 1, '', 'default', 'fake', 'xhigh', 'disabled', '',
+                        'workspace-write', 1000, 10, 0, 5, 0, 15, 2.0, 1.0, 'completed',
+                        '', '[]', '', ?, '', '', ''
+                    )
+                    """,
+                    (now,),
+                )
+                conn.commit()
+            stale_integration = {
+                "run_id": "finished-integration",
+                "actor_role": "integration_verifier",
+                "mode": "integrate",
+                "status": "running",
+                "phase": "heartbeat",
+                "updated_at": now,
+            }
+            current_researcher = {
+                "run_id": "current-researcher",
+                "actor_role": "researcher",
+                "mode": "prove",
+                "status": "running",
+                "phase": "heartbeat",
+                "updated_at": now,
+            }
+            (store.state_dir / "albilich_run_console.json").write_text(
+                json.dumps(
+                    {
+                        "current_invocation": [
+                            {"step": 1, "live_session_updates": [stale_integration]},
+                            {"step": 2, "live_session_updates": [current_researcher]},
+                        ],
+                        "live_logs": [stale_integration, current_researcher],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = build_monitor_payload(store)
+
+        live_by_run = {row["run_id"]: row for row in payload["live_logs"]}
+        self.assertEqual(live_by_run["finished-integration"]["status"], "completed")
+        self.assertEqual(live_by_run["finished-integration"]["phase"], "completed")
+        self.assertEqual(live_by_run["current-researcher"]["status"], "running")
+        self.assertIn("const ll = latestInvocationSessions(payload);", INDEX_HTML)
+        self.assertIn("liveStatus(l.status) && liveUpdateRecent(l)", INDEX_HTML)
+
     def test_endpoints_serve_html_and_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(tmpdir)

@@ -47,6 +47,75 @@ def validate_conn(conn: sqlite3.Connection) -> List[str]:
         for aid in json_loads(route["evidence_artifact_ids_json"]):
             if aid not in artifact_ids:
                 errors.append(f"route {route['route_id']} has dangling artifact {aid}")
+        if route["status"] == "integrated":
+            conclusion = conn.execute(
+                "SELECT validation_status, lifecycle_status FROM claims WHERE claim_id = ?",
+                (route["conclusion_claim_id"],),
+            ).fetchone()
+            if route["relation_to_parent"] != "sufficient":
+                errors.append(f"integrated route {route['route_id']} is not sufficient")
+            if conclusion and conclusion["lifecycle_status"] != "integrated":
+                errors.append(
+                    f"integrated route {route['route_id']} concludes non-integrated claim "
+                    f"{route['conclusion_claim_id']}"
+                )
+            if conclusion and conclusion["validation_status"] not in VERIFIED_STATUSES:
+                errors.append(
+                    f"integrated route {route['route_id']} concludes unverified claim "
+                    f"{route['conclusion_claim_id']}"
+                )
+            terminal_verified = False
+            route_inference_ids: List[str] = []
+            for inference in conn.execute(
+                "SELECT inference_id, conclusion_claim_id, validation_status FROM inferences WHERE route_id = ?",
+                (route["route_id"],),
+            ):
+                route_inference_ids.append(str(inference["inference_id"]))
+                if (
+                    inference["conclusion_claim_id"] != route["conclusion_claim_id"]
+                    or inference["validation_status"] not in VERIFIED_STATUSES
+                ):
+                    continue
+                premises = list(
+                    conn.execute(
+                        "SELECT premise_claim_id FROM inference_premises WHERE inference_id = ?",
+                        (inference["inference_id"],),
+                    )
+                )
+                if all(
+                    (
+                        premise := conn.execute(
+                            "SELECT validation_status FROM claims WHERE claim_id = ?",
+                            (row["premise_claim_id"],),
+                        ).fetchone()
+                    )
+                    and premise["validation_status"] in VERIFIED_STATUSES
+                    for row in premises
+                ):
+                    terminal_verified = True
+            if not terminal_verified:
+                errors.append(
+                    f"integrated route {route['route_id']} has no verified terminal inference "
+                    "with verified premises"
+                )
+            blocker_owner_ids = [str(route["route_id"]), *route_inference_ids]
+            if blocker_owner_ids:
+                placeholders = ", ".join("?" for _ in blocker_owner_ids)
+                blocker = conn.execute(
+                    f"""
+                    SELECT debt_id FROM debts
+                    WHERE owner_id IN ({placeholders})
+                      AND status = 'active'
+                      AND severity = 'blocking'
+                    LIMIT 1
+                    """,
+                    blocker_owner_ids,
+                ).fetchone()
+                if blocker:
+                    errors.append(
+                        f"integrated route {route['route_id']} carries active blocking debt "
+                        f"{blocker['debt_id']}"
+                    )
 
     for inf in conn.execute("SELECT * FROM inferences"):
         if inf["validation_status"] not in INFERENCE_STATUSES:
@@ -114,6 +183,8 @@ def validate_conn(conn: sqlite3.Connection) -> List[str]:
             if not any(_artifact_type(conn, aid) == "confirmed_counterexample" for aid in evidence_ids) and not _has_premiseless_verification_evidence(conn, evidence_ids):
                 errors.append(f"claim {claim['claim_id']} refuted without confirmed counterexample or strict verification evidence")
         if claim["lifecycle_status"] == "integrated":
+            if claim["validation_status"] not in VERIFIED_STATUSES:
+                errors.append(f"claim {claim['claim_id']} integrated without verified validation status")
             routes = list(conn.execute("SELECT route_id FROM routes WHERE conclusion_claim_id = ? AND relation_to_parent = 'sufficient' AND status = 'integrated'", (claim["claim_id"],)))
             if not routes:
                 errors.append(f"claim {claim['claim_id']} integrated without integrated sufficient route")

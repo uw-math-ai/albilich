@@ -18,7 +18,7 @@ from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.patches import apply_patch
 from agents.generation.phase2.receipt import build_partial_receipt_inventory, format_partial_receipt_appendix
 from agents.generation.phase2.research_policy import DEFAULT_RESEARCH_MODE, normalize_research_mode, theorem_matching_confidence
-from agents.generation.phase2.scheduler import _active_main_trunk_pressure, _active_route_for_claim, _advisor_followup_report, _advisor_requested_strict_verifier_action, _advisor_requested_validation_action, _advisor_requested_villain_action, _bottleneck_lock_action, _bottleneck_lock_debt_candidates, _branch_packet_card, _central_obstruction_payload, _claim_target_for_debt, _cooldown_proof_action, _executive_advisor_bottleneck_action, _first_blocking_debt, _frontier_pressure_action, _is_exact_citation_debt, _near_solution_spine_synthesis_action, _next_unverified_claim, _proof_architecture_pressure_action, _recursive_meta_drift, _root_refinement_signals, _route_without_inference, _unrouted_proof_candidate, _unrouted_proof_claim_action, _verifier_blocked_citation_action, bottleneck_frontier_summary, next_action, parallel_companion_actions, proof_spine_summary, route_verifier_readiness, verifier_ready_route_summaries
+from agents.generation.phase2.scheduler import _active_main_trunk_pressure, _active_route_for_claim, _advisor_followup_report, _advisor_requested_strict_verifier_action, _advisor_requested_validation_action, _advisor_requested_villain_action, _bottleneck_lock_action, _bottleneck_lock_debt_candidates, _branch_packet_card, _central_obstruction_payload, _claim_target_for_debt, _cooldown_proof_action, _executive_advisor_bottleneck_action, _first_blocking_debt, _frontier_pressure_action, _integration_candidates, _is_exact_citation_debt, _near_solution_spine_synthesis_action, _next_unverified_claim, _proof_architecture_pressure_action, _recursive_meta_drift, _root_refinement_signals, _route_without_inference, _unrouted_proof_candidate, _unrouted_proof_claim_action, _verifier_blocked_citation_action, bottleneck_frontier_summary, next_action, parallel_companion_actions, proof_spine_summary, route_verifier_readiness, verifier_ready_route_summaries
 from agents.generation.phase2.store import ProofStateStore
 from agents.generation.phase2.workflow import _evidence_boundary_errors, _stop_writer_action, _stop_writer_safety_blocker
 
@@ -3820,6 +3820,116 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertTrue(action["route_id"].startswith("route-citation-"))
         self.assertEqual(root_integration_companions, [])
 
+    def test_integration_candidates_skip_new_route_claim_and_inference_blockers(self) -> None:
+        verified_claim = claim(
+            "ready-lemma",
+            1,
+            validation_status="informally_verified",
+            parent_ids=["root"],
+        )
+        verified_claim["evidence_artifact_ids_json"] = json.dumps(["verification-ready-lemma"])
+        ready_route = route("route-ready-lemma", conclusion_claim_id="ready-lemma")
+        ready_inference = inference(
+            "inf-ready-lemma",
+            route_id="route-ready-lemma",
+            conclusion_claim_id="ready-lemma",
+            validation_status="informally_verified",
+        )
+        verification_artifact = {
+            "artifact_id": "verification-ready-lemma",
+            "artifact_type": "verification_report",
+            "producer_role": "strict_informal_verifier",
+            "created_at": "2026-01-02T00:00:00+00:00",
+            "metadata_json": json.dumps(
+                {
+                    "verdict": "verified",
+                    "verification_report": {
+                        "critical_errors": [],
+                        "gaps": [],
+                        "blocking_gap": False,
+                    },
+                }
+            ),
+        }
+        for owner_type, owner_id in (
+            ("route", "route-ready-lemma"),
+            ("claim", "ready-lemma"),
+            ("inference", "inf-ready-lemma"),
+        ):
+            with self.subTest(owner_type=owner_type):
+                state = {
+                    "claims": [verified_claim],
+                    "routes": [ready_route],
+                    "inferences": [ready_inference],
+                    "debts": [
+                        debt(
+                            f"debt-after-verification-{owner_type}",
+                            owner_type=owner_type,
+                            owner_id=owner_id,
+                            last_seen="2026-01-03T00:00:00+00:00",
+                        )
+                    ],
+                    "artifacts": [verification_artifact],
+                }
+
+                self.assertEqual(_integration_candidates(state), [])
+
+    def test_integration_candidates_allow_older_entity_debt_but_keep_route_debt(self) -> None:
+        verified_claim = claim(
+            "ready-lemma",
+            1,
+            validation_status="informally_verified",
+            parent_ids=["root"],
+        )
+        verified_claim["evidence_artifact_ids_json"] = json.dumps(["verification-ready-lemma"])
+        verified_inference = inference(
+            "inf-ready-lemma",
+            route_id="route-ready-lemma",
+            conclusion_claim_id="ready-lemma",
+            validation_status="informally_verified",
+        )
+        verified_inference["evidence_artifact_ids_json"] = json.dumps(["verification-ready-lemma"])
+        verification_artifact = {
+            "artifact_id": "verification-ready-lemma",
+            "artifact_type": "verification_report",
+            "producer_role": "strict_informal_verifier",
+            "created_at": "2026-01-02T00:00:00+00:00",
+            "metadata_json": json.dumps(
+                {
+                    "verdict": "correct_no_gaps",
+                    "verification_report": {
+                        "critical_errors": [],
+                        "gaps": [],
+                        "blocking_gap": False,
+                    },
+                }
+            ),
+        }
+        for owner_type, owner_id, should_integrate in (
+            ("claim", "ready-lemma", True),
+            ("inference", "inf-ready-lemma", True),
+            ("route", "route-ready-lemma", False),
+        ):
+            with self.subTest(owner_type=owner_type):
+                state = {
+                    "claims": [verified_claim],
+                    "routes": [route("route-ready-lemma", conclusion_claim_id="ready-lemma")],
+                    "inferences": [verified_inference],
+                    "debts": [
+                        debt(
+                            "debt-before-verification",
+                            owner_type=owner_type,
+                            owner_id=owner_id,
+                            last_seen="2026-01-01T00:00:00+00:00",
+                        )
+                    ],
+                    "artifacts": [verification_artifact],
+                }
+
+                candidates = _integration_candidates(state)
+
+                self.assertEqual(bool(candidates), should_integrate)
+
     def test_verified_side_route_integrates_while_unrelated_work_continues_in_parallel(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore(
@@ -6974,17 +7084,6 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                         },
                         {
                             "op": "add_debt",
-                            "debt_id": "debt-local-integration-route",
-                            "owner_type": "inference",
-                            "owner_id": "inf-packet-target",
-                            "debt_type": "missing_reference",
-                            "severity": "blocking",
-                            "status": "active",
-                            "obligation": "Check the reference used by this exact integration route.",
-                            "suggested_next_target": "inf-packet-target",
-                        },
-                        {
-                            "op": "add_debt",
                             "debt_id": "debt-unrelated-root-route",
                             "owner_type": "claim",
                             "owner_id": "root",
@@ -7044,6 +7143,32 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                 },
             )
             self.assertTrue(verified.accepted, verified.errors)
+
+            fresh_debt = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "strict_informal_verifier",
+                    "target_id": "inf-packet-target",
+                    "operations": [
+                        {
+                            "op": "add_debt",
+                            "debt_id": "debt-local-integration-route",
+                            "owner_type": "inference",
+                            "owner_id": "inf-packet-target",
+                            "debt_type": "missing_reference",
+                            "severity": "blocking",
+                            "status": "active",
+                            "obligation": "A later audit found an unchecked reference on this exact route.",
+                            "suggested_next_target": "inf-packet-target",
+                        }
+                    ],
+                    "rationale": "record a fresh route-local integration blocker",
+                },
+            )
+            self.assertTrue(fresh_debt.accepted, fresh_debt.errors)
 
             action = {"mode": "integrate", "target_id": "packet-target", "route_id": "route-packet-target"}
             full_manifest = build_context_manifest(

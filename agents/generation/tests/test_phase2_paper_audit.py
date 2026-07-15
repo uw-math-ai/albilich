@@ -86,6 +86,14 @@ def make_solved_store(tmpdir: Path, problem_id: str) -> ProofStateStore:
             "UPDATE claims SET lifecycle_status='integrated', validation_status='informally_verified'"
             " WHERE claim_id='root'"
         )
+        conn.execute(
+            "INSERT INTO inferences(inference_id, route_id, conclusion_claim_id, explanation,"
+            " conditions_json, condition_claim_ids_json, validation_status, evidence_artifact_ids_json,"
+            " created_at, updated_at)"
+            " VALUES ('inf-root', 'route-root', 'root', 'Verified direct proof of the root claim.',"
+            " '[]', '[]', 'informally_verified', '[]',"
+            " '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+        )
         conn.commit()
     outcome = apply_patch(
         store,

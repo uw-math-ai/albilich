@@ -27,7 +27,7 @@ from .invariants import validate_conn
 from .metrics import compute_metrics
 from .models import COMPLETION_POLICIES, DEFAULT_COMPLETION_POLICY, problem_id_from_file, sanitize_problem_id
 from .monitor import BackgroundMonitor, start_background_monitor
-from .patches import apply_patch
+from .patches import apply_patch, reconcile_integrated_claims
 from .report import build_markdown_report, write_markdown_report
 from .result_status import classify_result
 from .research_policy import DEFAULT_RESEARCH_MODE, DEFAULT_WEB_SEARCH, RESEARCH_MODES
@@ -92,6 +92,12 @@ def main(argv: list[str] | None = None) -> None:
 
     p_check = sub.add_parser("check", help="run invariant checks")
     p_check.add_argument("problem")
+
+    p_reconcile = sub.add_parser(
+        "reconcile-integrations",
+        help="reconcile stale verification debt and claim/route integration lifecycle state",
+    )
+    p_reconcile.add_argument("problem")
 
     p_snapshot = sub.add_parser("snapshot", help="write an explicit JSON snapshot of the SQLite proof state")
     p_snapshot.add_argument("problem")
@@ -287,6 +293,8 @@ def main(argv: list[str] | None = None) -> None:
         with store.connect() as conn:
             errors = validate_conn(conn)
         _print({"ok": not errors, "errors": errors})
+    elif args.command == "reconcile-integrations":
+        _print(reconcile_integrated_claims(store))
     elif args.command == "snapshot":
         store.write_snapshot()
         _print({"path": str(store.snapshot_path)})
