@@ -8,18 +8,20 @@ pdflatex compile of the normalized output.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from agents.generation.phase2.receipt import compile_latex_artifact
+from agents.generation.phase2.receipt import _find_pdflatex, compile_latex_artifact
 from agents.generation.phase2.writing.latex_template import normalize_paper_template
 
 # A compilable article with a non-house preamble (author kept graphicx and a
@@ -192,8 +194,17 @@ class TableNormalizationTest(unittest.TestCase):
 
 
 class NormalizedOutputCompilesTest(unittest.TestCase):
+    def test_pdflatex_override_survives_restricted_service_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executable = Path(tmpdir) / "pdflatex"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+            with mock.patch.dict(os.environ, {"ALBILICH_PDFLATEX": str(executable)}):
+                with mock.patch("shutil.which", return_value=None):
+                    self.assertEqual(_find_pdflatex(), str(executable))
+
     def test_normalized_paper_compiles_with_real_pdflatex(self) -> None:
-        if shutil.which("pdflatex") is None:
+        if not _find_pdflatex():
             self.skipTest("pdflatex is not installed")
         normalized = normalize_paper_template(BAD_PREAMBLE_PAPER)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -202,6 +213,23 @@ class NormalizedOutputCompilesTest(unittest.TestCase):
             sidecars = compile_latex_artifact(tex_path, tex_path.with_suffix(".pdf"))
             self.assertEqual("compiled", sidecars.get("pdf_status"), sidecars)
             self.assertTrue(tex_path.with_suffix(".pdf").is_file())
+
+    def test_relative_latex_source_compiles_from_isolated_workdir(self) -> None:
+        if not _find_pdflatex():
+            self.skipTest("pdflatex is not installed")
+        normalized = normalize_paper_template(BAD_PREAMBLE_PAPER)
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory(dir=original_cwd) as tmpdir:
+            workdir = Path(tmpdir)
+            try:
+                os.chdir(workdir)
+                tex_path = Path("relative.tex")
+                tex_path.write_text(normalized, encoding="utf-8")
+                sidecars = compile_latex_artifact(tex_path, tex_path.with_suffix(".pdf"))
+                self.assertEqual("compiled", sidecars.get("pdf_status"), sidecars)
+                self.assertTrue(tex_path.with_suffix(".pdf").is_file())
+            finally:
+                os.chdir(original_cwd)
 
 
 if __name__ == "__main__":

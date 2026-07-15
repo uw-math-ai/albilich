@@ -1,54 +1,71 @@
 # Albilich
 
-Albilich runs a team of language-model agents on a research-level theorem and
-returns either a verified proof, a verified counterexample, or an honest
-partial result with the remaining obstructions named. Every run is backed by a
-versioned proof state: a SQLite database of claims, routes, inferences, debts,
-retrieval cards, and artifacts. An agent advances the work only by submitting a
-patch that the store accepts, and the store rejects any patch that violates the
-role and evidence invariants. A theorem counts as solved after strict
-verification of the proof and a root-alignment check against the original
-statement, never because a proof sounded plausible or a source looked relevant.
+Albilich is an auditable multi-agent research system for difficult mathematics.
+It coordinates proof construction, counterexample search, literature review,
+computer algebra, strict verification, integration checking, and final writing
+around one persistent proof graph. A run returns a verified proof, a verified
+counterexample, or an honest partial result that names the remaining
+obstructions.
 
-## Current release
+This is not a single-pass prover. Every mathematical claim, route, inference,
+debt, source record, and proof artifact lives in a versioned SQLite proof state.
+Agents can advance that state only through validated patches, and only verifier
+roles can certify or refute mathematics. A theorem counts as solved only after
+its proof spine passes strict verification and a separate integration check
+confirms that it proves the original statement.
 
-This release brings the standalone package up to date with the current
-Albilich research workflow. It is a consolidated framework update.
+## Current release: a major research-engine upgrade
 
-- **Multi-branch research by default.** Hard-problem runs use three research
-  branches, sharing compact branch summaries and negative evidence while
-  researchers, villains, literature scouts, and verifiers work concurrently
-  where proof-state mutations are safe.
-- **A stronger strategy layer.** Bidirectional bridge search, bottleneck-local
-  conjectures, reviewed method cards, coherent deep sessions, information-gain
-  scoring, proof compression, and persisted advisor syntheses focus effort on
-  the weakest statement that would complete the best proof route.
-- **Parallel verification with strict authority.** Ready claims can receive
-  independent strict checks while safe research continues. Integration and
-  counterexample validation remain separate gates, and only verifying roles
-  can certify or refute mathematical claims.
-- **More accurate proof-state lifecycle.** Superseded, retired, challenged,
-  and route-local claims retain their proper scope. Recovered integrations,
-  claim relations, blocking debts, verifier readiness, and root alignment are
-  represented explicitly rather than inferred from prose.
-- **A clearer live dashboard.** The monitor shows claim hierarchy and
-  containment, lifecycle colors, branch activity, verifier capacity, recovered
-  integrations, run progress, and cached-versus-new token accounting.
-- **More reliable long runs.** The workflow repairs common structured-output
-  failures, including malformed JSON and LaTeX escapes; handles abnormal child
-  exits and missing executables; suppresses duplicate advisor loops; preserves
-  workflow timestamps; and stops solved runs before optional paper polishing.
-- **Disciplined computation and writing.** CAS passes follow an
-  experiment-conjecture-proof contract, configured GAP paths reach child
-  sessions, and the optional writing gate uses deterministic normalization,
-  separate revision budgets, stronger templates, and hard output checks.
-- **Stronger audits and branch discipline.** Paper audits run through the
-  verification pipeline with isolated packets and verifier reports, branch
-  work packets carry their repair debts, and section-substantiality checks
-  gate the writing harness.
-- **Expanded regression coverage.** The scheduler, proof store, parallel
-  workflow, verifiers, dashboard, recovery paths, research strategy, and
-  writing gate are covered by the public test suite included in this release.
+This release brings the strongest current Albilich workflow to the standalone
+public repository. It is a substantial upgrade to how long runs choose their
+next mathematical move, retrieve external results, coordinate parallel work,
+recover verifier evidence, close proof routes, report live state, and turn a
+verified result into a readable paper.
+
+- **Research intelligence is now proof-graph aware.** The scheduler computes
+  the smallest active sufficient-route obligation cut, scores the decisive
+  bottleneck, retrieves from eighteen reviewed method cards, and learns local
+  strategy-family outcomes only from later verifier-accepted evidence.
+- **Stalled attacks change mathematics, not just wording.** Repeated
+  bottlenecks trigger a representation-switch contract, theorem-adaptation
+  packets, proof-interface checks, or a new research philosophy. Multi-branch
+  waves must use genuinely different strategy families rather than launch
+  paraphrases of the same attempt.
+- **Literature search has a dedicated high-signal path.** Optional Matlas and
+  UW TheoremSearch adapters give the literature reviewer bounded theorem
+  candidates. Provider text is normalized, size-limited, origin-checked, and
+  treated as untrusted discovery data until the reviewer inspects the primary
+  source and records an exact retrieval card.
+- **Parallel research and verification are substantially more robust.** Hard
+  problems use three research branches with shared compact summaries and
+  negative evidence. Fresh source handoffs are prioritized, strict verifier
+  proof evidence survives context compaction, and compatible stale verifier
+  patches are recovered and revalidated instead of silently discarded.
+- **Proof closure is stricter and more accurate.** Integration debts remain
+  authoritative, repaired routes return to verification, integrated claims and
+  routes leave the active frontier, and a strictly verified root is displayed
+  as integration-pending until the final alignment gate actually accepts it.
+- **The live dashboard tells the truth about a large proof tree.** It shows
+  claim hierarchy and containment, lifecycle colors, recovered verification,
+  active debts, branch work, verifier capacity, run progress, and
+  cached-versus-new token accounting without presenting retired work as open.
+- **Long-running sessions recover more safely.** Structured-output repair
+  handles malformed JSON and LaTeX escapes, parallel patch recovery preserves
+  compatible evidence, abnormal child exits remain visible, duplicate advisor
+  loops are suppressed, and solved runs stop before optional publication work.
+- **Verified mathematics now has a stronger publication path.** The writing
+  gate normalizes LaTeX, detects thin or fragmented exposition, preserves
+  location-specific editorial debts, compiles with restricted service paths,
+  and exports the certificate, article source, and PDF as distinct artifacts.
+- **The public regression suite grew with the engine.** The synchronized
+  release passes 890 tests and 312 subtests across scheduling, retrieval,
+  research intelligence, proof-state mutation, parallel recovery, verifier
+  gates, dashboard state, CAS contracts, and mathematical writing.
+
+In practice, the new engine spends less time circling around attractive side
+lemmas and more time attacking the exact statement that would close the best
+route. It also makes the boundary between “promising,” “strictly verified,”
+“integrated,” and “solved” explicit at every stage.
 
 ## Quickstart
 
@@ -148,13 +165,26 @@ state. It does not add roles or verification authority.
 - Bottleneck-local conjectures and exceptional auxiliary definitions are
   capped, stress-tested, and admitted only when they have a precise route back
   to the root.
-- Reviewed method cards are retrieved by structural signature and include
+- Eighteen reviewed method cards are retrieved by structural signature and
+  domain tags. They include hypotheses, proof moves, diagnostic examples, and
   failure modes; they guide proof search but never become proof premises.
-- High-leverage branches can receive a coherent deep session, while every
-  resulting claim, route, and inference still passes the ordinary patch and
-  verifier gates.
-- Information-gain scores expose expected root progress, route-killing value,
-  duplication risk, verification cost, and resource cost.
+- The proof graph supplies the smallest active sufficient-route obligation cut;
+  side lemmas cannot outrank its decisive obligation merely through model
+  self-scoring.
+- High-leverage branches can receive a coherent deep session, but it is
+  persisted only when it produces a concrete proof-state mathematical delta.
+  Two no-delta sessions force a change of research philosophy.
+- Scheduler actions expose information-gain components and a local
+  verifier-filtered outcome posterior. This learns only from Albilich's later
+  verified or integrated evidence, never from a reference solution or private
+  cross-problem cache.
+- Repeated bottlenecks trigger a representation-switch contract; literature
+  work produces exact source-to-local theorem-adaptation packets; strict and
+  integration verification run a selective deterministic proof-interface
+  checklist without requiring Lean.
+- Multi-branch waves require different mathematical strategy families as well
+  as disjoint claim/debt ownership, so parallel slots pursue genuinely distinct
+  proof, adversarial, conceptual, or source-adaptation philosophies.
 - Proof compression preserves the full history while shrinking the primary
   context to the best route's dependency closure and weakest sufficient bridge.
 
@@ -212,6 +242,14 @@ retrieval cards, so it holds the auditable source catalog that citation triage
 and certification read. Online researcher and villain passes search for what the
 current attack needs; the librarian maintains the catalog and answers precise
 `literature_search_request` debts as a cheap parallel companion.
+
+For retrieve-mode actions, optional informal theorem search can query Matlas
+and UW TheoremSearch before the literature-review session starts. Enable it with
+`RETHLAS_INFORMAL_SEARCH=1`. The orchestrator owns the network boundary; child
+agents receive only bounded inert candidate data, and no provider result becomes
+proof evidence without primary-source review. See
+[`agents/generation/phase2/INFORMAL_RETRIEVAL.md`](agents/generation/phase2/INFORMAL_RETRIEVAL.md)
+for the provider and safety contracts.
 
 Run-level research modes set the opening portfolio:
 
@@ -290,9 +328,10 @@ Role prompts are assembled in `agents/generation/phase2/codex_runner.py`.
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s agents/generation/tests -t .
 ```
 
-The 807-test stdlib `unittest` suite covers the scheduler, patch validator,
-proof store, parallel workflow, runners, dashboard, research strategy,
-work-mode loops, verification gates, recovery paths, and paper-writing checks.
+The public suite currently passes 890 tests and 312 subtests covering the
+scheduler, patch validator, proof store, parallel workflow, theorem retrieval,
+research intelligence, runners, dashboard, work-mode loops, verification gates,
+recovery paths, and paper-writing checks.
 
 ## Requirements
 

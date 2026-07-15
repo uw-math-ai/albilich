@@ -40,6 +40,7 @@ from .research_policy import (
     research_intent_for_action,
     search_policy_for_action,
 )
+from .research_intelligence import action_patch_contract_errors
 from .branch_summary import sync_branch_workbenches
 from .scheduler import (
     DEFAULT_MULTI_BRANCH_WORKERS,
@@ -1435,6 +1436,8 @@ def _apply_scheduled_results(
         patch = execution.get("patch")
         patch_outcome = None
         boundary_errors = _evidence_boundary_errors(execution, session_plan)
+        if isinstance(patch, Mapping):
+            boundary_errors.extend(action_patch_contract_errors(action, patch))
         if boundary_errors:
             patch_outcome = {"accepted": False, "errors": boundary_errors}
             execution["patch_error"] = "\n".join(boundary_errors)
@@ -1537,7 +1540,10 @@ def _iter_shell_evidence_access_lines(handle: Any) -> Iterator[str]:
         if pending_exec_command:
             pending_exec_command = False
             in_exec_block = True
-            scan_exec_output = not _shell_command_reads_context_manifest(stripped)
+            scan_exec_output = not (
+                _shell_command_reads_context_manifest(stripped)
+                or _shell_command_reads_evidence_capsule(stripped)
+            )
             yield line
             continue
         if in_exec_block:
@@ -1548,6 +1554,19 @@ def _iter_shell_evidence_access_lines(handle: Any) -> Iterator[str]:
 
 def _shell_command_reads_context_manifest(command_line: str) -> bool:
     return "context.json" in command_line
+
+
+def _shell_command_reads_evidence_capsule(command_line: str) -> bool:
+    """Return whether a shell command reads the manifest-copied evidence packet.
+
+    Output from these reads is inert artifact content.  It may legitimately
+    quote provenance paths from an older checkout, but those quoted strings do
+    not mean the child opened the old files.  The command line itself remains
+    scanned, so an explicit second access outside the capsule is still caught.
+    """
+    return "/evidence/" in command_line or bool(
+        re.search(r"(?:^|[\s'\"=])(?:\./)?evidence/", command_line)
+    )
 
 
 def _local_evidence_policy_text_line(line: str) -> bool:

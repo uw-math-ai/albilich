@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .budget import summarize_runs
-from .graph_policy import claim_is_retired, claim_is_verified
+from .graph_policy import claim_is_retired, claim_is_verified, debt_covered_by_integrated_claim
 from .models import json_loads
 from .store import ProofStateStore
 
@@ -17,6 +17,8 @@ def compute_metrics(store: ProofStateStore, *, state: Dict[str, Any] | None = No
     runs = state["runs"]
     artifacts = state.get("artifacts", [])
     problem = state["problem_state"]
+    active_debts = [row for row in debts if row["status"] == "active"]
+    open_debts = [row for row in active_debts if not debt_covered_by_integrated_claim(state, row)]
     by_validation: dict[str, int] = {}
     by_lifecycle: dict[str, int] = {}
     for claim in claims:
@@ -36,8 +38,10 @@ def compute_metrics(store: ProofStateStore, *, state: Dict[str, Any] | None = No
         ),
         "route_count": len(routes),
         "active_route_count": sum(1 for row in routes if row["status"] == "active"),
-        "active_debt_count": sum(1 for row in debts if row["status"] == "active"),
-        "blocking_debt_count": sum(1 for row in debts if row["status"] == "active" and row["severity"] == "blocking"),
+        "active_debt_count": len(active_debts),
+        "blocking_debt_count": sum(1 for row in active_debts if row["severity"] == "blocking"),
+        "open_debt_count": len(open_debts),
+        "open_blocking_debt_count": sum(1 for row in open_debts if row["severity"] == "blocking"),
         "claims_by_validation": by_validation,
         "claims_by_lifecycle": by_lifecycle,
         "token_budget": {
@@ -49,7 +53,7 @@ def compute_metrics(store: ProofStateStore, *, state: Dict[str, Any] | None = No
         "runs": run_summary,
         "run_timing": store.get_run_timing(),
         "math_yield": _math_yield_metrics(claims, artifacts, run_summary),
-        "root_progress": _root_progress_metrics(claims, routes, debts, artifacts),
+        "root_progress": _root_progress_metrics(claims, routes, open_debts, artifacts),
         "benchmark_storage": _benchmark_storage_metrics(store),
     }
 

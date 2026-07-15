@@ -23,19 +23,28 @@ from .budget import plan_action_budget, plan_step_budget
 from .completion_policy import evaluate_partial_stop
 from .fact_graph import build_fact_graph
 from .models import SCHEMA_VERSION, fingerprint_text, statement_is_interrogative_problem
-from .writing.linter import run_all as run_writing_lint, run_paper_lint, run_slop_lint
+from .writing.linter import (
+    REQUIRED_FIX_MARKER as WRITING_REQUIRED_FIX_MARKER,
+    obligation_location as writing_obligation_location,
+    required_fix as writing_required_fix,
+    required_fix_for_obligation as writing_required_fix_for_obligation,
+    run_all as run_writing_lint,
+    run_paper_lint,
+    run_slop_lint,
+)
 from .debt_canonicalizer import central_debt_clusters, central_obstruction_for_debt
 from .graph_policy import (
     FAR_FROM_ROOT_DISTANCE,
     _compact_text,
     active_frontier_pressure,
+    debt_covered_by_integrated_claim,
     decomposition_cooldown_active,
     decisive_theorem_test_signal,
     frontier_claim_ids,
-    integrated_claim_covering_debt_id,
     maturity_rank,
     paused_route_ids,
     proof_trunk_maturity,
+    route_repair_pending_verifier,
     route_scoreboard,
     root_distance_for_claim_id,
 )
@@ -52,8 +61,10 @@ from .research_policy import (
     stamp_researcher_work_mode,
 )
 from .patches import apply_patch
+from .research_strategy import conceptual_invariant_trigger
 from .research_strategy import enrich_action as enrich_research_strategy_action
 from .research_strategy import next_strategy_operation, score_action as score_research_strategy_action
+from .research_intelligence import philosophy_signature, strategy_family
 from .store import ProofStateStore
 from . import steering
 
@@ -100,6 +111,7 @@ DECISIVE_THEOREM_TEST_INTENT = "decisive_theorem_test"
 BOTTLENECK_LOCK_INTENT = "bottleneck_lock_theorem_attack"
 EXECUTIVE_ADVISOR_LOCK_INTENT = "executive_advisor_bottleneck_lock"
 NEAR_SOLUTION_SPINE_SYNTHESIS_INTENT = "near_solution_spine_synthesis"
+NEAR_SOLUTION_SPINE_COOLDOWN_WINDOW = 24
 BOTTLENECK_LOCK_REPEAT_THRESHOLD = 2
 BOTTLENECK_LOCK_MIN_DIAGNOSTIC_ARTIFACTS = 2
 NEAR_SOLUTION_MIN_PARTIAL_CREDIT = 5
@@ -130,11 +142,12 @@ MULTI_BRANCH_MAX_WORKERS = 5
 # stale-patch pressure of enabling the five-worker ceiling by default.
 DEFAULT_MULTI_BRANCH_WORKERS = 3
 MULTI_BRANCH_WORKER_TEMPLATES = (
+    "conceptual_invariant",
     "spine",
-    "support_lemma",
-    "literature_adaptation",
     "villain_toy_model",
+    "literature_adaptation",
     "alternative_route",
+    "support_lemma",
 )
 MULTI_BRANCH_INTENT_PREFIX = "multi_branch_"
 FRESH_NARROWED_DEBT_ROIS = {
@@ -152,8 +165,8 @@ PROOF_SPINE_ARTIFACT_TYPES = {
     "cas_experiment_report",
     "source_adaptation_notes",
     "source_synthesis_report",
-    "advisor_report",
 }
+CANONICAL_PROOF_ARTIFACT_TYPES = {"proof_dossier", "proof_blueprint"}
 PROOF_ARCHITECTURE_SIGNAL_WINDOW = 12
 PROOF_ARCHITECTURE_MIN_SIGNAL_ARTIFACTS = 3
 CREATIVE_PROOF_ATTACK_INTENT = "creative_proof_attack"
@@ -174,6 +187,25 @@ OBSTRUCTION_SIGNAL_ARTIFACT_TYPES = {
     *ROUTE_OBSTRUCTION_ARTIFACT_TYPES,
 }
 PROOF_CANDIDATE_ARTIFACT_TYPES = {"proof_dossier", "proof_blueprint", "advisor_report"}
+VERIFIER_PRIMARY_EVIDENCE_ARTIFACT_TYPES = {
+    "final_proof",
+    "partial_proof_report",
+    "proof_blueprint",
+    "proof_dossier",
+    "research_notebook",
+    "verified_blueprint",
+}
+VERIFIER_SOURCE_EVIDENCE_ARTIFACT_TYPES = {
+    "definition_audit_report",
+    "source_adaptation_notes",
+    "source_synthesis_report",
+}
+VERIFIER_STRUCTURAL_EVIDENCE_ARTIFACT_TYPES = {
+    "decomposition_plan",
+    "key_failure_analysis",
+    "necessary_condition",
+    "route_obstruction",
+}
 NON_PROOF_CANDIDATE_ARTIFACT_ROIS = {
     "route_blocked_or_abandoned",
     "bottleneck_narrowed",
@@ -424,7 +456,12 @@ def next_action(
             requested_tokens=requested_tokens,
             research_mode=normalize_research_mode(research_mode),
         )
-        force_operations = {"proof_compression", "advisor_global_synthesis", "definition_invention"}
+        force_operations = {
+            "proof_compression",
+            "conceptual_invariant_discovery",
+            "advisor_global_synthesis",
+            "definition_invention",
+        }
         if (
             str(strategy_signal.get("operation") or "") in force_operations
             or score_research_strategy_action(strategy_state, candidate)["expected_value_score"]
@@ -769,6 +806,15 @@ def _plan_next_action(
     if post_integration_spine and not parent_implication_ready:
         return post_integration_spine
 
+    advisor_verification = _advisor_requested_strict_verifier_action(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    if advisor_verification and not parent_implication_ready:
+        return advisor_verification
+
     support_precheck = _support_lemma_precheck_action(
         state,
         problem=problem,
@@ -841,6 +887,49 @@ def _plan_next_action(
     )
     if root_refinement_guard and not parent_implication_ready:
         return root_refinement_guard
+
+    # A near-complete proof blocked on a named theorem/source should search for
+    # that exact interface before another advisor/spine/reduction pass.  This
+    # used to run below the near-solution synthesis branch, so mature runs could
+    # repeatedly rewrite the root proof while the same citation debt remained
+    # untouched.
+    exact_theorem_search = _verifier_blocked_citation_action(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+        web_search=web_search,
+    )
+    if exact_theorem_search and not parent_implication_ready:
+        return exact_theorem_search
+
+    # A checked source handoff must reach the proof worker before an older
+    # advisor/bottleneck directive launches another mathematical pass.  The
+    # librarian often answers the exact search requested immediately above;
+    # leaving source digestion near the bottom of the scheduler allowed an
+    # executive-advisor lock to mask that fresh packet indefinitely.
+    source_digest = _pending_source_handoff_digest(state)
+    if source_digest and not parent_implication_ready:
+        mode = "reduce"
+        budget_action = {
+            "target_id": source_digest["target_id"],
+            "source_adaptation_digest_required": True,
+            "search_intent": "source_adaptation_digest",
+        }
+        return _action(
+            mode,
+            source_digest["target_id"],
+            source_digest.get("route_id", ""),
+            "digest new literature handoff into a local proof dossier",
+            plan_action_budget(problem, mode, budget_action, requested_tokens),
+            research_mode=research_mode,
+            source_adaptation_digest_required=True,
+            source_artifact_id=source_digest["artifact_id"],
+            source_artifact_type=source_digest["artifact_type"],
+            search_request_id=source_digest.get("search_request_id", ""),
+            needs_proof_dossier=True,
+            search_intent="source_adaptation_digest",
+        )
 
     executive_advisor_lock = _executive_advisor_bottleneck_action(
         state,
@@ -934,16 +1023,6 @@ def _plan_next_action(
             definition_audit_reason=definition_audit["reason"],
             search_intent="definition_audit",
         )
-
-    exact_theorem_search = _verifier_blocked_citation_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-        web_search=web_search,
-    )
-    if exact_theorem_search and not parent_implication_ready:
-        return exact_theorem_search
 
     bottleneck_lock = _bottleneck_lock_action(
         state,
@@ -1120,29 +1199,6 @@ def _plan_next_action(
             source_synthesis_required=True,
             source_synthesis_reason=source_synthesis["reason"],
             search_intent="source_synthesis",
-        )
-
-    source_digest = _pending_source_handoff_digest(state)
-    if source_digest:
-        mode = "reduce"
-        budget_action = {
-            "target_id": source_digest["target_id"],
-            "source_adaptation_digest_required": True,
-            "search_intent": "source_adaptation_digest",
-        }
-        return _action(
-            mode,
-            source_digest["target_id"],
-            source_digest.get("route_id", ""),
-            "digest new literature handoff into a local proof dossier",
-            plan_action_budget(problem, mode, budget_action, requested_tokens),
-            research_mode=research_mode,
-            source_adaptation_digest_required=True,
-            source_artifact_id=source_digest["artifact_id"],
-            source_artifact_type=source_digest["artifact_type"],
-            search_request_id=source_digest.get("search_request_id", ""),
-            needs_proof_dossier=True,
-            search_intent="source_adaptation_digest",
         )
 
     route_decision_triage = _route_decision_triage_action(
@@ -1604,6 +1660,46 @@ def _plan_parallel_companion_actions(
             exclude_route_ids={str(primary_action.get("route_id") or "")},
             limit=verifier_slots,
         )
+    if primary_action.get("closure_pipeline_required"):
+        # Near closure, empty capacity is not permission to launch more proof
+        # exploration or another advisor summary.  Only overlap a genuinely
+        # verifier-ready, distinct route; integration overlap is added by the
+        # caller under its existing ownership guards.
+        verifier = _verifier_candidate_action(
+            state,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+            parallel_companion=True,
+        )
+        if not verifier:
+            return []
+        same_target = str(verifier.get("target_id") or "") == str(primary_action.get("target_id") or "")
+        same_route = bool(verifier.get("route_id")) and str(verifier.get("route_id")) == str(primary_action.get("route_id") or "")
+        return [] if (same_target or same_route) else [verifier]
+    if primary_action.get("long_mathematical_session_required"):
+        # Long discovery sessions need coherence.  Use at most one genuinely
+        # orthogonal companion rather than filling every branch slot with
+        # nearby lemmas in the same formalism.
+        adversary = _counterexample_companion_action(
+            primary_action,
+            state,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+        )
+        if adversary:
+            adversary["counterexample_probe_required"] = True
+            adversary["research_philosophy"] = "adversarial_probe"
+            return [adversary]
+        verifier = _verifier_candidate_action(
+            state,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+            parallel_companion=True,
+        )
+        return [verifier] if verifier else []
     support_precheck = _support_lemma_precheck_action(
         state,
         problem=problem,
@@ -1927,7 +2023,12 @@ def _debt_blocks_route_verification(
         # this, repaired routes could never reach the verifier (observed live:
         # the p=7 audit chain self-blocked for 300+ revisions).
         return False
-    if state and _explicit_route_repair_after_debt(state, route_id=route_id, conclusion_id=conclusion_id, debt=debt):
+    if state and route_repair_pending_verifier(
+        state,
+        route_id=route_id,
+        conclusion_id=conclusion_id,
+        debt=debt,
+    ):
         # A proof dossier explicitly marked route_repaired/verifier_ready_route
         # is a request to let the verifier adjudicate the existing blockers.
         # Requiring the debt to be resolved first creates a liveness cycle: only
@@ -1943,39 +2044,6 @@ def _debt_blocks_route_verification(
     if debt_type == "blocking_bridge" and _looks_like_downstream_claim_debt(debt):
         return False
     return True
-
-
-def _explicit_route_repair_after_debt(
-    state: Mapping[str, Any],
-    *,
-    route_id: str,
-    conclusion_id: str,
-    debt: Mapping[str, Any],
-) -> bool:
-    debt_last_seen = str(debt.get("last_seen") or "")
-    artifacts = state.get("research_artifacts")
-    if not isinstance(artifacts, list):
-        artifacts = state.get("artifacts", [])
-    for artifact in artifacts:
-        if str(artifact.get("artifact_type") or "") != "proof_dossier":
-            continue
-        metadata = _json_object(artifact.get("metadata_json"))
-        if str(metadata.get("artifact_roi") or "") not in {"route_repaired", "verifier_ready_route"}:
-            continue
-        artifact_route_id = str(metadata.get("route_id") or "")
-        artifact_target_id = str(metadata.get("target_id") or "")
-        if artifact_route_id and artifact_route_id != route_id:
-            continue
-        if artifact_target_id and artifact_target_id != conclusion_id:
-            continue
-        next_action = str(metadata.get("next_decisive_action") or "").lower()
-        if "verif" not in next_action:
-            continue
-        created_at = str(artifact.get("created_at") or "")
-        if debt_last_seen and created_at and created_at <= debt_last_seen:
-            continue
-        return True
-    return False
 
 
 def _debt_repair_pending_verifier(debt: Mapping[str, Any]) -> bool:
@@ -2123,9 +2191,15 @@ def _verifier_ready_route_candidates(state: Mapping[str, Any]) -> list[Dict[str,
     return candidates
 
 
-def _route_evidence_artifact_ids(state: Mapping[str, Any], route_id: str) -> list[str]:
+def _route_evidence_artifact_ids(
+    state: Mapping[str, Any],
+    route_id: str,
+    *,
+    focus_inference_id: str = "",
+) -> list[str]:
     route = _route(state, route_id)
     evidence_ids: list[str] = []
+    focus_evidence_ids: set[str] = set()
 
     def add_many(raw_ids: Any) -> None:
         for raw in _json_list(raw_ids):
@@ -2137,8 +2211,43 @@ def _route_evidence_artifact_ids(state: Mapping[str, Any], route_id: str) -> lis
         add_many(route.get("evidence_artifact_ids_json"))
     for inference in state.get("inferences", []):
         if str(inference.get("route_id") or "") == route_id:
-            add_many(inference.get("evidence_artifact_ids_json"))
-    return evidence_ids
+            inference_evidence_ids = _json_list(inference.get("evidence_artifact_ids_json"))
+            add_many(inference_evidence_ids)
+            if str(inference.get("inference_id") or "") == focus_inference_id:
+                focus_evidence_ids.update(str(raw_id) for raw_id in inference_evidence_ids if str(raw_id))
+
+    artifacts = state.get("research_artifacts") or state.get("artifacts") or []
+    artifact_by_id = {
+        str(artifact.get("artifact_id") or ""): artifact
+        for artifact in artifacts
+        if str(artifact.get("artifact_id") or "")
+    }
+    original_order = {artifact_id: index for index, artifact_id in enumerate(evidence_ids)}
+
+    def evidence_priority(artifact_id: str) -> tuple[int, int, int, int]:
+        # Context fitting may retain only the first proof artifact.  Keep the
+        # advisor's exact inference evidence first, then prefer the newest
+        # proof-grade dossier over historical plans and session summaries.
+        artifact = artifact_by_id.get(artifact_id, {})
+        artifact_type = str(artifact.get("artifact_type") or "")
+        if artifact_type in VERIFIER_PRIMARY_EVIDENCE_ARTIFACT_TYPES:
+            type_rank = 0
+        elif artifact_type in VERIFIER_SOURCE_EVIDENCE_ARTIFACT_TYPES:
+            type_rank = 1
+        elif artifact_type in VERIFIER_STRUCTURAL_EVIDENCE_ARTIFACT_TYPES:
+            type_rank = 2
+        elif artifact_type == "cas_experiment_report":
+            type_rank = 3
+        else:
+            type_rank = 4
+        return (
+            0 if artifact_id in focus_evidence_ids else 1,
+            type_rank,
+            -_revision_number(artifact.get("state_revision")),
+            original_order[artifact_id],
+        )
+
+    return sorted(evidence_ids, key=evidence_priority)
 
 
 def _route_evidence_state_revision(state: Mapping[str, Any], evidence_ids: list[str]) -> int:
@@ -2177,7 +2286,12 @@ def _post_integration_proof_spine_action(
     last_integration = _last_mode_run(state, "integrate")
     if not last_integration or str(last_integration.get("status") or "") not in {"completed", "patch_accepted"}:
         return None
-    if _recent_intent_seen(state, POST_INTEGRATION_PROOF_SPINE_INTENT, window=6):
+    last_compression = _last_intent_run(state, POST_INTEGRATION_PROOF_SPINE_INTENT)
+    if (
+        last_compression
+        and str(last_compression.get("status") or "") in {"completed", "patch_accepted"}
+        and _run_is_at_or_after(last_compression, last_integration)
+    ):
         return None
     if _recent_intent_seen(state, "root_alignment_audit", window=3):
         return None
@@ -2291,6 +2405,15 @@ def _verifier_blocked_citation_action(
         if _recent_exact_search_for_debt_target(state, target_id=target_id, route_id=route_id):
             continue
         query = _exact_citation_query(debt)
+        closure_signal = _near_solution_spine_signal(state)
+        closure_fields: Dict[str, Any] = {}
+        if closure_signal:
+            closure_fields = {
+                "closure_pipeline_required": True,
+                "closure_debt_id": str(debt.get("debt_id") or ""),
+                "canonical_proof_artifact_id": str(closure_signal.get("canonical_proof_artifact_id") or ""),
+                "source_certification_packet_required": True,
+            }
         return _action(
             "retrieve",
             target_id,
@@ -2320,6 +2443,7 @@ def _verifier_blocked_citation_action(
             search_intent=EXACT_THEOREM_SEARCH_INTENT,
             librarian_level="research_librarian",
             parallel_companion=parallel_companion,
+            **closure_fields,
         )
     return None
 
@@ -2734,7 +2858,11 @@ def _near_solution_spine_synthesis_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    if _recent_intent_seen(state, NEAR_SOLUTION_SPINE_SYNTHESIS_INTENT, window=6):
+    if _recent_intent_seen(
+        state,
+        NEAR_SOLUTION_SPINE_SYNTHESIS_INTENT,
+        window=NEAR_SOLUTION_SPINE_COOLDOWN_WINDOW,
+    ):
         return None
     signal = _near_solution_spine_signal(state)
     if not signal:
@@ -2744,41 +2872,40 @@ def _near_solution_spine_synthesis_action(
     budget_action = {
         "target_id": "root",
         "route_id": route_id,
-        "deep_research_required": True,
         "hard_theorem_attack_required": True,
-        "research_attack_stage": "proof_spine",
+        "research_attack_stage": "closure",
         "search_intent": NEAR_SOLUTION_SPINE_SYNTHESIS_INTENT,
     }
     return _action(
         mode,
         "root",
         route_id,
-        "near-solution proof portfolio should be assembled into a root proof spine before more local cleanup",
+        "near-solution proof has entered closure mode; repair exactly the selected debt and update the canonical proof",
         plan_action_budget(problem, mode, budget_action, requested_tokens),
         research_mode=research_mode,
         near_solution_spine_synthesis_required=True,
+        closure_pipeline_required=True,
+        closure_debt_id=str(signal.get("selected_debt_id") or ""),
+        debt_id=str(signal.get("selected_debt_id") or ""),
+        canonical_proof_update_required=True,
+        canonical_proof_artifact_id=str(signal.get("canonical_proof_artifact_id") or ""),
         proof_spine_mode_required=True,
         proof_spine_min_lemmas=3,
         proof_spine_max_lemmas=6,
-        global_synthesis_required=True,
-        research_synthesis_required=True,
-        theorem_building_synthesis_required=True,
         hard_theorem_attack_required=True,
         theorem_workbench_required=True,
         direct_solve_required=(mode == "prove"),
         proof_construction_required=bool(route_id),
         citation_allowed_in_proof=bool(route_id),
         needs_proof_dossier=True,
-        deep_research_required=True,
         closure_pressure_required=True,
         obligation_reduction_required=True,
-        speculative_proof_required=True,
         negative_result_ledger_required=True,
         near_miss_memory_required=True,
         route_cooldown_enforced=True,
         paperwork_throttle_required=True,
         near_solution_spine_signal=signal,
-        research_attack_stage="proof_spine",
+        research_attack_stage="closure",
         search_intent=NEAR_SOLUTION_SPINE_SYNTHESIS_INTENT,
     )
 
@@ -2807,6 +2934,14 @@ def _near_solution_spine_signal(state: Mapping[str, Any]) -> Optional[Dict[str, 
             _target_id_from_metadata(state, _json_object(artifact.get("metadata_json")), fallback="root"),
         ) <= 3
     ]
+    proof_artifacts.sort(
+        key=lambda artifact: (
+            _revision_number(artifact.get("state_revision")),
+            str(artifact.get("created_at") or ""),
+            str(artifact.get("artifact_id") or ""),
+        ),
+        reverse=True,
+    )
     active_root_debts = [
         debt for debt in state.get("debts", [])
         if str(debt.get("status") or "") == "active"
@@ -2833,9 +2968,23 @@ def _near_solution_spine_signal(state: Mapping[str, Any]) -> Optional[Dict[str, 
         "route_id": route_id,
         "partial_credit_claim_ids": [str(row.get("claim_id") or "") for row in partial_credit[:10]],
         "proof_artifact_ids": [str(row.get("artifact_id") or "") for row in proof_artifacts[:10]],
+        "canonical_proof_artifact_id": str(
+            next(
+                (
+                    artifact.get("artifact_id")
+                    for artifact in proof_artifacts
+                    if str(artifact.get("artifact_type") or "") in CANONICAL_PROOF_ARTIFACT_TYPES
+                ),
+                (proof_artifacts[0] if proof_artifacts else {}).get("artifact_id", ""),
+            )
+            or ""
+        ),
         "blocking_debt_ids": [str(row.get("debt_id") or "") for row in active_root_debts[:8]],
         "selected_debt_id": str(debt.get("debt_id") or ""),
-        "instruction": "Assemble a short root proof spine and attack exactly the selected remaining theorem-level gap.",
+        "instruction": (
+            "Treat the newest proof artifact as the canonical manuscript. Repair exactly the selected remaining "
+            "theorem-level gap and emit only the changed proof section plus its dependency splice."
+        ),
     }
 
 
@@ -3572,10 +3721,12 @@ def _counterexample_companion_action(
         "refute",
         target_id,
         route_id,
-        "parallel villain counterexample stress test while the main researcher tries proof/citation",
+        "parallel villain probe: test the full hypotheses against two competing structural conjectures while the main researcher works",
         plan_action_budget(problem, "refute", budget_action, requested_tokens),
         research_mode=research_mode,
         counterexample_search_required=True,
+        counterexample_probe_required=True,
+        research_philosophy="adversarial_probe",
         research_attack_stage="counterexample",
         search_intent="parallel_counterexample_search",
         parallel_companion=True,
@@ -4221,6 +4372,13 @@ def proof_spine_summary(state: Mapping[str, Any]) -> Dict[str, Any]:
         )
     )
 
+    root_claim = _claim(state, "root") or {}
+    root_status = str(root_claim.get("validation_status") or "untested")
+    root_lifecycle = str(root_claim.get("lifecycle_status") or "active")
+    root_verified = (
+        root_status in {"informally_verified", "formally_verified"}
+        and root_lifecycle not in {"superseded", "abandoned"}
+    )
     routes = route_scoreboard(state, limit=8)
     active_routes = [
         {
@@ -4233,10 +4391,24 @@ def proof_spine_summary(state: Mapping[str, Any]) -> Dict[str, Any]:
         for row in routes[:5]
     ]
     artifacts = _recent_proof_spine_artifacts(state, limit=6)
-    bottleneck = bottleneck_frontier_summary(state).get("current_bottleneck", {})
+    bottleneck = {} if root_verified else bottleneck_frontier_summary(state).get("current_bottleneck", {})
+    if root_lifecycle == "integrated":
+        next_workflow_rule = "The root route is integrated; proceed only with the configured final writing or completion policy."
+    elif root_verified:
+        next_workflow_rule = (
+            "The root route passed strict verification. Send it directly to the integration verifier; "
+            "do not reopen dominated side branches."
+        )
+    else:
+        next_workflow_rule = (
+            "Prefer a short verifier-checkable lemma chain. Convert proof-like artifacts into routes/inferences; "
+            "if blocked, name exactly one next theorem-level debt."
+        )
     return {
         "policy": "active-proof-spine",
-        "root_status": str((_claim(state, "root") or {}).get("validation_status") or "untested"),
+        "root_status": root_status,
+        "root_lifecycle_status": root_lifecycle,
+        "root_integration_pending": root_verified and root_lifecycle != "integrated",
         "verified_trunk_claims": [
             {
                 "claim_id": str(row.get("claim_id") or ""),
@@ -4250,10 +4422,7 @@ def proof_spine_summary(state: Mapping[str, Any]) -> Dict[str, Any]:
         "current_bottleneck": bottleneck,
         "verifier_ready_routes": verifier_ready_route_summaries(state)[:5],
         "recent_spine_artifacts": artifacts,
-        "next_workflow_rule": (
-            "Prefer a short verifier-checkable lemma chain. Convert proof-like artifacts into routes/inferences; "
-            "if blocked, name exactly one next theorem-level debt."
-        ),
+        "next_workflow_rule": next_workflow_rule,
     }
 
 
@@ -4336,7 +4505,7 @@ def _bottleneck_lock_debt_candidates(state: Mapping[str, Any]) -> list[Mapping[s
 
 
 def _debt_covered_by_integrated_claim(state: Mapping[str, Any], debt: Mapping[str, Any]) -> bool:
-    return bool(integrated_claim_covering_debt_id(state.get("claims", []), obligation=_debt_math_text(debt)))
+    return debt_covered_by_integrated_claim(state, debt)
 
 
 def _artifact_index(state: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -5562,6 +5731,16 @@ def _last_mode_run(state: Mapping[str, Any], mode: str) -> Optional[Mapping[str,
     return next((row for row in state.get("recent_runs", []) if row.get("mode") == mode), None)
 
 
+def _run_is_at_or_after(run: Mapping[str, Any], reference: Mapping[str, Any]) -> bool:
+    run_revision = _revision_number(run.get("state_revision"))
+    reference_revision = _revision_number(reference.get("state_revision"))
+    if run_revision != reference_revision:
+        return run_revision > reference_revision
+    run_created_at = str(run.get("created_at") or "")
+    reference_created_at = str(reference.get("created_at") or "")
+    return bool(run_created_at and reference_created_at and run_created_at >= reference_created_at)
+
+
 def _obstruction_signal_already_converted(signal: Mapping[str, Any], last_conversion: Mapping[str, Any] | None) -> bool:
     if not last_conversion:
         return False
@@ -6068,6 +6247,122 @@ def _advisor_requested_validation_action(
         validation_evidence_artifact_ids=validation_evidence_artifact_ids,
         validation_acceptance_criteria=acceptance,
         search_intent="counterexample_validation",
+    )
+
+
+def _advisor_requested_strict_verifier_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Honor a fresh advisor handoff to the strict route verifier.
+
+    Advisor targets may name a claim, route, or inference.  Previously an
+    inference target was discarded by the claim-only resolver, while the role
+    name ``strict_informal_verifier`` was not a recognized scheduler handoff;
+    the planner could therefore launch unrelated research instead.
+    """
+    reports = [
+        artifact
+        for artifact in state.get("research_artifacts", [])
+        if str(artifact.get("artifact_type") or "") == ADVISOR_REPORT_ARTIFACT_TYPE
+        and str(artifact.get("producer_role") or "") == "phd_advisor"
+    ]
+    if not reports:
+        return None
+    reports.sort(
+        key=lambda artifact: (
+            _revision_number(artifact.get("state_revision")),
+            str(artifact.get("artifact_id") or ""),
+        ),
+        reverse=True,
+    )
+    report = reports[0]
+    metadata = _json_object(report.get("metadata_json"))
+    next_role = str(metadata.get("next_role") or "").strip().lower()
+    classification = str(metadata.get("classification") or "").strip().lower()
+    if next_role not in {"strict_informal_verifier", "strict_verifier", "verifier"}:
+        return None
+    if classification == "candidate_counterexample_needing_validator":
+        return None
+    if _metadata_flag_false(metadata, "advisor_followup_required"):
+        return None
+
+    raw_target_id = str(
+        metadata.get("next_target_id")
+        or metadata.get("next_claim_id")
+        or metadata.get("recommended_target_id")
+        or ""
+    ).strip()
+    route_id = str(metadata.get("next_route_id") or metadata.get("recommended_route_id") or "").strip()
+    focus_inference_id = ""
+    if raw_target_id:
+        inference = next(
+            (row for row in state.get("inferences", []) if str(row.get("inference_id") or "") == raw_target_id),
+            None,
+        )
+        route = _route(state, raw_target_id)
+        claim = _claim(state, raw_target_id)
+        if inference:
+            focus_inference_id = raw_target_id
+            route_id = str(inference.get("route_id") or route_id)
+        elif route:
+            route_id = raw_target_id
+        elif claim and not route_id:
+            route_id = _active_route_for_claim(state, raw_target_id) or ""
+    if not route_id:
+        return None
+    route = _route(state, route_id)
+    if not route or str(route.get("status") or "") != "active" or route_id in paused_route_ids(state):
+        return None
+    target_id = str(route.get("conclusion_claim_id") or "")
+    readiness = _route_readiness_scorecard(state, route_id)
+    if not readiness.get("verifier_ready"):
+        return None
+
+    report_revision = _revision_number(report.get("state_revision"))
+    if any(
+        str(run.get("actor_role") or "") == "strict_informal_verifier"
+        and str(run.get("route_id") or "") == route_id
+        and str(run.get("status") or "") not in {"failed", "timeout", "no_patch", "cancelled", "patch_rejected"}
+        and _revision_number(run.get("state_revision")) >= report_revision
+        for run in state.get("recent_runs", [])
+    ):
+        return None
+
+    evidence_ids = _route_evidence_artifact_ids(
+        state,
+        route_id,
+        focus_inference_id=focus_inference_id,
+    )
+    evidence_revision = _route_evidence_state_revision(state, evidence_ids)
+    return _action(
+        "prove",
+        target_id,
+        route_id,
+        "PhD advisor explicitly assigned the next decisive route check to the strict informal verifier",
+        plan_step_budget(problem, "prove", requested_tokens),
+        research_mode=research_mode,
+        route_readiness=readiness,
+        verify_ready_route_policy=True,
+        strict_verifier_scope="single_route_verification_packet",
+        verifier_evidence_artifact_ids=evidence_ids,
+        verifier_evidence_state_revision=evidence_revision,
+        strict_verifier_no_fresh_evidence=True,
+        strict_verifier_no_cas=True,
+        advisor_requested_verification=True,
+        advisor_report_id=str(report.get("artifact_id") or ""),
+        advisor_next_target_id=raw_target_id,
+        verification_focus_inference_id=focus_inference_id,
+        advisor_recommended_next_action=str(
+            metadata.get("recommended_next_action")
+            or metadata.get("next_decisive_task")
+            or ""
+        ),
+        validation_acceptance_criteria=metadata.get("next_task_acceptance_criteria") or [],
+        search_intent="advisor_strict_verifier_followup",
     )
 
 
@@ -6617,7 +6912,17 @@ def multi_branch_research_actions(
     workers = normalize_parallel_branches(parallel_branches)
     if not workers:
         return []
+    if primary_action.get("long_mathematical_session_required"):
+        # _plan_parallel_companion_actions may add one orthogonal adversary or
+        # verifier.  Do not add generic filler workers around a long session.
+        return []
     if primary_action.get("paper_audit_verification_only"):
+        return []
+    if primary_action.get("closure_pipeline_required"):
+        # Closure is a role-diverse pipeline, not another exploratory wave.
+        # parallel_companion_actions may still add a ready verifier or an
+        # independent integration action, but do not fill empty slots with
+        # additional spine/support/alternative-route researchers.
         return []
     primary_mode = str(primary_action.get("mode") or "")
     if primary_mode in {"stop_with_partial_results", "stop_solved", "write", "review_writing"}:
@@ -6634,12 +6939,16 @@ def multi_branch_research_actions(
     wave: list[Mapping[str, Any]] = [primary_action, *wave_actions]
     claimed_fingerprints: set[str] = set()
     claimed_ownership: set[str] = set()
+    claimed_families: set[str] = set()
     session_count = 0
     for action in wave:
         if action_expects_researcher_session(action) or action_expects_villain_session(action):
             session_count += 1
         claimed_fingerprints |= _branch_goal_fingerprints(state, action)
         claimed_ownership |= _branch_packet_ownership(state, action)
+        family = strategy_family(action)
+        if family:
+            claimed_families.add(family)
     if session_count >= workers:
         return []
 
@@ -6661,12 +6970,23 @@ def multi_branch_research_actions(
             continue
         fingerprints = _branch_goal_fingerprints(state, action)
         ownership = _branch_packet_ownership(state, action)
+        family = strategy_family(action)
         # Duplicate-work suppressor: identical goal / theorem / debt
-        # fingerprints or overlapping packet ownership -> skip the dispatch.
-        if fingerprints & claimed_fingerprints or ownership & claimed_ownership:
+        # fingerprints, overlapping packet ownership, or the same mathematical
+        # philosophy -> skip the dispatch. Parallelism is useful only when the
+        # branches pursue genuinely different kinds of mathematics.
+        if fingerprints & claimed_fingerprints or ownership & claimed_ownership or family in claimed_families:
             continue
+        action["branch_diversity_contract"] = {
+            "philosophy_signature": list(philosophy_signature(action)),
+            "strategy_family": family,
+            "must_differ_from_active_families": sorted(claimed_families),
+            "semantic_duplicate_suppression": True,
+            "cross_branch_exchange_required": True,
+        }
         claimed_fingerprints |= fingerprints
         claimed_ownership |= ownership
+        claimed_families.add(family)
         planned.append(action)
     planned = [enrich_research_strategy_action(state, action) for action in planned]
     for action in planned:
@@ -6805,8 +7125,9 @@ def _branch_goal_fingerprints(state: Mapping[str, Any], action: Mapping[str, Any
     if not isinstance(action, Mapping):
         return set()
     mode = str(action.get("mode") or "")
+    philosophy = str(action.get("research_philosophy") or "")
     if mode in {"prove", "reduce", "weaken", "strengthen"}:
-        mode_class = "prove"
+        mode_class = "conceptual" if philosophy == "conceptual_invariant" else "prove"
     elif mode == "refute":
         mode_class = "refute"
     elif mode in {"retrieve", "synthesize_sources"}:
@@ -6838,6 +7159,49 @@ def _branch_worker_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
+    if template == "conceptual_invariant":
+        if (
+            not conceptual_invariant_trigger(state).get("due")
+            or _recent_intent_seen(state, "multi_branch_conceptual_invariant", window=12)
+        ):
+            return None
+        budget_action = {
+            "target_id": "root",
+            "conceptual_invariant_discovery_required": True,
+            "deep_research_required": True,
+            "long_mathematical_session_required": True,
+            "research_attack_stage": "deep",
+            "search_intent": "multi_branch_conceptual_invariant",
+        }
+        return _action(
+            "reduce",
+            "root",
+            "",
+            "multi-branch conceptual worker: seek one global invariant that compresses several local lemmas",
+            plan_action_budget(problem, "reduce", budget_action, requested_tokens),
+            research_mode=research_mode,
+            parallel_companion=True,
+            branch_focus="root",
+            multi_branch_worker="conceptual_invariant",
+            multi_branch_mode=MULTI_BRANCH_RESEARCH_MODE_NAME,
+            branch_packet=_branch_packet_card(state, "", "root", "conceptual_invariant"),
+            branch_worker_directive={
+                "worker": "conceptual_invariant",
+                "instruction": (
+                    "Pursue a mathematical philosophy distinct from local calculation: compare neighboring theorems with an explicit "
+                    "object/hypothesis dictionary and seek a functorial, quotient, action-kernel, restriction/induction, filtration, or "
+                    "universal-property invariant that makes at least two current lemmas consequences of one principle."
+                ),
+            },
+            conceptual_invariant_discovery_required=True,
+            deep_research_required=True,
+            long_mathematical_session_required=True,
+            analogy_pass_required=True,
+            counterexample_probe_required=True,
+            research_philosophy="conceptual_invariant",
+            research_attack_stage="deep",
+            search_intent="multi_branch_conceptual_invariant",
+        )
     if template == "spine":
         anchor = _first_unclaimed_anchor(state, anchors, claimed_ownership)
         if not anchor:
@@ -6918,12 +7282,14 @@ def _branch_worker_action(
             branch_worker_directive={
                 "worker": "villain_toy_model",
                 "instruction": (
-                    "You own the adversarial lane of this branch packet: build small/toy models, sweep bounded "
-                    "examples, and search for counterexamples or missing hypotheses against the branch claims. "
-                    "Record candidate_counterexample or hypothesis_gap artifacts; never mark claims verified."
+                    "You own the adversarial lane of this branch packet: state two competing structural conjectures, test the target's full "
+                    "hypotheses (not a weakened shadow), and build the smallest model whose possible outcomes change the proof decision. "
+                    "Record candidate_counterexample, hypothesis_gap, or explicit not_refuted evidence; never mark claims verified."
                 ),
             },
             counterexample_search_required=True,
+            counterexample_probe_required=True,
+            research_philosophy="adversarial_probe",
             research_attack_stage="counterexample",
             search_intent=f"{MULTI_BRANCH_INTENT_PREFIX}villain_toy_model",
         )
@@ -6980,9 +7346,9 @@ def _support_lemma_worker_action(
     """Support-lemma worker: prove the technical lemma adjacent to the best
     branch's blocker; fall back to a nearby-lemma pass on the next branch."""
     directive = (
-        "You own the support-lemma lane: prove the technical lemma adjacent to the branch blocker (or nearby "
-        "special cases / bridge lemmas) and land it with a proof dossier so the blocked spine can consume it "
-        "once verified."
+        "You own the support-lemma lane. Before working, apply the qualitative root-leverage gate: state whether proof closes a major case, "
+        "whether refutation teaches something, whether the statement is stronger than necessary or merely renames the gap, and whether its "
+        "hypotheses are attainable. Reject the lemma immediately if it fails. Otherwise prove it and land a proof dossier for the spine."
     )
     for anchor in anchors:
         route_id = str(anchor["route_id"])
@@ -7048,6 +7414,12 @@ def _branch_scoped_worker_action(
     search_intent: str = "",
 ) -> Dict[str, Any]:
     intent = search_intent or f"{MULTI_BRANCH_INTENT_PREFIX}{worker}"
+    philosophy = {
+        "spine": "main_spine_construction",
+        "support_lemma": "local_support_lemma",
+        "literature_adaptation": "external_theorem_adaptation",
+        "alternative_route": "alternative_construction",
+    }.get(worker, worker)
     mode = "reduce" if route_id else "prove"
     direct_solve = mode == "prove"
     budget_action = {
@@ -7068,6 +7440,7 @@ def _branch_scoped_worker_action(
         branch_focus=route_id or target_id,
         multi_branch_worker=worker,
         multi_branch_mode=MULTI_BRANCH_RESEARCH_MODE_NAME,
+        research_philosophy=philosophy,
         branch_packet=_branch_packet_card(state, route_id, target_id, worker),
         branch_worker_directive={"worker": worker, "instruction": directive},
         direct_solve_required=direct_solve,
@@ -8513,7 +8886,11 @@ def _central_obstruction_payload(state: Mapping[str, Any], debt: Mapping[str, An
         "closure_pressure_required": True,
         "negative_result_ledger_required": True,
         "proof_architecture_templates_required": True,
-        "cas_check_recommended": True,
+        # A classification/citation interface cannot be settled by another
+        # finite experiment.  Recommend CAS only when the obstruction is a
+        # mathematical construction or falsifiable finite pattern.
+        "cas_check_recommended": not _is_source_like_debt(debt),
+        "experiment_decision_gate_required": not _is_source_like_debt(debt),
     }
 
 
@@ -8818,6 +9195,10 @@ def _external_citation_candidate(state: Mapping[str, Any], *, target_id: str) ->
         card_target = str(applicability.get("target_id") or target_id)
         if card_target not in {target_id, "root"}:
             continue
+        if not _metadata_flag_true(applicability, "implication_to_target_verified"):
+            continue
+        if not _metadata_flag_true(applicability, "program_victory_candidate"):
+            continue
         relation = normalize_retrieval_relation(applicability.get("classification") or applicability.get("relation") or "")
         if relation not in relation_rank:
             continue
@@ -9028,8 +9409,8 @@ def _writing_gate_action(
     Mathematical correctness is ASSUMED AND OUT OF SCOPE: the main harness
     verified the certificate (final_proof), which is internal and never
     reviewed here (the patch-time residue guard on writer artifacts stands).
-    The gate costs at most 4 LLM sessions in the worst case (authoring +
-    deterministic revision + editor + editor revision):
+    The gate costs at most 5 LLM sessions in the worst case (authoring + up to
+    2 deterministic revisions + editor + editor revision; typically 3):
 
     1. Paper authoring (1 session): root integrated + final_proof exists + no
        final_paper -> dispatch mode="write" with paper_authoring=true
@@ -9039,26 +9420,34 @@ def _writing_gate_action(
     2. Deterministic syncs (free, every pass once a paper exists): run_all +
        run_slop_lint + run_paper_lint on the paper's LaTeX source, and the compile debt from
        its persisted pdf_status. Open blocker/major debts dispatch a writer
-       revision (writing_revision + paper_revision). The revision budget is
-       SPLIT: a revision whose blocking debts are ALL deterministic
-       (writing-lint- / writing-compile- debt-id prefixes) is dispatched with
-       search_intent "writing_gate_revision_deterministic" and counts against
-       MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES (= 2); it never consumes
-       the editor's revision allowance.
+       revision (writing_revision + paper_revision) whose prompt enumerates
+       EVERY open debt as a numbered location -> required-fix checklist. The
+       revision budget is SPLIT: a revision whose blocking debts are ALL
+       deterministic (writing-lint- / writing-compile- debt-id prefixes) is
+       dispatched with search_intent "writing_gate_revision_deterministic"
+       and counts against MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES
+       (= 2); it never consumes the editor's revision allowance.
     3. Editor review (1 session): one "editor" exposition pass total
-       (PAPER_EDITOR_MAX_PASSES). Pass -> the gate opens immediately. Fail ->
-       the editor's debts dispatch the single editor-debt revision
-       (search_intent "writing_gate_revision",
+       (PAPER_EDITOR_MAX_PASSES). Pass -> the gate opens immediately (when no
+       blocker/major debts remain). Fail -> the editor's debts dispatch the
+       single editor-debt revision (search_intent "writing_gate_revision",
        MAX_WRITING_GATE_REVISION_CYCLES = 1, 0-1 sessions; any blocking
        editor/LLM debt puts the revision in this bucket), after which only
        the deterministic re-check runs — no second editor pass, no lens-reset
        loop, no free verification pass.
+    4. EDITOR FALLTHROUGH ON EXHAUSTION: when blocker/major debts remain but
+       the forcing bucket's revision allowance is spent (and no residue or
+       compile failure forces a revision past the caps), the gate does NOT
+       open — it falls through to the editor phase. The editor review runs if
+       its pass budget remains; the editor-debt revision (if unspent) then
+       addresses BOTH the editor's findings and the leftover deterministic
+       blockers/majors in one revision. Only after the editor pass AND both
+       revision buckets are truly spent does the gate open, with the
+       unresolved debts left recorded in the report.
 
     Exceptions past the revision caps: generation residue (L1-CITE-03) and
     LaTeX-compile failures keep forcing revisions — deterministic, cheap fixes
-    that must never ship. With the applicable cap spent and only other
-    blocker/major debts open, the gate opens with those debts left recorded in
-    the report.
+    that must never ship.
     """
     certificate_id = str(final_artifact.get("artifact_id") or "")
     if not certificate_id:
@@ -9141,18 +9530,55 @@ def _writing_gate_action(
                 search_intent=revision_intent,
                 writing_gate_round=revision_rounds + 1,
             )
-        # Revision spent and only editor-tier debts remain: the gate opens with
-        # the unresolved debts left recorded in the report.
-        return None
+        # EDITOR FALLTHROUGH ON EXHAUSTION: the forcing bucket's revision
+        # allowance is spent (and nothing residue/compile-tier forces a
+        # revision past the caps), but the gate does NOT open while the editor
+        # phase still has budget.
+        if gate["editor_sessions"] < PAPER_EDITOR_MAX_PASSES:
+            # Fall through to the editor review dispatch below: the editor's
+            # findings (if any) then join the leftover blocker/major debts in
+            # the single editor-debt revision.
+            pass
+        elif gate["editor_revision_rounds"] < MAX_WRITING_GATE_REVISION_CYCLES:
+            # Editor pass spent, editor-debt revision unspent: one final
+            # revision addresses BOTH the editor's debts and the leftover
+            # deterministic blockers/majors in a single pass.
+            mode = "write"
+            return _action(
+                mode,
+                "root",
+                _integrated_route_for_claim(state, "root"),
+                f"writing gate: deterministic revision budget spent with {len(blocking)} blocker/major writing "
+                f"debts still open on final paper {artifact_id}; the remaining editor-debt revision addresses "
+                "every open debt in one pass",
+                plan_step_budget(problem, mode, requested_tokens),
+                research_mode=research_mode,
+                writing_revision=True,
+                paper_revision=True,
+                revision_of_artifact_id=artifact_id,
+                writing_debts=_writing_debt_cards(open_debts),
+                search_intent=WRITING_GATE_REVISION_INTENT,
+                writing_gate_round=gate["editor_revision_rounds"] + 1,
+            )
+        else:
+            # Every pass AND revision budget is truly spent: the gate opens
+            # with the unresolved debts left recorded in the report.
+            return None
     if gate["editor_sessions"] >= PAPER_EDITOR_MAX_PASSES:
         # Deterministically clean and the editor pass is spent: gate open.
         return None
+    review_reason = f"writing gate: exposition editor review of final paper {artifact_id}"
+    if blocking:
+        review_reason = (
+            f"writing gate: revision budget spent with {len(blocking)} blocker/major writing debts still open on "
+            f"final paper {artifact_id}; falling through to the exposition editor review"
+        )
     mode = "review_writing"
     return _action(
         mode,
         "root",
         "",
-        f"writing gate: exposition editor review of final paper {artifact_id}",
+        review_reason,
         plan_step_budget(problem, mode, requested_tokens),
         research_mode=research_mode,
         critic_lens=WRITING_GATE_EDITOR_LENS,
@@ -9204,6 +9630,9 @@ def _sync_writing_lint_debts(store: ProofStateStore, artifact_id: str, content: 
         excerpt = str(finding.excerpt or "").strip()
         if excerpt:
             obligation += f' — excerpt: "{_compact_text(excerpt, 140)}"'
+        # Every deterministic finding carries its concrete REQUIRED-FIX
+        # instruction so the revision prompt can enumerate location -> fix.
+        obligation += f"{WRITING_REQUIRED_FIX_MARKER}{writing_required_fix(finding)}"
         desired[debt_id] = {
             "op": "add_debt",
             "debt_id": debt_id,
@@ -9298,6 +9727,7 @@ def _sync_writing_compile_debt(store: ProofStateStore, artifact_id: str) -> None
         excerpt = _writing_compile_log_excerpt(log_path)
         if excerpt:
             obligation += f' — pdflatex log: "{excerpt}"'
+        obligation += f"{WRITING_REQUIRED_FIX_MARKER}{writing_required_fix_for_obligation(obligation)}"
         desired = {
             "op": "add_debt",
             "debt_id": f"{WRITING_COMPILE_DEBT_PREFIX}{status}-{fingerprint_text(artifact_id + status)[:10]}",
@@ -9351,8 +9781,10 @@ def _writing_gate_state(store: ProofStateStore, artifact_id: str) -> Dict[str, A
     ``deterministic_revision_rounds`` counts runs tagged
     "writing_gate_revision_deterministic" (revisions whose blocking debts were
     all lint/compile), ``editor_revision_rounds`` counts runs tagged
-    "writing_gate_revision" (revisions addressing at least one editor/LLM
-    debt; legacy stores recorded every revision under this intent, which keeps
+    "writing_gate_revision" (revisions drawing on the editor allowance: those
+    addressing at least one editor/LLM debt, plus the exhaustion-fallthrough
+    revision that sweeps up leftover deterministic majors after the editor
+    pass; legacy stores recorded every revision under this intent, which keeps
     the old, stricter accounting for resumed runs).
     """
     with store.connect() as conn:
@@ -9409,19 +9841,28 @@ def _writing_gate_state(store: ProofStateStore, artifact_id: str) -> Dict[str, A
 
 
 def _writing_debt_cards(debts: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """One card per debt — EVERY debt, uncapped, so a revision prompt can
+    enumerate all of them as a location -> required-fix checklist. ``location``
+    is the human-readable place (section title / line / excerpt) and
+    ``required_fix`` the concrete instruction (appended to lint obligations at
+    sync time; re-derived for legacy debts; "" for editor findings, whose
+    obligation already carries a suggested rewrite)."""
     severity_rank = {"blocking": 0, "major": 1, "minor": 2}
     cards: list[Dict[str, Any]] = []
     for debt in sorted(debts, key=lambda d: (severity_rank.get(str(d.get("severity") or ""), 9), str(d.get("debt_id") or ""))):
         obligation = str(debt.get("obligation") or "")
-        rule_match = _WRITING_RULE_ID_RE.match(obligation)
-        line_match = _WRITING_LINE_RE.search(obligation)
+        defect = obligation.split(WRITING_REQUIRED_FIX_MARKER, 1)[0]
+        rule_match = _WRITING_RULE_ID_RE.match(defect)
+        line_match = _WRITING_LINE_RE.search(defect)
         cards.append(
             {
                 "debt_id": str(debt.get("debt_id") or ""),
                 "severity": str(debt.get("severity") or ""),
                 "rule_id": rule_match.group(1) if rule_match else "",
                 "line": int(line_match.group(1)) if line_match else 0,
-                "obligation": _compact_text(obligation, 300),
+                "obligation": _compact_text(defect, 300),
+                "location": writing_obligation_location(obligation),
+                "required_fix": _compact_text(writing_required_fix_for_obligation(obligation), 300),
             }
         )
     return cards

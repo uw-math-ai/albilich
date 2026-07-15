@@ -44,6 +44,13 @@ def classify_state(state: Mapping[str, Any]) -> Dict[str, Any]:
         public_status = "solved_pending_final_writer"
         result_kind = relation
         summary = _writer_pending_summary(relation)
+    elif (
+        root.get("validation_status") in {"informally_verified", "formally_verified"}
+        and root.get("lifecycle_status") in {"active", "blocked"}
+    ):
+        public_status = "verified_pending_integration"
+        result_kind = "unresolved"
+        summary = "The root theorem passed strict verification and is awaiting integration."
     elif partials:
         public_status = "certified_partial_progress"
         result_kind = "partial"
@@ -79,6 +86,8 @@ def _report_classification(public_status: str, root: Mapping[str, Any], partials
         return "statement_likely_false"
     if public_status in {"solved", "solved_pending_final_writer"}:
         return "full_theorem_solved"
+    if public_status == "verified_pending_integration":
+        return "in_progress"
     if partials:
         relations = {str(row.get("relation_to_target") or "") for row in partials}
         if "weaker" in relations:
@@ -214,6 +223,9 @@ def _remaining_obligations(state: Mapping[str, Any], public_status: str) -> list
         return obligations
     if public_status == "solved_pending_final_writer":
         obligations.append("Run the writer/closer to emit the final_proof artifact.")
+        return obligations
+    if public_status == "verified_pending_integration":
+        obligations.append("Run the integration verifier on the strictly verified sufficient root route.")
         return obligations
     active_debts = [row for row in state.get("debts", []) if row.get("status") == "active"]
     for debt in active_debts[:8]:

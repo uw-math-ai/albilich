@@ -199,6 +199,9 @@ def build_markdown_report(store: ProofStateStore) -> str:
 
 def _research_strategy_lines(state: Dict[str, Any]) -> list[str]:
     strategy = strategy_observability(state)
+    frontier = strategy.get("decisive_obligation_frontier") or {}
+    learning = strategy.get("verifier_filtered_outcome_learning") or {}
+    roi = strategy.get("deep_session_roi") or {}
     if not any(
         strategy.get(key)
         for key in (
@@ -207,6 +210,7 @@ def _research_strategy_lines(state: Dict[str, Any]) -> list[str]:
             "latest_bridge_search_artifact_id",
             "latest_conjecture_portfolio_artifact_id",
             "active_invention_authorization_artifact_id",
+            "decisive_obligation_frontier",
         )
     ):
         return []
@@ -229,8 +233,13 @@ def _research_strategy_lines(state: Dict[str, Any]) -> list[str]:
             f"candidates={strategy.get('conjecture_candidate_count', 0)}, selected=`{strategy.get('selected_conjecture_id') or 'none'}`",
             f"- Active invention authorization: `{strategy.get('active_invention_authorization_artifact_id') or 'none'}`",
             f"- Global synthesis due: `{bool(trigger.get('due'))}`; reasons={trigger.get('reasons', [])}",
-            "- Information-gain policy: scheduler exposes closing, refuting, root-progress, information, reuse, duplication, token, wall-time, and verification-cost components on each action; speculative work never consumes the protected verification reserve.",
-            "- Method library policy: developer-curated structural method cards are advisory only and are kept separate from verified facts, external theorem cards, and private speculation.",
+            f"- Graph-derived decisive obligation: `{(frontier.get('decisive_obligation') or {}).get('obligation_id') or 'none'}`; "
+            f"selected route=`{frontier.get('selected_route_id') or 'none'}`, ready_for_verification={bool(frontier.get('selected_route_ready_for_verification'))}",
+            f"- Verifier-filtered outcome learning: family=`{learning.get('current_strategy_family') or 'none'}`; "
+            f"local families={len(learning.get('families') or {})}; reference_solution_used={bool(learning.get('reference_solution_used'))}",
+            f"- Deep-session ROI: allowed={bool(roi.get('allowed', True))}; reason={roi.get('reason') or 'not evaluated'}",
+            "- Information-gain policy: scheduler exposes closing, refuting, root-progress, information, reuse, duplication, token, wall-time, verification-cost, and verifier-filtered outcome components; speculative work never consumes the protected verification reserve.",
+            "- Method library policy: 18 developer-curated structural/domain method cards are advisory only and are kept separate from verified facts, external theorem cards, and private speculation.",
             "",
         ]
     )

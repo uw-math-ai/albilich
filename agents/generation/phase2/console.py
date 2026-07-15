@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .graph_policy import claim_is_verified, route_scoreboard
+from .graph_policy import claim_is_verified, debt_covered_by_integrated_claim, route_scoreboard
 from .metrics import compute_metrics
 from .research_policy import researcher_mode_summary
 from .result_status import classify_state
@@ -455,8 +455,8 @@ def _run_snapshot(
         open_case_count = 0
         open_blocking_case_count = 0
     else:
-        open_case_count = raw_active_debt_count
-        open_blocking_case_count = raw_blocking_debt_count
+        open_case_count = metrics.get("open_debt_count", raw_active_debt_count)
+        open_blocking_case_count = metrics.get("open_blocking_debt_count", raw_blocking_debt_count)
     return {
         "public_status": public_status,
         "result_kind": result.get("result_kind", ""),
@@ -654,32 +654,35 @@ def _run_timeline(runs: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
             }
         )
 
-    # An integration verifier can legitimately reject several stale proposals
-    # before a refreshed proposal for the same target/route is accepted.  Keep
-    # the historical attempts, but annotate failures that a later successful
-    # integration resolved so the dashboard does not present them as current
-    # unresolved failures.
-    recovered_by_key: dict[tuple[str, str], tuple[int, str, str]] = {}
+    # A session can be rejected for a recoverable framework reason before an
+    # accepted replay of the same mathematical job lands.  Keep the historical
+    # attempt, but annotate it as recovered so the dashboard distinguishes a
+    # discarded transport/framework patch from an unresolved mathematical
+    # rejection.  Include role and mode in the key: a villain or researcher
+    # success must not appear to recover a strict-verifier failure.
+    recovered_by_key: dict[tuple[str, str, str, str], tuple[int, str, str]] = {}
     for index, row in enumerate(timeline):
-        if (
-            row.get("actor_role") == "integration_verifier"
-            and row.get("mode") == "integrate"
-            and row.get("status") == "completed"
-        ):
-            key = (str(row.get("target_id") or ""), str(row.get("route_id") or ""))
+        if row.get("status") == "completed":
+            key = (
+                str(row.get("actor_role") or ""),
+                str(row.get("mode") or ""),
+                str(row.get("target_id") or ""),
+                str(row.get("route_id") or ""),
+            )
             recovered_by_key[key] = (
                 index,
                 str(row.get("run_id") or ""),
                 str(row.get("created_at") or ""),
             )
     for index, row in enumerate(timeline):
-        if (
-            row.get("actor_role") != "integration_verifier"
-            or row.get("mode") != "integrate"
-            or row.get("status") not in {"patch_rejected", "failed", "no_patch"}
-        ):
+        if row.get("status") not in {"patch_rejected", "failed", "no_patch"}:
             continue
-        key = (str(row.get("target_id") or ""), str(row.get("route_id") or ""))
+        key = (
+            str(row.get("actor_role") or ""),
+            str(row.get("mode") or ""),
+            str(row.get("target_id") or ""),
+            str(row.get("route_id") or ""),
+        )
         recovery = recovered_by_key.get(key)
         if recovery and recovery[0] > index:
             row["failure_recovered"] = True
@@ -784,7 +787,11 @@ def _open_case_groups(state: Mapping[str, Any]) -> dict[str, list[dict[str, Any]
         "Decomposition / Regulator": [],
         "Other": [],
     }
-    active_debts = [row for row in state.get("debts", []) if row.get("status") == "active"]
+    active_debts = [
+        row
+        for row in state.get("debts", [])
+        if row.get("status") == "active" and not debt_covered_by_integrated_claim(state, row)
+    ]
     active_debts.sort(
         key=lambda row: (
             row.get("severity") != "blocking",

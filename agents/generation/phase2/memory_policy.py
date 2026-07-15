@@ -16,7 +16,7 @@ silently dropping them.
 
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
-from .models import fingerprint_text, json_loads
+from .models import fingerprint_text, json_loads, normalize_text
 
 MEMORY_STATUSES = {
     "verified",
@@ -188,10 +188,65 @@ def artifact_is_raw_log(row: Mapping[str, Any]) -> bool:
     return artifact_id.startswith(RAW_LOG_ARTIFACT_ID_PREFIXES)
 
 
+_DEBT_SEMANTIC_STOPWORDS = {
+    "and", "are", "for", "from", "into", "must", "of", "or", "prove",
+    "show", "supply", "that", "the", "their", "this", "to", "verify", "with",
+}
+
+
 def _debt_dedupe_key(row: Mapping[str, Any]) -> Tuple[str, str]:
     obligation = str(row.get("obligation") or "")
     fingerprint = fingerprint_text(obligation) or str(row.get("fingerprint") or "")
     return (str(row.get("owner_id") or ""), fingerprint)
+
+
+def _debt_semantic_scope(row: Mapping[str, Any]) -> str:
+    return str(row.get("suggested_next_target") or row.get("owner_id") or "")
+
+
+def _debt_type_family(row: Mapping[str, Any]) -> str:
+    debt_type = str(row.get("debt_type") or "").lower()
+    if debt_type in {"missing_reference", "source_gap", "citation_verification"}:
+        return "source"
+    if debt_type in {"counterexample_risk", "counterexample_validation"}:
+        return "counterexample"
+    return "proof"
+
+
+def _debt_semantic_terms(row: Mapping[str, Any]) -> set[str]:
+    return {
+        term
+        for term in normalize_text(str(row.get("obligation") or "")).split()
+        if len(term) >= 4 and term not in _DEBT_SEMANTIC_STOPWORDS
+    }
+
+
+def _same_debt_obligation(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    if _debt_dedupe_key(left) == _debt_dedupe_key(right):
+        return True
+    # Writing debts are LOCATION-ANCHORED: one debt per violating place in the
+    # document, and same-rule obligations differ only in section title / line /
+    # excerpt (three sections missing their L4-HOUSE-07 opener are three
+    # distinct debts). Term-overlap merging would collapse them and truncate
+    # the writing-gate checklists, so only the exact owner+obligation
+    # fingerprint above may dedupe them.
+    if str(left.get("debt_type") or "") == "writing" or str(right.get("debt_type") or "") == "writing":
+        return False
+    if str(left.get("status") or "active") != str(right.get("status") or "active"):
+        return False
+    if _debt_semantic_scope(left) != _debt_semantic_scope(right):
+        return False
+    if _debt_type_family(left) != _debt_type_family(right):
+        return False
+    left_terms = _debt_semantic_terms(left)
+    right_terms = _debt_semantic_terms(right)
+    if min(len(left_terms), len(right_terms)) < 7:
+        return False
+    shared = left_terms & right_terms
+    union = left_terms | right_terms
+    jaccard = len(shared) / max(1, len(union))
+    containment = len(shared) / max(1, min(len(left_terms), len(right_terms)))
+    return (len(shared) >= 8 and jaccard >= 0.48) or containment >= 0.82
 
 
 def canonicalize_debts(
@@ -203,42 +258,55 @@ def canonicalize_debts(
     debt_id. Returns (canonical rows in input order, duplicate report cards) so
     manifests can report duplicates instead of silently dropping them.
     """
-    groups: Dict[Tuple[str, str], List[Mapping[str, Any]]] = {}
-    order: List[Tuple[str, str]] = []
+    groups: List[List[Mapping[str, Any]]] = []
     for row in rows:
-        key = _debt_dedupe_key(row)
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(row)
+        for group in groups:
+            if any(_same_debt_obligation(row, existing) for existing in group):
+                group.append(row)
+                break
+        else:
+            groups.append([row])
 
-    canonical_by_key: Dict[Tuple[str, str], Mapping[str, Any]] = {}
+    canonical_by_debt_id: Dict[str, Mapping[str, Any]] = {}
+    duplicate_ids: set[str] = set()
     duplicates: List[Dict[str, Any]] = []
-    for key in order:
+    for raw_group in groups:
         group = sorted(
-            groups[key],
+            raw_group,
             key=lambda row: (str(row.get("first_seen") or ""), str(row.get("debt_id") or "")),
         )
-        canonical_by_key[key] = group[0]
+        canonical_row = dict(group[0])
+        canonical_id = str(canonical_row.get("debt_id") or "")
+        alias_ids = [str(row.get("debt_id") or "") for row in group[1:]]
+        if alias_ids:
+            canonical_row["canonical_alias_debt_ids"] = alias_ids
+            canonical_row["repeated_count"] = sum(int(row.get("repeated_count") or 0) for row in group)
+        canonical_by_debt_id[canonical_id] = canonical_row
         if len(group) > 1:
+            duplicate_ids.update(alias_ids)
             duplicates.append(
                 {
                     "kind": "debt",
-                    "canonical_debt_id": str(group[0].get("debt_id") or ""),
-                    "duplicate_debt_ids": [str(row.get("debt_id") or "") for row in group[1:]],
-                    "owner_id": key[0],
-                    "obligation_fingerprint": key[1],
+                    "canonical_debt_id": canonical_id,
+                    "duplicate_debt_ids": alias_ids,
+                    "owner_id": str(group[0].get("owner_id") or ""),
+                    "obligation_fingerprint": fingerprint_text(str(group[0].get("obligation") or "")),
+                    "semantic_match": any(
+                        _debt_dedupe_key(group[0]) != _debt_dedupe_key(row) for row in group[1:]
+                    ),
                 }
             )
 
     canonical: List[Mapping[str, Any]] = []
-    seen: set[Tuple[str, str]] = set()
+    seen: set[str] = set()
     for row in rows:
-        key = _debt_dedupe_key(row)
-        if key in seen:
+        debt_id = str(row.get("debt_id") or "")
+        if debt_id in duplicate_ids:
             continue
-        seen.add(key)
-        canonical.append(canonical_by_key[key])
+        if debt_id in seen:
+            continue
+        seen.add(debt_id)
+        canonical.append(canonical_by_debt_id.get(debt_id, row))
     return canonical, duplicates
 
 

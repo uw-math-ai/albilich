@@ -6,12 +6,14 @@ integrated and a final proof was written" and "the run may conclude
 `stop_solved`", and it is **lightweight**: mathematical correctness is
 ASSUMED (the main harness verified the certificate), the internal
 `final_proof` (the *certificate*) is never linted or reviewed here, and the
-gate costs at most **4 LLM sessions in the worst case** — paper authoring (1),
+gate costs at most **5 LLM sessions in the worst case** — paper authoring (1),
 deterministic-defect revision(s) (0–2, typically 0–1), one "editor" exposition
 review (1), and at most one editor-debt revision (0–1). No run
 concludes solved until the `final_paper` — a standalone LaTeX research
 article — is deterministically clean (lint, paper-register rules, LaTeX
-compile) and the single editor session has been spent.
+compile) and the single editor session has been spent, **or** every pass and
+revision budget has been truly spent (in which case the unresolved debts are
+recorded in the report).
 
 ## Source of truth
 
@@ -94,6 +96,14 @@ residue guard on writer artifacts still stands).
      (`mode="write"`, `writing_revision: true` + `paper_revision: true`):
      diff-minimal, the writer re-attaches the COMPLETE revised LaTeX source as
      a new `final_paper` and resolves debts via `update_debt`. The revision
+     prompt enumerates **EVERY open writing debt** (no cap) as a numbered
+     `location -> REQUIRED FIX` checklist — location is the section title /
+     line / excerpt, the required fix is the concrete per-rule instruction
+     from `writing/linter.py` (`required_fix`, appended to each lint debt's
+     obligation at sync time behind `REQUIRED_FIX_MARKER`) — and instructs
+     the writer to fix every numbered item and self-check each location
+     before attaching, because the same deterministic scan re-flags whatever
+     it still finds. The revision
      **budget is split by what forced the revision**: a dispatch whose blocking
      debts are ALL deterministic (debt-id prefixes `writing-lint-` /
      `writing-compile-`) is tagged
@@ -117,17 +127,25 @@ residue guard on writer artifacts still stands).
    editor `review_writing` runs and editor `writing_review` artifacts (so a
    critic that attached nothing, or forgot its run metrics, cannot re-open the
    pass — that is also the livelock protection). **Pass** (a `writing_review`
-   with `verdict: "pass"`) → the gate opens (`stop_solved`). **Fail** (the
-   editor's `add_debt` findings) → the single editor-debt revision, after
+   with `verdict: "pass"`) → the gate opens (`stop_solved`) unless leftover
+   blocker/major debts remain (see the exhaustion fallthrough below). **Fail**
+   (the editor's `add_debt` findings) → the single editor-debt revision, after
    which only the deterministic re-check runs — no second editor pass, no
    lens resets, no free verification pass.
-4. **Exceptions past the revision caps.** Generation residue (`L1-CITE-03`)
+4. **Editor fallthrough on exhaustion.** When blocker/major debts remain but
+   the forcing bucket's revision allowance is spent (and no residue/compile
+   exception applies), the gate does **not** open — it falls through to the
+   editor phase: the editor review runs if its pass budget remains (its
+   dispatch reason names the leftover debts), and the editor-debt revision
+   (if unspent) then addresses **both** the editor's findings and the
+   leftover deterministic blockers/majors in one revision. The gate opens
+   with unresolved debts recorded in the phase2 report's "Writing Review"
+   section only after the editor pass **and** both revision buckets are
+   truly spent.
+5. **Exceptions past the revision caps.** Generation residue (`L1-CITE-03`)
    and LaTeX-compile failures (`writing-compile-` debts) keep forcing
    revisions regardless of budget — deterministic, cheap fixes that must
    never ship (residue is independently rejected at patch time, see guards).
-   With the applicable cap spent and only other blocker/major debts open, the
-   gate opens with those debts left recorded in the phase2 report's "Writing
-   Review" section.
 
 Convergence (`stop_solved`) fires **only after the gate opens**; the outcome
 label is still defined by the `final_proof`.
@@ -309,10 +327,13 @@ The revision budget is split into two buckets, distinguished by the dispatch
 `search_intent` persisted on the revision run (`writing_gate_revision` for
 editor-debt revisions, `writing_gate_revision_deterministic` for revisions
 whose blocking debts were all `writing-lint-`/`writing-compile-`); each bucket
-is counted separately in `_writing_gate_state`. Total LLM sessions ≤ 4 in the
-worst case: authoring + editor + deterministic revision + editor-debt revision
-(the deterministic cap admits one further deterministic revision, and the
-residue/compile exceptions can exceed any cap — both never ship regardless).
+is counted separately in `_writing_gate_state`. Total LLM sessions ≤ 5 in the
+worst case: authoring + up to 2 deterministic revisions + editor + editor-debt
+revision (the residue/compile exceptions can exceed any cap — both never ship
+regardless). The exhaustion fallthrough adds no sessions: it only reorders —
+leftover deterministic majors reach the editor phase instead of shipping
+unreviewed, and the editor-debt revision sweeps them up together with the
+editor's findings.
 
 | constant | default | meaning |
 | --- | --- | --- |

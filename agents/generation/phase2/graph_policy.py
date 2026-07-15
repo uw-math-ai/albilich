@@ -146,6 +146,95 @@ def _artifact_rows(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return rows
 
 
+def _revision_number(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _latest_route_work_directives(state: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return the newest explicit pause/keep decision for each route.
+
+    Route-triage artifacts are historical evidence, not permanent locks.  A
+    later advisor report that keeps, repairs, resumes, or reopens an active
+    route must supersede an older pause and may deliberately override the
+    scoreboard's heuristic stall classification.
+    """
+    pause_keys = (
+        "paused_or_abandoned_route_ids",
+        "paused_route_ids",
+        "abandoned_route_ids",
+        "blocked_route_ids",
+        "stale_route_ids",
+    )
+    keep_keys = (
+        "kept_route_ids",
+        "recommended_kept_route_ids",
+        "active_route_ids",
+        "resumed_route_ids",
+        "reopened_route_ids",
+    )
+    pause_terms = ("block", "pause", "abandon", "stale", "low_yield", "kill", "retire")
+    keep_terms = ("keep", "repair", "resume", "reopen", "reactivate", "continue", "active")
+    directives: dict[str, dict[str, Any]] = {}
+
+    def record(route_id: str, *, paused: bool, artifact: Mapping[str, Any], reason: str) -> None:
+        if not route_id:
+            return
+        rank = (
+            _revision_number(artifact.get("state_revision")),
+            str(artifact.get("created_at") or ""),
+            str(artifact.get("artifact_id") or ""),
+        )
+        existing = directives.get(route_id)
+        if existing and tuple(existing["rank"]) > rank:
+            return
+        directives[route_id] = {
+            "paused": paused,
+            "source_id": str(artifact.get("artifact_id") or ""),
+            "reason": reason,
+            "rank": rank,
+        }
+
+    for artifact in _artifact_rows(state):
+        metadata = _json_object(artifact.get("metadata_json", artifact.get("metadata")))
+        if not metadata:
+            continue
+        for route_id in _metadata_strings(metadata, *pause_keys):
+            record(route_id, paused=True, artifact=artifact, reason="explicit pause or abandonment directive")
+        for route_id in _metadata_strings(metadata, *keep_keys):
+            record(route_id, paused=False, artifact=artifact, reason="explicit keep or resume directive")
+
+        raw_decisions = metadata.get("route_decisions") or []
+        decisions: list[tuple[str, str]] = []
+        if isinstance(raw_decisions, Mapping):
+            for route_id, payload in raw_decisions.items():
+                if isinstance(payload, Mapping):
+                    decision = str(payload.get("decision") or payload.get("status") or "")
+                    route_id = str(payload.get("route_id") or route_id or "")
+                else:
+                    decision = str(payload or "")
+                decisions.append((str(route_id or ""), decision))
+        elif isinstance(raw_decisions, Iterable) and not isinstance(raw_decisions, (str, bytes)):
+            for payload in raw_decisions:
+                if not isinstance(payload, Mapping):
+                    continue
+                decisions.append(
+                    (
+                        str(payload.get("route_id") or payload.get("id") or ""),
+                        str(payload.get("decision") or payload.get("status") or ""),
+                    )
+                )
+        for route_id, decision in decisions:
+            normalized = decision.strip().lower()
+            if any(term in normalized for term in pause_terms):
+                record(route_id, paused=True, artifact=artifact, reason=f"route decision: {decision}")
+            elif any(term in normalized for term in keep_terms):
+                record(route_id, paused=False, artifact=artifact, reason=f"route decision: {decision}")
+    return directives
+
+
 def _explicitly_refuted_debt_ids(state: Mapping[str, Any]) -> set[str]:
     """Debts defeated by a validator-confirmed counterexample artifact."""
     refuted: set[str] = set()
@@ -268,13 +357,6 @@ def supersession_index(state: Mapping[str, Any]) -> Dict[str, Any]:
         "replaced_route_id",
         "replaced_route_ids",
     )
-    stale_route_keys = (
-        "paused_or_abandoned_route_ids",
-        "paused_route_ids",
-        "abandoned_route_ids",
-        "blocked_route_ids",
-        "stale_route_ids",
-    )
     replacement_claim_keys = (
         "replacement_claim_id",
         "replacement_claim_ids",
@@ -315,14 +397,16 @@ def supersession_index(state: Mapping[str, Any]) -> Dict[str, Any]:
                 source_id=source_id,
                 superseded=True,
             )
-        for stale_route_id in _metadata_strings(metadata, *stale_route_keys):
-            mark_route(
-                stale_route_id,
-                replacement_route_ids=replacement_routes,
-                reason="advisor or triage metadata says this route should not receive ordinary proof work",
-                source_id=source_id,
-                superseded=False,
-            )
+    for route_id, directive in _latest_route_work_directives(state).items():
+        if not directive["paused"]:
+            continue
+        mark_route(
+            route_id,
+            replacement_route_ids=[],
+            reason="latest advisor or triage directive says this route should not receive ordinary proof work",
+            source_id=str(directive.get("source_id") or ""),
+            superseded=False,
+        )
 
     return {
         "policy": "metadata-and-statement-repair-supersession",
@@ -577,11 +661,62 @@ def recent_substantive_runs(state: Mapping[str, Any], *, limit: int = 8) -> list
     return rows[:limit]
 
 
+def route_repair_pending_verifier(
+    state: Mapping[str, Any],
+    *,
+    route_id: str,
+    conclusion_id: str,
+    debt: Mapping[str, Any],
+) -> bool:
+    """Whether a newer route-local proof asks the verifier to judge ``debt``.
+
+    The debt ledger intentionally retains historical blockers.  Once a proof
+    dossier explicitly repairs a route and requests verification, those rows
+    must travel with the verifier packet instead of making the route look
+    stalled and therefore unschedulable.
+    """
+
+    debt_last_seen = str(debt.get("last_seen") or "")
+    artifacts = state.get("research_artifacts")
+    if not isinstance(artifacts, list):
+        artifacts = state.get("artifacts", [])
+    for artifact in artifacts:
+        if str(artifact.get("artifact_type") or "") not in {"proof_dossier", "deep_session_report"}:
+            continue
+        metadata = artifact.get("metadata_json", artifact.get("metadata", {}))
+        if isinstance(metadata, str):
+            metadata = json_loads(metadata, {})
+        if not isinstance(metadata, Mapping):
+            continue
+        if str(metadata.get("artifact_roi") or "") not in {"route_repaired", "verifier_ready_route"}:
+            continue
+        artifact_route_id = str(metadata.get("route_id") or "")
+        artifact_target_id = str(metadata.get("target_id") or "")
+        if artifact_route_id and artifact_route_id != route_id:
+            continue
+        if artifact_target_id and artifact_target_id != conclusion_id:
+            continue
+        next_action = str(
+            metadata.get("next_decisive_action")
+            or metadata.get("next_decisive_step")
+            or metadata.get("next_decisive_test")
+            or ""
+        ).lower()
+        if "verif" not in next_action:
+            continue
+        created_at = str(artifact.get("created_at") or "")
+        if debt_last_seen and created_at and created_at <= debt_last_seen:
+            continue
+        return True
+    return False
+
+
 def route_scoreboard(state: Mapping[str, Any], *, limit: int | None = None) -> list[Dict[str, Any]]:
     claims = claim_map(state)
     supersession = supersession_index(state)
     superseded_route_ids = set(supersession.get("superseded_route_ids", []))
     stale_route_ids = set(supersession.get("stale_route_ids", []))
+    route_work_directives = _latest_route_work_directives(state)
     inferences_by_route: dict[str, list[Mapping[str, Any]]] = {}
     for inf in state.get("inferences", []):
         inferences_by_route.setdefault(str(inf.get("route_id") or ""), []).append(inf)
@@ -601,6 +736,13 @@ def route_scoreboard(state: Mapping[str, Any], *, limit: int | None = None) -> l
             if debt.get("status") == "active"
             and debt.get("severity") == "blocking"
             and str(debt.get("owner_id") or "") in {route_id, conclusion_id}
+            and not debt_covered_by_integrated_claim(state, debt)
+            and not route_repair_pending_verifier(
+                state,
+                route_id=route_id,
+                conclusion_id=conclusion_id,
+                debt=debt,
+            )
         ]
         root_distance = root_distance_for_claim_id(state, conclusion_id)
         root_impact = float(conclusion.get("root_impact", 0.0) or 0.0)
@@ -609,6 +751,11 @@ def route_scoreboard(state: Mapping[str, Any], *, limit: int | None = None) -> l
             status, reasons = "superseded", ["route is superseded by repaired proof-state work"]
         elif route_id in stale_route_ids:
             status, reasons = "stalled", ["advisor or triage report paused this stale route"]
+        elif (
+            route_work_directives.get(route_id, {}).get("paused") is False
+            and str(route.get("status") or "") == "active"
+        ):
+            status, reasons = "promising", []
         else:
             status, reasons = _route_score_status(
                 route,
@@ -657,15 +804,6 @@ def paused_route_ids(state: Mapping[str, Any]) -> set[str]:
     }
     paused.update(str(route_id) for route_id in supersession.get("superseded_route_ids", []))
     paused.update(str(route_id) for route_id in supersession.get("stale_route_ids", []))
-    for artifact in state.get("research_artifacts", []):
-        if str(artifact.get("artifact_type") or "") not in {"route_triage_report", "advisor_report"}:
-            continue
-        metadata = json_loads(artifact.get("metadata_json"), {})
-        if not isinstance(metadata, Mapping):
-            continue
-        for route_id in metadata.get("paused_or_abandoned_route_ids") or []:
-            if route_id:
-                paused.add(str(route_id))
     return paused
 
 
@@ -1033,6 +1171,16 @@ def _claim_signature_tokens(statement: str) -> set[str]:
         elif len(token) > 4 and token.endswith("s"):
             token = token[:-1]
         tokens.add(token)
+    # ``normalize_text`` deliberately removes mathematical punctuation, but
+    # doing so turns family names such as ``A_n`` into the stopword-sized
+    # tokens ``a`` and ``n``.  Preserve subscripted identifiers as signature
+    # tokens so theorem templates for different mathematical objects do not
+    # look like restatements merely because their quantifiers and conclusions
+    # have the same prose shape.
+    tokens.update(
+        match.group(0).lower()
+        for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9]+\b", str(statement or ""))
+    )
     return tokens
 
 
@@ -1066,7 +1214,12 @@ def _near_integrated_claim_restatement(
         and existing_coverage >= 0.75
     ):
         return False
-    return new_coverage >= 0.62 and size_ratio <= 2.75
+    # The common quantified-theorem template can dominate a much shorter claim
+    # about a different object.  Require meaningful coverage in the existing
+    # theorem as well; otherwise a new special-family theorem can be rejected
+    # merely for sharing words such as ``Aut``, ``wr``, ``order``, and
+    # ``proper subgroup`` with an integrated theorem.
+    return new_coverage >= 0.62 and existing_coverage >= 0.70 and size_ratio <= 2.75
 
 
 def integrated_claim_covering_debt_id(
@@ -1091,6 +1244,59 @@ def integrated_claim_covering_debt_id(
         if debt_coverage >= 0.34 and claim_coverage >= 0.25:
             return str(row.get("claim_id") or "")
     return ""
+
+
+def debt_covered_by_integrated_claim(
+    state: Mapping[str, Any],
+    debt: Mapping[str, Any],
+) -> bool:
+    """Return whether an active-looking debt belongs to an integrated result.
+
+    Debts are retained as an audit ledger after their branch closes.  Consumers
+    deciding what is still open must therefore check both graph ownership and
+    semantic coverage instead of treating every ``status=active`` row as a live
+    proof obligation.
+    """
+    graph_ids = {
+        str(debt.get("owner_id") or ""),
+        str(debt.get("suggested_next_target") or ""),
+    }
+    target_ids = set(graph_ids)
+    target_ids.update(
+        str(row.get("conclusion_claim_id") or "")
+        for row in state.get("routes", [])
+        if str(row.get("route_id") or "") in graph_ids
+    )
+    target_ids.update(
+        str(row.get("conclusion_claim_id") or "")
+        for row in state.get("inferences", [])
+        if str(row.get("inference_id") or "") in graph_ids
+    )
+    if any(
+        str(claim.get("claim_id") or "") in target_ids
+        and str(claim.get("lifecycle_status") or "") == "integrated"
+        for claim in state.get("claims", [])
+    ):
+        return True
+    debt_id = str(debt.get("debt_id") or "")
+    debt_prefix = next((prefix for prefix in ("debt_", "debt-") if debt_id.startswith(prefix)), "")
+    if debt_prefix:
+        debt_subject = debt_id.removeprefix(debt_prefix)
+        if any(
+            any(
+                str(claim.get("claim_id") or "").removeprefix(prefix) == debt_subject
+                for prefix in ("claim_", "claim-")
+                if str(claim.get("claim_id") or "").startswith(prefix)
+            )
+            and str(claim.get("lifecycle_status") or "") == "integrated"
+            for claim in state.get("claims", [])
+        ):
+            return True
+    obligation = " ".join(
+        str(debt.get(key) or "")
+        for key in ("debt_id", "debt_type", "obligation", "suggested_next_target")
+    ).lower()
+    return bool(integrated_claim_covering_debt_id(state.get("claims", []), obligation=obligation))
 
 
 def obvious_duplicate_claim_id(

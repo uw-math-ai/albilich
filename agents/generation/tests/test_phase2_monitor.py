@@ -74,6 +74,84 @@ class MonitorTest(unittest.TestCase):
             self.assertIn(payload["_monitor"]["source"], {"store", "store+console"})
             self.assertIn("live", payload["_monitor"])
 
+    def test_open_case_counts_exclude_debts_covered_by_integrated_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            now = utc_now()
+            with store.connect() as conn:
+                conn.execute(
+                    """INSERT INTO claims(
+                           claim_id, kind, statement, normalized_statement, fingerprint,
+                           hypotheses, conditions_json, validation_status, lifecycle_status,
+                           root_impact, reduction_depth, parent_ids_json, source_ids_json,
+                           tags_json, evidence_artifact_ids_json, created_at, updated_at
+                       ) VALUES (?, 'lemma', ?, ?, 'fp-integrated-lemma', '', '[]',
+                                 'informally_verified', 'integrated', 0.8, 1, '[\"root\"]',
+                                 '[]', '[]', '[]', ?, ?)""",
+                    (
+                        "integrated-lemma",
+                        "The completed branch lemma.",
+                        "the completed branch lemma",
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO debts(
+                           debt_id, owner_type, owner_id, obligation, fingerprint, debt_type,
+                           severity, status, first_seen, last_seen, repeated_count,
+                           source_artifact_ids_json, suggested_next_target, resolution_evidence_json
+                       ) VALUES (?, 'claim', 'integrated-lemma', ?, 'fp-stale-debt', 'gap',
+                                 'blocking', 'active', ?, ?, 1, '[]', 'integrated-lemma', '{}')""",
+                    ("debt-integrated-lemma", "An old obligation retained for audit history.", now, now),
+                )
+                conn.commit()
+
+            payload = build_monitor_payload(store)
+
+        self.assertEqual(payload["snapshot"]["open_case_count"], 0)
+        self.assertEqual(payload["snapshot"]["open_blocking_case_count"], 0)
+        self.assertEqual(payload["snapshot"]["ledger_active_debt_count"], 1)
+        self.assertEqual(payload["snapshot"]["ledger_blocking_debt_count"], 1)
+        self.assertFalse(any(payload["open_cases"].values()))
+        self.assertEqual(payload["snapshot"]["root_local_blocking_debt_count"], 0)
+
+    def test_open_case_counts_match_root_debt_to_integrated_claim_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            now = utc_now()
+            with store.connect() as conn:
+                conn.execute(
+                    """INSERT INTO claims(
+                           claim_id, kind, statement, normalized_statement, fingerprint,
+                           hypotheses, conditions_json, validation_status, lifecycle_status,
+                           root_impact, reduction_depth, parent_ids_json, source_ids_json,
+                           tags_json, evidence_artifact_ids_json, created_at, updated_at
+                       ) VALUES ('claim-psl-bridge', 'lemma', 'The completed PSL bridge.',
+                                 'the completed psl bridge', 'fp-psl-bridge', '', '[]',
+                                 'informally_verified', 'integrated', 0.8, 1, '["root"]',
+                                 '[]', '[]', '[]', ?, ?)""",
+                    (now, now),
+                )
+                conn.execute(
+                    """INSERT INTO debts(
+                           debt_id, owner_type, owner_id, obligation, fingerprint, debt_type,
+                           severity, status, first_seen, last_seen, repeated_count,
+                           source_artifact_ids_json, suggested_next_target, resolution_evidence_json
+                       ) VALUES ('debt-psl-bridge', 'claim', 'root',
+                                 'Prove the PSL bridge in all outer cosets.', 'fp-psl-debt', 'gap',
+                                 'blocking', 'active', ?, ?, 1, '[]', 'root', '{}')""",
+                    (now, now),
+                )
+                conn.commit()
+
+            payload = build_monitor_payload(store)
+
+        self.assertEqual(payload["snapshot"]["open_case_count"], 0)
+        self.assertEqual(payload["snapshot"]["open_blocking_case_count"], 0)
+        self.assertEqual(payload["snapshot"]["ledger_active_debt_count"], 1)
+        self.assertFalse(any(payload["open_cases"].values()))
+
     def test_token_ui_distinguishes_processed_from_budget_spend(self) -> None:
         self.assertIn('cached/input*100', INDEX_HTML)
         self.assertIn('>Processed</th>', INDEX_HTML)
@@ -101,6 +179,28 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(timeline[0]["recovered_by_run_id"], "accept-1")
         self.assertNotIn("failure_recovered", timeline[1])
         self.assertIn("recovered later", INDEX_HTML)
+
+    def test_run_timeline_marks_strict_verifier_rejection_recovered_by_accepted_replay(self) -> None:
+        runs = [
+            {
+                "run_id": "strict-reject", "actor_role": "strict_informal_verifier", "mode": "prove",
+                "target_id": "claim-a", "route_id": "route-a", "status": "patch_rejected",
+            },
+            {
+                "run_id": "villain-success", "actor_role": "villain", "mode": "refute",
+                "target_id": "claim-a", "route_id": "route-a", "status": "completed",
+            },
+            {
+                "run_id": "strict-recovery", "actor_role": "strict_informal_verifier", "mode": "prove",
+                "target_id": "claim-a", "route_id": "route-a", "status": "completed",
+            },
+        ]
+
+        timeline = _run_timeline(runs)
+
+        self.assertTrue(timeline[0]["failure_recovered"])
+        self.assertEqual(timeline[0]["recovered_by_run_id"], "strict-recovery")
+        self.assertNotIn("failure_recovered", timeline[1])
 
     def test_claim_ledger_prioritizes_retired_lifecycle_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

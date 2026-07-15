@@ -141,7 +141,11 @@ def plan_action_budget(
     elif action.get("source_adaptation_digest_required"):
         desired = SOURCE_DIGEST_STEP_BUDGET
         policy = "source_digest"
-    elif action.get("deep_research_required") or action.get("research_attack_stage") == "deep":
+    elif (
+        action.get("deep_research_required")
+        or action.get("long_mathematical_session_required")
+        or action.get("research_attack_stage") == "deep"
+    ):
         desired = DEEP_RESEARCH_STEP_BUDGET
         policy = "deep_research_pass"
     elif action.get("research_attack_stage") == "fast" or search_intent in {"parallel_independent_solve", "parallel_direct_solve"}:

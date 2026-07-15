@@ -686,6 +686,11 @@ _HOUSE07_SECTION_OPENER_RE = re.compile(r"\bIn this section, we\b")
 _HOUSE07_APPENDIX_OPENER_RE = re.compile(r"\bIn this appendix, we\b")
 # The first paragraph ends at a blank line or at the next sectioning command.
 _HOUSE07_PARAGRAPH_END_RE = re.compile(r"\n[ \t]*\n|\\section\b|\\appendix\b|\\begin\{thebibliography\}|\\end\{document\}")
+# Between the heading and its first paragraph, skip whitespace and bare
+# \label{...} commands: "\section{X}\label{sec:x}" followed by a blank line
+# must not make the label line count as the first paragraph (that false
+# positive kept re-flagging sections whose opener the writer had fixed).
+_HOUSE07_LEADING_NOISE_RE = re.compile(r"(?:\s+|\\label\{[^}]*\})+")
 
 # L4-HOUSE-08 (major, HARD RULE per HOUSE 25): the deterministic subset of the
 # "we" discipline — habitual collocations banned outright in prose (the
@@ -1053,11 +1058,13 @@ def _check_house_section_openers(text: str, lines: List[str]) -> List[Finding]:
         if _HOUSE07_EXEMPT_TITLE_RE.search(title):
             continue
         in_appendix = section.start() >= appendix_start
-        # First paragraph: skip whitespace after the heading, then read up to
-        # the first blank line or the next sectioning command.
+        # First paragraph: skip whitespace and bare \label{...} commands after
+        # the heading (a same-line label followed by a blank line is not the
+        # first paragraph), then read up to the first blank line or the next
+        # sectioning command.
         rest = masked[section.end():]
-        body_offset = len(rest) - len(rest.lstrip())
-        body = rest[body_offset:]
+        noise = _HOUSE07_LEADING_NOISE_RE.match(rest)
+        body = rest[noise.end():] if noise else rest
         end = _HOUSE07_PARAGRAPH_END_RE.search(body)
         paragraph = body[: end.start()] if end else body
         opener = _HOUSE07_APPENDIX_OPENER_RE if in_appendix else _HOUSE07_SECTION_OPENER_RE
@@ -1392,6 +1399,243 @@ def _check_display_punctuation(
             )
         )
     return findings
+
+
+# --- required-fix directives (writing-gate revision guidance) -----------------
+
+# Every deterministic rule maps to a concrete, imperative REQUIRED-FIX template
+# so a writer revision receives an instruction it can execute mechanically, not
+# just a description of the defect. The writing gate appends the template to
+# each lint debt's obligation (REQUIRED_FIX_MARKER) and the debt cards carry it
+# as a separate field; legacy debts recorded before this existed are recovered
+# by :func:`required_fix_for_obligation`, which re-derives the template from
+# the stored obligation text.
+
+REQUIRED_FIX_MARKER = " — required fix: "
+
+# Parsers for the message shapes the templates need. Section titles come from
+# messages that embed ``{title!r}`` (repr quoting: single quotes unless the
+# title itself contains one), the HOUSE-07 opener from its quoted phrase.
+_RF_SECTION_TITLE_RE = re.compile(r"section (?P<q>['\"])(?P<title>.+?)(?P=q)")
+_RF_HOUSE07_OPENER_RE = re.compile(r'"(?P<opener>In this (?:section|appendix), we)')
+# Obligation shape written by the gate's lint sync:
+# "<rule_id>: <message> (line N)[ — excerpt: "..."][ — required fix: ...]".
+_RF_OBLIGATION_RULE_RE = re.compile(r"^([A-Z]\d-[A-Z0-9]+(?:-[A-Z0-9]+)*-\d+):\s*")
+_RF_OBLIGATION_LINE_RE = re.compile(r"\(line (\d+)\)")
+_RF_OBLIGATION_EXCERPT_RE = re.compile(r' — excerpt: ".*"\s*$', re.DOTALL)
+
+
+def required_fix(finding: Finding) -> str:
+    """A concrete, imperative fix instruction for a deterministic finding.
+
+    Always non-empty for linter findings: rules without a dedicated template
+    fall back to a generic located instruction quoting the finding message.
+    """
+    return (
+        _required_fix_text(finding.rule_id, finding.message, finding.line)
+        or f"Fix the {finding.rule_id} finding at line {finding.line} exactly as described: {finding.message}."
+    )
+
+
+def required_fix_for_obligation(obligation: str) -> str:
+    """Recover the REQUIRED-FIX instruction from a stored writing-debt
+    obligation. Prefers the appended ``REQUIRED_FIX_MARKER`` segment; for
+    legacy obligations the template is re-derived from the rule id, message,
+    and line. Returns "" for obligations that are not recognizable
+    deterministic lint/compile findings (e.g. editor findings, which already
+    carry their own suggested rewrite)."""
+    text, _marker, appended = obligation.partition(REQUIRED_FIX_MARKER)
+    if appended.strip():
+        return appended.strip()
+    rule_match = _RF_OBLIGATION_RULE_RE.match(text)
+    if rule_match is None:
+        return ""
+    message = _RF_OBLIGATION_EXCERPT_RE.sub("", text[rule_match.end() :]).strip()
+    line_match = _RF_OBLIGATION_LINE_RE.search(message)
+    line = int(line_match.group(1)) if line_match else 0
+    message = _RF_OBLIGATION_LINE_RE.sub("", message).strip()
+    return _required_fix_text(rule_match.group(1), message, line)
+
+
+def obligation_location(obligation: str) -> str:
+    """Human-readable location of a writing-debt obligation: section title,
+    line number, and excerpt whenever the obligation carries them."""
+    text, _marker, _appended = obligation.partition(REQUIRED_FIX_MARKER)
+    parts: List[str] = []
+    title_match = _RF_SECTION_TITLE_RE.search(text)
+    if title_match:
+        parts.append(f'section "{title_match.group("title")}"')
+    line_match = _RF_OBLIGATION_LINE_RE.search(text)
+    if line_match:
+        parts.append(f"line {line_match.group(1)}")
+    excerpt_match = re.search(r' — excerpt: "(.*)"\s*$', text, re.DOTALL)
+    if excerpt_match:
+        excerpt = " ".join(excerpt_match.group(1).split())
+        if len(excerpt) > 90:
+            excerpt = excerpt[:87].rstrip() + "..."
+        parts.append(f'excerpt "{excerpt}"')
+    return ", ".join(parts)
+
+
+def _required_fix_text(rule_id: str, message: str, line: int) -> str:
+    """Dispatch a rule id (+ its finding message and line) to its concrete
+    REQUIRED-FIX template; "" when the rule has no dedicated template."""
+    loc = f"line {line}" if line > 0 else "the flagged location"
+    if rule_id == "L4-HOUSE-07":
+        title_match = _RF_SECTION_TITLE_RE.search(message)
+        title = title_match.group("title") if title_match else "the flagged section"
+        opener_match = _RF_HOUSE07_OPENER_RE.search(message)
+        opener = opener_match.group("opener") if opener_match else None
+        if opener:
+            return (
+                f'Insert as the first sentence of section "{title}" ({loc}) a sentence beginning exactly '
+                f'"{opener}" stating what the section does.'
+            )
+        return (
+            f'Insert as the first sentence of section "{title}" ({loc}) a sentence beginning exactly '
+            '"In this section, we" (appendix: "In this appendix, we") stating what the section does.'
+        )
+    if rule_id == "L4-HOUSE-08":
+        return (
+            f'Rewrite the sentence at {loc} to drop the habitual "we" collocation quoted in the finding: '
+            'state the mathematical fact directly (e.g. "We note that X holds" becomes "X holds").'
+        )
+    if rule_id == "L4-HOUSE-09":
+        title_match = _RF_SECTION_TITLE_RE.search(message)
+        title = title_match.group("title") if title_match else "the flagged section"
+        return (
+            f'Merge section "{title}" ({loc}) into a neighboring section, or expand its body to at least '
+            f"{STUB_SECTION_MIN_WORDS} words of developed prose (math, displays, tables, and figures do not count)."
+        )
+    if rule_id == "L4-HOUSE-10":
+        return (
+            "Merge thin main-body sections into fewer substantial, cohesive sections so no stub sections remain "
+            f"and the main body has at most {FRAGMENTATION_MAX_SECTIONS_PER_1000_WORDS} sections per 1000 prose words."
+        )
+    if rule_id == "L4-HOUSE-11":
+        if message.startswith("list density"):
+            return (
+                "Fold most itemize/enumerate lists into cohesive prose so at most one list remains per two "
+                "sections; keep only genuinely short enumerations as lists."
+            )
+        return (
+            f"Convert the itemize/enumerate list at {loc} into cohesive prose paragraphs; only genuinely short "
+            "enumerations (case labels, short conditions) may stay a list."
+        )
+    if rule_id == "L4-HOUSE-03":
+        return (
+            f"Rewrite the sentence at {loc} to remove the colon/semicolon: split it into separate sentences or "
+            "use a connecting phrase."
+        )
+    if rule_id == "L4-SLOP-01":
+        return f"Replace the AI-vocabulary word quoted in the finding at {loc} with plain, specific mathematical wording."
+    if rule_id == "L4-SLOP-02":
+        return (
+            f"Delete or rewrite the significance-inflation phrase quoted in the finding at {loc}: state the "
+            "specific mathematical fact, or remove the sentence."
+        )
+    if rule_id == "L4-SLOP-03":
+        return f'Rewrite the phrase quoted in the finding at {loc} using a plain copula ("is"/"are"/"has").'
+    if rule_id == "L4-SLOP-04":
+        return (
+            f"Rewrite the sentence(s) at {loc} to state the positive claim directly, removing the "
+            "not-X-but-Y / it-is-not-A-it-is-B construction."
+        )
+    if rule_id == "L4-SLOP-05":
+        return f"Delete the recap opener quoted in the finding at {loc} and start the paragraph with its actual content."
+    if rule_id == "L4-SLOP-06":
+        return (
+            f"Reword the sentence at {loc} so consecutive sentences do not both open with a connector "
+            "(Moreover/Furthermore/Additionally/Also): vary or drop the connector."
+        )
+    if rule_id == "L4-SLOP-07":
+        return (
+            f"Reduce the em dashes near {loc}: rewrite with commas, parentheses, or separate sentences so at most "
+            f"{_EM_DASH_MAX_PER_WINDOW} em dashes remain per ~{_EM_DASH_WINDOW_CHARS} characters."
+        )
+    if rule_id == "L4-SLOP-09":
+        return (
+            f"Delete the task-narration/choreography phrase quoted in the finding at {loc} and state the "
+            "mathematical implication in use instead."
+        )
+    if rule_id == "L4-SLOP-11":
+        return (
+            f"Merge the one-sentence paragraph at {loc} into an adjacent paragraph, or develop it to 3 or more "
+            "sentences."
+        )
+    if rule_id == "L4-SLOP-12":
+        return (
+            f"Rewrite the paragraph opener at {loc} to replace the vague pronoun (This/These/It) with the "
+            "specific noun it refers to."
+        )
+    if rule_id == "L5-PAPER-01":
+        return (
+            f"Remove the markdown syntax at {loc} and write the LaTeX equivalent "
+            "(\\section{...}, \\emph{...}, itemize/enumerate, \\href)."
+        )
+    if rule_id == "L5-PAPER-02":
+        return (
+            f"Rewrite the sentence at {loc} without the internal system term named in the finding; internal "
+            "vocabulary may appear only in the Run archive paragraph of Appendix A."
+        )
+    if rule_id == "L5-PAPER-03":
+        return (
+            f"Add the missing structural element named in the finding ({message.removeprefix('paper structure: missing ')}) "
+            "so the paper is a complete standalone article."
+        )
+    if rule_id == "L1-CITE-03":
+        return (
+            f"Delete the generation residue quoted in the finding at {loc} and replace it with finished prose; "
+            "no TODO/placeholder/chat-register text may ship."
+        )
+    if rule_id == "L5-TEX-05":
+        return (
+            "Repair the LaTeX source so it compiles standalone with pdflatex: fix the error(s) shown in the "
+            "pdflatex log excerpt, then attach the complete corrected source."
+        )
+    if rule_id == "L4-LOGIC-01":
+        return (
+            f'Replace the logic symbol/command in the prose at {loc} with words ("for all", "there exists", '
+            '"implies", "and", "or", ...).'
+        )
+    if rule_id == "L4-SHORT-01":
+        return f"Expand the blackboard shorthand at {loc} exactly as directed in the finding."
+    if rule_id == "L4-SYM-02":
+        return (
+            f"Rewrite the sentence at {loc} so it does not begin with a symbol or formula: prepend the type word "
+            '(e.g. "The group $G$ ...").'
+        )
+    if rule_id == "L4-USAGE-03":
+        return f"Apply the spelling/usage correction named in the finding at {loc}."
+    if rule_id == "L4-USAGE-09":
+        return f"Expand the contraction at {loc} into its full form."
+    if rule_id == "L4-GRAM-04":
+        return (
+            f"Make the lead-in before the display at {loc} a complete sentence (e.g. end it with "
+            '"as follows.") or remove the colon.'
+        )
+    if rule_id == "L4-GRAM-07":
+        return f"Remove the exclamation point at {loc} and end the sentence with a period."
+    if rule_id == "L5-DISP-04":
+        return (
+            f'Replace the literal "..." at {loc} with \\ldots (between commas) or \\cdots (between operators).'
+        )
+    if rule_id == "L5-REF-03":
+        return (
+            f"Reconcile citations and bibliography at {loc}: give every \\cite key a \\bibitem entry and cite or "
+            "remove every uncited \\bibitem."
+        )
+    if rule_id == "L2-QUANT-02":
+        return (
+            f'Replace "any" at {loc} inside the formal statement with "every"/"each" (universal) or "some" '
+            "(existential), or recast the sentence."
+        )
+    if rule_id == "L4-SENT-01":
+        return (
+            f"Punctuate the display at {loc} so the sentence it belongs to is complete (usually a trailing "
+            "period or comma inside the display)."
+        )
+    return ""
 
 
 # --- shared helpers ----------------------------------------------------------

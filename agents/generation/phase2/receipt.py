@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import os
 from pathlib import Path
 import re
 import shutil
@@ -14,6 +15,10 @@ VERIFIED_SIDE_LEMMA_STATUSES = {"informally_verified", "formally_verified"}
 PARTIAL_RECEIPT_VERIFIED_HEADING = "## Verified Side Lemmas"
 PARTIAL_RECEIPT_LEDGER_HEADING = "## Claim Status Ledger"
 LATEX_TIMEOUT_SECONDS = 120
+PDFLATEX_ENV_VAR = "ALBILICH_PDFLATEX"
+PDFLATEX_STANDARD_PATHS = (
+    Path("/Library/TeX/texbin/pdflatex"),
+)
 
 
 def build_partial_receipt_inventory(
@@ -653,8 +658,29 @@ def _compact_text(value: str, max_chars: int) -> str:
     return value[: max(0, max_chars - 24)].rstrip() + " ... [truncated]"
 
 
+def _find_pdflatex() -> str:
+    """Find pdflatex even under a restricted service PATH.
+
+    macOS LaunchAgents commonly omit MacTeX's stable ``/Library/TeX/texbin``
+    shim.  Honor an explicit override first, then PATH, then that standard
+    installation location.
+    """
+
+    candidates = [os.environ.get(PDFLATEX_ENV_VAR, ""), shutil.which("pdflatex") or ""]
+    candidates.extend(str(path) for path in PDFLATEX_STANDARD_PATHS)
+    for candidate in candidates:
+        path = Path(candidate) if candidate else None
+        if path and path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return ""
+
+
 def _compile_latex(tex_path: Path, pdf_path: Path) -> Dict[str, str]:
-    pdflatex = shutil.which("pdflatex")
+    # The compiler runs from an isolated temporary directory, so a caller's
+    # relative source path would otherwise be interpreted relative to that
+    # directory and reported as a misleading TeX compile failure.
+    source_path = tex_path.resolve()
+    pdflatex = _find_pdflatex()
     if not pdflatex:
         return {"pdf_status": "pdflatex_missing", "pdf_path": ""}
     with tempfile.TemporaryDirectory(prefix="albilich_receipt_latex_") as tmp:
@@ -669,7 +695,7 @@ def _compile_latex(tex_path: Path, pdf_path: Path) -> Dict[str, str]:
                         "-halt-on-error",
                         "-output-directory",
                         str(tmpdir),
-                        str(tex_path),
+                        str(source_path),
                     ],
                     cwd=str(tmpdir),
                     text=True,

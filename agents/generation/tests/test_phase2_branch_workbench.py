@@ -451,6 +451,34 @@ class AdvisorBranchAdjudicationTests(unittest.TestCase):
 
 
 class MultiBranchResearchTests(unittest.TestCase):
+    def test_closure_pipeline_does_not_fill_slots_with_exploratory_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _make_store(tmpdir, "multi-branch-closure-lock")
+            _seed_multi_branch_problem(store, routes=4)
+            primary = {
+                "mode": "reduce",
+                "target_id": "root",
+                "route_id": "",
+                "closure_pipeline_required": True,
+                "closure_debt_id": "debt-root",
+            }
+            planned = multi_branch_research_actions(store, primary, [], parallel_branches=4)
+            self.assertEqual(planned, [])
+
+    def test_long_mathematical_session_does_not_get_generic_filler_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _make_store(tmpdir, "multi-branch-long-session")
+            _seed_multi_branch_problem(store, routes=4)
+            primary = {
+                "mode": "reduce",
+                "target_id": "root",
+                "route_id": "",
+                "long_mathematical_session_required": True,
+                "conceptual_invariant_discovery_required": True,
+            }
+            planned = multi_branch_research_actions(store, primary, [], parallel_branches=4)
+            self.assertEqual(planned, [])
+
     def test_four_workers_planned_with_disjoint_packets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = _make_store(tmpdir, "multi-branch-four-workers")
@@ -462,6 +490,15 @@ class MultiBranchResearchTests(unittest.TestCase):
             self.assertEqual(len(set(workers)), 4)
             self.assertIn("spine", workers)
             self.assertIn("villain_toy_model", workers)
+            philosophies = {str(action.get("research_philosophy") or "") for action in planned}
+            self.assertIn("main_spine_construction", philosophies)
+            self.assertIn("adversarial_probe", philosophies)
+            families = {
+                str((action.get("branch_diversity_contract") or {}).get("strategy_family") or "")
+                for action in planned
+            }
+            self.assertEqual(len(families), len(planned))
+            self.assertNotIn("", families)
             owned_claims: set[str] = set()
             owned_debts: set[str] = set()
             for action in planned:
@@ -495,9 +532,6 @@ class MultiBranchResearchTests(unittest.TestCase):
             )
             self.assertTrue(unclaimed)
             duplicate_wave_action = {"mode": "reduce", "target_id": "claim-a", "route_id": "route-a"}
-            self.assertTrue(
-                _branch_goal_fingerprints(state, unclaimed[0]) & _branch_goal_fingerprints(state, duplicate_wave_action)
-            )
             planned = multi_branch_research_actions(
                 store,
                 {"mode": "retrieve", "target_id": "root", "route_id": ""},

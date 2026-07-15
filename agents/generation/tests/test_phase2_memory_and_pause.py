@@ -303,6 +303,94 @@ class MemoryCanonicalizationTests(unittest.TestCase):
             hygiene = manifest.get("memory_hygiene", {})
             self.assertEqual(hygiene.get("duplicate_debts", [{}])[0].get("canonical_debt_id"), "debt-dup-a")
 
+    def test_semantic_debt_paraphrases_share_one_canonical_obligation(self) -> None:
+        rows = [
+            {
+                "debt_id": "debt-source-a",
+                "owner_type": "claim",
+                "owner_id": "root",
+                "suggested_next_target": "root",
+                "debt_type": "missing_reference",
+                "severity": "blocking",
+                "status": "active",
+                "first_seen": "2026-07-01T00:00:00+00:00",
+                "repeated_count": 2,
+                "obligation": (
+                    "Supply an exact theorem proving every high rank orthogonal automorphism is induced by a "
+                    "semilinear quadratic similitude, with scalar kernel and triality exceptions."
+                ),
+            },
+            {
+                "debt_id": "debt-source-b",
+                "owner_type": "inference",
+                "owner_id": "inf-root",
+                "suggested_next_target": "root",
+                "debt_type": "source_gap",
+                "severity": "blocking",
+                "status": "active",
+                "first_seen": "2026-07-02T00:00:00+00:00",
+                "repeated_count": 3,
+                "obligation": (
+                    "Cite a precise source showing every sufficiently high rank orthogonal automorphism comes from a "
+                    "semilinear quadratic similitude, checking the scalar kernel and triality exceptions."
+                ),
+            },
+            {
+                "debt_id": "debt-projective-cap",
+                "owner_type": "claim",
+                "owner_id": "root",
+                "suggested_next_target": "root",
+                "debt_type": "proof_gap",
+                "severity": "blocking",
+                "status": "active",
+                "first_seen": "2026-07-03T00:00:00+00:00",
+                "repeated_count": 1,
+                "obligation": "Prove the uniform projective degree bound for exceptional groups of Lie type.",
+            },
+        ]
+
+        canonical, duplicates = canonicalize_debts(rows)
+
+        self.assertEqual({row["debt_id"] for row in canonical}, {"debt-source-a", "debt-projective-cap"})
+        self.assertEqual(duplicates[0]["canonical_debt_id"], "debt-source-a")
+        self.assertEqual(duplicates[0]["duplicate_debt_ids"], ["debt-source-b"])
+        self.assertTrue(duplicates[0]["semantic_match"])
+        source = next(row for row in canonical if row["debt_id"] == "debt-source-a")
+        self.assertEqual(source["repeated_count"], 5)
+        self.assertEqual(source["canonical_alias_debt_ids"], ["debt-source-b"])
+
+    def test_writing_debts_never_collapse_semantically(self) -> None:
+        # Writing debts are location-anchored: same-rule obligations differ
+        # only in section title/line/excerpt, so term-overlap merging would
+        # truncate the writing-gate checklists. Only an exact owner+obligation
+        # fingerprint may dedupe them.
+        def house07(debt_id: str, title: str, line: int) -> dict:
+            return {
+                "debt_id": debt_id,
+                "owner_type": "artifact",
+                "owner_id": "final-paper-1",
+                "debt_type": "writing",
+                "severity": "major",
+                "status": "active",
+                "first_seen": "2026-07-01T00:00:00+00:00",
+                "repeated_count": 1,
+                "obligation": (
+                    f"L4-HOUSE-07: section '{title}' does not open with a sentence beginning "
+                    f'"In this section, we ..." in its first paragraph (HARD RULE, HOUSE 19) (line {line})'
+                ),
+            }
+
+        rows = [
+            house07("writing-lint-a", "Constituents and Coupling", 81),
+            house07("writing-lint-b", "Certificate and Assembly", 141),
+            house07("writing-lint-c", "Certification", 212),
+        ]
+
+        canonical, duplicates = canonicalize_debts(rows)
+
+        self.assertEqual(3, len(canonical), canonical)
+        self.assertEqual([], duplicates)
+
     def test_duplicate_retrieval_cards_are_reported_and_collapsed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = _make_store(tmpdir, "duplicate-card-test")

@@ -14,6 +14,7 @@ from agents.generation.phase2.research_strategy import (
     PROOF_COMPRESSION_SKELETON_REQUIRED_FIELDS,
     advisor_synthesis_trigger,
     apply_active_compression,
+    conceptual_invariant_trigger,
     enrich_action,
     latest_active_advisor_synthesis,
     next_strategy_operation,
@@ -46,6 +47,13 @@ def _bridge_candidate(
         "estimated_root_leverage": leverage,
         "possible_methods": methods or ["direct proof"],
         "falsifiability_plan": "Test the smallest admissible examples and the route boundary case.",
+        "root_leverage_gate": {
+            "if_proved_major_case": closes,
+            "if_refuted_information_gain": True,
+            "stronger_than_necessary": False,
+            "renames_current_gap": False,
+            "hypotheses_attainable": True,
+        },
         "status": status,
         "selection_reason": "Highest sufficiency and root-leverage score.",
         "sufficiency_precheck": {
@@ -261,7 +269,7 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
                 "bridge-runner-up",
                 "A distinct viable bridge theorem.",
                 status="viable",
-                closes=False,
+                closes=True,
                 leverage=0.3,
             )
             accepted = self._attach(
@@ -272,6 +280,7 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
                 _bridge_metadata(selected, runner_up),
             )
             self.assertTrue(accepted.accepted, accepted.errors)
+
     def test_duplicate_active_bridge_must_be_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(tmpdir, "strategy-bridge-duplicate")
@@ -308,6 +317,21 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
             )
             self.assertFalse(outcome.accepted)
             self.assertTrue(any("duplicates an existing claim" in error for error in outcome.errors))
+
+    def test_bridge_root_leverage_gate_rejects_gap_renaming(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-bridge-root-leverage")
+            candidate = _bridge_candidate("bridge-renamed", "The current gap in renamed notation.")
+            candidate["root_leverage_gate"]["renames_current_gap"] = True
+            outcome = self._attach(
+                store,
+                "researcher",
+                "bridge-gap-renaming",
+                "bridge_lemma_search",
+                _bridge_metadata(candidate),
+            )
+        self.assertFalse(outcome.accepted)
+        self.assertTrue(any("fails a guardrail" in error for error in outcome.errors))
 
     def test_bridge_workbench_is_enriched_with_two_sided_frontier(self) -> None:
         state = _pure_strategy_state()
@@ -398,6 +422,13 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         self.assertIn("bridge_id", candidate)
         self.assertIn("forward_support", candidate)
         self.assertIn("sufficiency_precheck", candidate)
+        self.assertEqual(set(candidate["root_leverage_gate"]), {
+            "if_proved_major_case",
+            "if_refuted_information_gain",
+            "stronger_than_necessary",
+            "renames_current_gap",
+            "hypotheses_attainable",
+        })
         self.assertIn("do not rename it candidates", contract["nesting_rule"])
         self.assertTrue(any("manifest.bridge_lemma_search_contract exactly" in line for line in manifest["instructions"]))
 
@@ -421,6 +452,8 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         self.assertTrue(contract["metadata_shape"]["history_preserved"])
         self.assertIn("metadata.minimal_proof_skeleton", contract["nesting_rule"])
         self.assertIn("may be empty", contract["verified_fact_rule"])
+        self.assertIn("single_decisive_missing_theorem", skeleton)
+        self.assertIn("most_informative_failed_ideas", skeleton)
         self.assertTrue(any("manifest.proof_compression_contract exactly" in line for line in manifest["instructions"]))
 
     def test_proof_compression_accepts_no_verified_facts(self) -> None:
@@ -443,11 +476,131 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
                         "unused_or_low_value_branches": ["Retire the failed branch."],
                         "shortest_known_route": ["Prove the bridge."],
                         "weakest_sufficient_new_statement": "The bridge holds.",
+                        "single_decisive_missing_theorem": "The bridge holds.",
+                        "strongest_candidate_counterexample_architecture": "Search the smallest admissible endpoint.",
+                        "most_informative_failed_ideas": ["Direct counting only renames the bridge gap."],
                     },
                 },
             )
 
         self.assertTrue(accepted.accepted, accepted.errors)
+
+    def test_proof_compression_keeps_at_most_three_active_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-compression-failure-cap")
+            rejected = self._attach(
+                store,
+                "researcher",
+                "compression-too-many-failures",
+                "proof_compression",
+                {
+                    "strategy_schema_version": 1,
+                    "history_preserved": True,
+                    "minimal_proof_skeleton": {
+                        "root": "root",
+                        "essential_verified_facts": [],
+                        "essential_routes": ["none_yet"],
+                        "unresolved_bridges": ["The decisive bridge."],
+                        "conditional_steps": ["The root follows from the bridge."],
+                        "unused_or_low_value_branches": ["Background branch."],
+                        "shortest_known_route": ["Prove the decisive bridge."],
+                        "weakest_sufficient_new_statement": "The decisive bridge holds.",
+                        "single_decisive_missing_theorem": "The decisive bridge holds.",
+                        "strongest_candidate_counterexample_architecture": "Minimal bad endpoint.",
+                        "most_informative_failed_ideas": ["one", "two", "three", "four"],
+                    },
+                },
+            )
+        self.assertFalse(rejected.accepted)
+        self.assertTrue(any("at most three" in error for error in rejected.errors))
+
+    def test_repeated_local_attacks_schedule_long_conceptual_invariant_session(self) -> None:
+        state = _pure_strategy_state()
+        state["research_artifacts"].append(
+            {
+                "artifact_id": "compression-before-concept",
+                "artifact_type": "proof_compression",
+                "state_revision": 6,
+                "metadata_json": "{}",
+            }
+        )
+        action = next_strategy_operation(state, {"mode": "reduce", "target_id": "root", "route_id": ""})
+        self.assertEqual(action["operation"], "conceptual_invariant_discovery")
+        self.assertTrue(action["long_mathematical_session_required"])
+        self.assertTrue(action["analogy_pass_required"])
+
+    def test_deep_session_conceptual_invariant_satisfies_freshness_watermark(self) -> None:
+        state = _pure_strategy_state(revision=12)
+        state["research_artifacts"].extend(
+            [
+                {
+                    "artifact_id": "compression-before-deep-concept",
+                    "artifact_type": "proof_compression",
+                    "state_revision": 6,
+                    "metadata_json": "{}",
+                },
+                {
+                    "artifact_id": "deep-conceptual-invariant",
+                    "artifact_type": "deep_session_report",
+                    "state_revision": 11,
+                    "metadata_json": {
+                        "candidate_invariants": [
+                            {
+                                "invariant_id": "simple-projective-height",
+                                "definition": "Maximum projective degree of a simple subgroup.",
+                            }
+                        ],
+                        "selected_invariant_id": "simple-projective-height",
+                    },
+                },
+            ]
+        )
+
+        trigger = conceptual_invariant_trigger(state)
+
+        self.assertFalse(trigger["due"])
+        self.assertEqual(trigger["reason"], "conceptual invariant pass is still fresh")
+
+    def test_conceptual_invariant_contract_requires_compression_and_falsification(self) -> None:
+        metadata = {
+            "strategy_schema_version": 1,
+            "candidate_invariants": [
+                {
+                    "invariant_id": "inv-kernel",
+                    "definition": "The common kernel of the induced chief-factor actions.",
+                    "transformations_controlled": ["quotients", "restriction"],
+                    "local_lemmas_subsumed": ["claim-a", "claim-b"],
+                    "root_consequence": "Both local kernel lemmas become one functorial statement.",
+                    "falsification_example": "A split extension with distinct action kernels.",
+                    "failure_modes": ["kernel is not functorial under the required quotient"],
+                    "status": "selected",
+                }
+            ],
+            "selected_invariant_id": "inv-kernel",
+            "neighboring_theorem_comparison": "The neighboring theorem controls the same action after quotienting.",
+            "object_dictionary": {"local kernel": "neighboring theorem stabilizer"},
+            "next_decisive_test": "Check functoriality on the smallest split extension.",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-conceptual-invariant")
+            accepted = self._attach(
+                store,
+                "researcher",
+                "conceptual-invariant-valid",
+                "conceptual_invariant_report",
+                metadata,
+            )
+            manifest = build_context_manifest(
+                store,
+                max_chars=30_000,
+                action={
+                    "mode": "reduce",
+                    "target_id": "root",
+                    "conceptual_invariant_discovery_required": True,
+                },
+            )
+        self.assertTrue(accepted.accepted, accepted.errors)
+        self.assertEqual(manifest["conceptual_invariant_contract"]["candidate_count"], "one to three")
 
     def test_cas_mode_manifest_exposes_exact_experiment_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -786,6 +939,7 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
             },
         )
         self.assertTrue(deep["deep_session_required"])
+        self.assertTrue(deep["long_mathematical_session_required"])
         self.assertFalse(deep["deep_session"]["verification_authority"])
         self.assertEqual(deep["deep_session"]["required_deliverable"]["strategy_schema_version"], 1)
         self.assertIn("strategy_schema_version", deep["deep_session"]["required_deliverable"]["fields"])
@@ -810,10 +964,13 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         metadata = {
             "strategy_schema_version": 1,
             "complete_local_argument": "A complete local reduction with one named gap.",
+            "independent_proof_attacks": ["Direct reduction.", "Minimal-counterexample induction."],
             "candidate_lemmas": ["The reduction lemma."],
             "failed_approaches": ["The direct counting bound was too weak."],
             "new_obstructions": ["One exact family bound remains."],
             "source_adaptations": [],
+            "analogy_or_neighboring_theorem_comparison": "The neighboring theorem uses the same quotient but a stronger kernel hypothesis.",
+            "full_proof_assembly_attempt": "Insert the reduction lemma after the verified core; only the family bound remains.",
             "proposed_route_revision": {"route_id": "route-root"},
             "next_decisive_step": "Prove the remaining family bound.",
             "state_patch_operations": ["Attach the reduction lemma."],

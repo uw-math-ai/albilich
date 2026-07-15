@@ -218,9 +218,9 @@ def preflight_patch_errors(patch: Mapping[str, Any], actor_role: str) -> List[st
     return errors
 
 
-# Op kinds that only add rows or propose non-verifying transitions; safe to
-# rebase onto a newer revision when row-disjoint from the intervening patches,
-# because every apply-time guard re-runs against the current state anyway.
+# Op kinds that only add rows or propose guarded transitions; safe to rebase
+# onto a newer revision when row-disjoint from the intervening patches, because
+# every apply-time guard re-runs against the current state anyway.
 SAFE_REBASE_OP_KINDS = {
     "attach_artifact",
     "add_artifact",
@@ -236,6 +236,12 @@ SAFE_REBASE_OP_KINDS = {
     "propose_status_transition",
 }
 NON_VERIFYING_TRANSITION_STATUSES = {"untested", "plausible", "challenged", "active", "blocked", "abandoned"}
+REBASE_SAFE_VERIFYING_TRANSITIONS = {
+    ("strict_informal_verifier", "informally_verified"),
+    ("strict_informal_verifier", "refuted"),
+    ("formal_backend", "formally_verified"),
+    ("counterexample_validator", "refuted"),
+}
 
 
 def _op_touched_ids(op: Mapping[str, Any]) -> tuple[set[str], bool]:
@@ -300,15 +306,83 @@ def _patch_touched_ids(operations: Any) -> tuple[set[str], bool]:
     return ids, unknown
 
 
+def _is_commutative_inference_update(op: Mapping[str, Any]) -> bool:
+    """Whether an inference update is an append-only merge operation."""
+    if str(op.get("op") or "") != "update_inference":
+        return False
+    allowed = {
+        "op",
+        "inference_id",
+        "target_id",
+        "add_evidence_artifact_ids",
+        "evidence_artifact_ids",
+        "explanation_append",
+        "argument_summary_append",
+    }
+    return bool(op.get("inference_id") or op.get("target_id")) and set(op).issubset(allowed)
+
+
+def _commutative_inference_ids(operations: Sequence[Mapping[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    conflicting: set[str] = set()
+    for op in operations:
+        touched, _ = _op_touched_ids(op)
+        inference_ids = {item for item in touched if item.startswith("inference:")}
+        if not inference_ids:
+            continue
+        if _is_commutative_inference_update(op):
+            ids |= inference_ids
+        else:
+            conflicting |= inference_ids
+    return ids - conflicting
+
+
+def _commutative_status_transition_signatures(
+    operations: Sequence[Mapping[str, Any]],
+) -> Dict[str, tuple[str, str, str]]:
+    """Return rows touched only by one idempotent status transition.
+
+    Repeating the same transition is safe because ``_status_transition`` unions
+    evidence ids and apply-time verification guards run again after rebasing.
+    Any other operation on the row, or competing transition targets, makes the
+    row non-commutative.
+    """
+    signatures: Dict[str, set[tuple[str, str, str]]] = {}
+    conflicting: set[str] = set()
+    for op in operations:
+        touched, unknown = _op_touched_ids(op)
+        if unknown or not touched:
+            continue
+        if str(op.get("op") or "") != "propose_status_transition" or len(touched) != 1:
+            conflicting |= touched
+            continue
+        row_id = next(iter(touched))
+        signature = (
+            str(op.get("target_type") or "claim"),
+            str(op.get("status_type") or "validation"),
+            str(op.get("new_status") or ""),
+        )
+        if not signature[2]:
+            conflicting.add(row_id)
+            continue
+        signatures.setdefault(row_id, set()).add(signature)
+    return {
+        row_id: next(iter(row_signatures))
+        for row_id, row_signatures in signatures.items()
+        if row_id not in conflicting and len(row_signatures) == 1
+    }
+
+
 def _stale_rebase_assessment(store: ProofStateStore, patch: Mapping[str, Any]) -> Dict[str, Any]:
     """Decide whether a stale patch can be retried against the current revision.
 
     Requires (1) every op of the stale patch to be a safe additive/non-verifying
-    kind, and (2) row-disjointness from everything the intervening applied
-    patches touched. Apply-time guards still re-validate the whole patch.
+    kind, and (2) row-disjointness or a narrowly proven commutative overlap with
+    intervening patches. Apply-time guards still re-validate the whole patch.
     """
     normalized = _normalize_patch_aliases(dict(patch))
     operations = normalized.get("operations") or []
+    actor_role = str(normalized.get("actor_role") or "")
     for op in operations:
         if not isinstance(op, Mapping):
             return {"ok": False, "reason": "malformed operation"}
@@ -317,7 +391,10 @@ def _stale_rebase_assessment(store: ProofStateStore, patch: Mapping[str, Any]) -
             return {"ok": False, "reason": f"op kind {kind} is not rebase-safe"}
         if kind == "propose_status_transition":
             new_status = str(op.get("new_status") or "")
-            if new_status not in NON_VERIFYING_TRANSITION_STATUSES:
+            if (
+                new_status not in NON_VERIFYING_TRANSITION_STATUSES
+                and (actor_role, new_status) not in REBASE_SAFE_VERIFYING_TRANSITIONS
+            ):
                 return {"ok": False, "reason": f"transition to {new_status} is not rebase-safe"}
     patch_ids, patch_unknown = _patch_touched_ids(operations)
     if patch_unknown:
@@ -330,16 +407,43 @@ def _stale_rebase_assessment(store: ProofStateStore, patch: Mapping[str, Any]) -
             (base_revision,),
         ).fetchall()
     intervening_ids: set[str] = set()
+    intervening_operations: list[Mapping[str, Any]] = []
     for row in rows:
         ops = json_loads(row["operations_json"], default=[])
         row_ids, row_unknown = _patch_touched_ids(ops)
         if row_unknown:
             return {"ok": False, "reason": "an intervening patch touches rows that cannot be attributed"}
         intervening_ids |= row_ids
+        intervening_operations.extend(op for op in ops if isinstance(op, Mapping))
     overlap = patch_ids & intervening_ids
     if overlap:
+        # Evidence and explanation appends to the same inference are merged by
+        # _update_inference (set-union plus append).  Allow those operations to
+        # rebase even though they touch the same row; status, premise, route,
+        # or conclusion changes remain conflicting.
+        patch_commutative = _commutative_inference_ids(
+            [op for op in operations if isinstance(op, Mapping)]
+        )
+        intervening_commutative = _commutative_inference_ids(intervening_operations)
+        overlap -= patch_commutative & intervening_commutative
+    if overlap:
+        # Parallel verifiers may both certify a shared premise while only one
+        # of them also carries a route-local report/inference update. Identical
+        # transitions are idempotent and merge their evidence, so they must not
+        # cause the second verifier's otherwise unique work to be discarded.
+        patch_transitions = _commutative_status_transition_signatures(
+            [op for op in operations if isinstance(op, Mapping)]
+        )
+        intervening_transitions = _commutative_status_transition_signatures(intervening_operations)
+        overlap -= {
+            row_id
+            for row_id in overlap
+            if patch_transitions.get(row_id) == intervening_transitions.get(row_id)
+            and patch_transitions.get(row_id) is not None
+        }
+    if overlap:
         return {"ok": False, "reason": f"row overlap with intervening patches: {sorted(overlap)[:4]}"}
-    return {"ok": True, "current_revision": current_revision, "reason": "row-disjoint additive patch"}
+    return {"ok": True, "current_revision": current_revision, "reason": "row-disjoint or commutative patch"}
 
 
 def apply_patch_with_stale_retry(store: ProofStateStore, patch: Dict[str, Any], *, max_retries: int = 3) -> PatchOutcome:
@@ -347,8 +451,8 @@ def apply_patch_with_stale_retry(store: ProofStateStore, patch: Dict[str, Any], 
 
     Parallel companions and long researcher sessions routinely go stale because
     advisor/metrics patches land mid-flight; when the stale patch is additive
-    and row-disjoint from everything that landed in between, retry it against
-    the current revision instead of discarding the whole session's work.
+    and row-disjoint or commutative with everything that landed in between,
+    retry it instead of discarding the whole session's work.
     """
     outcome = apply_patch(store, patch)
     retries = 0
@@ -774,6 +878,22 @@ def _normalize_patch_aliases(patch: Dict[str, Any]) -> Dict[str, Any]:
                 _flatten_nested(normalized_op, "debt")
             _normalize_debt_fields(normalized_op, patch_target_id=str(normalized.get("target_id") or ""))
         if kind in {"update_claim", "update_inference", "set_claim_status", "set_inference_status"}:
+            # Models frequently express an update as {"patch": {...}} or
+            # {"updates": {...}}.  Leaving either wrapper nested makes the op
+            # look valid while silently applying none of its evidence/text.
+            for wrapper in ("patch", "updates"):
+                _flatten_nested(normalized_op, wrapper)
+            nested_key = "claim" if kind in {"update_claim", "set_claim_status"} else "inference"
+            if isinstance(normalized_op.get(nested_key), dict):
+                normalized_op = _nested_payload_op(normalized_op, nested_key, kind)
+            if kind == "update_inference":
+                if (
+                    not normalized_op.get("add_evidence_artifact_ids")
+                    and isinstance(normalized_op.get("evidence_artifact_ids"), list)
+                ):
+                    normalized_op["add_evidence_artifact_ids"] = list(normalized_op["evidence_artifact_ids"])
+                if not normalized_op.get("explanation_append") and normalized_op.get("explanation"):
+                    normalized_op["explanation_append"] = normalized_op["explanation"]
             normalized_operations.extend(_expand_status_update(normalized_op, kind, verification_evidence_ids))
             continue
         if kind == "propose_status_transition":
@@ -2557,10 +2677,15 @@ def _guard_integration(
     integration_errors = _integration_report_errors(conn, evidence_ids, claim_id=claim_id, route=route, producer_role="integration_verifier")
     if integration_errors:
         raise PatchRejected(integration_errors)
+    inferences = list(conn.execute("SELECT * FROM inferences WHERE route_id = ?", (route_id,)))
+    if not inferences:
+        raise PatchRejected(["integration route has no inferences"])
+    blocker_owner_ids = [claim_id, route_id, *[str(inf["inference_id"]) for inf in inferences]]
+    placeholders = ", ".join("?" for _ in blocker_owner_ids)
     blockers = list(
         conn.execute(
-            "SELECT * FROM debts WHERE owner_id IN (?, ?) AND status = 'active' AND severity = 'blocking'",
-            (claim_id, route_id),
+            f"SELECT * FROM debts WHERE owner_id IN ({placeholders}) AND status = 'active' AND severity = 'blocking'",
+            blocker_owner_ids,
         )
     )
     resolved = set(resolved_debt_ids)
@@ -2578,9 +2703,6 @@ def _guard_integration(
         if row["debt_id"] not in resolved
     ):
         raise PatchRejected(["active blocking debt prevents integration"])
-    inferences = list(conn.execute("SELECT * FROM inferences WHERE route_id = ?", (route_id,)))
-    if not inferences:
-        raise PatchRejected(["integration route has no inferences"])
     verified_terminal_inferences = []
     for inf in inferences:
         if (

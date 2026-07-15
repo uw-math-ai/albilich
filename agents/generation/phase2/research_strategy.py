@@ -7,6 +7,21 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 from .models import fingerprint_text, json_loads, normalize_text
+from .research_intelligence import (
+    DEEP_SESSION_ROI_VERSION,
+    PRODUCTIVE_DELTA_KINDS,
+    decisive_obligation_frontier,
+    deep_session_roi,
+    infer_domain_tags,
+    proof_interface_contract,
+    representation_switch_contract,
+    theorem_adaptation_contract,
+    validate_deep_session_roi_metadata,
+    validate_proof_interface_metadata,
+    validate_representation_switch_metadata,
+    validate_theorem_adaptation_metadata,
+    verifier_filtered_outcome_learning,
+)
 
 
 STRATEGY_SCHEMA_VERSION = 1
@@ -18,6 +33,7 @@ STRATEGIC_ARTIFACT_TYPES = {
     "definition_candidate",
     "invention_authorization",
     "proof_compression",
+    "conceptual_invariant_report",
 }
 STRATEGIC_MARKDOWN_ARTIFACT_TYPES = set(STRATEGIC_ARTIFACT_TYPES)
 BRIDGE_STATUSES = {"proposed", "prechecked", "selected", "viable", "rejected", "proved", "refuted"}
@@ -75,7 +91,27 @@ PROOF_COMPRESSION_SKELETON_REQUIRED_FIELDS = (
     "unused_or_low_value_branches",
     "shortest_known_route",
     "weakest_sufficient_new_statement",
+    "single_decisive_missing_theorem",
+    "strongest_candidate_counterexample_architecture",
+    "most_informative_failed_ideas",
 )
+LEMMA_ROOT_LEVERAGE_GATE_FIELDS = (
+    "if_proved_major_case",
+    "if_refuted_information_gain",
+    "stronger_than_necessary",
+    "renames_current_gap",
+    "hypotheses_attainable",
+)
+CONCEPTUAL_INVARIANT_REQUIRED_FIELDS = (
+    "candidate_invariants",
+    "selected_invariant_id",
+    "neighboring_theorem_comparison",
+    "object_dictionary",
+    "next_decisive_test",
+)
+CONCEPTUAL_INVARIANT_INTENT = "conceptual_invariant_discovery"
+CONCEPTUAL_INVARIANT_LOCAL_PASS_THRESHOLD = 2
+CONCEPTUAL_INVARIANT_COOLDOWN_REVISIONS = 12
 INVENTION_CONDITION_KEYS = (
     "distinct_routes_share_obstruction",
     "bridge_search_exhausted",
@@ -137,6 +173,35 @@ def latest_artifact(state: Mapping[str, Any], artifact_type: str) -> Optional[Di
     return row
 
 
+def latest_conceptual_invariant_artifact(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the newest completed conceptual pass across valid deliverables.
+
+    Conceptual discovery can run as an ordinary ``conceptual_invariant_report``
+    or as a long mathematical session whose required artifact type is
+    ``deep_session_report``.  The latter counts only when it actually contains
+    the conceptual-invariant contract, so unrelated deep sessions do not reset
+    the watermark.
+    """
+    candidates: list[Mapping[str, Any]] = []
+    for row in _artifact_rows(state):
+        artifact_type = str(row.get("artifact_type") or "")
+        metadata = _artifact_metadata(row)
+        if artifact_type == "conceptual_invariant_report":
+            candidates.append(row)
+            continue
+        if (
+            artifact_type == "deep_session_report"
+            and _nonempty_list(metadata.get("candidate_invariants"))
+            and str(metadata.get("selected_invariant_id") or "").strip()
+        ):
+            candidates.append(row)
+    if not candidates:
+        return None
+    row = dict(max(candidates, key=_artifact_sort_key))
+    row["metadata"] = _artifact_metadata(row)
+    return row
+
+
 def load_method_cards() -> list[Dict[str, Any]]:
     global _METHOD_CARD_CACHE
     if _METHOD_CARD_CACHE is None:
@@ -166,6 +231,18 @@ _STRUCTURAL_CUE_GROUPS: Dict[str, tuple[str, ...]] = {
     "proof_invariant": ("invariant", "filtration", "valuation", "rank", "monotone quantity"),
     "natural_operations": ("under quotient", "under product", "under extension", "under deletion", "natural operation"),
     "monotonicity_or_stability": ("monotone", "stable under", "transformation law", "does not increase", "does not decrease"),
+    "chief_factor_structure": ("chief factor", "minimal normal subgroup", "composition factor", "socle", "primitive group"),
+    "fixed_point_action": ("fixed point", "stabilizer", "orbit", "permutation action", "base size"),
+    "character_restriction": ("character restriction", "restrict character", "induced character", "clifford theory", "codegree"),
+    "extension_obstruction": ("group extension", "extension class", "splitting", "complement", "cohomology"),
+    "double_counting": ("count in two ways", "double count", "incidence", "average degree"),
+    "probabilistic_witness": ("random choice", "positive probability", "expectation", "local lemma", "concentration"),
+    "spectral_encoding": ("eigenvalue", "spectrum", "adjacency matrix", "laplacian", "trace method"),
+    "generating_function": ("generating function", "coefficient", "recurrence", "formal power series"),
+    "normal_form": ("normal form", "rewrite", "canonical representative", "groebner", "reduction system"),
+    "duality_or_universal_property": ("dual", "adjoint", "universal property", "representable", "functor"),
+    "classification_reduction": ("classification", "simple group", "irreducible case", "finite list", "exceptional case"),
+    "representation_switch": ("reformulate", "equivalent language", "translate into", "view as", "encode as"),
 }
 
 
@@ -180,17 +257,21 @@ def structural_signature(text: str) -> list[str]:
 
 def retrieve_method_cards(text: str, *, limit: int = 3) -> list[Dict[str, Any]]:
     query_features = set(structural_signature(text))
-    if not query_features:
+    query_domains = set(infer_domain_tags(text))
+    if not query_features and not query_domains:
         return []
     ranked: list[tuple[float, str, Dict[str, Any]]] = []
     for card in load_method_cards():
         signature = set(str(item) for item in card.get("structural_signature", []))
-        overlap = len(query_features & signature)
-        if not overlap:
+        domains = set(str(item) for item in card.get("domain_tags", []))
+        feature_overlap = len(query_features & signature)
+        domain_overlap = len(query_domains & domains)
+        if not feature_overlap and not domain_overlap:
             continue
-        coverage = overlap / max(1, len(signature))
-        precision = overlap / max(1, len(query_features))
-        score = round(0.65 * coverage + 0.35 * precision, 4)
+        coverage = feature_overlap / max(1, len(signature))
+        precision = feature_overlap / max(1, len(query_features))
+        domain_coverage = domain_overlap / max(1, min(3, len(domains)))
+        score = round(0.5 * coverage + 0.25 * precision + 0.25 * domain_coverage, 4)
         ranked.append((score, str(card.get("method_id") or ""), card))
     ranked.sort(key=lambda item: (-item[0], item[1]))
     results: list[Dict[str, Any]] = []
@@ -200,6 +281,15 @@ def retrieve_method_cards(text: str, *, limit: int = 3) -> list[Dict[str, Any]]:
                 **card,
                 "structural_match_score": score,
                 "matched_structural_features": sorted(query_features & set(card.get("structural_signature", []))),
+                "matched_domain_tags": sorted(query_domains & set(card.get("domain_tags", []))),
+                "method_transfer_packet_required": True,
+                "method_transfer_fields": [
+                    "hypothesis_match",
+                    "object_translation",
+                    "reusable_proof_moves",
+                    "failure_boundaries",
+                    "decisive_test",
+                ],
                 "advisory_only": True,
             }
         )
@@ -259,13 +349,27 @@ def bridge_frontier_context(state: Mapping[str, Any], action: Mapping[str, Any])
     compression_meta = compression.get("metadata", {}) if compression else {}
     skeleton = _json_object(compression_meta.get("minimal_proof_skeleton"))
     weakest = str(skeleton.get("weakest_sufficient_new_statement") or "")
-    backward = [
+    graph_frontier = decisive_obligation_frontier(state)
+    graph_obligations = [
+        {
+            "debt_id": str(item.get("obligation_id") or ""),
+            "obligation": str(item.get("statement") or ""),
+            "severity": str(item.get("severity") or "blocking"),
+            "target_id": str(item.get("target_id") or ""),
+            "graph_derived": True,
+        }
+        for item in graph_frontier.get("minimal_cut_obligations", [])
+        if str(item.get("statement") or "").strip()
+    ]
+    backward = graph_obligations + [
         {
             "debt_id": str(debt.get("debt_id") or ""),
             "obligation": str(debt.get("obligation") or ""),
             "severity": str(debt.get("severity") or ""),
         }
         for debt in debts[:6]
+        if str(debt.get("debt_id") or "")
+        not in {str(item.get("debt_id") or "") for item in graph_obligations}
     ]
     if weakest and all(weakest != item["obligation"] for item in backward):
         backward.insert(0, {"debt_id": "compression-weakest-bridge", "obligation": weakest, "severity": "blocking"})
@@ -276,13 +380,22 @@ def bridge_frontier_context(state: Mapping[str, Any], action: Mapping[str, Any])
     return {
         "forward_frontier": verified[:8],
         "backward_frontier": backward[:7],
+        "graph_obligation_frontier": graph_frontier,
         "target_id": target_id,
         "target_route_id": route_id,
         "root_statement": root_statement,
         "maximum_candidates": 3,
         "maximum_selected": 2,
         "sufficiency_precheck_required": True,
-        "selection_policy": "prefer the smallest candidate that materially reduces obligations and would close the route",
+        "lemma_root_leverage_gate": {
+            "required_fields": list(LEMMA_ROOT_LEVERAGE_GATE_FIELDS),
+            "admission_rule": (
+                "Admit a lemma only when proving it closes a major case or materially shortens the root proof, refuting it is informative, "
+                "it is not stronger than necessary, it does not rename the current gap, and its hypotheses can realistically be obtained."
+            ),
+            "qualitative_not_hidden_solution_score": True,
+        },
+        "selection_policy": "prefer the weakest attainable candidate that materially reduces obligations and would close a major root case",
         "existing_statement_fingerprints": sorted(
             {
                 str(claim.get("fingerprint") or fingerprint_text(str(claim.get("statement") or "")))
@@ -310,11 +423,23 @@ def _conjecture_candidates(metadata: Mapping[str, Any]) -> list[Dict[str, Any]]:
 
 def _bridge_rank(candidate: Mapping[str, Any]) -> tuple[float, float, float, str]:
     precheck = _json_object(candidate.get("sufficiency_precheck"))
+    leverage_gate = _json_object(candidate.get("root_leverage_gate"))
     closes = 1.0 if precheck.get("would_reach_root") or precheck.get("would_close_route") else 0.0
+    if leverage_gate.get("if_proved_major_case") is True:
+        closes = max(closes, 0.85)
     leverage = float(candidate.get("estimated_root_leverage") or 0.0)
     difficulty = float(candidate.get("estimated_difficulty") or 0.0)
     hidden = len(_json_list(candidate.get("hidden_obligations")) or _json_list(precheck.get("hidden_obligations")))
-    return (closes, leverage - 0.35 * difficulty - 0.08 * hidden, leverage, str(candidate.get("bridge_id") or ""))
+    attainable = 0.0 if leverage_gate.get("hypotheses_attainable") is False else 0.15
+    informative_refutation = 0.1 if leverage_gate.get("if_refuted_information_gain") is True else 0.0
+    overstrong = 0.5 if leverage_gate.get("stronger_than_necessary") is True else 0.0
+    gap_rename = 0.8 if leverage_gate.get("renames_current_gap") is True else 0.0
+    return (
+        closes,
+        leverage + attainable + informative_refutation - overstrong - gap_rename - 0.35 * difficulty - 0.08 * hidden,
+        leverage,
+        str(candidate.get("bridge_id") or ""),
+    )
 
 
 def _candidate_needs_experiment(candidate: Mapping[str, Any]) -> bool:
@@ -493,6 +618,112 @@ def _compression_would_help(state: Mapping[str, Any]) -> bool:
     return len(state.get("claims", [])) >= 5 or len(state.get("routes", [])) >= 2 or len(state.get("debts", [])) >= 4
 
 
+def _successful_local_research_runs(
+    state: Mapping[str, Any], *, after_revision: int = -1
+) -> list[Mapping[str, Any]]:
+    global_intents = {
+        "active_proof_compression",
+        "proof_compression",
+        "advisor_global_synthesis",
+        CONCEPTUAL_INVARIANT_INTENT,
+        "global_synthesis",
+        "near_solution_spine_synthesis",
+    }
+    return [
+        run
+        for run in state.get("recent_runs", [])
+        if int(run.get("state_revision") or 0) > after_revision
+        and str(run.get("actor_role") or "") == "researcher"
+        and str(run.get("mode") or "") in {"prove", "reduce", "strengthen", "weaken"}
+        and str(run.get("status") or "").lower() not in {"failed", "error", "cancelled", "timeout"}
+        and str(run.get("search_intent") or "") not in global_intents
+    ]
+
+
+def conceptual_invariant_trigger(state: Mapping[str, Any]) -> Dict[str, Any]:
+    """Ask for a global mathematical object after repeated local formalism.
+
+    This is deliberately event-driven rather than a rigid round-robin.  A
+    conceptual pass becomes due only after a compressed proof picture exists
+    and at least two later local attacks have not closed the decisive gap.
+    """
+    compression = latest_artifact(state, "proof_compression")
+    if not compression:
+        return {"due": False, "reason": "canonical proof picture not yet available"}
+    latest_concept = latest_conceptual_invariant_artifact(state)
+    compression_revision = int(compression.get("state_revision") or 0)
+    concept_revision = int(latest_concept.get("state_revision") or -1) if latest_concept else -1
+    current_revision = int(state.get("problem_state", {}).get("current_revision") or 0)
+    if latest_concept and current_revision - concept_revision < CONCEPTUAL_INVARIANT_COOLDOWN_REVISIONS:
+        return {"due": False, "reason": "conceptual invariant pass is still fresh"}
+    local_runs = _successful_local_research_runs(
+        state, after_revision=max(compression_revision, concept_revision)
+    )
+    target_counts: Dict[str, int] = {}
+    for run in local_runs:
+        target_id = str(run.get("target_id") or "root")
+        target_counts[target_id] = target_counts.get(target_id, 0) + 1
+    target_id = max(target_counts, key=target_counts.get) if target_counts else "root"
+    repeated_same_formalism = target_counts.get(target_id, 0) >= CONCEPTUAL_INVARIANT_LOCAL_PASS_THRESHOLD
+    shared_obstruction = False
+    obstruction_routes: Dict[str, set[str]] = {}
+    for route in state.get("routes", []):
+        fingerprint = str(route.get("failure_fingerprint") or "")
+        if fingerprint and str(route.get("status") or "") in {"active", "blocked"}:
+            obstruction_routes.setdefault(fingerprint, set()).add(str(route.get("route_id") or ""))
+    shared_obstruction = any(len(route_ids) >= 2 for route_ids in obstruction_routes.values())
+    due = repeated_same_formalism or shared_obstruction
+    return {
+        "due": due,
+        "reason": (
+            "repeated local attacks should be compressed by one conceptual invariant"
+            if repeated_same_formalism
+            else "multiple routes share one obstruction that may have a common invariant explanation"
+            if shared_obstruction
+            else "local attacks have not yet justified a conceptual pass"
+        ),
+        "target_id": target_id,
+        "local_pass_count": len(local_runs),
+        "canonical_picture_artifact_id": str(compression.get("artifact_id") or ""),
+        "latest_concept_artifact_id": str(latest_concept.get("artifact_id") or "") if latest_concept else "",
+    }
+
+
+def research_cycle_state(state: Mapping[str, Any]) -> Dict[str, Any]:
+    recent = [
+        run
+        for run in state.get("recent_runs", [])
+        if str(run.get("status") or "").lower() not in {"failed", "error", "cancelled", "timeout"}
+    ][:8]
+    phases: list[str] = []
+    for run in recent:
+        intent = str(run.get("search_intent") or "")
+        mode = str(run.get("mode") or "")
+        if intent in {"active_proof_compression", "proof_compression", "near_solution_spine_synthesis"}:
+            phase = "global_assembly"
+        elif intent == CONCEPTUAL_INVARIANT_INTENT:
+            phase = "conceptual_comparison"
+        elif mode == "refute" or "counterexample" in intent:
+            phase = "adversarial_probe"
+        elif mode in {"triage_routes", "regulate_decomposition"}:
+            phase = "strategic_decision"
+        elif mode in {"prove", "reduce", "strengthen", "weaken"}:
+            phase = "local_attack"
+        else:
+            continue
+        if not phases or phases[-1] != phase:
+            phases.append(phase)
+    trigger = conceptual_invariant_trigger(state)
+    return {
+        "recent_distinct_phases": phases[:5],
+        "conceptual_invariant_due": bool(trigger.get("due")),
+        "policy": (
+            "Alternate deep local proof, global assembly, adversarial probe, conceptual comparison, and strategic decision when evidence changes; "
+            "do not repeat one formalism merely to satisfy a fixed cycle."
+        ),
+    }
+
+
 def _protected_primary_action(action: Mapping[str, Any]) -> bool:
     mode = str(action.get("mode") or "")
     if mode in {"integrate", "formalize", "validate_counterexample", "write", "review_writing", "stop_solved", "stop_with_partial_results"}:
@@ -547,6 +778,25 @@ def next_strategy_operation(state: Mapping[str, Any], primary_action: Mapping[st
             "selected_conjecture_proof_required": not experiment,
             "preferred_work_mode": "cas" if experiment else "offline",
         }
+    conceptual = conceptual_invariant_trigger(state)
+    if conceptual.get("due"):
+        return {
+            "operation": "conceptual_invariant_discovery",
+            "mode": "reduce",
+            "target_id": str(conceptual.get("target_id") or "root"),
+            "route_id": str(primary_action.get("route_id") or ""),
+            "search_intent": CONCEPTUAL_INVARIANT_INTENT,
+            "reason": str(conceptual.get("reason") or "repeated local work needs a conceptual invariant"),
+            "conceptual_invariant_discovery_required": True,
+            "conceptual_invariant_trigger": conceptual,
+            "deep_research_required": True,
+            "long_mathematical_session_required": True,
+            "analogy_pass_required": True,
+            "counterexample_probe_required": True,
+            "research_philosophy": "conceptual_invariant",
+            "research_attack_stage": "deep",
+            "preferred_work_mode": "offline",
+        }
     trigger = advisor_synthesis_trigger(state)
     if trigger.get("due"):
         if _compression_would_help(state) and not _compression_is_fresh_for_trigger(state, trigger):
@@ -558,7 +808,12 @@ def next_strategy_operation(state: Mapping[str, Any], primary_action: Mapping[st
                 "search_intent": "active_proof_compression",
                 "reason": "compress the current proof architecture before the due global advisor synthesis",
                 "proof_compression_operation_required": True,
+                "canonical_full_proof_reconstruction_required": True,
                 "proof_spine_mode_required": True,
+                "deep_research_required": True,
+                "long_mathematical_session_required": True,
+                "research_philosophy": "global_assembly",
+                "research_attack_stage": "deep",
                 "synthesis_trigger": trigger,
                 "preferred_work_mode": "offline",
             }
@@ -627,6 +882,16 @@ def score_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[st
     token_cost = min(1.0, requested / 250_000.0) if requested else 0.25
     wall_cost = 0.8 if is_experiment else 0.55 if action.get("deep_session_required") else 0.3
     verification_cost = 0.15 if is_verification else 0.55 if action.get("definition_invention_required") else 0.35
+    outcome_learning = verifier_filtered_outcome_learning(state, action)
+    outcome_adjustment = float(outcome_learning.get("current_family", {}).get("score_adjustment") or 0.0)
+    compact_outcome_learning = {
+        "outcome_learning_version": outcome_learning.get("outcome_learning_version"),
+        "policy": outcome_learning.get("policy"),
+        "reference_solution_used": False,
+        "private_cross_problem_cache_used": False,
+        "current_strategy_family": outcome_learning.get("current_strategy_family", ""),
+        "current_family": outcome_learning.get("current_family", {}),
+    }
     score = (
         1.6 * closing
         + 1.25 * refuting
@@ -637,6 +902,7 @@ def score_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[st
         - 0.45 * token_cost
         - 0.25 * wall_cost
         - 0.4 * verification_cost
+        + outcome_adjustment
     )
     return {
         "probability_of_closing_bottleneck": round(closing, 3),
@@ -649,7 +915,12 @@ def score_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[st
         "wall_time_cost": round(wall_cost, 3),
         "verification_cost": round(verification_cost, 3),
         "expected_value_score": round(score, 4),
-        "heuristic_not_calibrated_probability": True,
+        "heuristic_not_calibrated_probability": not bool(
+            outcome_learning.get("current_family", {}).get("trials")
+        ),
+        "verifier_filtered_outcome_learning": compact_outcome_learning,
+        "outcome_score_adjustment": round(outcome_adjustment, 4),
+        "reference_solution_used": False,
         "rotation_tie_break_rule": "when scores differ by at most 0.25, prefer the least-recent researcher work mode",
         "protected_verification_budget": "never charged to speculative research actions",
     }
@@ -671,7 +942,11 @@ def _deep_session_context(state: Mapping[str, Any], action: Mapping[str, Any]) -
         and str(run.get("actor_role") or "") == "researcher"
     )
     eligible_reason = ""
-    if action.get("selected_bridge_promotion_required") or action.get("bridge_lemma_workbench_required"):
+    if action.get("conceptual_invariant_discovery_required"):
+        eligible_reason = "conceptual_invariant_discovery"
+    elif action.get("canonical_full_proof_reconstruction_required"):
+        eligible_reason = "canonical_full_proof_reconstruction"
+    elif action.get("selected_bridge_promotion_required") or action.get("bridge_lemma_workbench_required"):
         eligible_reason = "central_bridge_lemma"
     elif action.get("source_adaptation_digest_required"):
         eligible_reason = "difficult_source_adaptation"
@@ -682,6 +957,9 @@ def _deep_session_context(state: Mapping[str, Any], action: Mapping[str, Any]) -
     elif action.get("deep_research_required") and leverage >= 0.7:
         eligible_reason = "high_estimated_root_leverage"
     if not eligible_reason:
+        return {}
+    roi = deep_session_roi(state, action)
+    if not roi.get("allowed"):
         return {}
     debts = _relevant_debts(state, target_id, route_id)
     synthesis = latest_active_advisor_synthesis(state)
@@ -698,27 +976,46 @@ def _deep_session_context(state: Mapping[str, Any], action: Mapping[str, Any]) -
         ][:12],
         "active_debt_ids": [str(debt.get("debt_id") or "") for debt in debts[:8]],
         "latest_advisor_synthesis_artifact_id": str(synthesis.get("artifact_id") or "") if synthesis else "",
-        "branch_budget_policy": "one coherent long session; ordinary patch and verification gates still apply",
+        "roi_gate": roi,
+        "branch_budget_policy": (
+            "one coherent long session; persist only a mathematical proof-state delta; ordinary patch and verification gates still apply"
+        ),
         "required_deliverable": {
-            "artifact_type": "deep_session_report",
+            "preferred_artifact_type": "proof_dossier",
+            "fallback_artifact_type": "deep_session_report",
+            "fallback_rule": "use deep_session_report only when it carries a productive mathematical delta",
             "strategy_schema_version": STRATEGY_SCHEMA_VERSION,
+            "deep_session_roi_version": DEEP_SESSION_ROI_VERSION,
             "fields": [
                 "strategy_schema_version",
+                "deep_session_roi_version",
+                "mathematical_delta_kind",
+                "mathematical_delta_summary",
+                "changed_proof_state",
+                "next_philosophy_if_stalled",
                 "complete_local_argument",
+                "independent_proof_attacks",
                 "candidate_lemmas",
                 "failed_approaches",
                 "new_obstructions",
                 "source_adaptations",
+                "analogy_or_neighboring_theorem_comparison",
+                "full_proof_assembly_attempt",
                 "proposed_route_revision",
                 "next_decisive_step",
                 "state_patch_operations",
             ],
             "field_rules": {
                 "candidate_lemmas": "nonempty list; include at least one exact local lemma, hypothesis, or falsifiable subclaim from this session",
+                "independent_proof_attacks": "at least two materially different proof attacks, unless the first closes the target",
                 "failed_approaches": "nonempty list",
                 "new_obstructions": "nonempty list",
                 "source_adaptations": "list; may be empty in an offline session",
+                "analogy_or_neighboring_theorem_comparison": "nonempty comparison with an explicit object and hypothesis dictionary",
+                "full_proof_assembly_attempt": "nonempty attempt to place the local result into the entire root proof",
                 "state_patch_operations": "nonempty list",
+                "mathematical_delta_kind": "one of: " + " | ".join(sorted(PRODUCTIVE_DELTA_KINDS)),
+                "changed_proof_state": "must be true; a management-only report is not progress and must not be persisted",
             },
         },
         "verification_authority": False,
@@ -728,6 +1025,29 @@ def _deep_session_context(state: Mapping[str, Any], action: Mapping[str, Any]) -
 
 def enrich_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[str, Any]:
     enriched = dict(action)
+    graph_frontier = decisive_obligation_frontier(state)
+    enriched["decisive_obligation_frontier"] = graph_frontier
+    decisive = _json_object(graph_frontier.get("decisive_obligation"))
+    if decisive:
+        enriched["decisive_obligation_frontier_required"] = True
+        enriched["decisive_obligation_id"] = str(decisive.get("obligation_id") or "")
+        enriched["decisive_obligation_target_id"] = str(decisive.get("target_id") or "")
+        enriched["decisive_obligation_statement"] = str(decisive.get("statement") or "")
+    if enriched.get("proof_compression_operation_required"):
+        enriched["canonical_full_proof_reconstruction_required"] = True
+        enriched["deep_research_required"] = True
+        enriched["long_mathematical_session_required"] = True
+        enriched.setdefault("research_philosophy", "global_assembly")
+    if str(enriched.get("mode") or "") == "refute" or enriched.get("counterexample_search_required"):
+        enriched["counterexample_probe_required"] = True
+        enriched["counterexample_probe_contract"] = {
+            "full_original_hypotheses_required": True,
+            "competing_conjectures_required": True,
+            "structural_question_required": True,
+            "outcome_dependent_next_actions_required": True,
+            "weakened_shadow_tests_are_diagnostic_only": True,
+        }
+        enriched.setdefault("research_philosophy", "adversarial_probe")
     bridge_like = bool(enriched.get("bridge_lemma_workbench_required")) or "bridge" in str(
         enriched.get("reason") or ""
     ).lower()
@@ -765,10 +1085,31 @@ def enrich_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[s
             {feature for card in methods for feature in card.get("matched_structural_features", [])}
         )
         enriched["method_cards_are_proof_evidence"] = False
+    roi = deep_session_roi(state, enriched)
+    enriched["deep_session_roi"] = roi
     deep = _deep_session_context(state, enriched)
     if deep:
         enriched["deep_session_required"] = True
         enriched["deep_session"] = deep
+        enriched["long_mathematical_session_required"] = True
+    elif not roi.get("allowed", True):
+        enriched["deep_session_suppressed"] = True
+        enriched["forced_research_philosophy"] = str(roi.get("forced_next_philosophy") or "alternative_construction")
+        enriched["research_philosophy"] = enriched["forced_research_philosophy"]
+        enriched.pop("long_mathematical_session_required", None)
+    representation_contract = representation_switch_contract(state, enriched)
+    if representation_contract:
+        enriched["representation_switch_required"] = True
+        enriched["representation_switch_contract"] = representation_contract
+    adaptation_contract = theorem_adaptation_contract(enriched)
+    if adaptation_contract:
+        enriched["theorem_adaptation_required"] = True
+        enriched["theorem_adaptation_contract"] = adaptation_contract
+    interface_contract = proof_interface_contract(enriched)
+    if interface_contract:
+        enriched["proof_interface_check_required"] = True
+        enriched["proof_interface_contract"] = interface_contract
+    enriched["research_cycle"] = research_cycle_state(state)
     enriched["information_gain_score"] = score_action(state, enriched)
     return enriched
 
@@ -794,6 +1135,12 @@ def apply_active_compression(
         "after_claim_count": len(compressed),
         "history_preserved": True,
         "weakest_sufficient_new_statement": str(skeleton.get("weakest_sufficient_new_statement") or ""),
+        "single_decisive_missing_theorem": str(skeleton.get("single_decisive_missing_theorem") or ""),
+        "strongest_candidate_counterexample_architecture": str(
+            skeleton.get("strongest_candidate_counterexample_architecture") or ""
+        ),
+        "most_informative_failed_ideas": _json_list(skeleton.get("most_informative_failed_ideas"))[:3],
+        "everything_else_is_background": True,
     }
 
 
@@ -803,6 +1150,7 @@ def strategy_context_card(state: Mapping[str, Any], action: Mapping[str, Any]) -
     bridge = selected_bridge_candidate(state)
     conjecture = selected_conjecture_candidate(state)
     authorization = active_invention_authorization(state)
+    conceptual = latest_artifact(state, "conceptual_invariant_report")
     query = " ".join(
         [
             str(state.get("problem_state", {}).get("root_statement") or ""),
@@ -832,6 +1180,28 @@ def strategy_context_card(state: Mapping[str, Any], action: Mapping[str, Any]) -
             if compression
             else {}
         ),
+        "compressed_mathematical_picture": (
+            {
+                "source_artifact_id": compression.get("artifact_id", ""),
+                "shortest_plausible_proof_spine": _json_object(compression.get("metadata", {}).get("minimal_proof_skeleton")).get("shortest_known_route", []),
+                "single_decisive_missing_theorem": _json_object(compression.get("metadata", {}).get("minimal_proof_skeleton")).get("single_decisive_missing_theorem", ""),
+                "strongest_candidate_counterexample_architecture": _json_object(compression.get("metadata", {}).get("minimal_proof_skeleton")).get("strongest_candidate_counterexample_architecture", ""),
+                "most_informative_failed_ideas": _json_list(_json_object(compression.get("metadata", {}).get("minimal_proof_skeleton")).get("most_informative_failed_ideas"))[:3],
+                "everything_else_is_background": True,
+            }
+            if compression
+            else {}
+        ),
+        "latest_conceptual_invariant_report": (
+            {"artifact_id": conceptual.get("artifact_id", ""), **conceptual.get("metadata", {})}
+            if conceptual
+            else {}
+        ),
+        "lemma_root_leverage_gate": {
+            "required_fields": list(LEMMA_ROOT_LEVERAGE_GATE_FIELDS),
+            "qualitative_not_hidden_solution_score": True,
+        },
+        "research_cycle": research_cycle_state(state),
         "selected_bridge": bridge or {},
         "selected_conjecture": conjecture or {},
         "active_invention_authorization": (
@@ -840,6 +1210,12 @@ def strategy_context_card(state: Mapping[str, Any], action: Mapping[str, Any]) -
             else {}
         ),
         "retrieved_method_cards": retrieve_method_cards(query, limit=3),
+        "decisive_obligation_frontier": decisive_obligation_frontier(state),
+        "verifier_filtered_outcome_learning": verifier_filtered_outcome_learning(state, action),
+        "deep_session_roi": deep_session_roi(state, action),
+        "representation_switch_contract": dict(action.get("representation_switch_contract") or {}),
+        "theorem_adaptation_contract": dict(action.get("theorem_adaptation_contract") or {}),
+        "proof_interface_contract": dict(action.get("proof_interface_contract") or {}),
         "experiment_conjecture_proof_contract": {
             "experiment_workflow_version": STRATEGY_SCHEMA_VERSION,
             "required_fields": list(EXPERIMENT_REQUIRED_FIELDS),
@@ -857,6 +1233,7 @@ def strategy_observability(state: Mapping[str, Any], action: Optional[Mapping[st
     compression = latest_artifact(state, "proof_compression")
     bridge_artifact = latest_artifact(state, "bridge_lemma_search")
     conjecture_artifact = latest_artifact(state, "conjecture_portfolio")
+    conceptual_artifact = latest_artifact(state, "conceptual_invariant_report")
     authorization = active_invention_authorization(state)
     bridge_candidates = _bridge_candidates(bridge_artifact["metadata"]) if bridge_artifact else []
     conjectures = _conjecture_candidates(conjecture_artifact["metadata"]) if conjecture_artifact else []
@@ -873,7 +1250,13 @@ def strategy_observability(state: Mapping[str, Any], action: Optional[Mapping[st
         "conjecture_candidate_count": len(conjectures),
         "selected_conjecture_id": str(selected_conjecture.get("conjecture_id") or ""),
         "active_invention_authorization_artifact_id": str(authorization.get("artifact_id") or "") if authorization else "",
+        "latest_conceptual_invariant_artifact_id": str(conceptual_artifact.get("artifact_id") or "") if conceptual_artifact else "",
+        "conceptual_invariant_trigger": conceptual_invariant_trigger(state),
+        "research_cycle": research_cycle_state(state),
         "information_gain_score": dict((action or {}).get("information_gain_score") or {}),
+        "decisive_obligation_frontier": decisive_obligation_frontier(state),
+        "verifier_filtered_outcome_learning": verifier_filtered_outcome_learning(state, action or {}),
+        "deep_session_roi": deep_session_roi(state, action or {}),
         "advisor_synthesis_trigger": advisor_synthesis_trigger(state),
     }
 
@@ -932,6 +1315,10 @@ def _validate_bridge_metadata(metadata: Mapping[str, Any], conn: sqlite3.Connect
         for key in ("materially_reduces_gap", "would_reach_root", "restates_root", "creates_more_severe_obligations"):
             if key not in precheck:
                 errors.append(f"{prefix}.sufficiency_precheck requires {key}")
+        leverage_gate = _json_object(candidate.get("root_leverage_gate"))
+        for key in LEMMA_ROOT_LEVERAGE_GATE_FIELDS:
+            if key not in leverage_gate:
+                errors.append(f"{prefix}.root_leverage_gate requires {key}")
         duplicate_active = fingerprint in existing_claim_fingerprints
         if duplicate_active and status != "rejected":
             errors.append(f"{prefix} duplicates an existing claim and must be rejected")
@@ -940,6 +1327,11 @@ def _validate_bridge_metadata(metadata: Mapping[str, Any], conn: sqlite3.Connect
             material
             and not bool(precheck.get("restates_root"))
             and not bool(precheck.get("creates_more_severe_obligations"))
+            and bool(leverage_gate.get("if_proved_major_case"))
+            and bool(leverage_gate.get("if_refuted_information_gain"))
+            and not bool(leverage_gate.get("stronger_than_necessary"))
+            and not bool(leverage_gate.get("renames_current_gap"))
+            and bool(leverage_gate.get("hypotheses_attainable"))
             and _nonempty_list(candidate.get("possible_methods"))
             and not duplicate_active
         )
@@ -1204,6 +1596,11 @@ def _validate_proof_compression(metadata: Mapping[str, Any], conn: sqlite3.Conne
         errors.append(f"proof_compression essential_verified_facts contains unknown claims: {unknown[:3]}")
     if metadata.get("history_preserved") is not True:
         errors.append("proof_compression requires history_preserved=true")
+    failed_ideas = skeleton.get("most_informative_failed_ideas")
+    if not isinstance(failed_ideas, list):
+        errors.append("minimal_proof_skeleton most_informative_failed_ideas must be a list")
+    elif len(failed_ideas) > 3:
+        errors.append("minimal_proof_skeleton may keep at most three most_informative_failed_ideas active")
     return errors
 
 
@@ -1212,9 +1609,12 @@ def _validate_deep_session(metadata: Mapping[str, Any]) -> list[str]:
         metadata,
         (
             "complete_local_argument",
+            "independent_proof_attacks",
             "candidate_lemmas",
             "failed_approaches",
             "new_obstructions",
+            "analogy_or_neighboring_theorem_comparison",
+            "full_proof_assembly_attempt",
             "proposed_route_revision",
             "next_decisive_step",
             "state_patch_operations",
@@ -1223,6 +1623,49 @@ def _validate_deep_session(metadata: Mapping[str, Any]) -> list[str]:
     )
     if "source_adaptations" not in metadata or not isinstance(metadata.get("source_adaptations"), list):
         errors.append("deep_session_report requires source_adaptations as a list (possibly empty)")
+    attacks = _json_list(metadata.get("independent_proof_attacks"))
+    if len(attacks) < 2 and metadata.get("target_closed_on_first_attack") is not True:
+        errors.append("deep_session_report requires at least two independent_proof_attacks unless the first closes the target")
+    errors.extend(validate_deep_session_roi_metadata(metadata))
+    return errors
+
+
+def _validate_conceptual_invariant_report(metadata: Mapping[str, Any]) -> list[str]:
+    errors = _require_fields(metadata, CONCEPTUAL_INVARIANT_REQUIRED_FIELDS, prefix="conceptual_invariant_report")
+    candidates = [dict(item) for item in _json_list(metadata.get("candidate_invariants")) if isinstance(item, Mapping)]
+    if not 1 <= len(candidates) <= 3:
+        errors.append("conceptual_invariant_report requires one to three candidate_invariants")
+        return errors
+    candidate_ids: set[str] = set()
+    for index, candidate in enumerate(candidates):
+        prefix = f"candidate_invariants[{index}]"
+        errors.extend(
+            _require_fields(
+                candidate,
+                (
+                    "invariant_id",
+                    "definition",
+                    "transformations_controlled",
+                    "local_lemmas_subsumed",
+                    "root_consequence",
+                    "falsification_example",
+                    "failure_modes",
+                    "status",
+                ),
+                prefix=prefix,
+            )
+        )
+        invariant_id = str(candidate.get("invariant_id") or "")
+        if invariant_id in candidate_ids:
+            errors.append(f"duplicate conceptual invariant id: {invariant_id}")
+        candidate_ids.add(invariant_id)
+        if len(_json_list(candidate.get("local_lemmas_subsumed"))) < 2:
+            errors.append(f"{prefix} must subsume at least two existing local lemmas")
+        if str(candidate.get("status") or "") not in {"selected", "viable", "rejected", "refuted"}:
+            errors.append(f"{prefix} has invalid status {candidate.get('status')}")
+    selected = str(metadata.get("selected_invariant_id") or "")
+    if selected != "none" and selected not in candidate_ids:
+        errors.append("conceptual_invariant_report selected_invariant_id must name a candidate or be none")
     return errors
 
 
@@ -1260,6 +1703,11 @@ def strategic_artifact_errors(
     base_revision: int,
 ) -> list[str]:
     errors: list[str] = []
+    errors.extend(validate_proof_interface_metadata(metadata))
+    errors.extend(validate_theorem_adaptation_metadata(metadata))
+    errors.extend(validate_representation_switch_metadata(metadata))
+    if artifact_type in {"proof_dossier", "proof_blueprint"}:
+        errors.extend(validate_deep_session_roi_metadata(metadata))
     allowed_roles = {
         "advisor_synthesis": {"phd_advisor", "advisor"},
         "invention_authorization": {"phd_advisor", "advisor"},
@@ -1268,6 +1716,7 @@ def strategic_artifact_errors(
         "definition_candidate": {"researcher"},
         "deep_session_report": {"researcher"},
         "proof_compression": {"researcher", "phd_advisor", "advisor"},
+        "conceptual_invariant_report": {"researcher"},
     }
     if artifact_type in allowed_roles and actor_role not in allowed_roles[artifact_type]:
         errors.append(f"{actor_role} cannot attach {artifact_type}; expected {', '.join(sorted(allowed_roles[artifact_type]))}")
@@ -1287,6 +1736,8 @@ def strategic_artifact_errors(
         errors.extend(_validate_proof_compression(metadata, conn))
     elif artifact_type == "deep_session_report":
         errors.extend(_validate_deep_session(metadata))
+    elif artifact_type == "conceptual_invariant_report":
+        errors.extend(_validate_conceptual_invariant_report(metadata))
     elif artifact_type == "cas_experiment_report":
         errors.extend(_validate_experiment(metadata))
     return errors

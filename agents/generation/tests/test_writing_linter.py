@@ -10,7 +10,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from agents.generation.phase2.writing.linter import (
     EXCERPT_MAX_CHARS,
+    REQUIRED_FIX_MARKER,
     Finding,
+    obligation_location,
+    required_fix,
+    required_fix_for_obligation,
     run_all,
     run_lint,
     run_residue_scan,
@@ -305,6 +309,128 @@ class RunAllTest(unittest.TestCase):
             "The factors are pairwise distinct because the roots of unity are distinct.\n"
         )
         self.assertEqual(run_all(text), [])
+
+
+# Every rule id any deterministic layer emits (run_all + run_slop_lint +
+# run_paper_lint + the compile-sync's L5-TEX-05). The required-fix template
+# test below pins that EACH of these yields a dedicated, concrete instruction
+# — never the generic "exactly as described" fallback.
+ALL_DETERMINISTIC_RULE_IDS = (
+    "L1-CITE-03",
+    "L2-QUANT-02",
+    "L4-GRAM-04",
+    "L4-GRAM-07",
+    "L4-HOUSE-03",
+    "L4-HOUSE-07",
+    "L4-HOUSE-08",
+    "L4-HOUSE-09",
+    "L4-HOUSE-10",
+    "L4-HOUSE-11",
+    "L4-LOGIC-01",
+    "L4-SENT-01",
+    "L4-SHORT-01",
+    "L4-SLOP-01",
+    "L4-SLOP-02",
+    "L4-SLOP-03",
+    "L4-SLOP-04",
+    "L4-SLOP-05",
+    "L4-SLOP-06",
+    "L4-SLOP-07",
+    "L4-SLOP-09",
+    "L4-SLOP-11",
+    "L4-SLOP-12",
+    "L4-SYM-02",
+    "L4-USAGE-03",
+    "L4-USAGE-09",
+    "L5-DISP-04",
+    "L5-PAPER-01",
+    "L5-PAPER-02",
+    "L5-PAPER-03",
+    "L5-REF-03",
+    "L5-TEX-05",
+)
+
+
+class RequiredFixTest(unittest.TestCase):
+    def test_every_deterministic_rule_id_yields_a_dedicated_concrete_instruction(self) -> None:
+        for rule_id in ALL_DETERMINISTIC_RULE_IDS:
+            with self.subTest(rule_id=rule_id):
+                finding = Finding(rule_id, "major", 7, "excerpt", "paper structure: missing abstract")
+                fix = required_fix(finding)
+                self.assertTrue(fix, rule_id)
+                # A dedicated template, never the generic located fallback.
+                self.assertNotIn("exactly as described", fix, rule_id)
+
+    def test_unknown_rule_id_falls_back_to_a_located_generic_instruction(self) -> None:
+        finding = Finding("L9-FUTURE-99", "major", 42, "excerpt", "something new is wrong")
+        fix = required_fix(finding)
+        self.assertIn("L9-FUTURE-99", fix)
+        self.assertIn("line 42", fix)
+        self.assertIn("something new is wrong", fix)
+
+    def test_house07_fix_names_the_section_and_the_exact_opener(self) -> None:
+        finding = Finding(
+            "L4-HOUSE-07",
+            "major",
+            31,
+            "\\section{Proof of the main theorem}",
+            "section 'Proof of the main theorem' does not open with a sentence beginning "
+            '"In this section, we ..." in its first paragraph (HARD RULE, HOUSE 19)',
+        )
+        fix = required_fix(finding)
+        self.assertIn('section "Proof of the main theorem"', fix)
+        self.assertIn('"In this section, we"', fix)
+        self.assertIn("line 31", fix)
+        self.assertIn("first sentence", fix)
+
+    def test_house07_appendix_fix_names_the_appendix_opener(self) -> None:
+        finding = Finding(
+            "L4-HOUSE-07",
+            "major",
+            88,
+            "\\section{Certification}",
+            "section 'Certification' does not open with a sentence beginning "
+            '"In this appendix, we ..." in its first paragraph (HARD RULE, HOUSE 19)',
+        )
+        fix = required_fix(finding)
+        self.assertIn('section "Certification"', fix)
+        self.assertIn('"In this appendix, we"', fix)
+
+    def test_required_fix_for_obligation_prefers_the_appended_marker(self) -> None:
+        obligation = (
+            "L4-SLOP-11: one-sentence paragraph (line 9)"
+            f'{REQUIRED_FIX_MARKER}Merge the one-sentence paragraph at line 9 into an adjacent paragraph.'
+        )
+        self.assertEqual(
+            "Merge the one-sentence paragraph at line 9 into an adjacent paragraph.",
+            required_fix_for_obligation(obligation),
+        )
+
+    def test_required_fix_for_legacy_obligation_is_rederived_from_the_rule_id(self) -> None:
+        obligation = 'L4-SLOP-11: one-sentence paragraph (line 9) — excerpt: "It is short."'
+        fix = required_fix_for_obligation(obligation)
+        self.assertIn("one-sentence paragraph", fix)
+        self.assertIn("line 9", fix)
+
+    def test_required_fix_for_editor_obligation_is_empty(self) -> None:
+        # Editor/LLM findings carry their own suggested rewrite; there is no
+        # deterministic template to derive.
+        self.assertEqual(
+            "", required_fix_for_obligation("L3-SELL-01: the introduction oversells the result (line 12)")
+        )
+
+    def test_obligation_location_extracts_section_line_and_excerpt(self) -> None:
+        obligation = (
+            "L4-HOUSE-07: section 'Proof of the main theorem' does not open with a sentence beginning "
+            '"In this section, we ..." in its first paragraph (HARD RULE, HOUSE 19) (line 31)'
+            ' — excerpt: "\\section{Proof of the main theorem}"'
+            f"{REQUIRED_FIX_MARKER}Insert the opener."
+        )
+        location = obligation_location(obligation)
+        self.assertIn('section "Proof of the main theorem"', location)
+        self.assertIn("line 31", location)
+        self.assertIn("excerpt", location)
+        self.assertNotIn("Insert the opener", location)
 
 
 if __name__ == "__main__":

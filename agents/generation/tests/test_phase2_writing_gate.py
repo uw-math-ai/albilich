@@ -105,6 +105,21 @@ In this appendix, we describe the finite verification that accompanies the proof
 """
 
 
+# CLEAN_FINAL_PAPER with all three L4-HOUSE-07 section openers removed: the
+# Introduction and proof sections lose "In this section, we ..." and the
+# certification appendix loses "In this appendix, we ..." — three major
+# HOUSE-07 debts, one per section, for the fallthrough/enumeration tests.
+PAPER_MISSING_THREE_OPENERS = (
+    CLEAN_FINAL_PAPER
+    .replace("In this section, we state the main theorem. ", "")
+    .replace(
+        "In this section, we prove Theorem~\\ref{thm:main} directly from the definition of a group of order one. ",
+        "",
+    )
+    .replace("In this appendix, we describe the finite verification that accompanies the proof. ", "")
+)
+
+
 def make_solved_store(tmpdir: Path, problem_id: str) -> ProofStateStore:
     """Store with an integrated root, ready for a writer final_proof."""
     store = ProofStateStore(problem_id, generation_root=tmpdir / "generation")
@@ -452,10 +467,10 @@ def active_writing_debts(store: ProofStateStore) -> list[dict]:
 
 class Phase2WritingGateSchedulerTest(unittest.TestCase):
     def test_lightweight_gate_budget_constants(self) -> None:
-        # The gate costs at most 4 LLM sessions in the worst case: authoring
-        # (1) + deterministic-defect revision(s) + one editor review + at most
-        # one editor-debt revision. These constants pin that design; the
-        # deterministic allowance is separate from the editor's.
+        # The gate costs at most 5 LLM sessions in the worst case: authoring
+        # (1) + up to 2 deterministic-defect revisions + one editor review +
+        # at most one editor-debt revision. These constants pin that design;
+        # the deterministic allowance is separate from the editor's.
         self.assertEqual(1, MAX_WRITING_GATE_REVISION_CYCLES)
         self.assertEqual(2, MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES)
         self.assertEqual(1, PAPER_EDITOR_MAX_PASSES)
@@ -649,7 +664,12 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertEqual("stop_solved", action["mode"], action)
             self.assertEqual("final-proof-1", action["final_artifact_id"])
 
-    def test_revision_spent_and_open_non_residue_debt_opens_gate_with_debt_recorded(self) -> None:
+    def test_revision_spent_and_open_non_residue_debt_falls_through_then_opens_gate(self) -> None:
+        # EDITOR FALLTHROUGH ON EXHAUSTION: with the editor-bucket revision
+        # spent and a blocker debt still open, the gate does NOT open while
+        # the editor pass remains — it falls through to the editor review;
+        # only once every pass+revision budget is truly spent does the gate
+        # open with the debt left recorded.
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_solved_store(Path(tmpdir), "writing-gate-budget-test")
             attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
@@ -667,6 +687,25 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
 
             spend_revision_budget(store)
 
+            # Revision budget spent, editor pass unspent: fall through to the
+            # editor review instead of opening the gate.
+            action = next_action(store, web_search="disabled")
+            self.assertEqual("review_writing", action["mode"], action)
+            self.assertEqual(WRITING_GATE_EDITOR_LENS, action["critic_lens"], action)
+            self.assertIn("falling through", action["reason"])
+
+            # Editor passes (finds nothing new): every budget is now truly
+            # spent, so the gate opens with the debt recorded.
+            attach_writing_review(
+                store, lens=WRITING_GATE_EDITOR_LENS, artifact_reviewed="final-paper-1", verdict="pass"
+            )
+            record_writing_run(
+                store,
+                run_id="editor-run-1",
+                mode="review_writing",
+                search_intent=EDITOR_REVIEW_INTENT,
+                state_revision=store.get_revision(),
+            )
             action = next_action(store, web_search="disabled")
             self.assertEqual("stop_solved", action["mode"], action)
             # The unresolved debt stays recorded on the ledger and in the report.
@@ -785,11 +824,12 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertTrue(action.get("paper_revision"))
             self.assertEqual(WRITING_GATE_REVISION_INTENT, action["search_intent"])
 
-    def test_deterministic_cap_spent_and_non_residue_lint_debt_opens_gate(self) -> None:
-        # With the deterministic allowance spent and only non-residue,
-        # non-compile deterministic debts open (a slop major), the gate opens
-        # with the debt left recorded — only residue and compile failures
-        # force revisions past the caps.
+    def test_deterministic_cap_spent_with_editor_pass_spent_uses_the_editor_revision(self) -> None:
+        # Deterministic allowance spent, editor pass already spent, but the
+        # editor-debt revision is NOT: the leftover deterministic major (a
+        # slop debt) dispatches that final revision instead of shipping
+        # unfixed. Only once the editor revision is spent too does the gate
+        # open with the debt left recorded.
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_solved_store(Path(tmpdir), "writing-gate-det-cap-test")
             attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
@@ -808,10 +848,144 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
 
             action = next_action(store, web_search="disabled")
 
+            self.assertEqual("write", action["mode"], action)
+            self.assertTrue(action.get("writing_revision"))
+            self.assertTrue(action.get("paper_revision"))
+            self.assertEqual(WRITING_GATE_REVISION_INTENT, action["search_intent"])
+            self.assertEqual(1, action["writing_gate_round"])
+            self.assertIn("every open debt", action["reason"])
+            self.assertTrue(
+                any(d["debt_id"].startswith("writing-lint-") for d in action["writing_debts"]),
+                action["writing_debts"],
+            )
+
+            # The final revision is spent without fixing the debt: every
+            # pass+revision budget is now truly spent, so the gate opens.
+            spend_revision_budget(store)
+
+            action = next_action(store, web_search="disabled")
             self.assertEqual("stop_solved", action["mode"], action)
             self.assertTrue(
                 any(d["debt_id"].startswith("writing-lint-") for d in active_writing_debts(store))
             )
+
+    def test_deterministic_exhaustion_with_majors_dispatches_the_editor_not_stop(self) -> None:
+        # EDITOR FALLTHROUGH ON EXHAUSTION: deterministic revision budget
+        # spent, deterministic majors (3 missing section openers) still open,
+        # editor never run -> the gate dispatches the editor review (never
+        # stop_solved); after an editor fail, the single editor-debt revision
+        # addresses BOTH the editor's finding and the leftover deterministic
+        # majors in one pass.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = make_solved_store(Path(tmpdir), "writing-gate-exhaustion-fallthrough-test")
+            attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
+            insert_final_paper(store, "final-paper-noopeners", PAPER_MISSING_THREE_OPENERS)
+            spend_deterministic_revision_budget(store)
+
+            action = next_action(store, web_search="disabled")
+
+            self.assertEqual("review_writing", action["mode"], action)
+            self.assertEqual(WRITING_GATE_EDITOR_LENS, action["critic_lens"], action)
+            self.assertEqual("final-paper-noopeners", action["artifact_reviewed"])
+            self.assertIn("falling through", action["reason"])
+            # The leftover deterministic majors are visible to the editor.
+            self.assertTrue(
+                any(d["debt_id"].startswith("writing-lint-") for d in action["open_writing_debts"]),
+                action["open_writing_debts"],
+            )
+
+            # Editor fails with one finding: the single editor-debt revision
+            # dispatches, carrying the editor debt AND all three leftover
+            # HOUSE-07 majors in its checklist.
+            attach_writing_review(
+                store, lens=WRITING_GATE_EDITOR_LENS, artifact_reviewed="final-paper-noopeners", verdict="fail"
+            )
+            add_blocking_writing_debt(
+                store,
+                debt_id="writing-editor-late-finding",
+                owner_id="final-paper-noopeners",
+                obligation="L3-SELL-01: abstract overstates generality (line 10)",
+            )
+            record_writing_run(
+                store,
+                run_id="editor-run-1",
+                mode="review_writing",
+                search_intent=EDITOR_REVIEW_INTENT,
+                state_revision=store.get_revision(),
+            )
+
+            action = next_action(store, web_search="disabled")
+            self.assertEqual("write", action["mode"], action)
+            self.assertTrue(action.get("writing_revision"))
+            self.assertEqual(WRITING_GATE_REVISION_INTENT, action["search_intent"])
+            debt_ids = {d["debt_id"] for d in action["writing_debts"]}
+            self.assertIn("writing-editor-late-finding", debt_ids)
+            house07 = [d for d in action["writing_debts"] if d["rule_id"] == "L4-HOUSE-07"]
+            self.assertEqual(3, len(house07), action["writing_debts"])
+
+    def test_full_exhaustion_opens_gate_with_all_debts_recorded(self) -> None:
+        # Only after the editor pass AND both revision buckets are truly
+        # spent does the gate open, with every unresolved debt recorded.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = make_solved_store(Path(tmpdir), "writing-gate-full-exhaustion-test")
+            attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
+            insert_final_paper(store, "final-paper-noopeners", PAPER_MISSING_THREE_OPENERS)
+            spend_deterministic_revision_budget(store)
+            attach_writing_review(
+                store, lens=WRITING_GATE_EDITOR_LENS, artifact_reviewed="final-paper-noopeners", verdict="pass"
+            )
+            record_writing_run(
+                store,
+                run_id="editor-run-1",
+                mode="review_writing",
+                search_intent=EDITOR_REVIEW_INTENT,
+                state_revision=store.get_revision(),
+            )
+            spend_revision_budget(store)
+
+            action = next_action(store, web_search="disabled")
+
+            self.assertEqual("stop_solved", action["mode"], action)
+            self.assertEqual("final-proof-1", action["final_artifact_id"])
+            leftover = active_writing_debts(store)
+            self.assertEqual(
+                3, sum(1 for d in leftover if d["obligation"].startswith("L4-HOUSE-07:")), leftover
+            )
+            report = build_markdown_report(store)
+            self.assertIn("## Writing Review", report)
+
+    def test_revision_prompt_enumerates_every_house07_debt_with_location_and_fix(self) -> None:
+        # REVISION DIRECTIVES: the writer's revision prompt renders EVERY open
+        # writing debt as a numbered location -> required-fix checklist; with
+        # three sections missing their openers, all three section titles must
+        # reach the prompt, each with its concrete HOUSE-07 instruction.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = make_solved_store(Path(tmpdir), "writing-gate-house07-prompt-test")
+            attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
+            insert_final_paper(store, "final-paper-noopeners", PAPER_MISSING_THREE_OPENERS)
+
+            action = next_action(store, web_search="disabled")
+            self.assertEqual("write", action["mode"], action)
+            self.assertTrue(action.get("writing_revision"))
+            house07 = [d for d in action["writing_debts"] if d["rule_id"] == "L4-HOUSE-07"]
+            self.assertEqual(3, len(house07), action["writing_debts"])
+            for card in house07:
+                self.assertTrue(card["location"], card)
+                self.assertIn("Insert as the first sentence of section", card["required_fix"])
+
+            prompt = build_session_prompt(
+                context_path=Path("/tmp/context.json"), action=action, actor_role="writer"
+            )
+            for title in ("Introduction", "Proof of the main theorem", "Certification"):
+                self.assertIn(title, prompt)
+            self.assertIn("numbered location -> required-fix checklist", prompt)
+            self.assertIn("1. [", prompt)
+            self.assertIn("2. [", prompt)
+            self.assertIn("3. [", prompt)
+            self.assertGreaterEqual(prompt.count("REQUIRED FIX:"), 3)
+            self.assertIn("Fix EVERY numbered item", prompt)
+            self.assertIn("SELF-CHECK each numbered location", prompt)
+            self.assertIn('"In this appendix, we"', prompt)
 
     def test_residue_debt_still_forces_revision_past_the_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

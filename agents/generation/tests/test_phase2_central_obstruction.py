@@ -361,6 +361,65 @@ class Phase2CentralObstructionTest(unittest.TestCase):
         self.assertEqual(scoreboard[0]["scoreboard_status"], "blocked")
         self.assertIn("route-blocked", paused_route_ids(state))
 
+    def test_newer_keep_directive_reactivates_heuristically_stalled_route(self) -> None:
+        state = {
+            "claims": [
+                {
+                    "claim_id": "root",
+                    "statement": "Root",
+                    "root_impact": 1.0,
+                    "reduction_depth": 0,
+                    "validation_status": "challenged",
+                    "lifecycle_status": "active",
+                    "parent_ids_json": "[]",
+                }
+            ],
+            "routes": [
+                {
+                    "route_id": "route-root",
+                    "conclusion_claim_id": "root",
+                    "status": "active",
+                    "relation_to_parent": "sufficient",
+                    "label": "Root route",
+                    "failure_fingerprint": "",
+                }
+            ],
+            "inferences": [],
+            "debts": [
+                {
+                    "debt_id": f"debt-{index}",
+                    "owner_id": "root",
+                    "status": "active",
+                    "severity": "blocking",
+                    "repeated_count": 1,
+                }
+                for index in range(3)
+            ],
+            "research_artifacts": [
+                {
+                    "artifact_id": "advisor-pause",
+                    "artifact_type": "advisor_report",
+                    "producer_role": "phd_advisor",
+                    "state_revision": 10,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "metadata_json": '{"paused_or_abandoned_route_ids":["route-root"]}',
+                },
+                {
+                    "artifact_id": "advisor-keep",
+                    "artifact_type": "advisor_report",
+                    "producer_role": "phd_advisor",
+                    "state_revision": 20,
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                    "metadata_json": '{"kept_route_ids":["route-root"],"route_decisions":[{"route_id":"route-root","decision":"keep_repair"}]}',
+                },
+            ],
+        }
+
+        scoreboard = route_scoreboard(state)
+
+        self.assertEqual(scoreboard[0]["scoreboard_status"], "promising")
+        self.assertNotIn("route-root", paused_route_ids(state))
+
 
 if __name__ == "__main__":
     unittest.main()

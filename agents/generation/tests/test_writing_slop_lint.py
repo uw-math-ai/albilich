@@ -449,6 +449,24 @@ class HouseSectionOpenerTest(unittest.TestCase):
         )
         self.assertEqual([], by_rule(run_slop_lint(clean), "L4-HOUSE-07"))
 
+    def test_same_line_label_and_blank_line_do_not_hide_the_opener(self) -> None:
+        # "\section{X}\label{sec:x}" followed by a blank line: the label is
+        # heading noise, not the first paragraph. The opener right after the
+        # blank line satisfies the rule (this false positive kept re-flagging
+        # sections whose opener the writer had already fixed).
+        clean = (
+            "\\section{Constituents and Coupling}\\label{sec:constituents}\n"
+            "\n"
+            "In this section, we reduce an arbitrary finite action to coset constituents.\n"
+        )
+        self.assertEqual([], by_rule(run_slop_lint(clean), "L4-HOUSE-07"))
+        flagged = (
+            "\\section{Constituents and Coupling}\\label{sec:constituents}\n"
+            "\n"
+            "The reduction uses only diagonal triples and the definition of closure.\n"
+        )
+        self.assertEqual(1, len(by_rule(run_slop_lint(flagged), "L4-HOUSE-07")))
+
     def test_every_violating_section_is_flagged_separately(self) -> None:
         text = (
             "\\section{Setup}\nThe order of the group is finite.\n"

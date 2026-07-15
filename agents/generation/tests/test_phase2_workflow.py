@@ -412,7 +412,17 @@ class WorkflowParallelRebaseTests(unittest.TestCase):
                                 "artifact_id": "recovered-verification-report",
                                 "artifact_type": "verification_report",
                                 "content": "Recovered strict verification pass produced a report.",
-                                "metadata": {"target_id": action.get("target_id", "root"), "verdict": "gap_found"},
+                                "metadata": {
+                                    "target_id": action.get("target_id", "root"),
+                                    "verdict": "gap_found",
+                                    "proof_interface_check_version": 1,
+                                    "quantifiers_preserved": True,
+                                    "hypotheses_matched": True,
+                                    "cases_exhaustive": True,
+                                    "reduction_direction_valid": True,
+                                    "finite_scope_not_overclaimed": True,
+                                    "dependencies_assemble": False,
+                                },
                             }
                         ],
                     },

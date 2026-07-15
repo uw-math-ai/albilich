@@ -1850,19 +1850,31 @@ function renderProofSpine(spine){
   const arts = spine.recent_spine_artifacts || [];
   const ready = spine.verifier_ready_routes || [];
   const bottleneck = spine.current_bottleneck || {};
+  const rootStatus = String(spine.root_status||"untested");
+  const rootLifecycle = String(spine.root_lifecycle_status||"active");
+  const rootIntegrated = rootLifecycle === "integrated";
+  const rootVerified = rootIntegrated || rootStatus === "informally_verified" || rootStatus === "formally_verified";
   if (!claims.length && !routes.length && !arts.length && !bottleneck.debt_id){
     $("spineCount").textContent = "";
     $("proofSpine").innerHTML = `<div class="empty">No compact proof spine yet.</div>`;
     return;
   }
-  $("spineCount").innerHTML = `${claims.length} trunk · ${ready.length} verifier-ready`;
+  $("spineCount").innerHTML = rootIntegrated
+    ? `${claims.length} trunk · root integrated`
+    : (rootVerified ? `${claims.length} trunk · integration pending` : `${claims.length} trunk · ${ready.length} verifier-ready`);
   $("proofSpine").innerHTML = `
     <div class="spine-panel">
       <div class="spine-main">
         <div class="bottleneck-title">
           <span class="pill info">proof spine</span>
-          <span class="pill mut">root ${esc(spine.root_status||"untested")}</span>
-          ${ready.length?`<span class="pill good">${ready.length} verifier-ready</span>`:`<span class="pill warn">route conversion needed</span>`}
+          <span class="pill mut">root ${esc(rootStatus)}</span>
+          ${rootIntegrated
+            ? `<span class="pill good">root integrated</span>`
+            : (rootVerified
+              ? `<span class="pill good">root strictly verified</span>`
+              : (ready.length
+                ? `<span class="pill good">${ready.length} verifier-ready</span>`
+                : `<span class="pill warn">route conversion needed</span>`))}
         </div>
         <div class="spine-rule">${esc(spine.next_workflow_rule || "")}</div>
         <div class="spine-list">

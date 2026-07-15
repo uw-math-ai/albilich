@@ -13,12 +13,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from agents.generation.phase2.graph_policy import active_frontier_pressure, build_proof_spine, decomposition_cooldown_active, obvious_duplicate_claim_id, route_scoreboard, supersession_index
 from agents.generation.phase2.codex_runner import _persist_normalized_final_patch, actor_role_for_action, attached_artifact_ids, build_session_prompt, extract_patch_from_text, prepare_session, run_metrics_operation
-from agents.generation.phase2.context_builder import _retrieval_card, build_context_manifest
+from agents.generation.phase2.context_builder import _fit_manifest, _retrieval_card, _select_artifacts, build_context_manifest, build_resume_delta_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.patches import apply_patch
 from agents.generation.phase2.receipt import build_partial_receipt_inventory, format_partial_receipt_appendix
 from agents.generation.phase2.research_policy import DEFAULT_RESEARCH_MODE, normalize_research_mode, theorem_matching_confidence
-from agents.generation.phase2.scheduler import _active_main_trunk_pressure, _active_route_for_claim, _advisor_followup_report, _advisor_requested_validation_action, _advisor_requested_villain_action, _bottleneck_lock_action, _bottleneck_lock_debt_candidates, _branch_packet_card, _claim_target_for_debt, _cooldown_proof_action, _executive_advisor_bottleneck_action, _first_blocking_debt, _frontier_pressure_action, _is_exact_citation_debt, _near_solution_spine_synthesis_action, _next_unverified_claim, _proof_architecture_pressure_action, _recursive_meta_drift, _root_refinement_signals, _route_without_inference, _unrouted_proof_candidate, _unrouted_proof_claim_action, bottleneck_frontier_summary, next_action, parallel_companion_actions, proof_spine_summary, route_verifier_readiness, verifier_ready_route_summaries
+from agents.generation.phase2.scheduler import _active_main_trunk_pressure, _active_route_for_claim, _advisor_followup_report, _advisor_requested_strict_verifier_action, _advisor_requested_validation_action, _advisor_requested_villain_action, _bottleneck_lock_action, _bottleneck_lock_debt_candidates, _branch_packet_card, _central_obstruction_payload, _claim_target_for_debt, _cooldown_proof_action, _executive_advisor_bottleneck_action, _first_blocking_debt, _frontier_pressure_action, _is_exact_citation_debt, _near_solution_spine_synthesis_action, _next_unverified_claim, _proof_architecture_pressure_action, _recursive_meta_drift, _root_refinement_signals, _route_without_inference, _unrouted_proof_candidate, _unrouted_proof_claim_action, _verifier_blocked_citation_action, bottleneck_frontier_summary, next_action, parallel_companion_actions, proof_spine_summary, route_verifier_readiness, verifier_ready_route_summaries
 from agents.generation.phase2.store import ProofStateStore
 from agents.generation.phase2.workflow import _evidence_boundary_errors, _stop_writer_action, _stop_writer_safety_blocker
 
@@ -880,6 +880,67 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertTrue(
             any(item.get("search_intent") == "advisor_evidence_synthesis" for item in companions)
         )
+
+    def test_post_integration_proof_spine_runs_once_per_integration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore(
+                "scheduler-post-integration-once-test",
+                generation_root=Path(tmpdir) / "generation",
+            )
+            store.init_problem("Target theorem.")
+            record_run(
+                store,
+                base_revision=0,
+                run_id="run-first-integration",
+                mode="integrate",
+                target_id="root",
+                route_id="route-first",
+                actor_role="integration_verifier",
+            )
+
+            first = next_action(store, research_mode="balanced", web_search="disabled")
+            self.assertEqual(first["search_intent"], "post_integration_proof_spine")
+
+            revision = int(store.get_scheduler_state()["problem_state"]["current_revision"])
+            record_run(
+                store,
+                base_revision=revision,
+                run_id="run-first-post-integration-spine",
+                mode="triage_routes",
+                target_id="root",
+                route_id="route-first",
+                search_intent="post_integration_proof_spine",
+                actor_role="phd_advisor",
+            )
+            for index in range(8):
+                revision = int(store.get_scheduler_state()["problem_state"]["current_revision"])
+                record_run(
+                    store,
+                    base_revision=revision,
+                    run_id=f"run-unrelated-{index}",
+                    mode="retrieve",
+                    target_id="root",
+                    search_intent=f"unrelated-{index}",
+                    actor_role="literature_researcher",
+                )
+
+            consumed = next_action(store, research_mode="balanced", web_search="disabled")
+            self.assertNotEqual(consumed.get("search_intent"), "post_integration_proof_spine")
+
+            revision = int(store.get_scheduler_state()["problem_state"]["current_revision"])
+            record_run(
+                store,
+                base_revision=revision,
+                run_id="run-second-integration",
+                mode="integrate",
+                target_id="root",
+                route_id="route-second",
+                actor_role="integration_verifier",
+            )
+            rearmed = next_action(store, research_mode="balanced", web_search="disabled")
+
+        self.assertEqual(rearmed["search_intent"], "post_integration_proof_spine")
+        self.assertEqual(rearmed["recently_integrated_route_id"], "route-second")
 
     def test_advisor_proof_candidate_report_schedules_researcher_route_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2879,6 +2940,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                                 "classification": "direct_match",
                                 "theorem_matching_status": "verified_statement_match",
                                 "implication_to_target_verified": True,
+                                "program_victory_candidate": True,
                             },
                         }
                     ],
@@ -2913,6 +2975,55 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(certification["search_intent"], "citation_certification")
         self.assertEqual(certification["budget"]["requested_tokens"], 120_000)
         self.assertEqual(actor_role_for_action(certification), "strict_informal_verifier")
+
+    def test_local_only_retrieval_card_does_not_schedule_root_citation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("scheduler-local-citation-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("Target theorem.")
+            outcome = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "literature_researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "cache_retrieval_card",
+                            "card_id": "retrieval-local-lemma-only",
+                            "target_id": "root",
+                            "exact_statement": "A local lemma used by one branch.",
+                            "source_identifiers": {
+                                "author": "A. Author",
+                                "title": "Local Lemma Paper",
+                                "theorem_number": "Theorem 2",
+                            },
+                            "source_version": "published",
+                            "source_location": "Theorem 2",
+                            "hypotheses": [],
+                            "local_definitions": [],
+                            "missing_hypotheses": [],
+                            "applicability": {
+                                "target_id": "root",
+                                "classification": "direct_match",
+                                "theorem_matching_status": "checked_match",
+                                "implication_to_target_verified": False,
+                                "program_victory_candidate": False,
+                                "root_relevance": "supports_only_local_proof_obligation",
+                            },
+                        }
+                    ],
+                    "rationale": "cache a source that proves only a local obligation",
+                },
+            )
+            self.assertTrue(outcome.accepted, outcome.errors)
+
+            action = next_action(store, research_mode="balanced", web_search="live")
+
+        self.assertFalse(action.get("citation_triage_required", False))
+        self.assertFalse(action.get("citation_certification_required", False))
+        self.assertNotIn(action.get("search_intent"), {"citation_triage", "citation_certification"})
 
     def test_citation_manifest_preserves_requested_retrieval_card_under_trimming(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3394,6 +3505,74 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             )
 
             self.assertEqual(errors, [])
+
+    def test_evidence_boundary_ignores_provenance_paths_quoted_by_allowed_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            context_dir = root / "contexts" / "rev9"
+            evidence_path = context_dir / "evidence" / "current-proof.md"
+            context_path = context_dir / "context.json"
+            log_path = root / "codex.log"
+            evidence_path.parent.mkdir(parents=True)
+            context_path.write_text(
+                json.dumps(
+                    {
+                        "local_search_policy": {
+                            "allowed_local_evidence_paths": [str(evidence_path)]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            log_path.write_text(
+                "exec\n"
+                f"/bin/zsh -lc 'sed -n 1,120p evidence/current-proof.md' in {context_dir}\n"
+                " succeeded in 0ms:\n"
+                "- Original source: `agents/generation/results/older_problem/phase2/artifacts/old-proof.md`\n"
+                "- Historical checkout: `/Users/other/Documents/GitHub/Rethlas-CAS/agents/generation/results/older_problem/phase2/artifacts/report.md`\n",
+                encoding="utf-8",
+            )
+
+            errors = _evidence_boundary_errors(
+                {"log_path": str(log_path)},
+                {"context_path": str(context_path)},
+            )
+
+            self.assertEqual(errors, [])
+
+    def test_evidence_boundary_still_checks_explicit_access_beside_allowed_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            context_dir = root / "contexts" / "rev9"
+            evidence_path = context_dir / "evidence" / "current-proof.md"
+            context_path = context_dir / "context.json"
+            log_path = root / "codex.log"
+            evidence_path.parent.mkdir(parents=True)
+            context_path.write_text(
+                json.dumps(
+                    {
+                        "local_search_policy": {
+                            "allowed_local_evidence_paths": [str(evidence_path)]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stale_path = "agents/generation/results/older_problem/phase2/artifacts/old-proof.md"
+            log_path.write_text(
+                "exec\n"
+                f"/bin/zsh -lc 'cat evidence/current-proof.md {stale_path}' in {context_dir}\n"
+                " succeeded in 0ms:\n",
+                encoding="utf-8",
+            )
+
+            errors = _evidence_boundary_errors(
+                {"log_path": str(log_path)},
+                {"context_path": str(context_path)},
+            )
+
+            self.assertTrue(errors)
+            self.assertIn("old-proof.md", errors[0])
 
     def test_manifest_prioritizes_current_inference_artifact_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3884,6 +4063,88 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertIn("exact_lookup_policy", compact_manifest["research_task"])
         self.assertEqual(actor_role_for_action(action), "literature_researcher")
 
+    def test_verifier_citation_debt_does_not_reopen_integrated_claim(self) -> None:
+        state = {
+            "problem_state": {"remaining_token_budget": 10_000_000, "reserved_verification_budget": 0},
+            "claims": [
+                claim("root", 0, root_impact=1.0),
+                claim(
+                    "integrated-classical-branch",
+                    1,
+                    validation_status="informally_verified",
+                    lifecycle_status="integrated",
+                    parent_ids=["root"],
+                ),
+            ],
+            "routes": [],
+            "inferences": [],
+            "debts": [
+                debt(
+                    "stale-classification-source-debt",
+                    owner_id="integrated-classical-branch",
+                    suggested_next_target="integrated-classical-branch",
+                    debt_type="missing_reference",
+                    obligation="Supply the exact automorphism classification source used by the old route.",
+                )
+            ],
+            "research_artifacts": [],
+            "recent_runs": [],
+        }
+
+        action = _verifier_blocked_citation_action(
+            state,
+            problem=state["problem_state"],
+            requested_tokens=None,
+            research_mode="hard_problem",
+            web_search="live",
+        )
+
+        self.assertIsNone(action)
+
+    def test_artifact_packet_prefers_recent_inference_evidence_over_storage_order(self) -> None:
+        artifacts = [
+            {
+                "artifact_id": f"artifact-{index:02d}",
+                "artifact_type": "proof_dossier",
+                "producer_role": "researcher",
+                "state_revision": index,
+                "created_at": f"2026-01-01T00:{index:02d}:00+00:00",
+                "content_summary": f"Evidence revision {index}.",
+                "sha256": f"sha-{index}",
+                "path": f"/tmp/artifact-{index:02d}.md",
+            }
+            for index in range(14)
+        ]
+        state = {
+            "problem_state": {"current_revision": 14},
+            "claims": [claim("root", 0, root_impact=1.0)],
+            "routes": [],
+            "inferences": [],
+            "debts": [],
+            "artifacts": artifacts,
+        }
+        selected = _select_artifacts(
+            state,
+            ["root"],
+            None,
+            [
+                {
+                    **inference("inf-root", route_id="route-root", conclusion_claim_id="root"),
+                    # This mirrors the alphabetized set-union persisted by the store.
+                    "evidence_artifact_ids": [row["artifact_id"] for row in artifacts],
+                }
+            ],
+            [],
+            target_id="root",
+            action={"mode": "retrieve", "target_id": "root"},
+        )
+
+        selected_ids = [row["artifact_id"] for row in selected]
+        self.assertEqual(len(selected_ids), 12)
+        self.assertEqual(selected_ids[0], "artifact-13")
+        self.assertIn("artifact-12", selected_ids)
+        self.assertNotIn("artifact-00", selected_ids)
+
     def test_computation_audit_debt_is_not_exact_theorem_search(self) -> None:
         debt_row = debt(
             "debt-q0-generation-audit",
@@ -4048,12 +4309,40 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                 },
             )
             self.assertTrue(request.accepted, request.errors)
-            handoff = apply_patch(
+            advisor = apply_patch(
                 store,
                 {
                     "schema_version": SCHEMA_VERSION,
                     "problem_id": store.problem_id,
                     "base_revision": 1,
+                    "actor_role": "phd_advisor",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "advisor-root-bottleneck-before-source",
+                            "artifact_type": "advisor_report",
+                            "content": "Keep the root theorem as the decisive bottleneck.",
+                            "metadata": {
+                                "advisor_followup_required": True,
+                                "triage_status": "decisive_root_bottleneck",
+                                "bottleneck_obligation": "Prove the root theorem.",
+                                "next_decisive_task": "Attack the root theorem.",
+                                "next_role": "researcher",
+                                "next_target_id": "root",
+                            },
+                        }
+                    ],
+                    "rationale": "record advisor lock before librarian returns",
+                },
+            )
+            self.assertTrue(advisor.accepted, advisor.errors)
+            handoff = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 2,
                     "actor_role": "literature_researcher",
                     "target_id": "root",
                     "operations": [
@@ -4873,6 +5162,50 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(readiness["blocking_debt_count"], 0)
         self.assertIn("one_inference_has_verified_premises", readiness["ready_checks"])
 
+    def test_deep_session_repair_allows_verifier_to_adjudicate_old_debt(self) -> None:
+        route_row = route("route-root-deep-repair", conclusion_claim_id="root")
+        route_row["evidence_artifact_ids_json"] = json.dumps(["deep-repair"])
+        inference_row = inference(
+            "inf-root-deep-repair",
+            route_id="route-root-deep-repair",
+            conclusion_claim_id="root",
+            validation_status="plausible",
+        )
+        inference_row["evidence_artifact_ids_json"] = json.dumps(["deep-repair"])
+        state = {
+            "claims": [claim("root", 0, root_impact=1.0)],
+            "routes": [route_row],
+            "inferences": [inference_row],
+            "debts": [
+                debt(
+                    "debt-root-before-deep-repair",
+                    owner_id="inf-root-deep-repair",
+                    owner_type="inference",
+                    last_seen="2026-01-01T00:00:00+00:00",
+                )
+            ],
+            "research_artifacts": [
+                {
+                    "artifact_id": "deep-repair",
+                    "artifact_type": "deep_session_report",
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                    "metadata_json": json.dumps(
+                        {
+                            "artifact_roi": "verifier_ready_route",
+                            "route_id": "route-root-deep-repair",
+                            "target_id": "root",
+                            "next_decisive_step": "Send the repaired root route to strict verification.",
+                        }
+                    ),
+                }
+            ],
+        }
+
+        readiness = route_verifier_readiness(state, "route-root-deep-repair")
+
+        self.assertTrue(readiness["verifier_ready"], readiness)
+        self.assertEqual(readiness["blocking_debt_count"], 0)
+
     def test_route_without_inference_gets_research_companion_not_verifier(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("scheduler-route-needs-inference-companion-test", generation_root=Path(tmpdir) / "generation")
@@ -4909,12 +5242,12 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertTrue(action["proof_construction_required"])
         self.assertTrue(action["citation_allowed_in_proof"])
         self.assertEqual(actor_role_for_action(action), "researcher")
-        self.assertEqual(len(companions), 2)
-        literature = next(item for item in companions if item["mode"] == "retrieve")
+        self.assertTrue(action["long_mathematical_session_required"])
+        self.assertEqual(len(companions), 1)
         counterexample = next(item for item in companions if item["mode"] == "refute")
-        self.assertEqual(literature["search_intent"], "literature_scoping")
         self.assertEqual(counterexample["target_id"], "root")
         self.assertTrue(counterexample["counterexample_search_required"])
+        self.assertTrue(counterexample["counterexample_probe_required"])
         self.assertEqual(actor_role_for_action(counterexample), "villain")
 
     def test_duplicate_research_loop_schedules_route_triage_guard(self) -> None:
@@ -6437,12 +6770,19 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                     "target_id": "packet-target",
                     "route_id": "route-packet-target",
                     "proof_repair_verification_required": True,
+                    "advisor_requested_verification": True,
+                    "verification_focus_inference_id": "inf-packet-target",
                     "verifier_evidence_artifact_ids": ["current-route-packet"],
                 },
                 max_chars=60_000,
             )
 
         packet = manifest["verification_packet"]
+        self.assertTrue(manifest["workflow_action"]["advisor_requested_verification"])
+        self.assertEqual(
+            manifest["workflow_action"]["verification_focus_inference_id"],
+            "inf-packet-target",
+        )
         self.assertEqual(packet["proof_artifacts"][0]["artifact_id"], "current-route-packet")
         self.assertIn("CURRENT ROUTE PACKET TEXT", packet["proof_artifacts"][0]["content"])
 
@@ -6529,6 +6869,49 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(packet["proof_artifacts"][0]["artifact_id"], "proof-artifact-packet")
         self.assertIn("UNIQUE COMPACT PACKET TEXT", packet["proof_artifacts"][0]["content"])
 
+    def test_strict_verifier_compaction_trims_advisory_context_before_proof_content(self) -> None:
+        proof_content = "BEGIN AUTHORITATIVE PROOF\n" + ("Check this exact proof step. " * 300) + "\nEND AUTHORITATIVE PROOF"
+        manifest = {
+            "manifest_version": 1,
+            "problem_id": "verifier-fit-order-test",
+            "state_revision": 7,
+            "target_id": "root",
+            "role_context_policy": {
+                "context_role": "strict_verifier",
+                "authoritative_packet": "verification_packet",
+                "summary": "verify only the bounded packet",
+            },
+            "verification_packet": {
+                "packet_type": "local_proof_verification",
+                "proof_artifacts": [
+                    {
+                        "artifact_id": "authoritative-proof",
+                        "artifact_type": "proof_dossier",
+                        "content": proof_content,
+                        "content_loaded": True,
+                    }
+                ],
+            },
+            "instructions": ["A" * 6_000, "B" * 6_000],
+            "research_strategy": {"advisory_noise": "C" * 6_000},
+            "retrieval_cards": [],
+            "theorem_library": [],
+            "artifacts": [],
+            "claims": [],
+            "inferences": [],
+            "debts": [],
+            "graph_focus": {},
+            "proof_spine": {},
+            "workflow_action": {},
+        }
+
+        fitted = _fit_manifest(manifest, max_chars=18_000)
+
+        artifact = fitted["verification_packet"]["proof_artifacts"][0]
+        self.assertEqual(artifact["content"], proof_content)
+        self.assertNotIn("content_trimmed", artifact)
+        self.assertLessEqual(len(json.dumps(fitted, sort_keys=True)), 18_000)
+
     def test_compacted_integration_manifest_preserves_verified_route_packet(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("scheduler-integration-packet-trim-test", generation_root=Path(tmpdir) / "generation")
@@ -6589,6 +6972,28 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                             "explanation": "The proof dossier gives the local construction.",
                             "evidence_artifact_ids": ["proof-artifact-packet"],
                         },
+                        {
+                            "op": "add_debt",
+                            "debt_id": "debt-local-integration-route",
+                            "owner_type": "inference",
+                            "owner_id": "inf-packet-target",
+                            "debt_type": "missing_reference",
+                            "severity": "blocking",
+                            "status": "active",
+                            "obligation": "Check the reference used by this exact integration route.",
+                            "suggested_next_target": "inf-packet-target",
+                        },
+                        {
+                            "op": "add_debt",
+                            "debt_id": "debt-unrelated-root-route",
+                            "owner_type": "claim",
+                            "owner_id": "root",
+                            "debt_type": "theorem_gap",
+                            "severity": "blocking",
+                            "status": "active",
+                            "obligation": "Complete a different downstream root argument.",
+                            "suggested_next_target": "root",
+                        },
                     ],
                     "rationale": "seed integration packet",
                 },
@@ -6641,12 +7046,26 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             self.assertTrue(verified.accepted, verified.errors)
 
             action = {"mode": "integrate", "target_id": "packet-target", "route_id": "route-packet-target"}
+            full_manifest = build_context_manifest(
+                store,
+                target_id="packet-target",
+                route_id="route-packet-target",
+                action=action,
+                max_chars=60_000,
+            )
             manifest = build_context_manifest(
                 store,
                 target_id="packet-target",
                 route_id="route-packet-target",
                 action=action,
                 max_chars=12_000,
+            )
+            resume_manifest = build_resume_delta_manifest(
+                store,
+                target_id="packet-target",
+                route_id="route-packet-target",
+                action=action,
+                since_revision=0,
             )
 
         self.assertLessEqual(len(json.dumps(manifest)), 12_000)
@@ -6656,6 +7075,28 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         artifact_ids = {row["artifact_id"] for row in manifest["artifacts"]}
         self.assertIn("proof-artifact-packet", artifact_ids)
         self.assertIn("verif-packet-target", artifact_ids)
+        self.assertEqual(
+            {row["debt_id"] for row in manifest["debts"]},
+            {"debt-local-integration-route"},
+        )
+        self.assertEqual(
+            {row["debt_id"] for row in full_manifest["debts"]},
+            {"debt-local-integration-route"},
+        )
+        self.assertNotIn(
+            "debt-unrelated-root-route",
+            {
+                row["debt_id"]
+                for row in full_manifest["proof_spine"].get("current_bottlenecks", [])
+            },
+        )
+        self.assertEqual(
+            {row["debt_id"] for row in resume_manifest["active_debts"]},
+            {"debt-local-integration-route"},
+        )
+        self.assertTrue(
+            any("only debt ids listed in manifest.debts" in item for item in full_manifest["instructions"])
+        )
         self.assertEqual(
             manifest["patch_contract"]["allowed_operation_names"],
             ["attach_artifact", "propose_status_transition", "add_debt"],
@@ -7330,6 +7771,35 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             "proper-two-anchor",
         )
 
+    def test_distinct_group_family_template_is_not_duplicate(self) -> None:
+        existing = [
+            {
+                "claim_id": "orthogonal-common-overgroup",
+                "statement": (
+                    "Fix distinct primes p and q, put R=max(p,q), E=4 lcm(1,2,...,2R), and n0=4RE. "
+                    "Let S=P Omega(V,Q) be a finite simple orthogonal group of natural dimension n>=n0. "
+                    "For every t>=1 and every X with S^t<=X<=Aut(S) wr Sym(t), elements of respective "
+                    "orders p and q have independent S^t-conjugates in one common proper subgroup of X."
+                ),
+                "fingerprint": "",
+                "validation_status": "informally_verified",
+                "lifecycle_status": "integrated",
+            }
+        ]
+
+        self.assertEqual(
+            obvious_duplicate_claim_id(
+                existing,
+                statement=(
+                    "Fix distinct primes p,q and put L=lcm(p,q). For every n>=max(7,L+1), every t>=1, "
+                    "every X with A_n^t<=X<=Aut(A_n) wr Sym(t), and every elements x,y in X of respective "
+                    "orders p,q, there are independent A_n^t-conjugates of x and y contained in one common "
+                    "proper subgroup of X."
+                ),
+            ),
+            "",
+        )
+
     def test_near_restatement_of_active_claim_is_not_duplicate(self) -> None:
         existing = [
             {
@@ -7451,6 +7921,81 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         row = route_scoreboard(state)[0]
         self.assertEqual(row["scoreboard_status"], "stalled")
         self.assertIn("blocking debt repeated", row["kill_reasons"][0])
+
+    def test_route_scoreboard_keeps_repaired_route_schedulable_for_verifier(self) -> None:
+        state = {
+            "claims": [claim("root", 0, root_impact=1.0)],
+            "routes": [route("route-root", conclusion_claim_id="root")],
+            "inferences": [inference("inf-root", route_id="route-root", conclusion_claim_id="root")],
+            "debts": [
+                debt(
+                    "debt-old-root-branch",
+                    owner_id="root",
+                    repeated_count=5,
+                    last_seen="2026-01-01T00:00:00+00:00",
+                )
+            ],
+            "research_artifacts": [
+                {
+                    "artifact_id": "root-repair",
+                    "artifact_type": "proof_dossier",
+                    "producer_role": "researcher",
+                    "state_revision": 10,
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                    "metadata_json": json.dumps(
+                        {
+                            "artifact_roi": "verifier_ready_route",
+                            "target_id": "root",
+                            "route_id": "route-root",
+                            "next_decisive_step": "Send the repaired root route to strict verification.",
+                        }
+                    ),
+                }
+            ],
+        }
+
+        row = route_scoreboard(state)[0]
+
+        self.assertEqual(row["scoreboard_status"], "promising")
+        self.assertEqual(row["blocking_debt_count"], 0)
+        self.assertEqual(_active_route_for_claim(state, "root"), "route-root")
+
+    def test_route_scoreboard_stalls_when_blocker_is_newer_than_repair(self) -> None:
+        state = {
+            "claims": [claim("root", 0, root_impact=1.0)],
+            "routes": [route("route-root", conclusion_claim_id="root")],
+            "inferences": [inference("inf-root", route_id="route-root", conclusion_claim_id="root")],
+            "debts": [
+                debt(
+                    "debt-new-root-gap",
+                    owner_id="root",
+                    repeated_count=3,
+                    last_seen="2026-01-03T00:00:00+00:00",
+                )
+            ],
+            "research_artifacts": [
+                {
+                    "artifact_id": "stale-root-repair",
+                    "artifact_type": "proof_dossier",
+                    "producer_role": "researcher",
+                    "state_revision": 10,
+                    "created_at": "2026-01-02T00:00:00+00:00",
+                    "metadata_json": json.dumps(
+                        {
+                            "artifact_roi": "verifier_ready_route",
+                            "target_id": "root",
+                            "route_id": "route-root",
+                            "next_decisive_step": "Send the repaired root route to strict verification.",
+                        }
+                    ),
+                }
+            ],
+        }
+
+        row = route_scoreboard(state)[0]
+
+        self.assertEqual(row["scoreboard_status"], "stalled")
+        self.assertEqual(row["blocking_debt_count"], 1)
 
     def test_paused_route_is_not_selected_as_ordinary_construction(self) -> None:
         state = {
@@ -7708,6 +8253,39 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(summary["verified_trunk_claims"][0]["claim_id"], "trunk-lemma")
         self.assertEqual(summary["recent_spine_artifacts"][0]["artifact_id"], "spine-art")
         self.assertEqual(summary["current_bottleneck"]["debt_id"], "debt-root-spine-gap")
+
+    def test_proof_spine_summary_sends_verified_root_to_integration(self) -> None:
+        state = {
+            "problem_state": {},
+            "claims": [
+                claim(
+                    "root",
+                    0,
+                    root_impact=1.0,
+                    validation_status="informally_verified",
+                    lifecycle_status="active",
+                ),
+            ],
+            "routes": [],
+            "inferences": [],
+            "debts": [
+                debt(
+                    "debt-stale-side-branch",
+                    owner_id="root",
+                    debt_type="proof_obligation",
+                    obligation="An older alternative route has a local gap.",
+                )
+            ],
+            "research_artifacts": [],
+            "recent_runs": [],
+        }
+
+        summary = proof_spine_summary(state)
+
+        self.assertTrue(summary["root_integration_pending"])
+        self.assertEqual(summary["current_bottleneck"], {})
+        self.assertIn("integration verifier", summary["next_workflow_rule"])
+        self.assertNotIn("Convert proof-like artifacts", summary["next_workflow_rule"])
 
     def test_executive_advisor_bottleneck_suppresses_older_local_proof_candidate(self) -> None:
         state = {
@@ -8066,6 +8644,89 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         )
         self.assertEqual(actor_role_for_action(action), "counterexample_validator")
 
+    def test_advisor_strict_verifier_handoff_resolves_inference_target(self) -> None:
+        state = {
+            "problem_state": {"remaining_token_budget": 10_000_000, "reserved_verification_budget": 0},
+            "claims": [claim("root", 0, root_impact=1.0, validation_status="challenged")],
+            "routes": [
+                {
+                    **route("route-root", conclusion_claim_id="root"),
+                    "evidence_artifact_ids_json": '["old-route-plan"]',
+                }
+            ],
+            "inferences": [
+                {
+                    **inference(
+                        "inf-root",
+                        route_id="route-root",
+                        conclusion_claim_id="root",
+                    ),
+                    "evidence_artifact_ids_json": '["root-proof"]',
+                }
+            ],
+            "debts": [],
+            "research_artifacts": [
+                {
+                    "artifact_id": "old-route-plan",
+                    "artifact_type": "decomposition_plan",
+                    "producer_role": "researcher",
+                    "state_revision": 1,
+                    "created_at": "2026-01-04T00:00:00+00:00",
+                    "content_summary": "An obsolete route decomposition.",
+                    "metadata_json": json.dumps({"route_id": "route-root"}),
+                },
+                {
+                    "artifact_id": "root-proof",
+                    "artifact_type": "proof_dossier",
+                    "producer_role": "researcher",
+                    "state_revision": 10,
+                    "created_at": "2026-01-04T00:01:00+00:00",
+                    "content_summary": "Root proof packet.",
+                    "metadata_json": json.dumps({"target_id": "root", "route_id": "route-root"}),
+                },
+                {
+                    "artifact_id": "advisor-verifier-handoff",
+                    "artifact_type": "advisor_report",
+                    "producer_role": "phd_advisor",
+                    "state_revision": 12,
+                    "created_at": "2026-01-04T00:02:00+00:00",
+                    "content_summary": "Verify the decisive inference.",
+                    "metadata_json": json.dumps(
+                        {
+                            "advisor_followup_required": True,
+                            "proof_candidate": True,
+                            "next_role": "strict_informal_verifier",
+                            "next_target_id": "inf-root",
+                            "recommended_next_action": "Check the exact theorem splice.",
+                            "next_task_acceptance_criteria": ["Check every hypothesis."],
+                            "kept_route_ids": ["route-root"],
+                        }
+                    ),
+                },
+            ],
+            "recent_runs": [],
+            "retrieval_cards": [],
+            "theorem_library_entries": [],
+        }
+
+        action = _advisor_requested_strict_verifier_action(
+            state,
+            problem=state["problem_state"],
+            requested_tokens=None,
+            research_mode="hard_problem",
+        )
+
+        assert action is not None
+        self.assertEqual(action["mode"], "prove")
+        self.assertEqual(action["target_id"], "root")
+        self.assertEqual(action["route_id"], "route-root")
+        self.assertEqual(action["verification_focus_inference_id"], "inf-root")
+        self.assertEqual(action["advisor_report_id"], "advisor-verifier-handoff")
+        self.assertEqual(action["validation_acceptance_criteria"], ["Check every hypothesis."])
+        self.assertEqual(action["strict_verifier_scope"], "single_route_verification_packet")
+        self.assertEqual(action["verifier_evidence_artifact_ids"], ["root-proof", "old-route-plan"])
+        self.assertEqual(actor_role_for_action(action), "strict_informal_verifier")
+
     def test_advisor_requested_villain_task_preempts_researcher_lock(self) -> None:
         state = {
             "problem_state": {"remaining_token_budget": 10_000_000, "reserved_verification_budget": 0},
@@ -8168,10 +8829,37 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(action["target_id"], "root")
         self.assertEqual(action["search_intent"], "near_solution_spine_synthesis")
         self.assertTrue(action["near_solution_spine_synthesis_required"])
+        self.assertTrue(action["closure_pipeline_required"])
+        self.assertEqual(action["closure_debt_id"], "debt-root-last-gap")
+        self.assertTrue(action["canonical_proof_update_required"])
+        self.assertEqual(action["canonical_proof_artifact_id"], "spine-art-4")
         self.assertTrue(action["proof_spine_mode_required"])
         self.assertTrue(action["hard_theorem_attack_required"])
         self.assertEqual(action["near_solution_spine_signal"]["selected_debt_id"], "debt-root-last-gap")
         self.assertEqual(action["budget"]["policy"], "hard_theorem_workbench")
+
+    def test_source_obstruction_does_not_recommend_cas(self) -> None:
+        first = debt(
+            "debt-source-a",
+            owner_id="root",
+            suggested_next_target="root",
+            debt_type="missing_reference",
+            obligation="Cite the exact high rank orthogonal automorphism classification theorem with scalar kernel.",
+        )
+        second = debt(
+            "debt-source-b",
+            owner_id="root",
+            suggested_next_target="root",
+            debt_type="missing_reference",
+            obligation="Supply the precise high rank orthogonal automorphism classification source and scalar kernel theorem.",
+        )
+        payload = _central_obstruction_payload(
+            {"claims": [claim("root", 0, root_impact=1.0)], "routes": [], "inferences": [], "debts": [first, second]},
+            first,
+        )
+        self.assertTrue(payload["closure_pressure_required"])
+        self.assertFalse(payload["cas_check_recommended"])
+        self.assertFalse(payload["experiment_decision_gate_required"])
 
     def test_certified_partial_progress_with_bottleneck_schedules_creative_attack(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

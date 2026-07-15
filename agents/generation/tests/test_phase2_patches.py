@@ -4620,6 +4620,150 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
             self.assertEqual(route_row["status"], "integrated")
             self.assertIn("closed_by_integrated_route", debt_row["resolution_evidence_json"])
 
+    def test_integration_blocks_unresolved_route_inference_debt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("patch-integration-inference-debt-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("Root theorem.")
+            setup = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "add_claim",
+                            "claim_id": "lemma-integrate",
+                            "kind": "lemma",
+                            "statement": "The route-local lemma holds.",
+                            "parent_ids": ["root"],
+                        },
+                        {
+                            "op": "add_route",
+                            "route_id": "route-lemma-integrate",
+                            "conclusion_claim_id": "lemma-integrate",
+                            "relation_to_parent": "sufficient",
+                            "strategy": "Use the checked local argument.",
+                        },
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "dossier-lemma-integrate",
+                            "artifact_type": "proof_dossier",
+                            "content": "Complete local argument.",
+                        },
+                        {
+                            "op": "add_inference",
+                            "inference_id": "inf-lemma-integrate",
+                            "route_id": "route-lemma-integrate",
+                            "conclusion_claim_id": "lemma-integrate",
+                            "premise_claim_ids": [],
+                            "validation_status": "plausible",
+                            "explanation": "The dossier proves the lemma.",
+                            "evidence_artifact_ids": ["dossier-lemma-integrate"],
+                        },
+                        {
+                            "op": "add_debt",
+                            "debt_id": "debt-inf-lemma-integrate",
+                            "owner_type": "inference",
+                            "owner_id": "inf-lemma-integrate",
+                            "debt_type": "missing_reference",
+                            "severity": "blocking",
+                            "status": "active",
+                            "obligation": "Certify the route-local reference before integration.",
+                            "suggested_next_target": "inf-lemma-integrate",
+                        },
+                    ],
+                    "rationale": "seed an integration route with an inference-owned blocker",
+                },
+            )
+            self.assertTrue(setup.accepted, setup.errors)
+            verified = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "strict_informal_verifier",
+                    "target_id": "lemma-integrate",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "verification-lemma-integrate",
+                            "artifact_type": "verification_report",
+                            "content": "verified",
+                            "metadata": {
+                                "verdict": "verified",
+                                "verification_report": {
+                                    "critical_errors": [],
+                                    "gaps": [],
+                                    "blocking_gap": False,
+                                },
+                            },
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "inference",
+                            "target_id": "inf-lemma-integrate",
+                            "status_type": "validation",
+                            "new_status": "informally_verified",
+                            "evidence_artifact_ids": ["verification-lemma-integrate"],
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "claim",
+                            "target_id": "lemma-integrate",
+                            "status_type": "validation",
+                            "new_status": "informally_verified",
+                            "evidence_artifact_ids": ["verification-lemma-integrate"],
+                        },
+                    ],
+                    "rationale": "verify the route while leaving its explicit debt unresolved",
+                },
+            )
+            self.assertTrue(verified.accepted, verified.errors)
+
+            rejected = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "integration_verifier",
+                    "target_id": "lemma-integrate",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "integration-lemma-integrate",
+                            "artifact_type": "integration_report",
+                            "content": "The route is locally verified.",
+                            "metadata": {
+                                "integrates": True,
+                                "claim_id": "lemma-integrate",
+                                "route_id": "route-lemma-integrate",
+                                "missing": [],
+                                "outcome": "integrated",
+                                "resolved_debt_ids": [],
+                            },
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "claim",
+                            "target_id": "lemma-integrate",
+                            "status_type": "lifecycle",
+                            "new_status": "integrated",
+                            "route_id": "route-lemma-integrate",
+                            "evidence_artifact_ids": ["integration-lemma-integrate"],
+                            "resolved_debt_ids": [],
+                        },
+                    ],
+                    "rationale": "integration must not bypass the inference-owned blocker",
+                },
+            )
+            self.assertFalse(rejected.accepted)
+            self.assertIn("active blocking debt prevents integration", rejected.errors)
+
 
 class Phase2StatusTransitionGraphIdAliasTest(unittest.TestCase):
     """propose_status_transition must accept concrete graph-id fields as target aliases.
@@ -4851,6 +4995,21 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
                 "target_id": "root",
                 "operations": [
                     {"op": "add_claim", "claim_id": "lemma-a", "kind": "lemma", "statement": "A.", "parent_ids": ["root"]},
+                    {
+                        "op": "add_route",
+                        "route_id": "route-a",
+                        "conclusion_claim_id": "lemma-a",
+                        "relation_to_parent": "sufficient",
+                        "strategy": "Prove A directly.",
+                    },
+                    {
+                        "op": "add_inference",
+                        "inference_id": "inf-a",
+                        "route_id": "route-a",
+                        "conclusion_claim_id": "lemma-a",
+                        "validation_status": "plausible",
+                        "explanation": "The direct argument proves A.",
+                    },
                 ],
                 "rationale": "seed",
             },
@@ -4879,6 +5038,254 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
             },
         )
         self.assertTrue(outcome.accepted, outcome.errors)
+
+    def test_nested_update_inference_payload_is_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("nested-update-inference-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("root")
+            self._seed(store)
+            outcome = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "researcher",
+                    "target_id": "lemma-a",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "nested-evidence",
+                            "artifact_type": "proof_dossier",
+                            "content": "A strengthened proof of A.",
+                        },
+                        {
+                            "op": "update_inference",
+                            "inference": {
+                                "inference_id": "inf-a",
+                                "add_evidence_artifact_ids": ["nested-evidence"],
+                                "explanation_append": "The strengthened argument closes the remaining case.",
+                            },
+                        },
+                    ],
+                    "rationale": "normalize the common nested operation shape",
+                },
+            )
+            self.assertTrue(outcome.accepted, outcome.errors)
+            with sqlite3.connect(store.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute("SELECT * FROM inferences WHERE inference_id='inf-a'").fetchone()
+            self.assertIn("nested-evidence", json.loads(row["evidence_artifact_ids_json"]))
+            self.assertIn("strengthened argument", row["explanation"])
+
+    def test_stale_patch_wrapped_update_inference_payload_is_normalized(self) -> None:
+        from agents.generation.phase2.patches import apply_patch_with_stale_retry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("wrapped-update-inference-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("root")
+            self._seed(store)
+            stale_base = store.get_revision()
+            self._bump_with_unrelated_patch(store)
+            outcome = apply_patch_with_stale_retry(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": stale_base,
+                    "actor_role": "researcher",
+                    "target_id": "lemma-a",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "wrapped-evidence",
+                            "artifact_type": "proof_dossier",
+                            "content": "A parallel proof delta.",
+                        },
+                        {
+                            "op": "update_inference",
+                            "inference_id": "inf-a",
+                            "patch": {
+                                "validation_status": "untested",
+                                "evidence_artifact_ids": ["wrapped-evidence"],
+                                "explanation": "The wrapped proof delta closes another case.",
+                            },
+                        },
+                    ],
+                    "rationale": "normalize a wrapped stale inference update",
+                },
+            )
+            self.assertTrue(outcome.accepted, outcome.errors)
+            with sqlite3.connect(store.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute("SELECT * FROM inferences WHERE inference_id='inf-a'").fetchone()
+            self.assertIn("wrapped-evidence", json.loads(row["evidence_artifact_ids_json"]))
+            self.assertIn("wrapped proof delta", row["explanation"])
+
+    def test_concurrent_append_only_inference_updates_rebase_and_merge(self) -> None:
+        from agents.generation.phase2.patches import apply_patch_with_stale_retry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("stale-inference-append-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("root")
+            self._seed(store)
+            stale_base = store.get_revision()
+            first = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": stale_base,
+                    "actor_role": "researcher",
+                    "target_id": "lemma-a",
+                    "operations": [
+                        {"op": "attach_artifact", "artifact_id": "parallel-evidence-1", "artifact_type": "proof_dossier", "content": "First proof delta."},
+                        {"op": "update_inference", "inference_id": "inf-a", "add_evidence_artifact_ids": ["parallel-evidence-1"], "explanation_append": "First independent delta."},
+                    ],
+                    "rationale": "first parallel append",
+                },
+            )
+            self.assertTrue(first.accepted, first.errors)
+            stale = {
+                "schema_version": SCHEMA_VERSION,
+                "problem_id": store.problem_id,
+                "base_revision": stale_base,
+                "actor_role": "researcher",
+                "target_id": "lemma-a",
+                "operations": [
+                    {"op": "attach_artifact", "artifact_id": "parallel-evidence-2", "artifact_type": "proof_dossier", "content": "Second proof delta."},
+                    {"op": "update_inference", "inference_id": "inf-a", "add_evidence_artifact_ids": ["parallel-evidence-2"], "explanation_append": "Second independent delta."},
+                ],
+                "rationale": "second parallel append",
+            }
+            outcome = apply_patch_with_stale_retry(store, stale)
+            self.assertTrue(outcome.accepted, outcome.errors)
+            with sqlite3.connect(store.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute("SELECT * FROM inferences WHERE inference_id='inf-a'").fetchone()
+            self.assertEqual(
+                set(json.loads(row["evidence_artifact_ids_json"])),
+                {"parallel-evidence-1", "parallel-evidence-2"},
+            )
+            self.assertIn("First independent delta", row["explanation"])
+            self.assertIn("Second independent delta", row["explanation"])
+
+    def test_concurrent_identical_verifier_transitions_rebase_and_merge(self) -> None:
+        from agents.generation.phase2.patches import apply_patch_with_stale_retry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("stale-verifier-transition-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("root")
+            self._seed(store)
+            stale_base = store.get_revision()
+
+            first = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": stale_base,
+                    "actor_role": "strict_informal_verifier",
+                    "target_id": "lemma-a",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "parallel-verification-1",
+                            "artifact_type": "verification_report",
+                            "content": "The shared dependency is correct with no gaps.",
+                            "metadata": {
+                                "verdict": "correct_no_gaps",
+                                "verification_report": {
+                                    "verdict": "correct_no_gaps",
+                                    "critical_errors": [],
+                                    "gaps": [],
+                                    "blocking_gap": False,
+                                },
+                            },
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "claim",
+                            "target_id": "lemma-a",
+                            "status_type": "validation",
+                            "new_status": "informally_verified",
+                            "evidence_artifact_ids": ["parallel-verification-1"],
+                        },
+                    ],
+                    "rationale": "first parallel verifier certifies the shared dependency",
+                },
+            )
+            self.assertTrue(first.accepted, first.errors)
+
+            stale = {
+                "schema_version": SCHEMA_VERSION,
+                "problem_id": store.problem_id,
+                "base_revision": stale_base,
+                "actor_role": "strict_informal_verifier",
+                "target_id": "lemma-a",
+                "operations": [
+                    {
+                        "op": "attach_artifact",
+                        "artifact_id": "parallel-verification-2",
+                        "artifact_type": "verification_report",
+                        "content": "The selected route and its inference are correct with no gaps.",
+                        "metadata": {
+                            "verdict": "correct_no_gaps",
+                            "verification_report": {
+                                "verdict": "correct_no_gaps",
+                                "critical_errors": [],
+                                "gaps": [],
+                                "blocking_gap": False,
+                            },
+                        },
+                    },
+                    {
+                        "op": "update_inference",
+                        "inference_id": "inf-a",
+                        "validation_status": "informally_verified",
+                        "evidence_artifact_ids": ["parallel-verification-2"],
+                    },
+                    {
+                        "op": "update_claim",
+                        "claim_id": "lemma-a",
+                        "validation_status": "informally_verified",
+                        "evidence_artifact_ids": ["parallel-verification-2"],
+                    },
+                ],
+                "rationale": "second parallel verifier repeats the shared status and certifies unique route evidence",
+            }
+            outcome = apply_patch_with_stale_retry(store, stale)
+            self.assertTrue(outcome.accepted, outcome.errors)
+
+            state = store.get_state()
+            lemma = next(row for row in state["claims"] if row["claim_id"] == "lemma-a")
+            inference = next(row for row in state["inferences"] if row["inference_id"] == "inf-a")
+            self.assertEqual(lemma["validation_status"], "informally_verified")
+            self.assertEqual(inference["validation_status"], "informally_verified")
+            with sqlite3.connect(store.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                lemma_row = conn.execute(
+                    "SELECT evidence_artifact_ids_json FROM claims WHERE claim_id='lemma-a'"
+                ).fetchone()
+                inference_row = conn.execute(
+                    "SELECT evidence_artifact_ids_json FROM inferences WHERE inference_id='inf-a'"
+                ).fetchone()
+                artifact_ids = {
+                    row["artifact_id"]
+                    for row in conn.execute("SELECT artifact_id FROM artifacts").fetchall()
+                }
+            self.assertEqual(
+                set(json.loads(lemma_row["evidence_artifact_ids_json"])),
+                {"parallel-verification-1", "parallel-verification-2"},
+            )
+            self.assertIn(
+                "parallel-verification-2",
+                json.loads(inference_row["evidence_artifact_ids_json"]),
+            )
+            self.assertIn(
+                "parallel-verification-2",
+                artifact_ids,
+            )
 
     def test_row_disjoint_additive_patch_is_rebased(self) -> None:
         from agents.generation.phase2.patches import apply_patch_with_stale_retry
@@ -4950,7 +5357,7 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
             self.assertFalse(outcome.accepted)
             self.assertTrue(any("stale patch" in e for e in outcome.errors))
 
-    def test_verifying_transition_is_never_rebased(self) -> None:
+    def test_row_disjoint_verifying_transition_is_rebased_and_revalidated(self) -> None:
         from agents.generation.phase2.patches import apply_patch_with_stale_retry
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4966,12 +5373,47 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
                 "actor_role": "strict_informal_verifier",
                 "target_id": "lemma-a",
                 "operations": [
-                    {"op": "propose_status_transition", "target_type": "claim", "target_id": "lemma-a", "status_type": "validation", "new_status": "informally_verified", "evidence_artifact_ids": []},
+                    {
+                        "op": "attach_artifact",
+                        "artifact_id": "vr-a",
+                        "artifact_type": "verification_report",
+                        "content": "The direct argument is correct with no gaps.",
+                        "metadata": {
+                            "verdict": "correct_no_gaps",
+                            "verification_report": {
+                                "verdict": "correct_no_gaps",
+                                "critical_errors": [],
+                                "gaps": [],
+                                "blocking_gap": False,
+                            },
+                        },
+                    },
+                    {
+                        "op": "propose_status_transition",
+                        "target_type": "inference",
+                        "target_id": "inf-a",
+                        "status_type": "validation",
+                        "new_status": "informally_verified",
+                        "evidence_artifact_ids": ["vr-a"],
+                    },
+                    {
+                        "op": "propose_status_transition",
+                        "target_type": "claim",
+                        "target_id": "lemma-a",
+                        "status_type": "validation",
+                        "new_status": "informally_verified",
+                        "evidence_artifact_ids": ["vr-a"],
+                    },
                 ],
-                "rationale": "stale verification must not silently rebase",
+                "rationale": "preserve a clean parallel verification when only unrelated rows changed",
             }
             outcome = apply_patch_with_stale_retry(store, stale_patch)
-            self.assertFalse(outcome.accepted)
+            self.assertTrue(outcome.accepted, outcome.errors)
+            state = store.get_state()
+            lemma = next(row for row in state["claims"] if row["claim_id"] == "lemma-a")
+            inference = next(row for row in state["inferences"] if row["inference_id"] == "inf-a")
+            self.assertEqual(lemma["validation_status"], "informally_verified")
+            self.assertEqual(inference["validation_status"], "informally_verified")
 
 
 class Phase2PatchRejectionEventTest(unittest.TestCase):

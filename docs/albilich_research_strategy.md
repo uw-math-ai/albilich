@@ -16,7 +16,7 @@ ordinary claims, routes, and inferences pass their existing verifier gates.
 | `definition_candidate` | researcher | Bounded candidate lifecycle under one authorization | Only `adopted` after well-defined, nontrivial, proof-relevant checks and an exact root-relevant theorem |
 | `conjecture_portfolio` | researcher or villain | Bottleneck-local intermediate conjectures | 1-3 candidates; at most 2 selected; explicit prechecks and falsification plan |
 | `proof_compression` | researcher or PhD advisor | Shortest plausible proof skeleton and weakest sufficient bridge | Full history preserved; essential dependency ids must exist |
-| `deep_session_report` | researcher | Coherent output from an eligible root-critical long session | Required deliverable fields; no verification authority |
+| `deep_session_report` | researcher | Delta-bearing fallback when a root-critical long session cannot emit a proof dossier | Productive mathematical delta required; no verification authority |
 | `cas_experiment_report` | researcher or villain | Decision-oriented experimental mathematics | New reports use `experiment_workflow_version=1` and the complete experiment contract |
 
 All new strategy-specific artifacts use `strategy_schema_version=1`. Historical
@@ -42,7 +42,7 @@ strategic verifier rejection, or the meaningful-action cadence. A fresh
 synthesis suppresses stale directives until a new major event or its revision
 window expires.
 
-Every scheduled action exposes heuristic score components:
+Every scheduled action exposes score components:
 
 - probability of closing the bottleneck;
 - probability of refuting a route;
@@ -52,10 +52,25 @@ Every scheduled action exposes heuristic score components:
 - duplication risk;
 - token, wall-time, and verification cost.
 
-The numbers are deliberately labeled as heuristics rather than calibrated
-probabilities. When scores are close, work-mode rotation remains the diversity
-tie-breaker. Speculative actions never consume the protected verification
-reserve.
+Before local evidence exists, the probability-like terms are deliberately
+labeled as heuristics. As the run proceeds, the scheduler builds a Bayesian
+local posterior for each strategy family from its own later verifier/integration
+evidence. Producing prose is not success: credit requires an output artifact to
+enter verified evidence, a concrete target claim to be verified, or the worked
+route to integrate. Rejections and timeouts are negative evidence. No reference
+solution and no private cross-problem run cache is consulted. When scores are
+close, work-mode rotation remains the diversity tie-breaker. Speculative actions
+never consume the protected verification reserve.
+
+## Graph-derived decisive obligation frontier
+
+For every active, unpaused sufficient route near the root, the strategy layer
+derives its unresolved premises, unchecked inferences, and active owned debts.
+It chooses the route with the smallest weighted obligation cut and exposes its
+highest-severity item as the decisive obligation. This graph calculation does
+not trust model-reported root leverage. Research may replace the decisive item
+only by a strictly smaller obligation with an explicit implication back to the
+selected route.
 
 ## Bridge and conjecture discipline
 
@@ -98,10 +113,15 @@ submit a debt repair, but only a verifier can close the mathematical debt.
 ## Method cards and memory separation
 
 `agents/generation/phase2/method_cards.json` is a reviewed developer-curated
-library of proof mechanisms. Retrieval first maps the current problem and
-bottleneck to structural features, then ranks cards by structural overlap; it
-does not use method cards as theorem evidence. Every returned card includes
-known failure modes.
+library of proof mechanisms. It includes general methods plus domain playbooks
+for chief-factor induction, character restriction, extension cohomology,
+permutation fixed-point geometry, double counting, probabilistic witnesses,
+spectral encodings, generating functions, normal forms, duality, classification
+endpoints, and representation switching. Retrieval maps the current problem and
+bottleneck to both structural features and domain tags. Every returned card
+requires a transfer packet: hypothesis match, object dictionary, reusable proof
+moves, failure boundary, and decisive test. Cards remain advisory and never
+become theorem evidence.
 
 Manifests keep four categories separate:
 
@@ -119,7 +139,12 @@ near-integration route, repeatedly surviving bottleneck, or other high-leverage
 branch. The packet contains the exact target and root relation, verified
 support, debts, negative results, selected sources, competing approaches,
 budget, and latest synthesis. It cannot inspect unrelated result directories or
-self-verify.
+self-verify. A proof dossier is the preferred output. A `deep_session_report` is
+only a fallback and must record a productive mathematical delta such as a proved
+lemma, verifier-ready proof, refuted conjecture, source adaptation, narrowed
+obligation, route-killing obstruction, or decisive counterexample. Two recent
+no-delta long sessions suppress another deep session and force a different
+research philosophy.
 
 Proof compression is an active research operation. It records the minimal root
 skeleton, essential facts and routes, unresolved bridges, conditional steps,
@@ -127,6 +152,30 @@ unused branches, shortest route, and weakest sufficient new statement. The
 database retains all history, while subsequent research/advisor manifests may
 reduce the primary claim context to that dependency closure. The weakest
 sufficient statement feeds the next bridge search.
+
+## Representation, sources, verification, and parallel diversity
+
+A repeatedly attacked or root-critical bottleneck receives a representation
+switch contract. The researcher compares two to four mathematical languages,
+records the object dictionary and the implication/equivalence back to the
+original obligation, and chooses only a representation that makes the missing
+step strictly simpler.
+
+Literature actions receive a theorem-adaptation contract: exact source location
+and statement, local notation and definition translation, full hypothesis map,
+checked and missing hypotheses, exact local deduction, reusable moves from the
+source proof, and the boundary where transfer fails. Survey-only handoffs do not
+satisfy this contract.
+
+Route and integration verification receive a selective proof-interface
+checklist for quantifiers, hypothesis propagation, case exhaustiveness,
+reduction direction, finite-to-universal overclaiming, and dependency assembly.
+A zero-gap verdict requires every interface check to pass. This is deterministic
+metadata validation and does not require Lean 4.
+
+Parallel research waves suppress not only duplicate goals and overlapping graph
+ownership but also duplicate strategy families. Active workers must pursue
+different mathematical philosophies and share concrete cross-branch signals.
 
 ## Observability
 
