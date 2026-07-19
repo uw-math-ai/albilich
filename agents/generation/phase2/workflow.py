@@ -67,7 +67,7 @@ CONSOLE_REFRESH_INTERVAL_ENV = "ALBILICH_CONSOLE_REFRESH_INTERVAL_SECONDS"
 DEFAULT_CONSOLE_REFRESH_INTERVAL_SECONDS = 15.0
 
 Executor = Callable[..., Mapping[str, Any]]
-TERMINAL_MODES = {"stop_with_partial_results", "stop_solved"}
+TERMINAL_MODES = {"await_human", "stop_with_partial_results", "stop_solved"}
 # Run-control (2026-07-09 TODO 5): persisted pause/stop states honored between
 # action dispatches; the watcher polls for hard stops during child sessions.
 RUN_CONTROL_POLL_SECONDS = 2.0
@@ -653,7 +653,7 @@ def _sync_run_status_at_start(store: ProofStateStore) -> None:
         current = store.get_run_status()
     except ValueError:
         return
-    if current not in {"stopped", "completed", "dashboard_paused"}:
+    if current not in {"stopped", "awaiting_human", "completed", "dashboard_paused"}:
         return
     store.set_run_status(
         "running",
@@ -715,6 +715,13 @@ def _finalize_run_status(store: ProofStateStore, history: list[Mapping[str, Any]
     last = history[-1] if history else {}
     action = last.get("action") if isinstance(last.get("action"), Mapping) else {}
     mode = str(action.get("mode") or "")
+    if mode == "await_human":
+        store.set_run_status(
+            "awaiting_human",
+            reason="scheduler paused for human steering",
+            source="workflow",
+        )
+        return
     if mode in TERMINAL_MODES:
         stop_code = str(action.get("stop_reason_code") or "")
         reason = f"scheduler stopped: {mode}"

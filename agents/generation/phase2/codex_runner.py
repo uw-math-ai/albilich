@@ -33,7 +33,14 @@ from .models import sha256_text, utc_now
 from .patches import preflight_patch_errors
 from .role_capabilities import role_can_use_cas, session_cas_enabled
 from .store import ProofStateStore
-from .writing.paper_contract import EDITOR_DIRECTIVE, PAPER_CONTRACT, PAPER_STANDARD_FOR_CRITICS
+from .writing.paper_contract import (
+    EDITOR_DIRECTIVE,
+    INTRODUCTION_EDITOR_DIRECTIVE,
+    PAPER_CONTRACT,
+    PAPER_STANDARD_FOR_CRITICS,
+    TERMINOLOGY_EDITOR_DIRECTIVE,
+)
+from .writing.revision import REVISION_DOCUMENT_ARTIFACT_TYPE
 from .writing.rubric import load_rubric, rules_for_critic
 
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
@@ -278,7 +285,12 @@ def _villain_work_mode_guidance(action: Mapping[str, Any]) -> str:
     )
 
 
-def _writing_rubric_rule_block(lens: str, *, extra_critics: tuple[str, ...] = ()) -> str:
+def _writing_rubric_rule_block(
+    lens: str,
+    *,
+    extra_critics: tuple[str, ...] = (),
+    rule_prefixes: tuple[str, ...] = (),
+) -> str:
     """Compact rubric block for one critic lens: LLM-checkable rules only.
 
     ``extra_critics`` folds another owner critic's LLM rules into the block
@@ -299,6 +311,7 @@ def _writing_rubric_rule_block(lens: str, *, extra_critics: tuple[str, ...] = ()
         for critic in (lens, *extra_critics)
         for rule in rules_for_critic(all_rules, critic)
         if rule.checkability == "llm"
+        and (not rule_prefixes or rule.rule_id.startswith(rule_prefixes))
     ]
     lines: list[str] = []
     for rule in rules[:WRITING_CRITIC_RULE_LINE_CAP]:
@@ -371,9 +384,41 @@ _WRITER_PAPER_PATH_ATTACH_CONTRACT = (
 )
 
 
+def _writer_external_revision_path_contract(document_format: str) -> str:
+    extension = "tex" if document_format == "tex" else "md"
+    return (
+        "SOURCE-PRESERVING DELIVERY: write the COMPLETE revised manuscript to "
+        f"manifest.writing_revision_packet.staging_dir/<artifact_id>.{extension}; attach it by path with "
+        f'{{"op":"attach_artifact","artifact_type":"{REVISION_DOCUMENT_ARTIFACT_TYPE}",'
+        '"artifact_id":...,"path":"<staging path>","metadata":{'
+        f'"document_format":"{extension}","revision_of_artifact_id":"<current id>",'
+        '"original_sha256":"<source_lineage.original_sha256>","revision_mode":true}}} and NO content field. '
+        "The store rejects format changes and broken source lineage. The artifact must contain the entire revised "
+        "document, not a patch, excerpt, rendering, or converted format. "
+    )
+
+
 def _writer_writing_revision_guidance(action: Mapping[str, Any]) -> str:
     if not action.get("writing_revision"):
         return ""
+    if action.get("external_writing_revision"):
+        revised_id = str(action.get("revision_of_artifact_id") or "the current revision_document")
+        document_format = str(action.get("document_format") or "md").strip().lower()
+        return (
+            f"EXTERNAL MANUSCRIPT REVISION PASS: revise revision_document {revised_id} in its original "
+            f"{document_format} source format. This manuscript was authored outside Albilich and is not a verified "
+            "proof artifact. Preserve the author's voice, mathematical claims, notation, labels, citations, and "
+            "source organization. Make the smallest changes that discharge the listed debts; do not homogenize "
+            "unflagged prose, strengthen claims, invent references, or convert formats. "
+            + _writing_debt_lines(action)
+            + "For terminology debt, use established literature language. Retain a coined term only when the human "
+            "has authorized it or the manuscript explicitly defines it and explains why the nearest standard term is "
+            "inadequate. Incorporate any manifest.human_steering answer exactly; never guess at consensus. For "
+            "introduction debt, rewrite the affected passage as a natural big-picture and causal proof narrative, not "
+            "a mechanical list of results. Resolve each named debt with update_debt and cite the new revision_document "
+            "in resolution_evidence_artifact_ids. "
+            + _writer_external_revision_path_contract(document_format)
+        )
     if action.get("paper_revision"):
         revised_id = str(action.get("revision_of_artifact_id") or "the current final_paper")
         return (
@@ -433,18 +478,59 @@ def _writer_paper_authoring_guidance(action: Mapping[str, Any]) -> str:
 def _writing_critic_guidance(action: Mapping[str, Any]) -> str:
     lens = str(action.get("critic_lens") or "").strip() or "editor"
     paper_review = bool(action.get("paper_review"))
-    reviewed_kind = "final paper" if paper_review else "final proof"
+    external_review = bool(action.get("external_writing_review"))
+    reviewed_kind = "external manuscript" if external_review else ("final paper" if paper_review else "final proof")
     artifact_reviewed = str(action.get("artifact_reviewed") or f"the current {reviewed_kind} artifact")
     common_head = (
         f"Act as the {lens.replace('_', ' ')} writing critic for the finished {reviewed_kind}. This is a bounded writing "
         "REVIEW pass, not a proof-search, verification, or rewriting pass. Read "
         "manifest.writing_review_packet.final_proof.content — that text is the paper under review "
-        f"(artifact {artifact_reviewed}). Never edit the paper, never attach a final_proof, final_paper, or any writer "
+        f"(artifact {artifact_reviewed}). Never edit the paper, never attach a final_proof, final_paper, "
+        "revision_document, or any writer "
         "artifact, and never propose claim/inference/route status transitions. "
     )
+    if lens == "terminology_editor":
+        return (
+            common_head
+            + TERMINOLOGY_EDITOR_DIRECTIVE
+            + " CONTEXT: use the manuscript, its bibliography, manifest.retrieval_cards, and "
+            "manifest.theorem_library. Live web search, when enabled for this run, is allowed only for bounded "
+            "terminology checks against authoritative mathematical sources. "
+            + _writing_rubric_rule_block("skeptical_editor", rule_prefixes=("L3-TERM-",))
+            + "MECHANICS: each finding is one add_debt owned by the reviewed artifact with debt_type='writing'. "
+            "Use severity major for L3-TERM-01/02 and blocking for L3-TERM-03. An uncertainty debt MUST preserve "
+            "the literal marker `HUMAN CONSULTATION REQUIRED:` in its obligation. On pass attach exactly one "
+            "writing_review with metadata {verdict:'pass', lens:'terminology_editor', artifact_reviewed, "
+            "state_revision_reviewed}; on fail attach the debts and one fail review. writing_review is the only "
+            "artifact type you may attach."
+        )
+    if lens == "introduction_editor":
+        introduction_context = (
+            " CONTEXT: this is an external manuscript, so the manuscript itself is the sole source for its "
+            "contribution and proof architecture; no proof-state claim summary is supplied. "
+            if external_review
+            else
+            " CONTEXT: manifest.writing_review_packet.claim_route_summary is available for checking whether the "
+            "introduction's stated contribution and proof map match the established document-level structure; do "
+            "not turn that summary into a theorem list. "
+        )
+        return (
+            common_head
+            + INTRODUCTION_EDITOR_DIRECTIVE
+            + introduction_context
+            + _writing_rubric_rule_block(
+                "skeptical_editor",
+                rule_prefixes=("L3-SELL-", "L3-INTRO-", "L3-STORY-", "L3-SKIM-"),
+            )
+            + "MECHANICS: each finding is one located add_debt owned by the reviewed artifact with "
+            "debt_type='writing', severity blocking|major|minor, and a concrete revision strategy or replacement "
+            "passage. At most 10 findings. On pass attach exactly one writing_review with metadata "
+            "{verdict:'pass', lens:'introduction_editor', artifact_reviewed, state_revision_reviewed}; on fail attach "
+            "the debts and one fail review. writing_review is the only artifact type you may attach."
+        )
     if lens == "editor":
-        # The one lens the lightweight gate dispatches: exposition only,
-        # correctness assumed, one pass, at most 12 located actionable findings.
+        # Final whole-paper lens: exposition only, one pass, at most 12 located
+        # actionable findings, including independent terminology/intro re-audits.
         return (
             common_head
             + EDITOR_DIRECTIVE
@@ -454,7 +540,7 @@ def _writing_critic_guidance(action: Mapping[str, Any]) -> str:
             "reference is a finding). "
             + _writing_rubric_rule_block("skeptical_editor", extra_critics=("pedant",))
             + "MECHANICS: each finding is exactly one add_debt operation with owner_type='artifact', owner_id set to "
-            "the reviewed final_paper artifact id, debt_type='writing', severity blocking|major|minor, and an "
+            "the reviewed artifact id, debt_type='writing', severity blocking|major|minor, and an "
             "obligation formatted '<rule_id>: <location> — <what is wrong> — suggested rewrite: <replacement text>'. "
             "At most 12 findings, ranked by importance. On pass, attach exactly one writing_review artifact with "
             "metadata {verdict:'pass', lens:'editor', artifact_reviewed, state_revision_reviewed}; on fail you may "

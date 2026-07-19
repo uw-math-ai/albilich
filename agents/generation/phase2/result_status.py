@@ -5,6 +5,11 @@ from typing import Any, Dict, Mapping
 
 from .models import json_loads
 from .store import ProofStateStore
+from .writing.paper_contract import (
+    HUMAN_TERMINOLOGY_CONSULTATION_MARKER,
+    REQUIRED_WRITING_REVIEW_LENSES,
+)
+from .writing.revision import latest_revision_document, revision_document_format
 
 SOLVED_RELATIONS = {"exact", "equivalent", "stronger"}
 PARTIAL_RELATIONS = {"weaker", "conditional", "partial", "method", "background", "orthogonal", "unknown"}
@@ -17,8 +22,12 @@ REPORT_CLASSIFICATIONS = {
     "conditional_proof",
     "partial_progress",
     "statement_likely_false",
+    "writing_revision_complete",
+    "writing_revision_awaiting_human",
+    "writing_revision_in_progress",
     "in_progress",
 }
+WRITING_REVIEW_RUN_INTENT_PREFIX = "writing_gate_review:"
 
 
 def classify_result(store: ProofStateStore) -> Dict[str, Any]:
@@ -28,6 +37,9 @@ def classify_result(store: ProofStateStore) -> Dict[str, Any]:
 
 
 def classify_state(state: Mapping[str, Any]) -> Dict[str, Any]:
+    revision_document = latest_revision_document(state)
+    if revision_document is not None:
+        return _classify_writing_revision(state, revision_document)
     problem = state["problem_state"]
     root = next((row for row in state["claims"] if row["claim_id"] == "root"), {})
     final_artifact = _final_proof_artifact(state)
@@ -76,6 +88,104 @@ def classify_state(state: Mapping[str, Any]) -> Dict[str, Any]:
         "integration_artifact_id": integration.get("artifact_id", "") if integration else "",
         "certified_partial_results": partials,
         "remaining_obligations": _remaining_obligations(state, public_status),
+    }
+
+
+def _classify_writing_revision(
+    state: Mapping[str, Any],
+    revision_document: Mapping[str, Any],
+) -> Dict[str, Any]:
+    active_debts = [
+        row
+        for row in state.get("debts", [])
+        if str(row.get("debt_type") or "") == "writing" and str(row.get("status") or "") == "active"
+    ]
+    gating_debts = [
+        row for row in active_debts if str(row.get("severity") or "") in {"blocking", "major"}
+    ]
+    review_lenses = set()
+    current_editor_review_artifacts = 0
+    current_editor_passes = 0
+    current_document_id = str(revision_document.get("artifact_id") or "")
+    for artifact in state.get("artifacts", []):
+        if str(artifact.get("artifact_type") or "") != "writing_review":
+            continue
+        metadata = _metadata(artifact)
+        lens = str(metadata.get("lens") or "")
+        if lens:
+            review_lenses.add(lens)
+        if lens == "editor" and str(metadata.get("artifact_reviewed") or "") == current_document_id:
+            current_editor_review_artifacts += 1
+            if str(metadata.get("verdict") or "") == "pass":
+                current_editor_passes += 1
+    # Match scheduler livelock accounting: a completed critic session spends
+    # its lens even if the critic failed to attach the redundant review
+    # artifact. Otherwise the scheduler can finish while public status remains
+    # permanently "in progress".
+    for run in state.get("runs", []):
+        if str(run.get("mode") or "") != "review_writing":
+            continue
+        if str(run.get("status") or "") != "completed":
+            continue
+        intent = str(run.get("search_intent") or "")
+        if not intent.startswith(WRITING_REVIEW_RUN_INTENT_PREFIX):
+            continue
+        lens = intent[len(WRITING_REVIEW_RUN_INTENT_PREFIX) :]
+        if lens in REQUIRED_WRITING_REVIEW_LENSES:
+            review_lenses.add(lens)
+    missing_lenses = [lens for lens in REQUIRED_WRITING_REVIEW_LENSES if lens not in review_lenses]
+    current_document_revision = int(revision_document.get("state_revision") or 0)
+    current_editor_run = any(
+        str(run.get("mode") or "") == "review_writing"
+        and str(run.get("status") or "") == "completed"
+        and str(run.get("search_intent") or "")
+        == f"{WRITING_REVIEW_RUN_INTENT_PREFIX}editor"
+        and int(run.get("state_revision") or 0) >= current_document_revision
+        for run in state.get("runs", [])
+    )
+    current_editor_confirmed = bool(
+        current_editor_passes
+        or (not current_editor_review_artifacts and current_editor_run)
+    )
+    if not current_editor_confirmed and "editor" not in missing_lenses:
+        missing_lenses.append("editor")
+    awaiting_human = any(
+        HUMAN_TERMINOLOGY_CONSULTATION_MARKER in str(debt.get("obligation") or "")
+        for debt in gating_debts
+    )
+    if awaiting_human:
+        public_status = "writing_revision_awaiting_human"
+        classification = "writing_revision_awaiting_human"
+        summary = "Writing revision is paused for a human terminology decision."
+    elif not gating_debts and not missing_lenses:
+        public_status = "writing_revision_complete"
+        classification = "writing_revision_complete"
+        summary = "The external manuscript passed terminology, introduction, and whole-paper quality control."
+    else:
+        public_status = "writing_revision_in_progress"
+        classification = "writing_revision_in_progress"
+        summary = "The external manuscript is still moving through writing revision and audit."
+    obligations = [
+        f"{debt.get('severity', 'debt')}: {debt.get('obligation', '')}" for debt in gating_debts[:8]
+    ]
+    obligations.extend(f"run the {lens.replace('_', ' ')} audit" for lens in missing_lenses)
+    problem = state.get("problem_state", {})
+    return {
+        "public_status": public_status,
+        "result_kind": "writing_revision",
+        "relation_to_target": "not_applicable",
+        "target_statement": str(problem.get("root_statement") or ""),
+        "proved_statement": "",
+        "summary": summary,
+        "report_classification": classification,
+        "final_artifact_id": str(revision_document.get("artifact_id") or ""),
+        "integration_artifact_id": "",
+        "certified_partial_results": [],
+        "remaining_obligations": obligations,
+        "document_format": revision_document_format(revision_document),
+        "required_review_lenses": list(REQUIRED_WRITING_REVIEW_LENSES),
+        "completed_review_lenses": sorted(review_lenses),
+        "latest_document_editor_confirmed": current_editor_confirmed,
     }
 
 

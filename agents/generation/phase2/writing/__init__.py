@@ -29,6 +29,15 @@ from .rubric import (
     load_rubric_report,
     rules_for_critic,
 )
+from .revision import (
+    REVISION_DOCUMENT_ARTIFACT_ID,
+    REVISION_DOCUMENT_ARTIFACT_TYPE,
+    WRITING_REVISION_RESEARCH_MODE,
+    ingest_writing_revision,
+    is_writing_revision_state,
+    latest_revision_document,
+    revision_document_format,
+)
 
 __all__ = [
     "AUTOFIXES",
@@ -40,15 +49,22 @@ __all__ = [
     "INLINE_MATH_PLACEHOLDER",
     "LAYERS",
     "REQUIRED_FIX_MARKER",
+    "REVISION_DOCUMENT_ARTIFACT_ID",
+    "REVISION_DOCUMENT_ARTIFACT_TYPE",
     "Rule",
     "SCOPES",
     "SEVERITIES",
+    "WRITING_REVISION_RESEARCH_MODE",
+    "ingest_writing_revision",
+    "is_writing_revision_state",
+    "latest_revision_document",
     "lint_rules",
     "load_rubric",
     "load_rubric_report",
     "obligation_location",
     "required_fix",
     "required_fix_for_obligation",
+    "revision_document_format",
     "rules_for_critic",
     "run_all",
     "run_lint",

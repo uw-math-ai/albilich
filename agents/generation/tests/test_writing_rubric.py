@@ -67,6 +67,30 @@ class WritingRubricLoadTest(unittest.TestCase):
         self.assertEqual(rule.owner_critic, "skeptical_editor")
         self.assertEqual(rule.severity, "major")
 
+    def test_terminology_governance_rules_are_auditable(self) -> None:
+        standard = self.by_id["L3-TERM-01"]
+        coinage = self.by_id["L3-TERM-02"]
+        consultation = self.by_id["L3-TERM-03"]
+        for rule in (standard, coinage, consultation):
+            self.assertEqual("L3", rule.layer)
+            self.assertEqual("llm", rule.checkability)
+        self.assertEqual("major", standard.severity)
+        self.assertIn("standard terminology", standard.statement.lower())
+        self.assertEqual("major", coinage.severity)
+        self.assertIn("justification", coinage.statement.lower())
+        self.assertEqual("blocker", consultation.severity)
+        self.assertIn("human", consultation.statement.lower())
+
+    def test_introduction_high_control_rules_are_auditable(self) -> None:
+        for rule_id in ("L3-INTRO-08", "L3-INTRO-09", "L3-INTRO-10"):
+            self.assertIn(rule_id, self.by_id)
+        self.assertEqual("major", self.by_id["L3-INTRO-08"].severity)
+        self.assertIn("big-picture", self.by_id["L3-INTRO-08"].statement.lower())
+        self.assertEqual("major", self.by_id["L3-INTRO-09"].severity)
+        self.assertIn("causal", self.by_id["L3-INTRO-09"].statement.lower())
+        self.assertEqual("meta", self.by_id["L3-INTRO-10"].checkability)
+        self.assertIn("dedicated", self.by_id["L3-INTRO-10"].statement.lower())
+
     def test_known_hard_house_rules_l4_house_07_08(self) -> None:
         # The two deterministically enforced house hard rules: section openers
         # and the "we"-collocation discipline. Both lint, both major.

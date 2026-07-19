@@ -34,6 +34,7 @@ from .research_policy import DEFAULT_RESEARCH_MODE, DEFAULT_WEB_SEARCH, RESEARCH
 from .scheduler import DEFAULT_MULTI_BRANCH_WORKERS, next_action
 from .store import GENERATION_ROOT, ProofStateStore
 from .workflow import run_workflow
+from .writing.revision import WRITING_REVISION_RESEARCH_MODE, ingest_writing_revision
 
 DEFAULT_ATTEMPT_STEPS = 48
 DEFAULT_ATTEMPT_WALL_SECONDS = 24 * 60 * 60
@@ -191,6 +192,16 @@ def main(argv: list[str] | None = None) -> None:
     p_audit.add_argument("--total-token-budget", type=int, default=DEFAULT_INIT_TOTAL_TOKEN_BUDGET)
     p_audit.add_argument("--reserved-verification-budget", type=int, default=DEFAULT_INIT_VERIFICATION_RESERVE)
 
+    p_revise = sub.add_parser(
+        "revise-paper",
+        help="ingest an externally authored Markdown/LaTeX manuscript for writing-only revision and audit",
+    )
+    p_revise.add_argument("document", help="path to the manuscript to revise (.md or .tex)")
+    p_revise.add_argument("--problem-id", help="explicit problem id (default: writing/<document stem>)")
+    p_revise.add_argument("--title", default="", help="manuscript title (default: derived from the document)")
+    p_revise.add_argument("--total-token-budget", type=int, default=DEFAULT_INIT_TOTAL_TOKEN_BUDGET)
+    p_revise.add_argument("--reserved-verification-budget", type=int, default=DEFAULT_INIT_VERIFICATION_RESERVE)
+
     p_patch = sub.add_parser("apply-patch", help="apply a structured Albilich v1 patch JSON file")
     p_patch.add_argument("problem")
     p_patch.add_argument("patch_json")
@@ -268,6 +279,22 @@ def main(argv: list[str] | None = None) -> None:
         )
         result["next_step"] = (
             f"run the audit with: run {store.problem_id} --execute --research-mode {PAPER_AUDIT_RESEARCH_MODE}"
+        )
+        _print(result)
+        return
+    if args.command == "revise-paper":
+        problem_id = args.problem_id or ("writing/" + sanitize_problem_id(Path(args.document).stem))
+        store = ProofStateStore(problem_id)
+        result = ingest_writing_revision(
+            store,
+            Path(args.document),
+            title=args.title,
+            total_token_budget=args.total_token_budget,
+            reserved_verification_budget=args.reserved_verification_budget,
+        )
+        result["next_step"] = (
+            f"run the revision with: run {store.problem_id} --execute "
+            f"--research-mode {WRITING_REVISION_RESEARCH_MODE} --completion-policy publication_ready"
         )
         _print(result)
         return

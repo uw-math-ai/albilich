@@ -305,12 +305,14 @@ def _run_control_event_lines(timing: Dict[str, Any]) -> list[str]:
 def _writing_review_lines(state: Dict[str, Any]) -> list[str]:
     """"Writing review" section: lens verdicts per reviewed document revision
     (naming the reviewed artifact's type: final_proof certificate or shipped
-    final_paper), the shipped final_paper's compile status, writing-debt counts
-    by severity, and the unresolved list (present whenever the gate opened on
-    budget exhaustion with debts still recorded)."""
+    final_paper/revision_document), shipped-document status, writing-debt counts
+    by severity, and the unresolved list used for human quality steering."""
     reviews = [row for row in state.get("artifacts", []) if row.get("artifact_type") == "writing_review"]
     writing_debts = [row for row in state.get("debts", []) if str(row.get("debt_type") or "") == "writing"]
-    if not reviews and not writing_debts:
+    has_revision_document = any(
+        row.get("artifact_type") == "revision_document" for row in state.get("artifacts", [])
+    )
+    if not reviews and not writing_debts and not has_revision_document:
         return []
     artifact_types = {
         str(row.get("artifact_id") or ""): str(row.get("artifact_type") or "")
@@ -339,6 +341,19 @@ def _writing_review_lines(state: Dict[str, Any]) -> list[str]:
         paper_status = str(paper_metadata.get("pdf_status") or "no compile status recorded")
         lines.append(f"- Final paper: `{final_paper.get('artifact_id', '')}` ({paper_status})")
         lines.append("")
+    revision_document = _latest_revision_document(state)
+    if revision_document is not None:
+        revision_metadata = json.loads(revision_document.get("metadata_json") or "{}")
+        if not isinstance(revision_metadata, dict):
+            revision_metadata = {}
+        lines.append(
+            f"- Revised external manuscript: `{revision_document.get('artifact_id', '')}` "
+            f"(`{revision_metadata.get('document_format', 'unknown')}`, revision "
+            f"{revision_metadata.get('revision_number', 0)}, mathematical status "
+            f"`{revision_metadata.get('mathematical_status', 'not_verified_by_writing_harness')}`)"
+        )
+        lines.append(f"- Source lineage: `{revision_metadata.get('original_sha256', '')}`")
+        lines.append("")
     compile_status = _shipped_final_proof_compile_status(state)
     if compile_status:
         lines.append(f"- Shipped final_proof LaTeX compile status: `{compile_status}`")
@@ -363,6 +378,16 @@ def _latest_final_paper(state: Dict[str, Any]) -> Dict[str, Any] | None:
     if not papers:
         return None
     return max(papers, key=lambda row: (int(row.get("state_revision") or 0), str(row.get("created_at") or "")))
+
+
+def _latest_revision_document(state: Dict[str, Any]) -> Dict[str, Any] | None:
+    documents = [row for row in state.get("artifacts", []) if row.get("artifact_type") == "revision_document"]
+    if not documents:
+        return None
+    return max(
+        documents,
+        key=lambda row: (int(row.get("state_revision") or 0), str(row.get("created_at") or "")),
+    )
 
 
 def _shipped_final_proof_compile_status(state: Dict[str, Any]) -> str:

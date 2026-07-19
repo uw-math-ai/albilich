@@ -69,6 +69,35 @@ Sources: `TAO`, `PAK-CLEAR`, `PAK-STORY`, `HALMOS`, `MILNE`, `SERRE`, `AMS-NOTIC
 - `L3-INTRO-07` [llm] **Foreword pattern for long intros:** intros > ~4 pages get subsections
   with a nontechnical foreword (big picture, cross-field motivation, ≤1 page). severity:
   `nit`. (`PAK-CLEAR` 17)
+- `L3-INTRO-08` [llm] **The introduction conveys one coherent big-picture story, not a
+  mechanically complete inventory.** A reader should be able to retell the phenomenon, the
+  problem, the exact contribution, and why the result changes the picture in one natural
+  arc. A catalogue of results or chronological work log is not a story. severity: `major`.
+  (`TAO`, `PAK-STORY`, `HOUSE`)
+- `L3-INTRO-09` [llm] **The proof overview is causal rather than enumerative.** It explains
+  why the main ingredients enter, what obstacle each resolves, and how they assemble into
+  the main theorem. Merely listing theorem numbers, lemmas, or section contents is a major
+  defect even when every listed item is correct. severity: `major`. (`TAO`, `PAK-CLEAR`,
+  `HOUSE`)
+- `L3-INTRO-10` [meta] **The introduction receives an independent dedicated audit and is
+  re-audited by the whole-paper editor.** The gate may pass only after both controls have
+  run; unresolved L3-SELL, L3-INTRO, L3-STORY, or L3-SKIM major findings remain revision
+  debt. severity: `major`. (`HOUSE`)
+
+## Terminology governance
+
+- `L3-TERM-01` [llm] **Use standard terminology established in the relevant literature.** Audit
+  technical names against cited and standard references; replace bizarre, ornamental, or
+  idiosyncratic labels when a standard term has the intended meaning. A single search hit is
+  not evidence of consensus. severity: `major`. (`PAK-CLEAR`, `HOUSE`)
+- `L3-TERM-02` [llm] **Every coined term has a mathematical necessity, a precise definition,
+  and an explicit justification.** The text names the nearest standard term and the concrete
+  mismatch that makes it inadequate. Convenience, variety, or rhetorical color does not
+  justify new nomenclature. severity: `major`. (`HALMOS`, `HOUSE`)
+- `L3-TERM-03` [llm] **Terminological uncertainty is routed to the human expert, never filled
+  by a guess.** A critic that cannot establish whether a term is standard emits a blocking,
+  located `HUMAN CONSULTATION REQUIRED:` question with candidate alternatives and their
+  consequences; revision pauses until answered. severity: `blocker`. (`HOUSE`)
 
 ## Organization
 

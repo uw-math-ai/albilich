@@ -34,6 +34,7 @@ RUN_STATUSES = {
     "paused",
     "stopping",
     "stopped",
+    "awaiting_human",
     "completed",
 }
 # Run-level completion policy (problem_state.completion_policy, 2026-07-09
@@ -57,6 +58,7 @@ RUN_MODES = {
     "formalize",
     "write",
     "review_writing",
+    "await_human",
     "stop_with_partial_results",
     "stop_solved",
 }

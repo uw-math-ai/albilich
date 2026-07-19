@@ -424,7 +424,7 @@ class ProofStateStore:
                     """
                     SELECT artifact_id, artifact_type, path, state_revision, metadata_json, created_at
                     FROM artifacts
-                    WHERE artifact_type IN ('final_proof', 'verified_blueprint', 'final_paper')
+                    WHERE artifact_type IN ('final_proof', 'verified_blueprint', 'final_paper', 'revision_document')
                     ORDER BY created_at DESC
                     """
                 ).fetchall()
@@ -935,7 +935,7 @@ class ProofStateStore:
         run_status = str(state.get("run_status") or "running")
         started_at = _parse_timestamp(str(state.get("created_at") or ""))
         now = datetime.now(timezone.utc)
-        if run_status in {"stopped", "completed"}:
+        if run_status in {"stopped", "awaiting_human", "completed"}:
             end_candidates = [
                 _parse_timestamp(str(last_activity or "")),
                 _parse_timestamp(str(state.get("updated_at") or "")),

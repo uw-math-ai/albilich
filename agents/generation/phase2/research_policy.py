@@ -4,6 +4,7 @@ import json
 from typing import Any, Dict, Mapping
 
 from .result_status import normalize_result_relation
+from .writing.revision import WRITING_REVISION_RESEARCH_MODE
 
 RESEARCH_MODES = {
     "independent",
@@ -15,6 +16,8 @@ RESEARCH_MODES = {
     # Conservative referee mode (2026-07-09 TODO 6): audit a submitted proof
     # document instead of proving the statement; see phase2/audit.py.
     "paper_solution_audit",
+    # Writing-only mode for an externally authored Markdown/LaTeX manuscript.
+    WRITING_REVISION_RESEARCH_MODE,
 }
 DEFAULT_RESEARCH_MODE = "hard_problem"
 DEFAULT_WEB_SEARCH = "live"
@@ -118,6 +121,8 @@ def should_run_librarian(
 ) -> Dict[str, Any]:
     """Decide whether a research-oriented run should begin with literature lookup."""
     mode = normalize_research_mode(research_mode)
+    if mode == WRITING_REVISION_RESEARCH_MODE:
+        return {"run": False, "reason": "writing_revision mode never dispatches theorem-research retrieval"}
     if mode in {"independent", "proof_first"}:
         return {"run": False, "reason": f"{mode} mode does not force a literature scan"}
     if mode == "citation_pass" and phase != "post_integration":

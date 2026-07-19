@@ -32,6 +32,16 @@ from .writing.linter import (
     run_paper_lint,
     run_slop_lint,
 )
+from .writing.revision import (
+    REVISION_DOCUMENT_ARTIFACT_TYPE,
+    is_writing_revision_state,
+    latest_revision_document,
+    revision_document_format,
+)
+from .writing.paper_contract import (
+    HUMAN_TERMINOLOGY_CONSULTATION_MARKER,
+    REQUIRED_WRITING_REVIEW_LENSES,
+)
 from .debt_canonicalizer import central_debt_clusters, central_obstruction_for_debt
 from .graph_policy import (
     FAR_FROM_ROOT_DISTANCE,
@@ -360,30 +370,31 @@ SUPPORT_LEMMA_THEOREM_TERMS: tuple[tuple[str, tuple[str, ...], str], ...] = (
 
 
 # --- writing gate ------------------------------------------------------------
-# Lightweight exposition gate between the final proof and stop_solved.
-# Mathematical correctness is ASSUMED (the main harness verified it); the gate
-# polices exposition only and costs at most 4 LLM sessions in the worst case:
-# paper authoring (1) + deterministic-defect revision(s) (0-2, typically 0-1) +
-# one "editor" exposition review (1) + at most one editor-debt revision (0-1).
-# The certificate (final_proof) is internal and is never reviewed.
+# Writing-quality gate for an internally verified final paper or an externally
+# submitted revision document. Correctness review is out of scope: the internal
+# path already has a verified certificate; the external path explicitly makes
+# no verification claim. Both run terminology, introduction, and whole-paper
+# audits. The certificate (final_proof) is internal and is never reviewed.
 # See docs/writing_harness_plugin.md.
-WRITING_GATE_EDITOR_LENS = "editor"
-# At most ONE editor review session for the whole gate (counted across paper
-# revisions: after the revision only the deterministic re-check runs).
+WRITING_GATE_REVIEW_LENSES = REQUIRED_WRITING_REVIEW_LENSES
+WRITING_GATE_EDITOR_LENS = "editor"  # legacy/public constant: the final whole-paper lens
+# Each required lens is spent once globally; the same per-document threshold
+# also requires a final editor confirmation after an editor-driven revision.
 PAPER_EDITOR_MAX_PASSES = 1
 # The revision budget is SPLIT by what forced the revision:
-# - At most ONE editor-debt revision total (a revision whose blocking debts
-#   include any editor/LLM-critic finding).
+# - Up to one review-driven revision per required independent audit (a
+#   revision whose blocking debts include any LLM-critic finding).
 # - Deterministic-defect revisions (ALL blocking debts carry the
 #   writing-lint- / writing-compile- debt-id prefixes) count against their own
-#   cap and never consume the editor's allowance: fixing a lint or compile
-#   defect must not eat the one revision the editor's findings are entitled to.
+#   cap and never consume the review-driven allowance: fixing a lint or compile
+#   defect must not eat the revisions the critics' findings are entitled to.
 # Residue and compile failures still force revisions past either cap
 # (deterministic, cheap, must never ship).
-MAX_WRITING_GATE_REVISION_CYCLES = 1
+MAX_WRITING_GATE_REVISION_CYCLES = len(WRITING_GATE_REVIEW_LENSES)
 MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES = 2
 WRITING_GATE_REVISION_INTENT = "writing_gate_revision"
 WRITING_GATE_DETERMINISTIC_REVISION_INTENT = "writing_gate_revision_deterministic"
+WRITING_GATE_HUMAN_REVISION_INTENT_PREFIX = "writing_gate_revision_human:"
 WRITING_GATE_PAPER_INTENT = "writing_gate_paper"
 WRITING_GATE_REVIEW_INTENT_PREFIX = "writing_gate_review:"
 WRITING_DEBT_TYPE = "writing"
@@ -399,6 +410,7 @@ WRITING_COMPILE_DEBT_PREFIX = "writing-compile-"
 WRITING_COMPILE_RULE_ID = "L5-TEX-05"
 WRITING_COMPILE_FAIL_STATUSES = {"compile_failed", "compile_error"}
 WRITING_RESIDUE_RULE_ID = "L1-CITE-03"
+WRITING_HUMAN_CONSULTATION_MARKER = HUMAN_TERMINOLOGY_CONSULTATION_MARKER
 WRITING_GATE_BLOCKING_SEVERITIES = {"blocking", "major"}
 # Rubric severity -> debts-table severity vocabulary (models.DEBT_SEVERITIES):
 # blocker maps to the highest ("blocking"), major stays "major", and the
@@ -440,7 +452,7 @@ def next_action(
         web_search=web_search,
         allow_integration=allow_integration,
     )
-    if action.get("paper_audit_verification_only"):
+    if action.get("paper_audit_verification_only") or action.get("writing_revision_only"):
         return action
     # The research-strategy layer is a deterministic view over persisted proof
     # state. It may preempt ordinary mature-run rotation for a due compression,
@@ -678,6 +690,15 @@ def _plan_next_action(
             research_mode=research_mode,
             stop_reason_code="state_invariant_violation",
             completion_policy=str(problem.get("completion_policy") or "full_proof_first"),
+        )
+
+    if is_writing_revision_state(state):
+        return _external_writing_revision_action(
+            store,
+            state,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
         )
 
     paper_audit_terminal = _paper_audit_verification_only_action(
@@ -9512,50 +9533,28 @@ def _writing_gate_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    """Lightweight exposition gate between the final proof and stop_solved.
+    """Publication writing gate between an internal certificate and stop_solved.
 
-    Mathematical correctness is ASSUMED AND OUT OF SCOPE: the main harness
-    verified the certificate (final_proof), which is internal and never
-    reviewed here (the patch-time residue guard on writer artifacts stands).
-    The gate costs at most 5 LLM sessions in the worst case (authoring + up to
-    2 deterministic revisions + editor + editor revision; typically 3):
+    Mathematical correctness review is out of scope because the main harness
+    already verified ``final_proof``, which remains internal and is never
+    reviewed here. The bounded path costs at most twelve LLM sessions: one
+    paper-authoring pass, up to two deterministic repairs, up to three
+    review-driven revisions, the three required audits, and whole-paper
+    confirmations of documents revised after the initial editor pass.
 
-    1. Paper authoring (1 session): root integrated + final_proof exists + no
-       final_paper -> dispatch mode="write" with paper_authoring=true
-       (search_intent "writing_gate_paper") immediately; the writer turns the
-       certificate into a standalone LaTeX article under the paper contract
-       and style core (writing/paper_contract.py).
-    2. Deterministic syncs (free, every pass once a paper exists): run_all +
-       run_slop_lint + run_paper_lint on the paper's LaTeX source, and the compile debt from
-       its persisted pdf_status. Open blocker/major debts dispatch a writer
-       revision (writing_revision + paper_revision) whose prompt enumerates
-       EVERY open debt as a numbered location -> required-fix checklist. The
-       revision budget is SPLIT: a revision whose blocking debts are ALL
-       deterministic (writing-lint- / writing-compile- debt-id prefixes) is
-       dispatched with search_intent "writing_gate_revision_deterministic"
-       and counts against MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES
-       (= 2); it never consumes the editor's revision allowance.
-    3. Editor review (1 session): one "editor" exposition pass total
-       (PAPER_EDITOR_MAX_PASSES). Pass -> the gate opens immediately (when no
-       blocker/major debts remain). Fail -> the editor's debts dispatch the
-       single editor-debt revision (search_intent "writing_gate_revision",
-       MAX_WRITING_GATE_REVISION_CYCLES = 1, 0-1 sessions; any blocking
-       editor/LLM debt puts the revision in this bucket), after which only
-       the deterministic re-check runs — no second editor pass, no lens-reset
-       loop, no free verification pass.
-    4. EDITOR FALLTHROUGH ON EXHAUSTION: when blocker/major debts remain but
-       the forcing bucket's revision allowance is spent (and no residue or
-       compile failure forces a revision past the caps), the gate does NOT
-       open — it falls through to the editor phase. The editor review runs if
-       its pass budget remains; the editor-debt revision (if unspent) then
-       addresses BOTH the editor's findings and the leftover deterministic
-       blockers/majors in one revision. Only after the editor pass AND both
-       revision buckets are truly spent does the gate open, with the
-       unresolved debts left recorded in the report.
+    Once the writer attaches ``final_paper``, deterministic lint, paper
+    register, and compile checks run on every pass. Blocking findings dispatch
+    a diff-minimal revision with every open debt enumerated. Deterministic-only
+    repairs have their own budget and never consume the review-driven budget.
 
-    Exceptions past the revision caps: generation residue (L1-CITE-03) and
-    LaTeX-compile failures keep forcing revisions — deterministic, cheap fixes
-    that must never ship.
+    A clean paper then receives, in order, the terminology editor, introduction
+    editor, and whole-paper editor. Completed lenses are not reset by unrelated
+    revisions, but any document revised after its whole-paper audit must pass a
+    final editor confirmation. An uncertain terminology finding pauses for an
+    explicit human decision. Any unresolved blocker or major after automated budgets are
+    exhausted also pauses for human resolution; the gate never silently ships
+    major writing debt. Generation residue and compile failures remain
+    non-bypassable past the normal caps.
     """
     certificate_id = str(final_artifact.get("artifact_id") or "")
     if not certificate_id:
@@ -9580,19 +9579,120 @@ def _writing_gate_action(
             certificate_artifact_id=certificate_id,
             search_intent=WRITING_GATE_PAPER_INTENT,
         )
+    return _writing_existing_document_gate_action(
+        store,
+        state,
+        document_artifact=paper_artifact,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+        external_revision=False,
+    )
+
+
+def _external_writing_revision_action(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Dict[str, Any]:
+    document = latest_revision_document(state)
+    if document is None:  # defensive: caller checked is_writing_revision_state
+        return _action(
+            "await_human",
+            "root",
+            "",
+            "writing revision state is missing its revision_document artifact",
+            plan_step_budget(problem, "await_human", 0),
+            research_mode=research_mode,
+            writing_revision_only=True,
+            terminal_classification="writing_revision_input_missing",
+        )
+    action = _writing_existing_document_gate_action(
+        store,
+        state,
+        document_artifact=document,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+        external_revision=True,
+    )
+    if action is not None:
+        action["writing_revision_only"] = True
+        return action
+    return _action(
+        "stop_solved",
+        "root",
+        "",
+        "external manuscript revision complete: terminology, introduction, and whole-paper audits are spent and no gating writing debt remains",
+        plan_step_budget(problem, "stop_solved", 0),
+        research_mode=research_mode,
+        writing_revision_only=True,
+        terminal_classification="writing_revision_complete",
+        final_artifact_id=str(document.get("artifact_id") or ""),
+        document_format=revision_document_format(document),
+    )
+
+
+def _writing_existing_document_gate_action(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    document_artifact: Mapping[str, Any],
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    external_revision: bool,
+) -> Optional[Dict[str, Any]]:
+    """Run deterministic checks and the three independent writing reviews."""
+
+    paper_artifact = document_artifact
     artifact_id = str(paper_artifact.get("artifact_id") or "")
+    document_type = str(paper_artifact.get("artifact_type") or "final_paper")
+    document_format = revision_document_format(paper_artifact) if external_revision else "tex"
+    document_label = "external manuscript" if external_revision else "final paper"
     content = _writing_artifact_content(paper_artifact)
-    _sync_writing_lint_debts(store, artifact_id, content)
-    _sync_writing_compile_debt(store, artifact_id)
+    _sync_writing_lint_debts(
+        store,
+        artifact_id,
+        content,
+        include_paper_register=not external_revision,
+    )
+    # Externally submitted source is not assumed to be standalone: it may rely
+    # on a venue class, bibliography, or included files outside the ingested
+    # manuscript. A best-effort sidecar may be recorded, but only Albilich's
+    # internally generated final_paper has a blocking standalone compile gate.
+    if not external_revision:
+        _sync_writing_compile_debt(store, artifact_id)
     gate = _writing_gate_state(store, artifact_id)
     open_debts = gate["open_writing_debts"]
-    blocking = [debt for debt in open_debts if str(debt.get("severity") or "") in WRITING_GATE_BLOCKING_SEVERITIES]
+    blocking = [
+        debt
+        for debt in open_debts
+        if str(debt.get("severity") or "") in WRITING_GATE_BLOCKING_SEVERITIES
+    ]
+    consultation = _writing_human_consultation_action(
+        store,
+        blocking,
+        artifact_id=artifact_id,
+        problem=problem,
+        research_mode=research_mode,
+    )
+    if consultation is not None:
+        return consultation
+
+    remaining_lenses = [
+        lens
+        for lens in WRITING_GATE_REVIEW_LENSES
+        if int(gate["lens_sessions"].get(lens, 0)) < PAPER_EDITOR_MAX_PASSES
+    ]
     if blocking:
-        # Bucket the revision by what forces it: ALL-deterministic blocking
-        # debts (lint/compile prefixes) draw on the deterministic allowance;
-        # any editor/LLM-critic blocking debt draws on the editor allowance.
         deterministic_only = all(
-            str(debt.get("debt_id") or "").startswith((WRITING_LINT_DEBT_PREFIX, WRITING_COMPILE_DEBT_PREFIX))
+            str(debt.get("debt_id") or "").startswith(
+                (WRITING_LINT_DEBT_PREFIX, WRITING_COMPILE_DEBT_PREFIX)
+            )
             for debt in blocking
         )
         if deterministic_only:
@@ -9605,81 +9705,111 @@ def _writing_gate_action(
             revision_intent = WRITING_GATE_REVISION_INTENT
         budget_exhausted = revision_rounds >= revision_cap
         residue = [
-            debt for debt in blocking
+            debt
+            for debt in blocking
             if str(debt.get("obligation") or "").startswith(WRITING_RESIDUE_RULE_ID)
         ]
         compile_failures = [
-            debt for debt in blocking
+            debt
+            for debt in blocking
             if str(debt.get("debt_id") or "").startswith(WRITING_COMPILE_DEBT_PREFIX)
         ]
         if not budget_exhausted or residue or compile_failures:
             reason = (
-                f"writing gate: {len(blocking)} open blocker/major writing debts on final paper {artifact_id}; "
-                "writer must revise diff-minimally"
+                f"writing gate: {len(blocking)} open blocker/major writing debts on {document_label} "
+                f"{artifact_id}; writer must revise diff-minimally"
             )
             if budget_exhausted and (residue or compile_failures):
                 defect = "generation residue" if residue else "a LaTeX compile failure"
                 reason = (
-                    f"writing gate: revision budget exhausted but {defect} remains on final paper {artifact_id}; "
-                    "residue and compile failures never bypass the gate"
+                    f"writing gate: revision budget exhausted but {defect} remains on {document_label} "
+                    f"{artifact_id}; residue and compile failures never bypass the gate"
                 )
             mode = "write"
             return _action(
                 mode,
                 "root",
-                _integrated_route_for_claim(state, "root"),
+                "" if external_revision else _integrated_route_for_claim(state, "root"),
                 reason,
                 plan_step_budget(problem, mode, requested_tokens),
                 research_mode=research_mode,
                 writing_revision=True,
-                paper_revision=True,
+                paper_revision=not external_revision,
+                external_writing_revision=external_revision,
+                revision_document_type=document_type,
+                document_format=document_format,
                 revision_of_artifact_id=artifact_id,
                 writing_debts=_writing_debt_cards(open_debts),
                 search_intent=revision_intent,
                 writing_gate_round=revision_rounds + 1,
             )
-        # EDITOR FALLTHROUGH ON EXHAUSTION: the forcing bucket's revision
-        # allowance is spent (and nothing residue/compile-tier forces a
-        # revision past the caps), but the gate does NOT open while the editor
-        # phase still has budget.
-        if gate["editor_sessions"] < PAPER_EDITOR_MAX_PASSES:
-            # Fall through to the editor review dispatch below: the editor's
-            # findings (if any) then join the leftover blocker/major debts in
-            # the single editor-debt revision.
-            pass
-        elif gate["editor_revision_rounds"] < MAX_WRITING_GATE_REVISION_CYCLES:
-            # Editor pass spent, editor-debt revision unspent: one final
-            # revision addresses BOTH the editor's debts and the leftover
-            # deterministic blockers/majors in a single pass.
+        if not remaining_lenses and gate["editor_revision_rounds"] < MAX_WRITING_GATE_REVISION_CYCLES:
             mode = "write"
             return _action(
                 mode,
                 "root",
-                _integrated_route_for_claim(state, "root"),
-                f"writing gate: deterministic revision budget spent with {len(blocking)} blocker/major writing "
-                f"debts still open on final paper {artifact_id}; the remaining editor-debt revision addresses "
-                "every open debt in one pass",
+                "" if external_revision else _integrated_route_for_claim(state, "root"),
+                f"writing gate: all independent reviews are spent with {len(blocking)} blocker/major debts "
+                f"still open on {document_label} {artifact_id}; run one focused revision over every open debt",
                 plan_step_budget(problem, mode, requested_tokens),
                 research_mode=research_mode,
                 writing_revision=True,
-                paper_revision=True,
+                paper_revision=not external_revision,
+                external_writing_revision=external_revision,
+                revision_document_type=document_type,
+                document_format=document_format,
                 revision_of_artifact_id=artifact_id,
                 writing_debts=_writing_debt_cards(open_debts),
                 search_intent=WRITING_GATE_REVISION_INTENT,
                 writing_gate_round=gate["editor_revision_rounds"] + 1,
             )
-        else:
-            # Every pass AND revision budget is truly spent: the gate opens
-            # with the unresolved debts left recorded in the report.
-            return None
-    if gate["editor_sessions"] >= PAPER_EDITOR_MAX_PASSES:
-        # Deterministically clean and the editor pass is spent: gate open.
-        return None
-    review_reason = f"writing gate: exposition editor review of final paper {artifact_id}"
+        if not remaining_lenses and gate["editor_revision_rounds"] >= MAX_WRITING_GATE_REVISION_CYCLES:
+            return _writing_quality_exhausted_action(
+                store,
+                state,
+                blocking,
+                artifact_id=artifact_id,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                external_revision=external_revision,
+                document_type=document_type,
+                document_format=document_format,
+            )
+        # The next independent critic may sharpen the remaining defects before
+        # the next available editor-debt revision. We never silently pass with
+        # unresolved major debt.
+
+    final_editor_confirmation = (
+        not blocking
+        and not remaining_lenses
+        and int(gate["current_lens_sessions"].get(WRITING_GATE_EDITOR_LENS, 0))
+        < PAPER_EDITOR_MAX_PASSES
+    )
+    if not remaining_lenses and not final_editor_confirmation:
+        return None if not blocking else _writing_quality_exhausted_action(
+            store,
+            state,
+            blocking,
+            artifact_id=artifact_id,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+            external_revision=external_revision,
+            document_type=document_type,
+            document_format=document_format,
+        )
+    lens = WRITING_GATE_EDITOR_LENS if final_editor_confirmation else remaining_lenses[0]
+    lens_label = lens.replace("_", " ")
+    review_reason = (
+        f"writing gate: final whole-paper confirmation of revised {document_label} {artifact_id}"
+        if final_editor_confirmation
+        else f"writing gate: independent {lens_label} review of {document_label} {artifact_id}"
+    )
     if blocking:
         review_reason = (
-            f"writing gate: revision budget spent with {len(blocking)} blocker/major writing debts still open on "
-            f"final paper {artifact_id}; falling through to the exposition editor review"
+            f"writing gate: revision allowance currently spent with {len(blocking)} blocker/major debts still "
+            f"open on {document_label} {artifact_id}; independent {lens_label} review will sharpen the remaining work"
         )
     mode = "review_writing"
     return _action(
@@ -9689,12 +9819,148 @@ def _writing_gate_action(
         review_reason,
         plan_step_budget(problem, mode, requested_tokens),
         research_mode=research_mode,
-        critic_lens=WRITING_GATE_EDITOR_LENS,
+        critic_lens=lens,
         artifact_reviewed=artifact_id,
-        paper_review=True,
+        paper_review=not external_revision,
+        external_writing_review=external_revision,
+        document_format=document_format,
         state_revision_reviewed=gate["artifact_state_revision"],
-        search_intent=f"{WRITING_GATE_REVIEW_INTENT_PREFIX}{WRITING_GATE_EDITOR_LENS}",
+        search_intent=f"{WRITING_GATE_REVIEW_INTENT_PREFIX}{lens}",
         open_writing_debts=_writing_debt_cards(open_debts),
+        final_editor_confirmation=final_editor_confirmation,
+    )
+
+
+def _writing_human_consultation_action(
+    store: ProofStateStore,
+    debts: list[Dict[str, Any]],
+    *,
+    artifact_id: str,
+    problem: Mapping[str, Any],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Pause on an unanswered L3-TERM-03 consultation instead of guessing."""
+
+    snapshot = steering.snapshot(store.state_dir)
+    resolved = {
+        str(blocker.get("fingerprint") or ""): blocker
+        for blocker in snapshot.get("resolved_blockers", [])
+        if str(blocker.get("answered_with") or "").strip()
+    }
+    for debt in debts:
+        obligation = str(debt.get("obligation") or "")
+        if WRITING_HUMAN_CONSULTATION_MARKER not in obligation:
+            continue
+        debt_id = str(debt.get("debt_id") or "")
+        fingerprint = f"writing-terminology:{debt_id}"
+        if fingerprint in resolved:
+            continue
+        question = obligation.split(WRITING_HUMAN_CONSULTATION_MARKER, 1)[1].strip()
+        blocker = steering.raise_blocker(
+            store.state_dir,
+            kind="terminology",
+            target_id=artifact_id,
+            summary=f"Human terminology decision required for {artifact_id}",
+            detail=question or obligation,
+            options=[
+                "use the established literature term",
+                "retain the new term and justify it explicitly",
+                "provide a different preferred term",
+            ],
+            fingerprint=fingerprint,
+            revision=int(problem.get("current_revision") or 0),
+        )
+        return _action(
+            "await_human",
+            "root",
+            "",
+            f"writing gate paused for expert terminology guidance: {question or debt_id}",
+            plan_step_budget(problem, "await_human", 0),
+            research_mode=research_mode,
+            terminal_classification="writing_terminology_consultation_required",
+            human_blocker_id=str(blocker.get("id") or ""),
+            terminology_debt_id=debt_id,
+            artifact_reviewed=artifact_id,
+        )
+    return None
+
+
+def _writing_quality_exhausted_action(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    debts: list[Dict[str, Any]],
+    *,
+    artifact_id: str,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    external_revision: bool,
+    document_type: str,
+    document_format: str,
+) -> Dict[str, Any]:
+    """Pause for steering, then spend exactly one human-authorized revision."""
+
+    cards = _writing_debt_cards(debts)
+    debt_fingerprint = fingerprint_text(
+        "|".join(str(card.get("debt_id") or "") for card in cards)
+    )[:16]
+    with store.connect() as conn:
+        human_revision_rounds = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM runs WHERE search_intent GLOB ? AND status = 'completed'",
+                (f"{WRITING_GATE_HUMAN_REVISION_INTENT_PREFIX}*",),
+            ).fetchone()["n"]
+        )
+    fingerprint = f"writing-quality-exhausted:{debt_fingerprint}:round-{human_revision_rounds}"
+    resolved = {
+        str(blocker.get("fingerprint") or ""): blocker
+        for blocker in steering.snapshot(store.state_dir).get("resolved_blockers", [])
+        if str(blocker.get("answered_with") or "").strip()
+    }
+    if fingerprint in resolved:
+        mode = "write"
+        return _action(
+            mode,
+            "root",
+            "" if external_revision else _integrated_route_for_claim(state, "root"),
+            f"human steering authorized a focused revision over {len(debts)} unresolved writing findings",
+            plan_step_budget(problem, mode, requested_tokens),
+            research_mode=research_mode,
+            writing_revision=True,
+            paper_revision=not external_revision,
+            external_writing_revision=external_revision,
+            revision_document_type=document_type,
+            document_format=document_format,
+            revision_of_artifact_id=artifact_id,
+            writing_debts=cards,
+            search_intent=f"{WRITING_GATE_HUMAN_REVISION_INTENT_PREFIX}{fingerprint}",
+            writing_gate_round=human_revision_rounds + 1,
+            human_steering_authorized=True,
+        )
+    blocker = steering.raise_blocker(
+        store.state_dir,
+        kind="writing_quality",
+        target_id=artifact_id,
+        summary=f"Writing revision budget exhausted with {len(debts)} gating finding(s)",
+        detail="; ".join(str(card.get("obligation") or "") for card in cards[:8]),
+        options=[
+            "supply a concrete rewrite or terminology decision",
+            "authorize another focused revision pass",
+        ],
+        fingerprint=fingerprint,
+        revision=int(problem.get("current_revision") or 0),
+    )
+    return _action(
+        "await_human",
+        "root",
+        "",
+        f"writing gate requires human resolution after quality-control budget exhaustion on {artifact_id}",
+        plan_step_budget(problem, "await_human", 0),
+        research_mode=research_mode,
+        terminal_classification="writing_quality_human_resolution_required",
+        human_blocker_id=str(blocker.get("id") or ""),
+        artifact_reviewed=artifact_id,
+        open_writing_debts=cards,
     )
 
 
@@ -9716,21 +9982,31 @@ def _writing_lint_debt_id(artifact_id: str, rule_id: str, line: int, message: st
     return f"{WRITING_LINT_DEBT_PREFIX}{rule_id}-L{line}-{digest[:10]}"
 
 
-def _sync_writing_lint_debts(store: ProofStateStore, artifact_id: str, content: str) -> None:
+def _sync_writing_lint_debts(
+    store: ProofStateStore,
+    artifact_id: str,
+    content: str,
+    *,
+    include_paper_register: bool = True,
+) -> None:
     """Sync deterministic lint findings to writing debts (idempotent).
 
-    The gated artifact is always the final_paper (the certificate is never
-    linted), so the findings are run_all plus the anti-slop layer
+    The gated artifact is either final_paper or an external revision_document
+    (the certificate is never linted). Findings are run_all plus anti-slop
     (run_slop_lint: L4-SLOP-*/L4-HOUSE-03 — majors gate, minors are
     ledger + editor-visible; slop is a debt here, never a patch-time
-    attach-rejection) plus the L5-PAPER paper-register
-    rules on its LaTeX source. New findings become active writing debts owned
+    attach-rejection), plus L5-PAPER paper-register rules for internally
+    generated final_paper LaTeX only. External Markdown/LaTeX is preserved in
+    place and therefore does not inherit Albilich's mandatory house preamble.
+    New findings become active writing debts owned
     by the paper; previously recorded lint debts that no longer reproduce
     (including debts against superseded revisions) are resolved as stale.
     LLM-critic debts are never auto-closed here. Applies at most one scheduler
     patch and none when nothing changed.
     """
-    findings = (run_writing_lint(content) + run_slop_lint(content) + run_paper_lint(content)) if content else []
+    findings = (run_writing_lint(content) + run_slop_lint(content)) if content else []
+    if content and include_paper_register:
+        findings += run_paper_lint(content)
     desired: Dict[str, Dict[str, Any]] = {}
     for finding in findings:
         debt_id = _writing_lint_debt_id(artifact_id, finding.rule_id, finding.line, finding.message)
@@ -9877,23 +10153,22 @@ def _sync_writing_compile_debt(store: ProofStateStore, artifact_id: str) -> None
 
 
 def _writing_gate_state(store: ProofStateStore, artifact_id: str) -> Dict[str, Any]:
-    """Open writing debts, per-bucket revision rounds, and total editor sessions.
+    """Open debts, revision rounds, and globally spent independent reviews.
 
-    ``editor_sessions`` counts the editor pass GLOBALLY (not per revision):
-    completed review_writing runs with the editor intent, or editor
-    writing_review artifacts (whichever is larger, so neither a critic that
-    forgot its run metrics nor one that attached no review can re-open the
-    pass). There is no per-lens or per-revision reset — one pass total.
+    Each lens is counted across document revisions: a writer revision must not
+    reset a completed terminology/introduction/editor audit. Completed runs and
+    writing_review artifacts are both counted; the larger count wins so a
+    critic that omitted either run metrics or its review artifact cannot cause
+    an accidental repeat.
 
     Revision rounds are counted per budget bucket by dispatch search_intent:
     ``deterministic_revision_rounds`` counts runs tagged
     "writing_gate_revision_deterministic" (revisions whose blocking debts were
     all lint/compile), ``editor_revision_rounds`` counts runs tagged
-    "writing_gate_revision" (revisions drawing on the editor allowance: those
-    addressing at least one editor/LLM debt, plus the exhaustion-fallthrough
-    revision that sweeps up leftover deterministic majors after the editor
-    pass; legacy stores recorded every revision under this intent, which keeps
-    the old, stricter accounting for resumed runs).
+    "writing_gate_revision" (revisions drawing on the review-driven allowance:
+    those addressing at least one LLM-critic debt, plus a focused sweep after
+    all independent reviews; legacy stores recorded every revision under this
+    intent, which keeps stricter accounting for resumed runs).
     """
     with store.connect() as conn:
         artifact_row = conn.execute(
@@ -9909,21 +10184,44 @@ def _writing_gate_state(store: ProofStateStore, artifact_id: str) -> Dict[str, A
                 (WRITING_DEBT_TYPE,),
             ).fetchall()
         ]
-        editor_reviews = 0
+        lens_reviews = {lens: 0 for lens in WRITING_GATE_REVIEW_LENSES}
+        current_lens_passes = {lens: 0 for lens in WRITING_GATE_REVIEW_LENSES}
+        current_lens_artifacts = {lens: 0 for lens in WRITING_GATE_REVIEW_LENSES}
         for row in conn.execute(
             "SELECT metadata_json FROM artifacts WHERE artifact_type = 'writing_review' AND producer_role = ?",
             ("writing_critic",),
         ).fetchall():
             metadata = json.loads(row["metadata_json"] or "{}")
-            if isinstance(metadata, Mapping) and str(metadata.get("lens") or "") == WRITING_GATE_EDITOR_LENS:
-                editor_reviews += 1
-        editor_runs = int(
-            conn.execute(
-                "SELECT COUNT(*) AS n FROM runs WHERE mode = 'review_writing' AND status = 'completed' "
-                "AND search_intent = ?",
-                (f"{WRITING_GATE_REVIEW_INTENT_PREFIX}{WRITING_GATE_EDITOR_LENS}",),
-            ).fetchone()["n"]
-        )
+            lens = str(metadata.get("lens") or "") if isinstance(metadata, Mapping) else ""
+            if lens in lens_reviews:
+                lens_reviews[lens] += 1
+                if str(metadata.get("artifact_reviewed") or "") == artifact_id:
+                    current_lens_artifacts[lens] += 1
+                    if str(metadata.get("verdict") or "") == "pass":
+                        current_lens_passes[lens] += 1
+        lens_sessions: Dict[str, int] = {}
+        current_lens_sessions: Dict[str, int] = {}
+        for lens in WRITING_GATE_REVIEW_LENSES:
+            run_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM runs WHERE mode = 'review_writing' AND status = 'completed' "
+                    "AND search_intent = ?",
+                    (f"{WRITING_GATE_REVIEW_INTENT_PREFIX}{lens}",),
+                ).fetchone()["n"]
+            )
+            lens_sessions[lens] = max(lens_reviews[lens], run_count)
+            current_run_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM runs WHERE mode = 'review_writing' AND status = 'completed' "
+                    "AND search_intent = ? AND state_revision >= ?",
+                    (f"{WRITING_GATE_REVIEW_INTENT_PREFIX}{lens}", artifact_state_revision),
+                ).fetchone()["n"]
+            )
+            current_lens_sessions[lens] = (
+                current_lens_passes[lens]
+                if current_lens_artifacts[lens]
+                else current_run_count
+            )
         # Only completed sessions consume revision budget: a failed/timed-out
         # session produced no revision, and charging it would strand the gate
         # with recorded editor debts it is no longer allowed to fix.
@@ -9942,7 +10240,10 @@ def _writing_gate_state(store: ProofStateStore, artifact_id: str) -> Dict[str, A
     return {
         "artifact_state_revision": artifact_state_revision,
         "open_writing_debts": open_writing_debts,
-        "editor_sessions": max(editor_reviews, editor_runs),
+        "lens_sessions": lens_sessions,
+        "current_lens_sessions": current_lens_sessions,
+        "editor_sessions": lens_sessions.get(WRITING_GATE_EDITOR_LENS, 0),
+        "review_sessions": sum(lens_sessions.values()),
         "editor_revision_rounds": editor_revision_rounds,
         "deterministic_revision_rounds": deterministic_revision_rounds,
     }

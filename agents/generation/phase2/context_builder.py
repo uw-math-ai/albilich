@@ -61,7 +61,8 @@ from .writing.linter import (
     obligation_location as writing_obligation_location,
     required_fix_for_obligation as writing_required_fix_for_obligation,
 )
-from .writing.paper_contract import PAPER_CONTRACT
+from .writing.paper_contract import PAPER_CONTRACT, SUPPORTED_WRITING_REVIEW_LENSES
+from .writing.revision import REVISION_DOCUMENT_ARTIFACT_TYPE, revision_document_format
 from . import steering
 
 FULL_PROOF_ARTIFACT_TYPES = {
@@ -755,19 +756,21 @@ def build_context_manifest(
         manifest["instructions"].append(
             "Writing review must use manifest.writing_review_packet as the authoritative packet: "
             "writing_review_packet.final_proof.content is the document under review (see its "
-            "reviewed_artifact_type; a final_paper is complete LaTeX article source) and is already inlined here, "
+            "reviewed_artifact_type and document_format) and is already inlined here, "
             "so you need not read it from disk; if you do, its own path is permitted. The rest of the manifest is "
             "deliberately reduced for lens isolation; do not ask for the missing proof-state context."
         )
     writing_revision_packet = _writing_revision_packet(state, action=action)
     if writing_revision_packet:
         manifest["writing_revision_packet"] = writing_revision_packet
+        _permit_writing_review_artifact_path(manifest, writing_revision_packet)
         revised_type = str(writing_revision_packet.get("revised_artifact_type") or "final_proof")
         manifest["instructions"].append(
             "Writing revision must use manifest.writing_revision_packet: revise "
             "writing_revision_packet.final_proof.content DIFF-MINIMALLY to discharge exactly the listed "
             f"open_writing_debts, attach the revised {revised_type} (complete content, new artifact_id), "
-            "and resolve each debt via update_debt."
+            "and resolve each debt via update_debt. The exact current-document path is permitted for a full-file "
+            "read when the inlined content is truncated."
         )
     writing_paper_packet = _writing_paper_packet(state, action=action)
     if writing_paper_packet:
@@ -780,18 +783,28 @@ def build_context_manifest(
         )
         manifest["instructions"].append(PAPER_CONTRACT)
     if str((action or {}).get("mode") or "") == "write" and (
-        (action or {}).get("paper_authoring") or (action or {}).get("paper_revision")
+        (action or {}).get("paper_authoring")
+        or (action or {}).get("paper_revision")
+        or (action or {}).get("external_writing_revision")
     ):
         staging_dir = _permit_writer_paper_staging_dir(manifest, store)
         if writing_paper_packet:
             writing_paper_packet["staging_dir"] = staging_dir
         if writing_revision_packet:
             writing_revision_packet["staging_dir"] = staging_dir
-        manifest["instructions"].append(
-            "Author the final_paper as a real file, not a JSON string: write the COMPLETE LaTeX source to "
-            f"{staging_dir}/<artifact_id>.tex via shell, then attach it by path (attach_artifact with path set and "
-            "NO content field); this avoids all JSON escaping of LaTeX."
-        )
+        if (action or {}).get("external_writing_revision"):
+            document_format = str((action or {}).get("document_format") or "md")
+            manifest["instructions"].append(
+                "Revise the external manuscript as a real file: preserve its source format, write the COMPLETE "
+                f"revised document to {staging_dir}/<artifact_id>.{document_format}, then attach it by path with "
+                "artifact_type=revision_document and NO content field."
+            )
+        else:
+            manifest["instructions"].append(
+                "Author the final_paper as a real file, not a JSON string: write the COMPLETE LaTeX source to "
+                f"{staging_dir}/<artifact_id>.tex via shell, then attach it by path (attach_artifact with path set and "
+                "NO content field); this avoids all JSON escaping of LaTeX."
+            )
     if stop_writer:
         manifest["partial_result_receipt"] = build_partial_receipt_inventory(
             state["claims"],
@@ -1321,7 +1334,34 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
                 "rule": "Attach exactly one verifier-only referee report with no proposed repairs or other operations.",
             }
         ]
-    if mode == "write" and (action.get("paper_authoring") or action.get("paper_revision")):
+    if mode == "write" and action.get("external_writing_revision"):
+        document_format = str(action.get("document_format") or "md")
+        contracts["writer"] = [
+            {
+                "op": "attach_artifact",
+                "fields": [
+                    "artifact_id",
+                    "artifact_type=revision_document",
+                    f"path=<staging .{document_format} file under <state_dir>/artifacts/staging/>",
+                    "content=<COMPLETE revised source> (fallback only when path is not used)",
+                    f"metadata.document_format={document_format}",
+                    "metadata.revision_of_artifact_id",
+                    "metadata.original_sha256",
+                    "metadata.revision_mode=true",
+                ],
+                "rule": (
+                    "Attach exactly one complete revision_document in the original source format. Preserve the "
+                    "original_sha256 lineage and do not attach a diff, proof artifact, or converted format."
+                ),
+            },
+            {
+                "op": "update_debt",
+                "fields": ["debt_id", "status=resolved", "resolution_note", "resolution_evidence_artifact_ids"],
+                "rule": "Resolve exactly the open writing debts named in manifest.writing_revision_packet.",
+            },
+            {"op": "record_run_metrics", "fields": ["run_id", "mode", "target_id", "status"]},
+        ]
+    elif mode == "write" and (action.get("paper_authoring") or action.get("paper_revision")):
         contracts["writer"] = [
             {
                 "op": "attach_artifact",
@@ -2984,14 +3024,13 @@ def _researcher_packet(
     }
 
 
-WRITING_PACKET_MAX_ARTIFACT_CHARS = 60_000
-# "editor" is the single lens the scheduler dispatches; the legacy lenses stay
-# supported so old data and prompts remain coherent.
-WRITING_CRITIC_LENSES = ("editor", "confused_reader", "skeptical_editor", "provenance_auditor")
-# The two writer documents the writing gate operates on: the internal
-# certificate (final_proof, markdown) and the shipped article (final_paper,
-# complete LaTeX source).
-WRITING_GATE_DOCUMENT_TYPES = ("final_proof", "final_paper")
+WRITING_PACKET_MAX_ARTIFACT_CHARS = 200_000
+# Three independent lenses are required; legacy lenses stay supported so old
+# data and resumed prompts remain coherent.
+WRITING_CRITIC_LENSES = SUPPORTED_WRITING_REVIEW_LENSES
+# Documents the writing layer understands: internal certificate/paper plus an
+# externally ingested source-preserving revision document.
+WRITING_GATE_DOCUMENT_TYPES = ("final_proof", "final_paper", REVISION_DOCUMENT_ARTIFACT_TYPE)
 
 
 def _latest_writer_document_row(
@@ -3100,7 +3139,12 @@ def _writing_review_packet(
     if str(action.get("mode") or "") != "review_writing":
         return {}
     lens = str(action.get("critic_lens") or "") or "confused_reader"
-    preferred = ("final_paper", "final_proof") if action.get("paper_review") else ("final_proof", "final_paper")
+    if action.get("external_writing_review"):
+        preferred = (REVISION_DOCUMENT_ARTIFACT_TYPE, "final_paper", "final_proof")
+    elif action.get("paper_review"):
+        preferred = ("final_paper", "final_proof", REVISION_DOCUMENT_ARTIFACT_TYPE)
+    else:
+        preferred = ("final_proof", "final_paper", REVISION_DOCUMENT_ARTIFACT_TYPE)
     row = _latest_writer_document_row(state, str(action.get("artifact_reviewed") or ""), preferred_types=preferred)
     if row is None:
         return {}
@@ -3111,6 +3155,9 @@ def _writing_review_packet(
         "lens": lens,
         "artifact_reviewed": str(row.get("artifact_id") or ""),
         "reviewed_artifact_type": reviewed_type,
+        "document_format": revision_document_format(row) if reviewed_type == REVISION_DOCUMENT_ARTIFACT_TYPE else (
+            "tex" if reviewed_type == "final_paper" else "md"
+        ),
         "state_revision_reviewed": int(action.get("state_revision_reviewed") or row.get("state_revision") or 0),
         "final_proof": {
             "artifact_id": str(row.get("artifact_id") or ""),
@@ -3120,7 +3167,9 @@ def _writing_review_packet(
         },
         "open_writing_debts": _open_writing_debt_cards(state),
     }
-    if lens == "skeptical_editor":
+    if lens in {"skeptical_editor", "introduction_editor", "editor"} and not action.get(
+        "external_writing_review"
+    ):
         packet["claim_route_summary"] = _claim_route_summary(state)
     if lens == "provenance_auditor":
         packet["artifact_ledger"] = [
@@ -3192,10 +3241,9 @@ def _permit_writer_paper_staging_dir(manifest: Dict[str, Any], store: ProofState
 def _apply_writing_lens_isolation(manifest: Dict[str, Any], lens: str) -> None:
     """Context isolation for writing critics.
 
-    The editor (the one dispatched lens) keeps the citation ledger (retrieval
-    cards + theorem library) so it can check that bibliography entries are
-    real, cited works — its directive names manifest.retrieval_cards and
-    manifest.theorem_library. Legacy lenses: confused_reader sees only the
+    The terminology editor and whole-paper editor keep the citation ledger
+    (retrieval cards + theorem library) so they can check literature usage.
+    Legacy lenses: confused_reader sees only the
     paper; skeptical_editor additionally keeps the packet's brief claim/route
     summary; provenance_auditor keeps the citation/artifact ledger. Everything
     below is proof-state context that must not leak into the review.
@@ -3220,7 +3268,7 @@ def _apply_writing_lens_isolation(manifest: Dict[str, Any], lens: str) -> None:
         "researcher_mode_state",
     ):
         manifest.pop(key, None)
-    if lens not in ("editor", "provenance_auditor"):
+    if lens not in ("terminology_editor", "editor", "provenance_auditor"):
         manifest["retrieval_cards"] = []
         manifest["theorem_library"] = []
 
@@ -3237,7 +3285,12 @@ def _writing_revision_packet(
     action = action or {}
     if str(action.get("mode") or "") != "write" or not action.get("writing_revision"):
         return {}
-    preferred = ("final_paper", "final_proof") if action.get("paper_revision") else ("final_proof", "final_paper")
+    if action.get("external_writing_revision"):
+        preferred = (REVISION_DOCUMENT_ARTIFACT_TYPE, "final_paper", "final_proof")
+    elif action.get("paper_revision"):
+        preferred = ("final_paper", "final_proof", REVISION_DOCUMENT_ARTIFACT_TYPE)
+    else:
+        preferred = ("final_proof", "final_paper", REVISION_DOCUMENT_ARTIFACT_TYPE)
     row = _latest_writer_document_row(state, str(action.get("revision_of_artifact_id") or ""), preferred_types=preferred)
     if row is None:
         return {}
@@ -3246,7 +3299,17 @@ def _writing_revision_packet(
     debt_cards = [dict(debt) for debt in debts if isinstance(debt, Mapping)] if isinstance(debts, list) else []
     if not debt_cards:
         debt_cards = _open_writing_debt_cards(state)
-    if revised_type == "final_paper":
+    metadata = _json_object(row.get("metadata_json"))
+    if revised_type == REVISION_DOCUMENT_ARTIFACT_TYPE:
+        document_format = revision_document_format(row)
+        revision_contract = (
+            "Revise diff-minimally and preserve the author's voice, mathematical claims, notation, bibliography, "
+            f"and {document_format} source format. Address exactly the listed writing debts; resolve each via "
+            "update_debt naming the new revision_document; attach exactly one COMPLETE revision_document with a "
+            "new artifact_id and preserve metadata.original_sha256. Never convert the manuscript into a different "
+            "format or present it as mathematically verified."
+        )
+    elif revised_type == "final_paper":
         revision_contract = (
             "Revise diff-minimally and voice-preservingly; address exactly the listed writing debts; resolve each via "
             "update_debt with a resolution_note and resolution_evidence_artifact_ids naming the revised final_paper; "
@@ -3263,6 +3326,14 @@ def _writing_revision_packet(
         "packet_type": "writing_revision",
         "revision_of_artifact_id": str(row.get("artifact_id") or ""),
         "revised_artifact_type": revised_type,
+        "document_format": revision_document_format(row) if revised_type == REVISION_DOCUMENT_ARTIFACT_TYPE else (
+            "tex" if revised_type == "final_paper" else "md"
+        ),
+        "source_lineage": {
+            "original_sha256": str(metadata.get("original_sha256") or ""),
+            "revision_number": int(metadata.get("revision_number") or 0),
+            "source_file": str(metadata.get("source_file") or ""),
+        },
         "final_proof": {
             "artifact_id": str(row.get("artifact_id") or ""),
             "artifact_type": revised_type,

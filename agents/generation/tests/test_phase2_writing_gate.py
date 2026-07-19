@@ -20,13 +20,16 @@ from agents.generation.phase2.context_builder import build_context_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.patches import apply_patch
 from agents.generation.phase2.report import build_markdown_report
+from agents.generation.phase2.steering import submit_steering
 from agents.generation.phase2.scheduler import (
     MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES,
     MAX_WRITING_GATE_REVISION_CYCLES,
     PAPER_EDITOR_MAX_PASSES,
     WRITING_GATE_DETERMINISTIC_REVISION_INTENT,
     WRITING_GATE_EDITOR_LENS,
+    WRITING_GATE_HUMAN_REVISION_INTENT_PREFIX,
     WRITING_GATE_PAPER_INTENT,
+    WRITING_GATE_REVIEW_LENSES,
     WRITING_GATE_REVIEW_INTENT_PREFIX,
     WRITING_GATE_REVISION_INTENT,
     next_action,
@@ -39,6 +42,8 @@ from agents.generation.phase2.store import ProofStateStore
 LEGACY_WRITING_LENSES = ("confused_reader", "skeptical_editor", "provenance_auditor")
 
 EDITOR_REVIEW_INTENT = f"{WRITING_GATE_REVIEW_INTENT_PREFIX}{WRITING_GATE_EDITOR_LENS}"
+TERMINOLOGY_REVIEW_INTENT = f"{WRITING_GATE_REVIEW_INTENT_PREFIX}terminology_editor"
+INTRODUCTION_REVIEW_INTENT = f"{WRITING_GATE_REVIEW_INTENT_PREFIX}introduction_editor"
 
 CLEAN_FINAL_PROOF = """# Final Proof
 
@@ -396,6 +401,22 @@ def spend_revision_budget(store: ProofStateStore) -> None:
         )
 
 
+def spend_required_review_passes(
+    store: ProofStateStore,
+    *,
+    lenses: tuple[str, ...] = WRITING_GATE_REVIEW_LENSES,
+) -> None:
+    """Record completed independent writing audits without fabricating findings."""
+    for lens in lenses:
+        record_writing_run(
+            store,
+            run_id=f"{lens}-run",
+            mode="review_writing",
+            search_intent=f"{WRITING_GATE_REVIEW_INTENT_PREFIX}{lens}",
+            state_revision=store.get_revision(),
+        )
+
+
 def spend_deterministic_revision_budget(store: ProofStateStore) -> None:
     """Record deterministic-defect revision runs up to MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES."""
     for round_index in range(MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES):
@@ -475,11 +496,14 @@ def active_writing_debts(store: ProofStateStore) -> list[dict]:
 
 class Phase2WritingGateSchedulerTest(unittest.TestCase):
     def test_lightweight_gate_budget_constants(self) -> None:
-        # The gate costs at most 5 LLM sessions in the worst case: authoring
-        # (1) + up to 2 deterministic-defect revisions + one editor review +
-        # at most one editor-debt revision. These constants pin that design;
-        # the deterministic allowance is separate from the editor's.
-        self.assertEqual(1, MAX_WRITING_GATE_REVISION_CYCLES)
+        # The gate owns three independent audits. Each audit may produce one
+        # focused writer revision; deterministic repair remains a separate
+        # allowance and never consumes an audit-driven revision.
+        self.assertEqual(
+            ("terminology_editor", "introduction_editor", "editor"),
+            WRITING_GATE_REVIEW_LENSES,
+        )
+        self.assertEqual(len(WRITING_GATE_REVIEW_LENSES), MAX_WRITING_GATE_REVISION_CYCLES)
         self.assertEqual(2, MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES)
         self.assertEqual(1, PAPER_EDITOR_MAX_PASSES)
         self.assertEqual("editor", WRITING_GATE_EDITOR_LENS)
@@ -542,8 +566,8 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertTrue(action.get("paper_authoring"), action)
             self.assertEqual([], active_writing_debts(store))
 
-    def test_clean_paper_dispatches_exactly_one_editor_review(self) -> None:
-        # Deterministically-clean paper -> the single editor exposition review.
+    def test_clean_paper_dispatches_terminology_review_first(self) -> None:
+        # Deterministically-clean paper starts the independent review sequence.
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_solved_store(Path(tmpdir), "writing-gate-editor-dispatch-test")
             attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
@@ -552,10 +576,10 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             action = next_action(store, web_search="disabled")
 
             self.assertEqual("review_writing", action["mode"], action)
-            self.assertEqual(WRITING_GATE_EDITOR_LENS, action["critic_lens"], action)
+            self.assertEqual("terminology_editor", action["critic_lens"], action)
             self.assertEqual("final-paper-1", action["artifact_reviewed"])
             self.assertTrue(action.get("paper_review"))
-            self.assertEqual(EDITOR_REVIEW_INTENT, action["search_intent"])
+            self.assertEqual(TERMINOLOGY_REVIEW_INTENT, action["search_intent"])
             self.assertEqual("writing_critic", actor_role_for_action(action))
 
     def test_editor_pass_opens_the_gate(self) -> None:
@@ -563,9 +587,7 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             store = make_solved_store(Path(tmpdir), "writing-gate-editor-pass-test")
             attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
             insert_final_paper(store, "final-paper-1", CLEAN_FINAL_PAPER)
-            attach_writing_review(
-                store, lens=WRITING_GATE_EDITOR_LENS, artifact_reviewed="final-paper-1", verdict="pass"
-            )
+            spend_required_review_passes(store)
 
             action = next_action(store, web_search="disabled")
 
@@ -610,12 +632,17 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertTrue(action.get("writing_revision"))
             self.assertEqual(WRITING_GATE_REVISION_INTENT, action["search_intent"])
 
-    def test_editor_fail_dispatches_single_revision_then_gate_opens_without_second_review(self) -> None:
+    def test_editor_fail_dispatches_revision_then_confirms_the_latest_paper(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_solved_store(Path(tmpdir), "writing-gate-editor-fail-test")
             attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
             insert_final_paper(store, "final-paper-1", CLEAN_FINAL_PAPER)
-            self.assertEqual("review_writing", next_action(store, web_search="disabled")["mode"])
+            spend_required_review_passes(
+                store, lenses=("terminology_editor", "introduction_editor")
+            )
+            first_action = next_action(store, web_search="disabled")
+            self.assertEqual("review_writing", first_action["mode"])
+            self.assertEqual(WRITING_GATE_EDITOR_LENS, first_action["critic_lens"])
 
             # Editor fails: files a blocking debt (and a fail review), run completes.
             attach_writing_review(
@@ -667,17 +694,25 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
                 store, debt_id="writing-editor-finding-1", evidence_artifact_id="final-paper-2"
             )
 
-            # Deterministic re-check only: the gate opens with NO second editor pass.
+            # The revised source itself gets one final whole-paper confirmation.
+            action = next_action(store, web_search="disabled")
+            self.assertEqual("review_writing", action["mode"], action)
+            self.assertEqual(WRITING_GATE_EDITOR_LENS, action["critic_lens"])
+            self.assertTrue(action["final_editor_confirmation"])
+            self.assertEqual("final-paper-2", action["artifact_reviewed"])
+            attach_writing_review(
+                store,
+                lens=WRITING_GATE_EDITOR_LENS,
+                artifact_reviewed="final-paper-2",
+                verdict="pass",
+            )
             action = next_action(store, web_search="disabled")
             self.assertEqual("stop_solved", action["mode"], action)
             self.assertEqual("final-proof-1", action["final_artifact_id"])
 
-    def test_revision_spent_and_open_non_residue_debt_falls_through_then_opens_gate(self) -> None:
-        # EDITOR FALLTHROUGH ON EXHAUSTION: with the editor-bucket revision
-        # spent and a blocker debt still open, the gate does NOT open while
-        # the editor pass remains — it falls through to the editor review;
-        # only once every pass+revision budget is truly spent does the gate
-        # open with the debt left recorded.
+    def test_revision_spent_and_open_non_residue_debt_requires_human_after_reviews(self) -> None:
+        # Exhaustion never silently ships an unresolved major. Independent
+        # audits still run, then the harness raises a human steering blocker.
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_solved_store(Path(tmpdir), "writing-gate-budget-test")
             attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
@@ -695,28 +730,20 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
 
             spend_revision_budget(store)
 
-            # Revision budget spent, editor pass unspent: fall through to the
-            # editor review instead of opening the gate.
+            # Revision budget spent: fall through to the first independent
+            # audit instead of opening the gate.
             action = next_action(store, web_search="disabled")
             self.assertEqual("review_writing", action["mode"], action)
-            self.assertEqual(WRITING_GATE_EDITOR_LENS, action["critic_lens"], action)
-            self.assertIn("falling through", action["reason"])
+            self.assertEqual("terminology_editor", action["critic_lens"], action)
+            self.assertIn("currently spent", action["reason"])
 
-            # Editor passes (finds nothing new): every budget is now truly
-            # spent, so the gate opens with the debt recorded.
-            attach_writing_review(
-                store, lens=WRITING_GATE_EDITOR_LENS, artifact_reviewed="final-paper-1", verdict="pass"
-            )
-            record_writing_run(
-                store,
-                run_id="editor-run-1",
-                mode="review_writing",
-                search_intent=EDITOR_REVIEW_INTENT,
-                state_revision=store.get_revision(),
-            )
+            spend_required_review_passes(store)
             action = next_action(store, web_search="disabled")
-            self.assertEqual("stop_solved", action["mode"], action)
-            # The unresolved debt stays recorded on the ledger and in the report.
+            self.assertEqual("await_human", action["mode"], action)
+            self.assertEqual(
+                "writing_quality_human_resolution_required",
+                action["terminal_classification"],
+            )
             self.assertTrue(active_writing_debts(store))
             report = build_markdown_report(store)
             self.assertIn("## Writing Review", report)
@@ -726,7 +753,7 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
         # The revision budget is SPLIT: a revision whose blocking debts are all
         # deterministic (here a compile failure) counts against the
         # deterministic cap, so a run whose single revision fixed a compile
-        # failure can STILL dispatch one editor-debt revision after an editor
+        # failure can STILL dispatch a review-driven revision after an editor
         # fail.
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_solved_store(Path(tmpdir), "writing-gate-split-budget-test")
@@ -755,6 +782,9 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             insert_final_paper(
                 store, "final-paper-2", CLEAN_FINAL_PAPER, created_at="2026-01-05T00:00:00+00:00"
             )
+            spend_required_review_passes(
+                store, lenses=("terminology_editor", "introduction_editor")
+            )
 
             # The revised, deterministically clean paper still gets the editor pass.
             action = next_action(store, web_search="disabled")
@@ -763,7 +793,7 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertEqual("final-paper-2", action["artifact_reviewed"])
 
             # Editor fails: the deterministic revision did NOT consume the
-            # editor allowance, so the single editor-debt revision dispatches.
+            # review allowance, so the editor-debt revision dispatches.
             attach_writing_review(
                 store, lens=WRITING_GATE_EDITOR_LENS, artifact_reviewed="final-paper-2", verdict="fail"
             )
@@ -786,8 +816,8 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertEqual(WRITING_GATE_REVISION_INTENT, action["search_intent"])
             self.assertEqual(1, action["writing_gate_round"])
 
-            # The editor-debt revision completes and resolves the debt: only
-            # the deterministic re-check runs, and the gate opens.
+            # The editor-debt revision completes and resolves the debt, then
+            # the actual revised source receives a whole-paper confirmation.
             record_writing_run(
                 store,
                 run_id="editor-revision-1",
@@ -800,6 +830,16 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             )
             resolve_writing_debt(
                 store, debt_id="writing-editor-late-finding", evidence_artifact_id="final-paper-3"
+            )
+            action = next_action(store, web_search="disabled")
+            self.assertEqual("review_writing", action["mode"], action)
+            self.assertTrue(action["final_editor_confirmation"])
+            self.assertEqual("final-paper-3", action["artifact_reviewed"])
+            attach_writing_review(
+                store,
+                lens=WRITING_GATE_EDITOR_LENS,
+                artifact_reviewed="final-paper-3",
+                verdict="pass",
             )
             action = next_action(store, web_search="disabled")
             self.assertEqual("stop_solved", action["mode"], action)
@@ -832,7 +872,7 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertTrue(action.get("paper_revision"))
             self.assertEqual(WRITING_GATE_REVISION_INTENT, action["search_intent"])
 
-    def test_deterministic_cap_spent_with_editor_pass_spent_uses_the_editor_revision(self) -> None:
+    def test_deterministic_cap_spent_with_reviews_spent_requires_human_if_unfixed(self) -> None:
         # Deterministic allowance spent, editor pass already spent, but the
         # editor-debt revision is NOT: the leftover deterministic major (a
         # slop debt) dispatches that final revision instead of shipping
@@ -849,9 +889,7 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
                     "We prove the following result, which plays a crucial role in the classical literature~\\cite{zorn}.",
                 ),
             )
-            attach_writing_review(
-                store, lens=WRITING_GATE_EDITOR_LENS, artifact_reviewed="final-paper-slop", verdict="pass"
-            )
+            spend_required_review_passes(store)
             spend_deterministic_revision_budget(store)
 
             action = next_action(store, web_search="disabled")
@@ -867,21 +905,38 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
                 action["writing_debts"],
             )
 
-            # The final revision is spent without fixing the debt: every
-            # pass+revision budget is now truly spent, so the gate opens.
+            # The final revision is spent without fixing the debt: the gate
+            # pauses for human steering instead of shipping it.
             spend_revision_budget(store)
 
             action = next_action(store, web_search="disabled")
-            self.assertEqual("stop_solved", action["mode"], action)
+            self.assertEqual("await_human", action["mode"], action)
+            self.assertEqual(
+                "writing_quality_human_resolution_required",
+                action["terminal_classification"],
+            )
             self.assertTrue(
                 any(d["debt_id"].startswith("writing-lint-") for d in active_writing_debts(store))
             )
+            submit_steering(
+                store.state_dir,
+                "Run one more focused revision and remove the listed phrase.",
+                blocker_id=action["human_blocker_id"],
+            )
+            authorized = next_action(store, web_search="disabled")
+            self.assertEqual("write", authorized["mode"], authorized)
+            self.assertTrue(authorized["human_steering_authorized"])
+            self.assertTrue(
+                authorized["search_intent"].startswith(
+                    WRITING_GATE_HUMAN_REVISION_INTENT_PREFIX
+                )
+            )
 
-    def test_deterministic_exhaustion_with_majors_dispatches_the_editor_not_stop(self) -> None:
+    def test_deterministic_exhaustion_with_majors_dispatches_remaining_editor(self) -> None:
         # EDITOR FALLTHROUGH ON EXHAUSTION: deterministic revision budget
         # spent, deterministic majors (3 missing section openers) still open,
         # editor never run -> the gate dispatches the editor review (never
-        # stop_solved); after an editor fail, the single editor-debt revision
+        # stop_solved); after an editor fail, a review-driven revision
         # addresses BOTH the editor's finding and the leftover deterministic
         # majors in one pass.
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -889,20 +944,23 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
             insert_final_paper(store, "final-paper-noopeners", PAPER_MISSING_THREE_OPENERS)
             spend_deterministic_revision_budget(store)
+            spend_required_review_passes(
+                store, lenses=("terminology_editor", "introduction_editor")
+            )
 
             action = next_action(store, web_search="disabled")
 
             self.assertEqual("review_writing", action["mode"], action)
             self.assertEqual(WRITING_GATE_EDITOR_LENS, action["critic_lens"], action)
             self.assertEqual("final-paper-noopeners", action["artifact_reviewed"])
-            self.assertIn("falling through", action["reason"])
+            self.assertIn("currently spent", action["reason"])
             # The leftover deterministic majors are visible to the editor.
             self.assertTrue(
                 any(d["debt_id"].startswith("writing-lint-") for d in action["open_writing_debts"]),
                 action["open_writing_debts"],
             )
 
-            # Editor fails with one finding: the single editor-debt revision
+            # Editor fails with one finding: the review-driven revision
             # dispatches, carrying the editor debt AND all three leftover
             # HOUSE-07 majors in its checklist.
             attach_writing_review(
@@ -931,30 +989,24 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             house07 = [d for d in action["writing_debts"] if d["rule_id"] == "L4-HOUSE-07"]
             self.assertEqual(3, len(house07), action["writing_debts"])
 
-    def test_full_exhaustion_opens_gate_with_all_debts_recorded(self) -> None:
-        # Only after the editor pass AND both revision buckets are truly
-        # spent does the gate open, with every unresolved debt recorded.
+    def test_full_exhaustion_pauses_with_all_debts_recorded(self) -> None:
+        # Unresolved majors remain visible and force human steering after all
+        # automated review and revision budgets are spent.
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_solved_store(Path(tmpdir), "writing-gate-full-exhaustion-test")
             attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
             insert_final_paper(store, "final-paper-noopeners", PAPER_MISSING_THREE_OPENERS)
             spend_deterministic_revision_budget(store)
-            attach_writing_review(
-                store, lens=WRITING_GATE_EDITOR_LENS, artifact_reviewed="final-paper-noopeners", verdict="pass"
-            )
-            record_writing_run(
-                store,
-                run_id="editor-run-1",
-                mode="review_writing",
-                search_intent=EDITOR_REVIEW_INTENT,
-                state_revision=store.get_revision(),
-            )
+            spend_required_review_passes(store)
             spend_revision_budget(store)
 
             action = next_action(store, web_search="disabled")
 
-            self.assertEqual("stop_solved", action["mode"], action)
-            self.assertEqual("final-proof-1", action["final_artifact_id"])
+            self.assertEqual("await_human", action["mode"], action)
+            self.assertEqual(
+                "writing_quality_human_resolution_required",
+                action["terminal_classification"],
+            )
             leftover = active_writing_debts(store)
             self.assertEqual(
                 3, sum(1 for d in leftover if d["obligation"].startswith("L4-HOUSE-07:")), leftover
@@ -1265,9 +1317,9 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             )
             action = next_action(store, web_search="disabled")
 
-            # Clean revision: stale lint debts close and the editor review runs.
+            # Clean revision: stale lint debts close and independent audits begin.
             self.assertEqual("review_writing", action["mode"], action)
-            self.assertEqual(WRITING_GATE_EDITOR_LENS, action["critic_lens"])
+            self.assertEqual("terminology_editor", action["critic_lens"])
             self.assertEqual("final-paper-clean", action["artifact_reviewed"])
             self.assertEqual([], active_writing_debts(store))
             with sqlite3.connect(store.db_path) as conn:
@@ -1326,23 +1378,17 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             action = next_action(store, web_search="disabled")
 
             self.assertEqual("review_writing", action["mode"], action)
-            self.assertEqual(WRITING_GATE_EDITOR_LENS, action["critic_lens"])
+            self.assertEqual("terminology_editor", action["critic_lens"])
             self.assertFalse(any(d["debt_id"].startswith("writing-compile-") for d in active_writing_debts(store)))
 
-    def test_completed_editor_run_without_review_artifact_counts_as_the_pass(self) -> None:
-        # Livelock protection: a completed review_writing run with the editor
-        # intent spends the editor session even if the critic attached nothing.
+    def test_completed_review_runs_without_artifacts_count_as_the_passes(self) -> None:
+        # Livelock protection: completed review_writing runs spend each audit
+        # even if a critic fails to attach its writing_review artifact.
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_solved_store(Path(tmpdir), "writing-gate-livelock-test")
             attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
             insert_final_paper(store, "final-paper-1", CLEAN_FINAL_PAPER)
-            record_writing_run(
-                store,
-                run_id="editor-run-1",
-                mode="review_writing",
-                search_intent=EDITOR_REVIEW_INTENT,
-                state_revision=store.get_revision(),
-            )
+            spend_required_review_passes(store)
 
             action = next_action(store, web_search="disabled")
 
@@ -2020,7 +2066,7 @@ class Phase2WritingModeGuidanceTest(unittest.TestCase):
             },
             actor_role="writing_critic",
         )
-        self.assertIn("MATHEMATICAL CORRECTNESS IS ASSUMED", prompt)
+        self.assertIn("MATHEMATICAL CORRECTNESS REVIEW IS OUT OF SCOPE", prompt)
         self.assertIn("at most 12", prompt.lower())
         self.assertIn("writing_review", prompt)
         self.assertIn("add_debt", prompt)
@@ -2036,6 +2082,44 @@ class Phase2WritingModeGuidanceTest(unittest.TestCase):
         # The editor folds the skeptical_editor + pedant rubric rules in.
         self.assertIn("Rubric rules for this lens", prompt)
         self.assertIn("L4-SENT-02", prompt)
+
+    def test_terminology_editor_requires_evidence_and_human_consultation(self) -> None:
+        prompt = build_session_prompt(
+            context_path=Path("/tmp/context.json"),
+            action={
+                "mode": "review_writing",
+                "target_id": "root",
+                "critic_lens": "terminology_editor",
+                "artifact_reviewed": "paper-1",
+                "external_writing_review": True,
+            },
+            actor_role="writing_critic",
+        )
+        self.assertIn("L3-TERM-01", prompt)
+        self.assertIn("L3-TERM-02", prompt)
+        self.assertIn("L3-TERM-03", prompt)
+        self.assertIn("HUMAN CONSULTATION REQUIRED:", prompt)
+        self.assertIn("DO NOT GUESS", prompt)
+        self.assertIn("standard references", prompt)
+
+    def test_introduction_editor_enforces_story_and_causal_proof_outline(self) -> None:
+        prompt = build_session_prompt(
+            context_path=Path("/tmp/context.json"),
+            action={
+                "mode": "review_writing",
+                "target_id": "root",
+                "critic_lens": "introduction_editor",
+                "artifact_reviewed": "paper-1",
+                "external_writing_review": True,
+            },
+            actor_role="writing_critic",
+        )
+        self.assertIn("highest-control section", prompt)
+        self.assertIn("one-sentence big-picture story", prompt)
+        self.assertIn("causal proof overview", prompt)
+        self.assertIn("mechanical list of lemmas", prompt)
+        self.assertIn("L3-INTRO-08", prompt)
+        self.assertIn("L3-INTRO-09", prompt)
 
     def test_confused_reader_prompt_is_isolated_to_the_paper(self) -> None:
         prompt = build_session_prompt(
@@ -2549,8 +2633,7 @@ class Phase2WritingReviewManifestTest(unittest.TestCase):
 
 class Phase2WritingReviewReportTest(unittest.TestCase):
     def test_report_writing_review_section_renders_the_editor_flow(self) -> None:
-        # The new flow: one editor review on the final paper; legacy-lens
-        # reviews from old runs still render alongside it.
+        # Required editor reviews and legacy-lens reviews both render.
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_solved_store(Path(tmpdir), "writing-report-test")
             attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)

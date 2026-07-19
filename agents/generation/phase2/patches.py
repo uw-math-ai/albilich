@@ -39,6 +39,11 @@ from .result_status import SOLVED_RELATIONS, root_alignment_from_metadata
 from .store import ProofStateStore
 from .writing.latex_template import normalize_paper_template
 from .writing.linter import run_paper_lint, run_residue_scan
+from .writing.paper_contract import SUPPORTED_WRITING_REVIEW_LENSES
+from .writing.revision import (
+    REVISION_DOCUMENT_ARTIFACT_TYPE,
+    revision_document_metadata,
+)
 
 
 class PatchRejected(Exception):
@@ -55,6 +60,7 @@ ARTIFACT_PRODUCER_ROLES = {
     "referee_report": {"writer"},
     "writing_review": {"writing_critic"},
     "final_paper": {"writer"},
+    REVISION_DOCUMENT_ARTIFACT_TYPE: {"writer"},
     "advisor_synthesis": {"phd_advisor", "advisor"},
     "invention_authorization": {"phd_advisor", "advisor"},
     "bridge_lemma_search": {"researcher"},
@@ -69,10 +75,15 @@ WRITING_CRITIC_ARTIFACT_TYPES = {"writing_review"}
 WRITING_REVIEW_VERDICTS = {"pass", "fail"}
 # "editor" is the single lens the scheduler dispatches; the legacy three-lens
 # names stay accepted so old review data still parses.
-WRITING_CRITIC_LENSES = {"editor", "confused_reader", "skeptical_editor", "provenance_auditor"}
+WRITING_CRITIC_LENSES = set(SUPPORTED_WRITING_REVIEW_LENSES)
 # Writer artifact types scanned for generation residue (rule L1-CITE-03) at
 # patch time; residue in the shipped exposition is always rejected.
-WRITER_RESIDUE_SCANNED_ARTIFACT_TYPES = {"final_proof", "partial_proof_report", "final_paper"}
+WRITER_RESIDUE_SCANNED_ARTIFACT_TYPES = {
+    "final_proof",
+    "partial_proof_report",
+    "final_paper",
+    REVISION_DOCUMENT_ARTIFACT_TYPE,
+}
 # Artifact types whose file extension is not the markdown/txt default; the
 # final_paper's content IS complete LaTeX source, so it ships as a .tex file
 # that the attach-time sidecar compiles directly (no markdown->LaTeX pass).
@@ -1711,6 +1722,7 @@ def _attach_artifact(conn: sqlite3.Connection, store: ProofStateStore, patch: Di
     if not isinstance(metadata, dict):
         raise PatchRejected(["artifact metadata must be an object"])
     metadata = _compact_artifact_metadata(artifact_type, metadata)
+    metadata = _prepare_revision_document_metadata(conn, actor, artifact_type, metadata)
     strategy_errors = strategic_artifact_errors(
         conn,
         artifact_type=artifact_type,
@@ -1724,6 +1736,16 @@ def _attach_artifact(conn: sqlite3.Connection, store: ProofStateStore, patch: Di
     path = _validated_artifact_path(store, op.get("path", ""))
     if content is not None and path:
         raise PatchRejected(["attach_artifact with inline content must omit path; the proof-state store writes artifacts under state_dir/artifacts"])
+    if path and actor == "writer" and artifact_type == REVISION_DOCUMENT_ARTIFACT_TYPE:
+        expected_suffix = f".{metadata['document_format']}"
+        actual_suffix = Path(path).suffix.lower()
+        if actual_suffix != expected_suffix:
+            raise PatchRejected(
+                [
+                    "revision_document staged path must preserve source format "
+                    f"{expected_suffix!r}; got {actual_suffix or '<no suffix>'!r}"
+                ]
+            )
     staged_from_path = False
     if content is None and path and actor == "writer" and artifact_type in WRITER_PATH_ATTACH_ARTIFACT_TYPES:
         # Path-based writer attach: load the staged file so the full writer
@@ -1758,9 +1780,12 @@ def _attach_artifact(conn: sqlite3.Connection, store: ProofStateStore, patch: Di
         # Inline content, or a writer's staged file: the recorded artifact must
         # point at the store-managed copy under state_dir/artifacts with the
         # standard naming/extension, never at the mutable staging file.
-        path = str(_write_artifact_content(store, artifact_id, artifact_type, content))
+        path = str(_write_artifact_content(store, artifact_id, artifact_type, content, metadata=metadata))
     if actor == "writer" and content is not None and path:
-        if artifact_type == "final_paper":
+        if artifact_type == "final_paper" or (
+            artifact_type == REVISION_DOCUMENT_ARTIFACT_TYPE
+            and str(metadata.get("document_format") or "") == "tex"
+        ):
             # The final_paper's content IS LaTeX source already stored as .tex;
             # compile it directly — no markdown->LaTeX conversion pass.
             sidecars = compile_latex_artifact(Path(path), Path(path).with_suffix(".pdf"))
@@ -1795,6 +1820,58 @@ def _attach_artifact(conn: sqlite3.Connection, store: ProofStateStore, patch: Di
             utc_now(),
         ),
     )
+
+
+def _prepare_revision_document_metadata(
+    conn: sqlite3.Connection,
+    actor: str,
+    artifact_type: str,
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate immutable format/source lineage for external revisions."""
+
+    if artifact_type != REVISION_DOCUMENT_ARTIFACT_TYPE:
+        return metadata
+    if actor != "writer":
+        return metadata
+    revision_of = str(metadata.get("revision_of_artifact_id") or "").strip()
+    if not revision_of:
+        raise PatchRejected(["writer revision_document requires metadata.revision_of_artifact_id"])
+    row = conn.execute(
+        "SELECT artifact_type, metadata_json FROM artifacts WHERE artifact_id = ?",
+        (revision_of,),
+    ).fetchone()
+    if row is None or str(row["artifact_type"] or "") != REVISION_DOCUMENT_ARTIFACT_TYPE:
+        raise PatchRejected(
+            [f"revision_document predecessor {revision_of!r} does not exist or is not a revision_document"]
+        )
+    previous = revision_document_metadata({"metadata_json": row["metadata_json"]})
+    previous_format = str(previous.get("document_format") or "").strip().lower()
+    document_format = str(metadata.get("document_format") or "").strip().lower()
+    if document_format not in {"md", "tex"}:
+        raise PatchRejected(["revision_document metadata.document_format must be 'md' or 'tex'"])
+    if document_format != previous_format:
+        raise PatchRejected(
+            [f"revision_document must preserve source format {previous_format!r}; got {document_format!r}"]
+        )
+    original_sha256 = str(metadata.get("original_sha256") or "").strip().lower()
+    expected_sha256 = str(previous.get("original_sha256") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", original_sha256) or original_sha256 != expected_sha256:
+        raise PatchRejected(["revision_document must preserve the predecessor's metadata.original_sha256"])
+    if metadata.get("revision_mode") is not True:
+        raise PatchRejected(["revision_document requires metadata.revision_mode=true"])
+    return {
+        **previous,
+        **metadata,
+        "document_format": document_format,
+        "original_sha256": expected_sha256,
+        "revision_of_artifact_id": revision_of,
+        "revision_number": int(previous.get("revision_number") or 0) + 1,
+        "revision_mode": True,
+        "diff_minimal": True,
+        "voice_preserving": True,
+        "mathematical_status": "not_verified_by_writing_harness",
+    }
 
 
 def _artifact_inline_content(op: Mapping[str, Any]) -> Optional[str]:
@@ -2022,7 +2099,7 @@ def _guard_writing_review_metadata(artifact_type: str, artifact_id: str, metadat
         raise PatchRejected(
             [
                 f"writing_review artifact {artifact_id} requires metadata.artifact_reviewed naming the reviewed "
-                "final_proof or final_paper"
+                "final_proof, final_paper, or revision_document"
             ]
         )
 
@@ -3703,7 +3780,7 @@ def _compact_artifact_metadata(artifact_type: str, metadata: Dict[str, Any]) -> 
         if "notes" in compact:
             compact["notes"] = _compact_text(compact["notes"], 600)
         return compact
-    if artifact_type in {"final_proof", "final_paper"}:
+    if artifact_type in {"final_proof", "final_paper", REVISION_DOCUMENT_ARTIFACT_TYPE}:
         compact = dict(metadata)
         compact["source_artifact_ids"] = _compact_list(compact.get("source_artifact_ids", []), item_chars=120, max_items=24)
         return compact
@@ -3794,7 +3871,14 @@ def _first_nonempty(values: Any) -> str:
     return ""
 
 
-def _write_artifact_content(store: ProofStateStore, artifact_id: str, artifact_type: str, content: str) -> str:
+def _write_artifact_content(
+    store: ProofStateStore,
+    artifact_id: str,
+    artifact_type: str,
+    content: str,
+    *,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> str:
     markdown_types = {
         "final_proof",
         "proof_blueprint",
@@ -3818,9 +3902,13 @@ def _write_artifact_content(store: ProofStateStore, artifact_id: str, artifact_t
         "writing_review",
         *STRATEGIC_MARKDOWN_ARTIFACT_TYPES,
     }
-    suffix = ARTIFACT_CONTENT_EXTENSIONS.get(
-        artifact_type, ".md" if artifact_type in markdown_types else ".txt"
-    )
+    if artifact_type == REVISION_DOCUMENT_ARTIFACT_TYPE:
+        document_format = str((metadata or {}).get("document_format") or "").strip().lower()
+        suffix = ".tex" if document_format == "tex" else ".md"
+    else:
+        suffix = ARTIFACT_CONTENT_EXTENSIONS.get(
+            artifact_type, ".md" if artifact_type in markdown_types else ".txt"
+        )
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", artifact_id).strip("._") or "artifact"
     artifact_dir = store.state_dir / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)

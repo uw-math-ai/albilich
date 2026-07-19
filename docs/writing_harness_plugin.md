@@ -1,19 +1,23 @@
 # Writing Harness Plugin: the Phase2 Writing Gate
 
-How the math-writing harness is wired into the albilich phase2 engine
-(`agents/generation/phase2/`). The gate sits between "the root theorem is
-integrated and a final proof was written" and "the run may conclude
-`stop_solved`", and it is **lightweight**: mathematical correctness is
-ASSUMED (the main harness verified the certificate), the internal
-`final_proof` (the *certificate*) is never linted or reviewed here, and the
-gate costs at most **5 LLM sessions in the worst case** — paper authoring (1),
-deterministic-defect revision(s) (0–2, typically 0–1), one "editor" exposition
-review (1), and at most one editor-debt revision (0–1). No run
-concludes solved until the `final_paper` — a standalone LaTeX research
-article — is deterministically clean (lint, paper-register rules, LaTeX
-compile) and the single editor session has been spent, **or** every pass and
-revision budget has been truly spent (in which case the unresolved debts are
-recorded in the report).
+How the math-writing harness is wired into the Albilich phase2 engine
+(`agents/generation/phase2/`). It has two entry paths:
+
+1. The publication gate follows an internally verified `final_proof` and
+   authors a standalone LaTeX `final_paper`. Mathematical correctness review
+   is out of scope here because the proof harness already verified the
+   certificate.
+2. `revise-paper` ingests an externally authored `.md` or `.tex` manuscript as
+   a `revision_document` and runs writing-only revision. The submitted source
+   is explicitly **not** proof evidence and receives no mathematical
+   verification claim from this harness.
+
+Both paths run deterministic checks followed by three independent audits, in
+order: terminology, introduction, and whole-paper exposition. The
+introduction has the highest quality-control standard. Uncertain terminology
+never triggers an agent guess: it raises a blocking human-consultation item in
+the steering dashboard. No document ships with an unresolved blocker or major
+writing debt; exhausted automation pauses for human resolution.
 
 ## Source of truth
 
@@ -46,109 +50,89 @@ recorded in the report).
   `run_paper_lint(text)` (the `final_paper`-only paper-register rules
   `L5-PAPER-01/02/03`, all blockers). All return
   `Finding(rule_id, severity, line, excerpt, message)`.
-- **Paper contract**: `agents/generation/phase2/writing/paper_contract.py` —
+- **Paper and revision contracts**:
+  `agents/generation/phase2/writing/paper_contract.py` —
   `PAPER_CONTRACT` (the verbatim writer directive for paper authoring: journal
   register, mandatory amsart structure, faithfulness-to-certificate rules, the
-  register wall), `EDITOR_DIRECTIVE` (the single exposition-editor lens
-  directive: correctness assumed, publishable-paper standard, at most 12
-  located actionable findings), and `PAPER_STANDARD_FOR_CRITICS` (legacy;
-  appended to the legacy lens directives when the reviewed artifact is a
-  `final_paper`). This is the quality lever; edit the texts only there.
+  register wall), `TERMINOLOGY_EDITOR_DIRECTIVE`,
+  `INTRODUCTION_EDITOR_DIRECTIVE`, and `EDITOR_DIRECTIVE` (the final
+  whole-paper re-audit, at most 12 located actionable findings). The shared
+  `WRITING_STYLE_CORE` requires standard literature terminology, justified
+  coinages, a coherent big-picture introduction, and a causal proof overview.
+  Edit these standards only in this module.
+- **External revision ingestion**:
+  `agents/generation/phase2/writing/revision.py` — validates `.md`/`.tex`,
+  copies the source into immutable run storage, records its original SHA-256
+  and format, and labels its mathematical status
+  `not_verified_by_writing_harness`.
 - **This plugin** (the wiring, owned by phase2): scheduler gate, `writing_critic`
   role, patch guards, context isolation, and reporting.
 
-## The gate's state machine (lightweight, ≤4 LLM sessions worst case)
+## The gate's state machine
 
-Scheduler entry point: `_writing_gate_action` in `phase2/scheduler.py`, called
-only when the root claim is integrated, a `final_proof` exists, and the
-post-integration librarian gate declined. The certificate is **internal**:
-never linted, never reviewed, never revised by the gate (the patch-time
-residue guard on writer artifacts still stands).
+Scheduler entry points are `_writing_gate_action` for an internally generated
+paper and `_external_writing_revision_action` for an ingested manuscript. The
+certificate on the internal path remains private proof evidence: it is never
+linted, reviewed, or revised by this gate. The external path has no
+certificate and bypasses proof research, integration, and proof-status gates.
 
-1. **Paper authoring (1 session).** Root integrated + `final_proof` exists +
-   no `final_paper` → immediately dispatch `mode="write"` with
-   `paper_authoring: true` (`search_intent="writing_gate_paper"`). The writer
-   receives `manifest.writing_paper_packet` (certificate content, root
-   statement, claim/route summary, literature ledger) plus the
-   `PAPER_CONTRACT` and attaches exactly one `final_paper` whose `content` IS
-   complete LaTeX source. The artifact is stored as `.tex` and compiled
-   **directly** at attach time (`receipt.compile_latex_artifact`, no
-   markdown→LaTeX conversion); `pdf_status` (+ `latex_log_path` on failure)
-   is persisted into the artifact metadata.
-2. **Deterministic syncs (free, every pass once a paper exists).**
-   - **Lint sync** (in-process, no LLM): `run_all` **plus** `run_slop_lint`
-     (anti-slop: slop majors like significance inflation, recap openers, and
-     choreography force the revision; slop minors are ledger + editor-visible
-     debts) **plus** `run_paper_lint`
-     (markdown residue, internal register, article structure) on the latest
-     `final_paper`'s LaTeX source; findings become writing debts; recorded
-     lint debts that no longer reproduce are resolved as stale (see debt
-     conventions). Slop findings are **debts, never attach-rejections** — the
-     patch-time guard does not run `run_slop_lint`.
-   - **LaTeX-compile sync** (reads the compile outcome the writer's sidecar
-     persisted at attach time, no recompile): a paper whose `.tex` did not
-     compile (`pdf_status ∈ {compile_failed, compile_error}`) gets a
-     **blocking** `L5-TEX-05` writing debt carrying a pdflatex-log excerpt.
-     `compiled` (or, with no `pdflatex`, an unassertable `pdflatex_missing`)
-     clears any stale compile debt; the raw status is surfaced in the report
-     either way.
-   - Open blocker/major writing debts dispatch **a writer revision**
-     (`mode="write"`, `writing_revision: true` + `paper_revision: true`):
-     diff-minimal, the writer re-attaches the COMPLETE revised LaTeX source as
-     a new `final_paper` and resolves debts via `update_debt`. The revision
-     prompt enumerates **EVERY open writing debt** (no cap) as a numbered
-     `location -> REQUIRED FIX` checklist — location is the section title /
-     line / excerpt, the required fix is the concrete per-rule instruction
-     from `writing/linter.py` (`required_fix`, appended to each lint debt's
-     obligation at sync time behind `REQUIRED_FIX_MARKER`) — and instructs
-     the writer to fix every numbered item and self-check each location
-     before attaching, because the same deterministic scan re-flags whatever
-     it still finds. The revision
-     **budget is split by what forced the revision**: a dispatch whose blocking
-     debts are ALL deterministic (debt-id prefixes `writing-lint-` /
-     `writing-compile-`) is tagged
-     `search_intent="writing_gate_revision_deterministic"` and counts against
-     the deterministic cap (`MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES =
-     2`); a dispatch addressing any editor/LLM debt is tagged
-     `search_intent="writing_gate_revision"` and counts against the editor cap
-     (`MAX_WRITING_GATE_REVISION_CYCLES = 1`). Deterministic-defect revisions
-     therefore never consume the editor's revision allowance: a run whose only
-     revision so far fixed a compile failure can still dispatch one
-     editor-debt revision after an editor fail. (Legacy stores recorded every
-     revision under `writing_gate_revision`, which resumes with the old,
-     stricter accounting.)
-3. **Editor review (1 session, total).** Deterministically clean → dispatch
-   `mode="review_writing"` (actor: `writing_critic`,
-   `critic_lens="editor"`, `paper_review: true`,
-   `search_intent="writing_gate_review:editor"`), governed by
-   `EDITOR_DIRECTIVE`: exposition only, correctness assumed, at most 12
-   located actionable findings. There is **one editor session for the whole
-   gate** (`PAPER_EDITOR_MAX_PASSES = 1`), counted as the max of completed
-   editor `review_writing` runs and editor `writing_review` artifacts (so a
-   critic that attached nothing, or forgot its run metrics, cannot re-open the
-   pass — that is also the livelock protection). **Pass** (a `writing_review`
-   with `verdict: "pass"`) → the gate opens (`stop_solved`) unless leftover
-   blocker/major debts remain (see the exhaustion fallthrough below). **Fail**
-   (the editor's `add_debt` findings) → the single editor-debt revision, after
-   which only the deterministic re-check runs — no second editor pass, no
-   lens resets, no free verification pass.
-4. **Editor fallthrough on exhaustion.** When blocker/major debts remain but
-   the forcing bucket's revision allowance is spent (and no residue/compile
-   exception applies), the gate does **not** open — it falls through to the
-   editor phase: the editor review runs if its pass budget remains (its
-   dispatch reason names the leftover debts), and the editor-debt revision
-   (if unspent) then addresses **both** the editor's findings and the
-   leftover deterministic blockers/majors in one revision. The gate opens
-   with unresolved debts recorded in the phase2 report's "Writing Review"
-   section only after the editor pass **and** both revision buckets are
-   truly spent.
-5. **Exceptions past the revision caps.** Generation residue (`L1-CITE-03`)
-   and LaTeX-compile failures (`writing-compile-` debts) keep forcing
-   revisions regardless of budget — deterministic, cheap fixes that must
-   never ship (residue is independently rejected at patch time, see guards).
+1. **Author or ingest.** On the internal path, root integration plus a
+   `final_proof` and no `final_paper` dispatches one paper-authoring writer
+   session under `PAPER_CONTRACT`. The resulting standalone LaTeX source is
+   stored as `.tex` and compiled directly at attach time. On the external
+   path, run
+   `python -m agents.generation.phase2.cli revise-paper <file.md|file.tex>` and
+   then execute the printed command with
+   `--research-mode writing_revision --completion-policy publication_ready`.
+   Ingestion creates `revision_document_root`, records the original file hash,
+   and does not convert `.md` to `.tex` or vice versa.
+2. **Deterministic checks.** Every document receives `run_all` plus
+   `run_slop_lint`; findings become writing debts and stale deterministic
+   debts close when no longer reproduced. Internal `final_paper` artifacts
+   additionally receive `run_paper_lint` and the standalone LaTeX compile
+   gate. External manuscripts may depend on a venue class, bibliography, or
+   included files, so a sidecar compile outcome is informative but does not
+   block revision. Open blocker/major debts dispatch a diff-minimal writer
+   revision whose packet enumerates every debt as a located required-fix
+   checklist. Deterministic-only revisions use a separate cap of two.
+3. **Terminology audit.** The `terminology_editor` inventories technical
+   names and checks them against the manuscript's citations, supplied
+   literature, and bounded live search when enabled. Standard terminology is
+   preferred. A coinage must be precisely defined and explain why the nearest
+   standard term is inadequate. Ambiguous evidence produces a blocking
+   `L3-TERM-03` debt containing the exact marker
+   `HUMAN CONSULTATION REQUIRED:`.
+4. **Introduction audit.** The `introduction_editor` treats the abstract and
+   introduction as the highest-control prose in the manuscript. It requires
+   one natural big-picture story, accurate scope, and a causal proof
+   architecture that explains why the ingredients enter and how they combine.
+   A theorem inventory, section list, or chronological work log is a major
+   failure.
+5. **Whole-paper audit.** The `editor` checks publishable exposition, repeats
+   the introduction and terminology checks independently, and may file at
+   most 12 located, actionable findings. Mathematical correctness review is
+   out of scope: internal papers already have a verified certificate, while
+   external documents make no verification claim. Each required lens is spent
+   once across document revisions, but a document revised after the initial
+   whole-paper pass receives a final editor confirmation before shipping. The count is the maximum of completed
+   `review_writing` runs and corresponding `writing_review` artifacts, which
+   prevents livelock if a critic omits one record.
+6. **Revisions and human steering.** Review findings trigger focused,
+   voice-preserving revisions. The review-driven cap is three, allowing one
+   revision per independent audit without resetting completed lenses. An
+   unanswered terminology marker returns terminal mode `await_human`, creates
+   a deduplicated dashboard steering blocker, and resumes after the expert's
+   answer. If automation is otherwise exhausted while a blocker or major debt
+   remains, the scheduler also pauses for human quality resolution. It never
+   silently ships unresolved major debt.
+7. **Non-bypassable defects.** Generation residue (`L1-CITE-03`) and, for an
+   internal paper, LaTeX compile failures continue forcing revisions past the
+   normal caps.
 
-Convergence (`stop_solved`) fires **only after the gate opens**; the outcome
-label is still defined by the `final_proof`.
+Convergence (`stop_solved`) requires all three audits and no gating debt.
+Internal-paper outcome identity remains defined by the `final_proof`.
+External revision reports `writing_revision_complete`, relation to theorem
+target `not_applicable`, and no proved statement.
 
 ## The paper deliverable
 
@@ -184,19 +168,34 @@ label is still defined by the `final_proof`.
     `\begin{abstract}`, a theorem environment, `\begin{proof}`, `\appendix`,
     a bibliography, `\end{document}`) — blocker.
 
-Editor pass/fail:
+Independent review pass/fail:
 
-- **pass**: the editor attaches `artifact_type="writing_review"` with metadata
-  `{"verdict": "pass", "lens": "editor", "artifact_reviewed": <final_paper
-  id>, "state_revision_reviewed": ...}` (the metadata guard accepts a
-  `final_proof` or `final_paper` id as the reviewed artifact, and the legacy
-  lens names remain valid vocabulary for old data).
-- **fail**: the editor adds writing debts — at most 12, each a located,
-  actionable local edit with a suggested rewrite — and may attach a
-  `writing_review` with `verdict: "fail"`.
-- Livelock protection: a completed editor `review_writing` run counts as the
-  editor session even without a review artifact (e.g. a critic that only
-  filed minor debts), so a misbehaving critic cannot pin the gate.
+- **pass**: each critic attaches `artifact_type="writing_review"` with
+  `verdict: "pass"`, its exact lens, the reviewed artifact id, and the state
+  revision reviewed. The reviewed artifact may be `final_paper` or
+  `revision_document`; legacy lens names remain valid for old runs.
+- **fail**: the critic adds one located writing debt per actionable finding
+  and may attach `writing_review` with `verdict: "fail"`. Terminology and
+  introduction findings use the dedicated `L3-TERM-*` and `L3-INTRO-*` rules.
+- Livelock protection is per lens: a completed `review_writing` run counts
+  even if the critic attached no review artifact, and an artifact counts even
+  if run metrics were omitted.
+
+## External revision deliverable
+
+- Artifact type `revision_document`, initially produced by `human_operator`
+  at ingestion and writer-only for subsequent revisions.
+- Each revision must name `metadata.revision_of_artifact_id`, preserve
+  `metadata.original_sha256`, set `revision_mode: true`, and retain the exact
+  `document_format` (`md` or `tex`). The store increments `revision_number`
+  and forces `diff_minimal`, `voice_preserving`, and
+  `mathematical_status: not_verified_by_writing_harness`.
+- The writer attaches a complete document, preferably by a staged path. A
+  format conversion or changed original hash is rejected transactionally.
+- The revision packet contains the current source, immutable lineage, every
+  open writing debt, the exact current file path as allowed evidence, and an
+  explicit prohibition on strengthening claims or presenting the result as
+  mathematically verified.
 
 ## Debt conventions
 
@@ -205,7 +204,7 @@ Findings are debts in the ordinary `debts` table:
 | field | value |
 | --- | --- |
 | `owner_type` | `"artifact"` |
-| `owner_id` | the gated `final_paper` id (stores from the legacy two-stage gate may carry `final_proof`-owned debts) |
+| `owner_id` | the gated `final_paper` or `revision_document` id (legacy stores may carry `final_proof`-owned debts) |
 | `debt_type` | `"writing"` |
 | `obligation` | `"<rule_id>: <message> (line N)"` (lint debts append a quoted excerpt) |
 | `severity` | rubric → debt vocabulary mapping below |
@@ -243,13 +242,14 @@ certificate or the `final_paper`); the rest of the manifest is stripped
 (claims/routes/inferences/debts/artifacts/graph_focus/proof_spine emptied,
 research packets and ledgers removed).
 
-**`editor` is the only lens the scheduler dispatches.** It sees the paper
-plus the citation ledger (`manifest.retrieval_cards`,
-`manifest.theorem_library`) so it can check that bibliography entries are
-real, cited works; its directive is `EDITOR_DIRECTIVE` (correctness assumed
-and out of scope; publishable-paper standard; at most 12 located, actionable
-findings ranked by importance) and it embeds the skeptical_editor + pedant
-rubric rules.
+The scheduler dispatches `terminology_editor`, `introduction_editor`, then
+`editor`. The terminology and whole-paper lenses retain the citation ledger
+(`manifest.retrieval_cards`, `manifest.theorem_library`) for literature-based
+terminology and bibliography checks. The introduction lens receives the
+document plus a compact claim/route summary on the internal path, but not the
+literature ledger; its job is narrative architecture, not a second research
+session. The final editor receives both. All three receive the full reviewed
+document, whether `final_paper` or `revision_document`.
 
 The legacy lenses (`confused_reader`: only the paper text;
 `skeptical_editor`: paper + brief claim/route summary
@@ -261,11 +261,10 @@ stay coherent — but the scheduler never dispatches them. When the reviewed
 artifact is a `final_paper` (action `paper_review: true`), each legacy lens
 directive additionally gets `PAPER_STANDARD_FOR_CRITICS` appended.
 
-Each lens directive embeds its rubric rules compactly:
-`rules_for_critic(load_rubric(...), lens)` filtered to
-`checkability == "llm"`, statements truncated to ~160 chars, capped at
-`WRITING_CRITIC_RULE_LINE_CAP = 120` rules (constants in
-`phase2/codex_runner.py`; the rubric parse is cached per process).
+Each lens directive embeds a compact rule subset. The terminology lens gets
+`L3-TERM-*`; the introduction lens gets the SELL/INTRO/STORY/SKIM families;
+the final editor receives the broad editor/pedant set. Statements are capped
+by `WRITING_CRITIC_RULE_LINE_CAP` and rubric parsing is cached per process.
 
 Critics are instructed: report only genuine findings with `rule_id` and a
 located obligation; one `add_debt` per finding; attach `writing_review`
@@ -274,7 +273,8 @@ over taste); never edit the paper.
 
 ## Roles, modes, and guards
 
-- `RUN_MODES` gains `"review_writing"`; `NON_VERIFYING_ROLES` gains
+- `RUN_MODES` includes `"review_writing"` and the terminal pause mode
+  `"await_human"`; `NON_VERIFYING_ROLES` includes
   `"writing_critic"` (`phase2/models.py`). `actor_role_for_action`:
   `review_writing → writing_critic`. Model tier: `"writing"` (same as the
   writer). Budget class: `review_writing` joins `write` in
@@ -287,11 +287,13 @@ over taste); never edit the paper.
   - `final_paper` may only be attached by the `writer`
     (`ARTIFACT_PRODUCER_ROLES`).
   - `writing_review` metadata must carry `verdict ∈ {pass, fail}`, a known
-    `lens`, and `artifact_reviewed` (a `final_proof` or `final_paper` id;
+    `lens`, and `artifact_reviewed` (a `final_proof`, `final_paper`, or
+    `revision_document` id;
     mirrors the verification_report verdict guard).
   - `writing_critic` may not propose any claim/inference/route status
     transition.
-  - Writer `final_proof`/`partial_proof_report`/`final_paper` content is
+  - Writer `final_proof`/`partial_proof_report`/`final_paper`/
+    `revision_document` content is
     residue-scanned at patch time (`run_residue_scan`); any hit rejects the
     patch with the rule_id + line + excerpt listed.
   - `final_paper` content additionally runs `run_paper_lint` at patch time
@@ -323,35 +325,33 @@ over taste); never edit the paper.
 
 All in `phase2/scheduler.py` unless noted:
 
-The revision budget is split into two buckets, distinguished by the dispatch
-`search_intent` persisted on the revision run (`writing_gate_revision` for
-editor-debt revisions, `writing_gate_revision_deterministic` for revisions
-whose blocking debts were all `writing-lint-`/`writing-compile-`); each bucket
-is counted separately in `_writing_gate_state`. Total LLM sessions ≤ 5 in the
-worst case: authoring + up to 2 deterministic revisions + editor + editor-debt
-revision (the residue/compile exceptions can exceed any cap — both never ship
-regardless). The exhaustion fallthrough adds no sessions: it only reorders —
-leftover deterministic majors reach the editor phase instead of shipping
-unreviewed, and the editor-debt revision sweeps them up together with the
-editor's findings.
+The revision budget is split into deterministic and review-driven buckets,
+distinguished by the persisted dispatch `search_intent`. Each is counted
+separately in `_writing_gate_state`. The bounded internal path uses at most
+twelve LLM sessions: authoring, up to two deterministic repairs, up to three
+audit-driven revisions, the three required audits, and whole-paper
+confirmations after editor-driven revisions. The external path omits authoring.
+Residue and internal-paper compile exceptions can exceed these caps because
+neither defect may ship. Exhaustion never changes quality policy: it pauses
+for human resolution.
 
 | constant | default | meaning |
 | --- | --- | --- |
-| `MAX_WRITING_GATE_REVISION_CYCLES` | 1 | the single editor-debt revision (any blocking editor/LLM debt) |
+| `MAX_WRITING_GATE_REVISION_CYCLES` | 3 | audit-driven revisions, allowing one focused pass per required lens |
 | `MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES` | 2 | deterministic-defect revisions (all blocking debts `writing-lint-`/`writing-compile-`); never consumes the editor allowance |
-| `PAPER_EDITOR_MAX_PASSES` | 1 | one editor review session for the whole gate (no per-revision reset) |
-| `WRITING_GATE_EDITOR_LENS` | `editor` | the single dispatched lens |
+| `PAPER_EDITOR_MAX_PASSES` | 1 | one required pass per lens, plus one editor pass on the latest revised document |
+| `WRITING_GATE_REVIEW_LENSES` | terminology, introduction, editor | required audit order |
+| `WRITING_GATE_EDITOR_LENS` | `editor` | compatibility name for the final whole-paper lens |
 | `WRITING_GATE_PAPER_INTENT` | `writing_gate_paper` | search_intent of the paper-authoring write pass |
 | `WRITING_GATE_BLOCKING_SEVERITIES` | `{blocking, major}` | debt severities that force a revision |
 | `WRITING_LINT_SEVERITY_TO_DEBT` | blocker→blocking, major→major, minor/nit→minor | rubric→debt severity mapping |
 | `WRITING_GATE_MAX_ARTIFACT_CHARS` | 400 000 | max gated-artifact chars fed to the linter |
 | `WRITING_CRITIC_RULE_LINE_CAP` (codex_runner) | 120 | max rubric rules embedded per lens directive |
-| `WRITING_PACKET_MAX_ARTIFACT_CHARS` (context_builder) | 60 000 | max document chars embedded in critic/revision/paper packets |
+| `WRITING_PACKET_MAX_ARTIFACT_CHARS` (context_builder) | 200 000 | max document chars embedded in critic/revision/paper packets |
 
-Tuning: raise `MAX_WRITING_GATE_REVISION_CYCLES` (and possibly
-`PAPER_EDITOR_MAX_PASSES`) for high-stakes runs where writing quality matters
-more than tokens; the editor's standard and finding cap live in
-`EDITOR_DIRECTIVE` (`writing/paper_contract.py`); new deterministic rules
+Tuning: raise `MAX_WRITING_GATE_REVISION_CYCLES` only when additional
+automated repair is preferable to earlier human escalation. The audit
+standards live in the three directives in `writing/paper_contract.py`; new deterministic rules
 belong in the rubric + `writing/linter.py` and flow into the gate
 automatically through `run_all` (or `run_slop_lint` for anti-slop rules —
 debts only, never attach-rejections — or `run_paper_lint` for
@@ -360,30 +360,34 @@ paper's register itself is tuned by editing `writing/paper_contract.py`.
 
 ## Reporting
 
-`report.py` adds a "Writing review" section to the phase2 markdown report:
+`report.py` adds a "Writing review" section to the phase2 Markdown report:
 one line per `writing_review` artifact (lens, verdict, reviewed artifact **and
 its artifact type**, state revision), a `Final paper: <artifact_id>
 (pdf_status)` line when a `final_paper` exists, open+resolved writing-debt
 counts by severity, and the list of unresolved writing debts whenever any
-remain (which is exactly the budget-exhaustion residue the gate left
-recorded). The outcome label is unchanged: `solved_final` is still defined by
-the `final_proof`.
+remain. For external revision it also names the current revision document,
+source format, revision number, immutable original hash, and
+`not_verified_by_writing_harness` status. Internal outcome remains defined by
+`final_proof`; external outcome uses the dedicated writing-revision classes.
 
 ## Tests
 
-`agents/generation/tests/test_phase2_writing_gate.py`: lightweight scheduler
-dispatch (certificate never linted/reviewed → immediate paper authoring →
-one editor review on the paper), editor pass/fail convergence and
-`stop_solved` without a second review after the single revision, gate opening
-with unresolved non-residue debts once the revision is spent, the
-residue/compile exceptions past the cap, lint→debt sync incl. stale closure
+`agents/generation/tests/test_phase2_writing_gate.py`: internal scheduler
+dispatch (certificate never linted/reviewed → paper authoring → terminology,
+introduction, and whole-paper audits), audit/revision convergence, mandatory
+human escalation instead of shipping unresolved major debt, the
+residue/compile exceptions past the cap, lint→debt sync including stale closure
 and paper-register rules, compile-debt sync and healing, livelock protection,
 all patch guards (incl. the `final_paper` paper-register guard, `.tex`
 storage, and the real pdflatex compile of the good-paper fixture),
 lens-isolation manifest checks (incl. the editor's literature ledger, the
 paper-authoring packet, and the legacy provenance auditor's certificate),
-mode-guidance smoke tests (editor + legacy lenses), actor-role mapping, and
+mode-guidance smoke tests (all required and legacy lenses), actor-role mapping, and
 the report section.
+`agents/generation/tests/test_phase2_writing_revision.py`: `.md`/`.tex`
+ingestion, CLI wiring, nonverification labeling, ordered audits, review packet
+isolation, terminology consultation and steering resume, immutable source
+lineage, format preservation, and result classification.
 `agents/generation/tests/test_writing_paper_lint.py`: unit coverage for
 `run_paper_lint` (positive/negative cases per rule, verbatim exemption,
 "manifestly" non-flag, appendix-scoped identifiers).
