@@ -1,0 +1,5 @@
+{
+  "id": "realmath_matharxiv_00",
+  "answer": "\\[\n\\mathcal{H}_{P_2\\times C_m}(u_i, v_j)=\\begin{cases}\n\\frac{1}{2m-1}\\Bigl(2H_{m-1}+\\frac{1}{m}\\Bigr), & \\text{if } m \\text{ is odd},\\\\[1mm]\n\\frac{1}{2m-1}\\Bigl(2H_{\\frac{m-2}{2}}+\\frac{2}{m}\\Bigr), & \\text{if } m \\text{ is even}.\n\\end{cases}\n\\]",
+  "source": "http://arxiv.org/abs/2205.03791v1"
+}

@@ -1,0 +1,1 @@
+The forward frontier is the verified two-orbit criterion. The backward obligation is the complete proper-subgroup-pair theorem for PSL(2,7). The base-synchronization bridge eliminates every pair containing a nonmaximal subgroup, and the exceptional-geometries bridge handles precisely the remaining six pairs. Both bridges are proved in proof_dossier_psl27_total_3closure_rev32.

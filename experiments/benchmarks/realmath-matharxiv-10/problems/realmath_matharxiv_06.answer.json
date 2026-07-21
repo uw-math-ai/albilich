@@ -1,0 +1,5 @@
+{
+  "id": "realmath_matharxiv_06",
+  "answer": "We have $$e_c(G_1,7)=324,$$ $$e_c(G_2,7)=338,$$ $$e_c(G_3,7)=332,$$ $$e_c(G_4,7)=332,$$ and $$e_c(G_5,7)=344.$$",
+  "source": "http://arxiv.org/abs/2412.15688v1"
+}

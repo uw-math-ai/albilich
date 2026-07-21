@@ -1,0 +1,5 @@
+{
+  "id": "realmath_matharxiv_01",
+  "answer": "(a) The eigenvalue is $$2q(p+n-1).$$\n\n(b) The dimension is given by $$\\dim \\mathcal{H}_{p,q}(S^{2n-1}) = \\left(\\frac{p+q}{n-1}+1\\right) \\binom{p+n-2}{n-2}\\binom{q+n-2}{n-2}.$$",
+  "source": "http://arxiv.org/abs/2206.14250v1"
+}

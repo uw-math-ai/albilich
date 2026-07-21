@@ -1,0 +1,5 @@
+Targeted interface: `PSL(2,7) has a faithful transitive coset action of degree at most 32 whose 3-closure properly contains PSL(2,7)`.
+
+The exhaustive GAP certificate in `cas_psl27_coset_3closure_sweep_rev16` lists every proper-subgroup conjugacy class in the required index range and computes the exact 3-closure of each action. All eight closures equal PSL(2,7). Therefore the proposed low-degree transitive-coset witness route is obstructed throughout its complete finite scope.
+
+Explicit not_refuted result: the computation produces no non-3-closed action and therefore does not establish that PSL(2,7) is not totally 3-closed; it also does not establish total 3-closedness. The smallest unsupported transitive hypothesis is that one of the three index-42 actions, corresponding to the two V4 classes and the C4 class, has a larger 3-closure. No lifecycle transition is proposed by this villain patch.

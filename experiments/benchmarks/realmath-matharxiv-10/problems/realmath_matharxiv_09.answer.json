@@ -1,0 +1,5 @@
+{
+  "id": "realmath_matharxiv_09",
+  "answer": "$$\\Theta_{k,l}(\\mathcal{C}_2)=\\begin{cases}0, & \\text{if } k \\text{ and } l \\text{ are odd},\\\\[10pt]\\frac{(k+l+2)(3l+k+4)}{8}, & \\text{if } k \\text{ and } l \\text{ are even},\\\\[10pt]-\\frac{(k+1)(k+2l+3)}{8}, & \\text{if } k \\text{ is odd and } l \\text{ is even},\\\\[10pt]-\\frac{(l+1)(3l+2k+5)}{8}, & \\text{if } k \\text{ is even and } l \\text{ is odd}.\\end{cases}$$",
+  "source": "http://arxiv.org/abs/2412.17324v1"
+}

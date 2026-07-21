@@ -1,0 +1,5 @@
+{
+  "id": "realmath_matharxiv_07",
+  "answer": "For all sufficiently large $n$, $$\\mu(\\theta_{n,i}(E)) = 0$$ and $$\\lambda(\\theta_{n,i}(E)) = \\frac{p-1}{2} \\cdot p^{n-1} + \\lambda(E^F,\\omega^{(p-1)/2+i}).$$",
+  "source": "http://arxiv.org/abs/2412.16629v1"
+}

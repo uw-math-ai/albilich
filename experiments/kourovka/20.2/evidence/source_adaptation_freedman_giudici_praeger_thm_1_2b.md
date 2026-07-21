@@ -1,0 +1,1 @@
+This direct source studies the same closure number as the root problem. Its exceptional-family theorem supplies a checked uniform bound, but the paper explicitly presents determination of closure number three as unresolved. The useful handoff is the reduction from arbitrary faithful actions to maximal base sizes of primitive actions.

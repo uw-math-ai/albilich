@@ -1,0 +1,1 @@
+KEEP/REPAIR the negative chief-factor trunk: its alternating and inner-diagonal PSL lemmas justify continued investment. BLOCK expansion to graph automorphisms and the other classical families until the diagonal-field PSL lemma is proved or refuted. Next action: one offline researcher pass on that lemma.

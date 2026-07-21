@@ -1,0 +1,15 @@
+{
+  "experiment": "realmath_matharxiv_10",
+  "date": "2026-07-20",
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "xhigh",
+  "research_mode": "hard_problem",
+  "cas_enabled": true,
+  "problem_count": 10,
+  "solved_final_count": 10,
+  "cas_fired_count": 10,
+  "total_tokens_approx": 28100000,
+  "clear_reference_match_count": 9,
+  "equivalence_review_count": 1,
+  "grading_method": "human inspection of extracted answers against supplied references"
+}

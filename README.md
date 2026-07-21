@@ -67,6 +67,14 @@ lemmas and more time attacking the exact statement that would close the best
 route. It also makes the boundary between “promising,” “strictly verified,”
 “integrated,” and “solved” explicit at every stage.
 
+## Published experiments
+
+The [`experiments/`](experiments/) archive contains public, checksum-verified
+records for paired CAS-on/CAS-off Kourovka 17.91 runs, the ten-problem RealMath
+Math_arXiv benchmark, the long Kourovka 21.142 run, and the 1.5-hour-class
+Kourovka 20.2 run. Each record preserves the exact prompt, aggregate token and
+timing metrics, the generated report, and deduplicated proof or CAS evidence.
+
 ## Quickstart
 
 ```bash
