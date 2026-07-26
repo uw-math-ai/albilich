@@ -1,0 +1,28 @@
+{
+  "problem_id": "kourovka/problem_20_2_totally_3_closed_lie_type_noadvisor_ablation_5h_20260727",
+  "problem_sha256": "18255b205a0a8feb49a81aaca2839dcde6c6fe37923f4c134f43f0fbf1fe5c0f",
+  "historical_source_base_commit": "ca5ad52a0538ee87da93079c71ee1848e63e11b5",
+  "experiment_control_commit": "c552c8b0425959e5c590d8db5fe73fcc494a81ae",
+  "current_main_control_port_commit": "74f37304",
+  "environment": {
+    "ALBILICH_ADVISOR_ENABLED": "0"
+  },
+  "backend": "codex",
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "xhigh",
+  "research_mode": "hard_problem",
+  "web_search": "live",
+  "completion_policy": "full_proof_first",
+  "parallel_branches": 3,
+  "session_resume": false,
+  "stop_on_rejection": false,
+  "write_on_stop": false,
+  "total_token_budget": 80000000,
+  "reserved_verification_budget": 12000000,
+  "max_reduction_depth": 4,
+  "per_session_timeout_seconds": 7200,
+  "max_wall_seconds": 18000,
+  "started_at": "2026-07-26T17:41:00.947045+00:00",
+  "completed_at": "2026-07-26T19:27:49.107343+00:00",
+  "deadline_at": "2026-07-26T22:41:00.947045+00:00"
+}
