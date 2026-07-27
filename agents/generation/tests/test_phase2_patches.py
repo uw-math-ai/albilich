@@ -7,13 +7,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.console import build_run_console_payload
+from agents.generation.phase2 import metrics as metrics_module
+from agents.generation.phase2.console import build_run_console, build_run_console_payload
 from agents.generation.phase2.patches import apply_patch
 from agents.generation.phase2.receipt import format_receipt_latex
 from agents.generation.phase2.report import build_markdown_report
@@ -45,6 +47,25 @@ def add_debt_patch(*, problem_id: str, base_revision: int, debt_id: str, obligat
 
 
 class Phase2PatchDebtTest(unittest.TestCase):
+    def test_metrics_reuses_directory_sizes_for_unchanged_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("patch-metrics-cache-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("prove the root theorem")
+            metrics_module._directory_size_at_revision.cache_clear()
+            original = metrics_module._directory_size
+            with mock.patch.object(
+                metrics_module,
+                "_directory_size",
+                wraps=original,
+            ) as directory_size:
+                first = metrics_module.compute_metrics(store)
+                first_call_count = directory_size.call_count
+                second = metrics_module.compute_metrics(store)
+
+            self.assertGreater(first_call_count, 0)
+            self.assertEqual(directory_size.call_count, first_call_count)
+            self.assertEqual(first["benchmark_storage"], second["benchmark_storage"])
+
     def test_interrogative_root_cannot_be_marked_refuted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("patch-question-root-refutation-test", generation_root=Path(tmpdir) / "generation")
@@ -290,6 +311,54 @@ class Phase2PatchDebtTest(unittest.TestCase):
             self.assertNotIn("Prior/stopped carry-over", report)
             self.assertIn("| Stored memory artifacts |", report)
             self.assertIn("| Reported tokens | 579 |", report)
+
+    def test_console_separates_current_budget_window_from_lifetime_charge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("patch-budget-reset-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("prove the root theorem", total_token_budget=100_000, reserved_verification_budget=10_000)
+            recorded = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "scheduler",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "record_run_metrics",
+                            "run_id": "run-before-budget-reset",
+                            "actor_role": "researcher",
+                            "mode": "prove",
+                            "target_id": "root",
+                            "input_tokens": 10_000,
+                            "cached_input_tokens": 8_000,
+                            "output_tokens": 1_000,
+                            "reasoning_output_tokens": 500,
+                            "total_tokens": 11_000,
+                            "status": "completed",
+                        }
+                    ],
+                    "rationale": "record charged usage before resetting the allocation window",
+                },
+            )
+            self.assertTrue(recorded.accepted, recorded.errors)
+            with store.connect() as conn:
+                conn.execute(
+                    "UPDATE problem_state SET remaining_token_budget = total_token_budget WHERE problem_id = ?",
+                    (store.problem_id,),
+                )
+                conn.commit()
+
+            payload = build_run_console_payload(store)
+            snapshot = payload["snapshot"]
+            self.assertEqual(snapshot["tokens_budget_window_spent"], 0)
+            self.assertEqual(snapshot["tokens_charged_lifetime"], 3_500)
+            self.assertEqual(snapshot["tokens_spent_reported"], 11_000)
+
+            console = build_run_console(store)
+            self.assertIn("Current token budget window: `0` charged", console)
+            self.assertIn("Lifetime charged usage: `3500` tokens", console)
 
     def test_console_verifier_audit_counts_report_artifacts_without_run_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

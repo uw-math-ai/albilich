@@ -5,7 +5,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .graph_policy import claim_is_verified, debt_covered_by_integrated_claim, route_scoreboard
+from .graph_policy import (
+    DebtCoverageIndex,
+    claim_is_verified,
+    debt_covered_by_integrated_claim,
+    route_scoreboard,
+)
 from .metrics import compute_metrics
 from .research_policy import researcher_mode_summary
 from .result_status import classify_state
@@ -47,7 +52,12 @@ def build_run_console_payload(
     state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = state if state is not None else store.get_state()
-    metrics = compute_metrics(store, state=state)
+    debt_coverage_index = DebtCoverageIndex(state)
+    metrics = compute_metrics(
+        store,
+        state=state,
+        debt_coverage_index=debt_coverage_index,
+    )
     result = classify_state(state)
     runs = sorted(state.get("runs", []), key=lambda row: row.get("created_at", ""))
     verifier_audit = _verifier_audit(state, runs)
@@ -66,9 +76,13 @@ def build_run_console_payload(
         "parallel_exchange": _parallel_exchange_payload(store),
         "researcher_mode_state": researcher_mode_summary(state),
         "decomposition_board": _decomposition_board(state),
-        "open_cases": _open_case_groups(state),
+        "open_cases": _open_case_groups(state, debt_coverage_index=debt_coverage_index),
         "run_timeline": _run_timeline(runs),
-        "route_scoreboard": route_scoreboard(state, limit=16),
+        "route_scoreboard": route_scoreboard(
+            state,
+            limit=16,
+            debt_coverage_index=debt_coverage_index,
+        ),
         "recent_research_artifacts": _research_artifacts(state),
     }
 
@@ -109,7 +123,8 @@ def _render_console_markdown(payload: Mapping[str, Any]) -> str:
         f"- Routes: `{snapshot.get('active_route_count', 0)}` active of `{snapshot.get('route_count', 0)}` total",
         f"- Open cases: `{snapshot.get('open_case_count', snapshot.get('active_debt_count', 0))}` active, "
         f"`{snapshot.get('open_blocking_case_count', snapshot.get('blocking_debt_count', 0))}` blocking{ledger_note}",
-        f"- Token budget: `{snapshot.get('tokens_spent_reported', 0)}` spent, `{snapshot.get('tokens_remaining', 0)}` remaining, `{snapshot.get('tokens_reserved_verification', 0)}` reserved",
+        f"- Current token budget window: `{snapshot.get('tokens_budget_window_spent', 0)}` charged, `{snapshot.get('tokens_remaining', 0)}` remaining, `{snapshot.get('tokens_reserved_verification', 0)}` reserved",
+        f"- Lifetime charged usage: `{snapshot.get('tokens_charged_lifetime', 0)}` tokens (cached input excluded)",
         f"- Recorded usage: `{snapshot.get('recorded_tokens', 0)}` tokens / `{_format_seconds(snapshot.get('recorded_wall_seconds', 0))}` child wall / `{_format_memory(snapshot.get('recorded_peak_memory_mb', 0))}` peak memory",
         f"- Stored memory: artifacts `{_format_bytes(snapshot.get('stored_memory_artifacts_bytes', 0))}`, native result `{_format_bytes(snapshot.get('native_result_dir_bytes', 0))}`, downloads `{_format_bytes(snapshot.get('downloaded_source_dir_bytes', 0))}`",
         f"- Latest run: {snapshot.get('latest_run_summary', 'none')}",
@@ -379,7 +394,8 @@ def _render_run_timeline(timeline: list[Any]) -> list[str]:
         lines.append(
             f"| {_cell(row.get('created_at'))} | `{_cell(row.get('run_id'))}` | `{_cell(row.get('actor_role'))}` | "
             f"`{_cell(row.get('mode'))}` | `{_cell(row.get('search_intent'))}` | `{_cell(row.get('target_id'))}` | "
-            f"`{_cell(row.get('route_id'))}` | `{_cell(row.get('status'))}` | {row.get('total_tokens', 0)} | "
+            f"`{_cell(row.get('route_id'))}` | `{_cell(row.get('display_status') or row.get('status'))}` | "
+            f"{row.get('total_tokens', 0)} | "
             f"{_cell(row.get('wall_time_seconds'))} | {_cell(', '.join(_as_str_list(row.get('output_artifact_ids'))))} |"
         )
     lines.append("")
@@ -478,9 +494,19 @@ def _run_snapshot(
         "ledger_blocking_debt_count": raw_blocking_debt_count,
         "tokens_spent_reported": token_budget.get("spent_reported", 0),
         "tokens_total": token_budget.get("total", 0),
-        # Budget actually consumed = total - remaining (cached input is not
-        # charged, so this is less than recorded_tokens which counts everything).
-        "tokens_budget_spent": max(0, int(token_budget.get("total", 0) or 0) - int(token_budget.get("remaining", 0) or 0)),
+        # The current allocation window can be reset or extended independently
+        # of the durable run ledger. Keep it separate from lifetime charged
+        # usage so a continuation does not make old spend appear to vanish.
+        "tokens_budget_window_spent": max(
+            0,
+            int(token_budget.get("total", 0) or 0) - int(token_budget.get("remaining", 0) or 0),
+        ),
+        # Backward-compatible alias for older monitor clients.
+        "tokens_budget_spent": max(
+            0,
+            int(token_budget.get("total", 0) or 0) - int(token_budget.get("remaining", 0) or 0),
+        ),
+        "tokens_charged_lifetime": int(token_budget.get("charged_lifetime", 0) or 0),
         "tokens_remaining": token_budget.get("remaining", 0),
         "tokens_reserved_verification": token_budget.get("reserved_verification", 0),
         "recorded_tokens": total_usage.get("total_tokens", 0),
@@ -635,6 +661,7 @@ def _live_session_updates(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
 def _run_timeline(runs: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     timeline: list[dict[str, Any]] = []
     for row in runs[-80:]:
+        display_status, status_detail = _run_status_display(row)
         timeline.append(
             {
                 "created_at": row.get("created_at", ""),
@@ -648,6 +675,8 @@ def _run_timeline(runs: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
                 "target_id": row.get("target_id", ""),
                 "route_id": row.get("route_id", ""),
                 "status": row.get("status", ""),
+                "display_status": display_status,
+                "status_detail": status_detail,
                 "total_tokens": _token_total(row),
                 "wall_time_seconds": row.get("wall_time_seconds", 0),
                 "output_artifact_ids": _json_list(row.get("output_artifact_ids_json")),
@@ -689,6 +718,24 @@ def _run_timeline(runs: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
             row["recovered_by_run_id"] = recovery[1]
             row["recovered_at"] = recovery[2]
     return timeline
+
+
+def _run_status_display(row: Mapping[str, Any]) -> tuple[str, str]:
+    """Present transport stalls separately from configured time limits."""
+    status = str(row.get("status") or "")
+    failure_kind = str(row.get("failure_kind") or "")
+    if status == "timeout" and failure_kind == "stale_stream":
+        return (
+            "stream stalled",
+            "Codex transport stopped producing log or token progress during a stream retry; "
+            "this was not the configured session time limit.",
+        )
+    if status == "timeout" and failure_kind == "deadline":
+        return (
+            "time limit reached",
+            "The child session reached its configured Albilich time limit.",
+        )
+    return status, ""
 
 
 def _decomposition_board(state: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -779,7 +826,11 @@ def _subgoal_status(
     }
 
 
-def _open_case_groups(state: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def _open_case_groups(
+    state: Mapping[str, Any],
+    *,
+    debt_coverage_index: DebtCoverageIndex | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     groups: dict[str, list[dict[str, Any]]] = {
         "Blocking": [],
         "Citation / Hypothesis": [],
@@ -790,7 +841,12 @@ def _open_case_groups(state: Mapping[str, Any]) -> dict[str, list[dict[str, Any]
     active_debts = [
         row
         for row in state.get("debts", [])
-        if row.get("status") == "active" and not debt_covered_by_integrated_claim(state, row)
+        if row.get("status") == "active"
+        and not debt_covered_by_integrated_claim(
+            state,
+            row,
+            debt_coverage_index=debt_coverage_index,
+        )
     ]
     active_debts.sort(
         key=lambda row: (

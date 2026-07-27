@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
+from agents.generation.phase2 import graph_policy as graph_policy_module
+from agents.generation.phase2 import research_intelligence as research_intelligence_module
 from agents.generation.phase2.research_intelligence import (
     action_patch_contract_errors,
     decisive_obligation_frontier,
@@ -92,6 +95,95 @@ def _state() -> dict:
 
 
 class ResearchIntelligenceTests(unittest.TestCase):
+    def test_route_scoreboard_indexes_large_debt_coverage_scan(self) -> None:
+        integrated_claims = [
+            {
+                "claim_id": f"claim_integrated_{index}",
+                "statement": (
+                    "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu "
+                    "nu xi omicron pi rho sigma tau upsilon phi chi psi omega "
+                    f"family_{index}"
+                ),
+                "lifecycle_status": "integrated",
+                "validation_status": "informally_verified",
+                "parent_ids": ["root"],
+            }
+            for index in range(20)
+        ]
+        route_claims = [
+            {
+                "claim_id": f"claim_route_{index}",
+                "statement": f"Route conclusion {index}",
+                "lifecycle_status": "active",
+                "validation_status": "untested",
+                "parent_ids": ["root"],
+                "root_impact": 0.5,
+            }
+            for index in range(60)
+        ]
+        routes = [
+            {
+                "route_id": f"route_{index}",
+                "conclusion_claim_id": f"claim_route_{index}",
+                "status": "active",
+                "label": f"Route {index}",
+            }
+            for index in range(60)
+        ]
+        debts = [
+            {
+                "debt_id": f"debt_route_{index}",
+                "owner_id": f"route_{index}",
+                "suggested_next_target": f"claim_route_{index}",
+                "debt_type": "proof_gap",
+                "obligation": (
+                    "one two three four five six seven eight nine ten eleven twelve thirteen "
+                    "fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone "
+                    "twentytwo twentythree twentyfour"
+                ),
+                "status": "active",
+                "severity": "blocking",
+            }
+            for index in range(60)
+        ]
+        state = {
+            "claims": [
+                {
+                    "claim_id": "root",
+                    "statement": "Root theorem",
+                    "lifecycle_status": "active",
+                    "validation_status": "untested",
+                    "parent_ids": [],
+                },
+                *integrated_claims,
+                *route_claims,
+            ],
+            "routes": routes,
+            "inferences": [],
+            "debts": debts,
+            "artifacts": [],
+        }
+        original = graph_policy_module._claim_signature_tokens
+        with mock.patch.object(
+            graph_policy_module,
+            "_claim_signature_tokens",
+            wraps=original,
+        ) as signature_tokens:
+            scoreboard = graph_policy_module.route_scoreboard(state)
+        self.assertEqual(len(scoreboard), 60)
+        self.assertTrue(all(row["blocking_debt_count"] == 1 for row in scoreboard))
+        self.assertLessEqual(signature_tokens.call_count, len(integrated_claims) + len(debts))
+        with mock.patch.object(
+            graph_policy_module,
+            "_claim_signature_tokens",
+            wraps=original,
+        ) as signature_tokens:
+            research_intelligence_module.decisive_obligation_frontier(state)
+        self.assertLessEqual(
+            signature_tokens.call_count,
+            2 * (len(integrated_claims) + len(debts)),
+        )
+
     def test_graph_frontier_selects_smallest_sufficient_route_cut(self) -> None:
         frontier = decisive_obligation_frontier(_state())
         self.assertTrue(frontier["graph_derived"])

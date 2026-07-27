@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict
 
 from .budget import summarize_runs
-from .graph_policy import claim_is_retired, claim_is_verified, debt_covered_by_integrated_claim
+from .graph_policy import (
+    DebtCoverageIndex,
+    claim_is_retired,
+    claim_is_verified,
+    debt_covered_by_integrated_claim,
+)
 from .models import json_loads
 from .store import ProofStateStore
 
 
-def compute_metrics(store: ProofStateStore, *, state: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def compute_metrics(
+    store: ProofStateStore,
+    *,
+    state: Dict[str, Any] | None = None,
+    debt_coverage_index: DebtCoverageIndex | None = None,
+) -> Dict[str, Any]:
     state = state if state is not None else store.get_state()
+    debt_coverage_index = debt_coverage_index or DebtCoverageIndex(state)
     claims = state["claims"]
     routes = state["routes"]
     debts = state["debts"]
@@ -18,7 +30,14 @@ def compute_metrics(store: ProofStateStore, *, state: Dict[str, Any] | None = No
     artifacts = state.get("artifacts", [])
     problem = state["problem_state"]
     active_debts = [row for row in debts if row["status"] == "active"]
-    open_debts = [row for row in active_debts if not debt_covered_by_integrated_claim(state, row)]
+    open_debts = [
+        row for row in active_debts
+        if not debt_covered_by_integrated_claim(
+            state,
+            row,
+            debt_coverage_index=debt_coverage_index,
+        )
+    ]
     by_validation: dict[str, int] = {}
     by_lifecycle: dict[str, int] = {}
     for claim in claims:
@@ -49,12 +68,16 @@ def compute_metrics(store: ProofStateStore, *, state: Dict[str, Any] | None = No
             "remaining": problem["remaining_token_budget"],
             "reserved_verification": problem["reserved_verification_budget"],
             "spent_reported": run_summary["total_tokens"],
+            "charged_lifetime": run_summary["charged_tokens"],
         },
         "runs": run_summary,
         "run_timing": store.get_run_timing(),
         "math_yield": _math_yield_metrics(claims, artifacts, run_summary),
         "root_progress": _root_progress_metrics(claims, routes, open_debts, artifacts),
-        "benchmark_storage": _benchmark_storage_metrics(store),
+        "benchmark_storage": _benchmark_storage_metrics(
+            store,
+            state_revision=int(problem.get("current_revision") or 0),
+        ),
     }
 
 
@@ -148,17 +171,24 @@ def _root_progress_metrics(
     }
 
 
-def _benchmark_storage_metrics(store: ProofStateStore) -> Dict[str, Any]:
+def _benchmark_storage_metrics(
+    store: ProofStateStore,
+    *,
+    state_revision: int,
+) -> Dict[str, Any]:
     state_dir = store.state_dir
     result_dir = state_dir.parent
     source_dirs = _existing_source_dirs(state_dir, result_dir)
-    source_bytes = sum(_directory_size(path) for path in source_dirs)
+    source_bytes = sum(_directory_size_at_revision(path, state_revision) for path in source_dirs)
     return {
         "artifact_dir": str(state_dir / "artifacts"),
         "native_result_dir": str(result_dir),
         "downloaded_source_dirs": [str(path) for path in source_dirs],
-        "stored_memory_artifacts_bytes": _directory_size(state_dir / "artifacts"),
-        "native_result_dir_bytes": _directory_size(result_dir),
+        "stored_memory_artifacts_bytes": _directory_size_at_revision(
+            state_dir / "artifacts",
+            state_revision,
+        ),
+        "native_result_dir_bytes": _directory_size_at_revision(result_dir, state_revision),
         "downloaded_source_dir_bytes": source_bytes,
     }
 
@@ -202,3 +232,10 @@ def _directory_size(path: Path) -> int:
         except OSError:
             continue
     return total
+
+
+@lru_cache(maxsize=32)
+def _directory_size_at_revision(path: Path, state_revision: int) -> int:
+    """Avoid walking a mature result tree on every unchanged-state refresh."""
+
+    return _directory_size(path)

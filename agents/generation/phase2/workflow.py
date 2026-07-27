@@ -780,6 +780,8 @@ def _recoverable_stale_retry_failure(action: Mapping[str, Any], result: Mapping[
     if str(result.get("status") or "") != "timeout":
         return False
     execution = result.get("execution") if isinstance(result.get("execution"), Mapping) else {}
+    if str(execution.get("failure_kind") or "") == "stale_stream":
+        return True
     patch_error = str(execution.get("patch_error") or "")
     patch_outcome = result.get("patch_outcome") if isinstance(result.get("patch_outcome"), Mapping) else {}
     for error in patch_outcome.get("errors", []) if isinstance(patch_outcome.get("errors"), list) else []:

@@ -711,15 +711,26 @@ def route_repair_pending_verifier(
     return False
 
 
-def route_scoreboard(state: Mapping[str, Any], *, limit: int | None = None) -> list[Dict[str, Any]]:
+def route_scoreboard(
+    state: Mapping[str, Any],
+    *,
+    limit: int | None = None,
+    debt_coverage_index: DebtCoverageIndex | None = None,
+) -> list[Dict[str, Any]]:
     claims = claim_map(state)
     supersession = supersession_index(state)
     superseded_route_ids = set(supersession.get("superseded_route_ids", []))
     stale_route_ids = set(supersession.get("stale_route_ids", []))
     route_work_directives = _latest_route_work_directives(state)
+    debt_coverage_index = debt_coverage_index or DebtCoverageIndex(state)
     inferences_by_route: dict[str, list[Mapping[str, Any]]] = {}
     for inf in state.get("inferences", []):
         inferences_by_route.setdefault(str(inf.get("route_id") or ""), []).append(inf)
+    blocking_debts_by_owner: dict[str, list[Mapping[str, Any]]] = {}
+    for debt in state.get("debts", []):
+        if debt.get("status") != "active" or debt.get("severity") != "blocking":
+            continue
+        blocking_debts_by_owner.setdefault(str(debt.get("owner_id") or ""), []).append(debt)
 
     rows: list[Dict[str, Any]] = []
     for route in state.get("routes", []):
@@ -731,12 +742,18 @@ def route_scoreboard(state: Mapping[str, Any], *, limit: int | None = None) -> l
             inf for inf in inferences
             if inf.get("validation_status") in VERIFIED_VALIDATION_STATUSES
         ]
+        candidate_debts = [
+            debt
+            for owner_id in {route_id, conclusion_id}
+            for debt in blocking_debts_by_owner.get(owner_id, [])
+        ]
         blocking_debts = [
-            debt for debt in state.get("debts", [])
-            if debt.get("status") == "active"
-            and debt.get("severity") == "blocking"
-            and str(debt.get("owner_id") or "") in {route_id, conclusion_id}
-            and not debt_covered_by_integrated_claim(state, debt)
+            debt for debt in candidate_debts
+            if not debt_covered_by_integrated_claim(
+                state,
+                debt,
+                debt_coverage_index=debt_coverage_index,
+            )
             and not route_repair_pending_verifier(
                 state,
                 route_id=route_id,
@@ -1226,14 +1243,21 @@ def integrated_claim_covering_debt_id(
     existing_claims: Iterable[Mapping[str, Any]],
     *,
     obligation: str,
+    claim_signatures: Iterable[tuple[str, set[str]]] | None = None,
 ) -> str:
     debt_tokens = _claim_signature_tokens(obligation)
     if len(debt_tokens) < 20:
         return ""
-    for row in existing_claims:
-        if not _is_integrated_claim_row(row):
-            continue
-        claim_tokens = _claim_signature_tokens(str(row.get("statement") or ""))
+    if claim_signatures is None:
+        claim_signatures = (
+            (
+                str(row.get("claim_id") or ""),
+                _claim_signature_tokens(str(row.get("statement") or "")),
+            )
+            for row in existing_claims
+            if _is_integrated_claim_row(row)
+        )
+    for claim_id, claim_tokens in claim_signatures:
         if len(claim_tokens) < 15:
             continue
         shared = debt_tokens & claim_tokens
@@ -1242,13 +1266,63 @@ def integrated_claim_covering_debt_id(
         debt_coverage = len(shared) / max(1, len(debt_tokens))
         claim_coverage = len(shared) / max(1, len(claim_tokens))
         if debt_coverage >= 0.34 and claim_coverage >= 0.25:
-            return str(row.get("claim_id") or "")
+            return claim_id
     return ""
+
+
+class DebtCoverageIndex:
+    """State-local indexes for repeated debt-closure checks.
+
+    Scheduler and console consumers inspect the same immutable proof-state
+    snapshot many times.  Build the graph and semantic signatures once per
+    snapshot instead of rescanning and renormalizing every integrated claim for
+    every route/debt pair.
+    """
+
+    def __init__(self, state: Mapping[str, Any]) -> None:
+        integrated_claims = [
+            claim for claim in state.get("claims", [])
+            if _is_integrated_claim_row(claim)
+        ]
+        self.integrated_claim_ids = {
+            str(claim.get("claim_id") or "")
+            for claim in integrated_claims
+        }
+        self.integrated_claim_subjects = {
+            claim_id.removeprefix(prefix)
+            for claim_id in self.integrated_claim_ids
+            for prefix in ("claim_", "claim-")
+            if claim_id.startswith(prefix)
+        }
+        self.graph_conclusions: dict[str, set[str]] = {}
+        for collection, id_key in (("routes", "route_id"), ("inferences", "inference_id")):
+            for row in state.get(collection, []):
+                graph_id = str(row.get(id_key) or "")
+                conclusion_id = str(row.get("conclusion_claim_id") or "")
+                if graph_id and conclusion_id:
+                    self.graph_conclusions.setdefault(graph_id, set()).add(conclusion_id)
+        self.integrated_claim_signatures = [
+            (
+                str(claim.get("claim_id") or ""),
+                _claim_signature_tokens(str(claim.get("statement") or "")),
+            )
+            for claim in integrated_claims
+        ]
+        self.coverage_by_debt: dict[tuple[str, str, str, str, str], bool] = {}
+
+    @staticmethod
+    def debt_key(debt: Mapping[str, Any]) -> tuple[str, str, str, str, str]:
+        return tuple(
+            str(debt.get(key) or "")
+            for key in ("debt_id", "owner_id", "suggested_next_target", "debt_type", "obligation")
+        )
 
 
 def debt_covered_by_integrated_claim(
     state: Mapping[str, Any],
     debt: Mapping[str, Any],
+    *,
+    debt_coverage_index: DebtCoverageIndex | None = None,
 ) -> bool:
     """Return whether an active-looking debt belongs to an integrated result.
 
@@ -1257,46 +1331,41 @@ def debt_covered_by_integrated_claim(
     semantic coverage instead of treating every ``status=active`` row as a live
     proof obligation.
     """
+    index = debt_coverage_index or DebtCoverageIndex(state)
+    debt_key = index.debt_key(debt)
+    if debt_key in index.coverage_by_debt:
+        return index.coverage_by_debt[debt_key]
+
     graph_ids = {
         str(debt.get("owner_id") or ""),
         str(debt.get("suggested_next_target") or ""),
     }
     target_ids = set(graph_ids)
-    target_ids.update(
-        str(row.get("conclusion_claim_id") or "")
-        for row in state.get("routes", [])
-        if str(row.get("route_id") or "") in graph_ids
-    )
-    target_ids.update(
-        str(row.get("conclusion_claim_id") or "")
-        for row in state.get("inferences", [])
-        if str(row.get("inference_id") or "") in graph_ids
-    )
-    if any(
-        str(claim.get("claim_id") or "") in target_ids
-        and str(claim.get("lifecycle_status") or "") == "integrated"
-        for claim in state.get("claims", [])
-    ):
+    for graph_id in graph_ids:
+        target_ids.update(index.graph_conclusions.get(graph_id, set()))
+    if target_ids & index.integrated_claim_ids:
+        index.coverage_by_debt[debt_key] = True
         return True
     debt_id = str(debt.get("debt_id") or "")
     debt_prefix = next((prefix for prefix in ("debt_", "debt-") if debt_id.startswith(prefix)), "")
     if debt_prefix:
         debt_subject = debt_id.removeprefix(debt_prefix)
-        if any(
-            any(
-                str(claim.get("claim_id") or "").removeprefix(prefix) == debt_subject
-                for prefix in ("claim_", "claim-")
-                if str(claim.get("claim_id") or "").startswith(prefix)
-            )
-            and str(claim.get("lifecycle_status") or "") == "integrated"
-            for claim in state.get("claims", [])
-        ):
+        if debt_subject in index.integrated_claim_subjects:
+            index.coverage_by_debt[debt_key] = True
             return True
     obligation = " ".join(
         str(debt.get(key) or "")
         for key in ("debt_id", "debt_type", "obligation", "suggested_next_target")
     ).lower()
-    return bool(integrated_claim_covering_debt_id(state.get("claims", []), obligation=obligation))
+    covered = bool(
+        integrated_claim_covering_debt_id(
+            (),
+            obligation=obligation,
+            claim_signatures=index.integrated_claim_signatures,
+        )
+    )
+    index.coverage_by_debt[debt_key] = covered
+    return covered
 
 
 def obvious_duplicate_claim_id(

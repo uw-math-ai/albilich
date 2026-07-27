@@ -1649,10 +1649,17 @@ function renderKpis(snap){
 function renderTokens(snap, usage){
   const reserved = snap.tokens_reserved_verification||0;
   const rem = snap.tokens_remaining||0;
-  // Budget bar uses effective spend (cached input not charged) for consistency
-  // with how remaining_token_budget is decremented.
+  // The bar describes the current allocation window. A continuation may reset
+  // that window, so show durable lifetime charge separately.
   const total = Number(snap.tokens_total)|| (Number(snap.tokens_spent_reported||0)+rem);
-  const spent = Number(snap.tokens_budget_spent!=null ? snap.tokens_budget_spent : Math.max(0,total-rem));
+  const windowSpent = Number(
+    snap.tokens_budget_window_spent!=null
+      ? snap.tokens_budget_window_spent
+      : (snap.tokens_budget_spent!=null ? snap.tokens_budget_spent : Math.max(0,total-rem))
+  );
+  const lifetimeCharged = Number(
+    snap.tokens_charged_lifetime!=null ? snap.tokens_charged_lifetime : windowSpent
+  );
   const tot = usage.total_recorded || {};
   const live = usage.active_live_children || {};
   const inflight = Number(live.total_tokens)||0;
@@ -1661,7 +1668,7 @@ function renderTokens(snap, usage){
   const input = Number(tot.input_tokens)||0;
   const cached = Number(tot.cached_input_tokens)||0;
   const cacheRatio = input ? (cached/input*100) : 0;
-  const pctSpent = total ? (spent/total*100) : 0;
+  const pctSpent = total ? (windowSpent/total*100) : 0;
   const pctInflight = total ? Math.min(100-pctSpent, inflight/total*100) : 0;
   const runs = tot.run_count||0;
   const avg = runs ? Math.round(processed/runs) : 0;
@@ -1669,7 +1676,8 @@ function renderTokens(snap, usage){
     ? `<span class="inflight-tag">+${compact(inflight)} in-flight</span>`
     : (liveRuns > 0 ? `<span class="pill info">${liveRuns} live session(s) · tokens post at step end</span>` : "");
   const chips = [
-    ["Budget spent", compact(spent), true],
+    ["Window charged", compact(windowSpent), true],
+    ["Lifetime charged", compact(lifetimeCharged), false],
     ["Processed (incl cached)", compact(processed), false],
     ["Cached (free)", compact(cached), false],
     ["Cache ratio", cacheRatio.toFixed(0)+"%", false],
@@ -1683,8 +1691,8 @@ function renderTokens(snap, usage){
   $("tokens").innerHTML = `
     <div class="top">
       <div>
-        <div class="lead">Token budget · spent (cached excluded)${inflight>0?" · live":""}</div>
-        <div class="big">${compact(spent)}<small> / ${compact(total)} budget · ${compact(processed)} processed</small></div>
+        <div class="lead">Current token budget window · charged (cached excluded)${inflight>0?" · live":""}</div>
+        <div class="big">${compact(windowSpent)}<small> / ${compact(total)} window · ${compact(processed)} processed</small></div>
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${inflightTag}<span class="pctchip">${pctSpent.toFixed(1)}% used · ${compact(rem)} left</span></div>
     </div>
@@ -2117,12 +2125,16 @@ function renderTimeline(rows){
   h += `<table><thead><tr><th>Run</th><th>Actor</th><th>Mode</th><th>Status</th><th class="num" title="Provider-reported input plus output; budget spend excludes cached input and includes reasoning.">Processed</th><th class="num">Wall</th></tr></thead><tbody>`;
   for (const r of rows){
     const recovered = Boolean(r.failure_recovered);
-    const statusText = `${r.status||""}${recovered?" · recovered":""}`;
-    const statusTitle = recovered ? `Recovered by later integration ${r.recovered_by_run_id||""}` : "";
+    const visibleStatus = String(r.display_status || r.status || "");
+    const statusText = `${visibleStatus}${recovered?" · recovered":""}`;
+    const statusTitle = [
+      String(r.status_detail || ""),
+      recovered ? `Recovered by later integration ${r.recovered_by_run_id||""}` : "",
+    ].filter(Boolean).join(" ");
     h += `<tr><td class="mid" title="${esc(r.run_id)}">${esc(String(r.run_id||"").replace(/^v1_/,""))}</td>
       <td><span class="pill ${PILL(r.actor_role)}">${esc(r.actor_role||"")}</span></td>
       <td class="mono" style="font-size:11px">${esc(r.mode||"")}</td>
-      <td><span class="pill ${recovered?"info":PILL(r.status)}" title="${esc(statusTitle)}">${esc(statusText)}</span></td>
+      <td><span class="pill ${recovered?"info":PILL(visibleStatus)}" title="${esc(statusTitle)}">${esc(statusText)}</span></td>
       <td class="num">${num(r.total_tokens||0)}</td><td class="num">${fmtSec(r.wall_time_seconds)}</td></tr>`;
   }
   $("timeline").innerHTML = h + `</tbody></table>`;

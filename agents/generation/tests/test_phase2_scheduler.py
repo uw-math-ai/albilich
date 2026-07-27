@@ -119,6 +119,7 @@ def record_run(
     search_intent: str = "",
     actor_role: str = "researcher",
     status: str = "completed",
+    failure_kind: str = "",
     error_summary: str = "",
 ) -> None:
     action = {
@@ -143,6 +144,7 @@ def record_run(
         model="test-model",
     )
     op["search_intent"] = search_intent
+    op["failure_kind"] = failure_kind
     operations: list[dict[str, Any]] = []
     if error_summary:
         error_artifact_id = f"session_failure_{run_id.replace(':', '_').replace('/', '_')}"
@@ -2171,7 +2173,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                 search_intent="global_synthesis",
                 actor_role="researcher",
                 status="timeout",
-                error_summary="Codex stream retry stalled with no further log/token progress before a patch was produced.",
+                failure_kind="stale_stream",
             )
 
             action = next_action(store, research_mode="balanced", web_search="disabled")

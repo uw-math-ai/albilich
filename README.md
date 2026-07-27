@@ -58,7 +58,7 @@ verified result into a readable paper.
   location-specific editorial debts, compiles with restricted service paths,
   and exports the certificate, article source, and PDF as distinct artifacts.
 - **The public regression suite grew with the engine.** The synchronized
-  release passes 890 tests and 312 subtests across scheduling, retrieval,
+  release passes 908 tests and 312 subtests across scheduling, retrieval,
   research intelligence, proof-state mutation, parallel recovery, verifier
   gates, dashboard state, CAS contracts, and mathematical writing.
 
@@ -74,6 +74,9 @@ records for paired CAS-on/CAS-off Kourovka 17.91 runs, the ten-problem RealMath
 Math_arXiv benchmark, the long Kourovka 21.142 run, and the 1.5-hour-class
 Kourovka 20.2 run. Each record preserves the exact prompt, aggregate token and
 timing metrics, the generated report, and deduplicated proof or CAS evidence.
+The archive also includes a matched-model 21.142 advisor-off study, clearly
+marked as unsolved at an operator stop rather than as a terminal negative
+result.
 
 ## Quickstart
 

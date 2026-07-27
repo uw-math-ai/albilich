@@ -170,6 +170,7 @@ def summarize_runs(runs: list[Mapping[str, Any]]) -> Dict[str, Any]:
     output_tokens = sum(int(row.get("output_tokens", 0)) for row in runs)
     reasoning_output_tokens = sum(int(row.get("reasoning_output_tokens", 0)) for row in runs)
     total_tokens = sum(_run_total_tokens(row) for row in runs)
+    charged_tokens = sum(run_spend_from_operation(row) for row in runs)
     wall_time_seconds = sum(float(row.get("wall_time_seconds", 0.0) or 0.0) for row in runs)
     peak_memory_mb = max((float(row.get("peak_memory_mb", 0.0) or 0.0) for row in runs), default=0.0)
     cache_ratio = (cached_input_tokens / input_tokens) if input_tokens else 0.0
@@ -180,6 +181,7 @@ def summarize_runs(runs: list[Mapping[str, Any]]) -> Dict[str, Any]:
         "output_tokens": output_tokens,
         "reasoning_output_tokens": reasoning_output_tokens,
         "total_tokens": total_tokens,
+        "charged_tokens": charged_tokens,
         "wall_time_seconds": round(wall_time_seconds, 3),
         "peak_memory_mb": round(peak_memory_mb, 1),
         "cache_ratio": round(cache_ratio, 4),

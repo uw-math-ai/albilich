@@ -281,7 +281,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
                     else:
                         os.environ[name] = value
 
-    def test_child_log_filter_suppresses_only_known_startup_noise(self) -> None:
+    def test_child_log_filter_suppresses_only_known_background_noise(self) -> None:
         self.assertTrue(
             _should_suppress_child_log_line(
                 "2026-06-26T00:00:00Z  WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt[0]\n"
@@ -302,6 +302,26 @@ class Phase2TokenUsageTest(unittest.TestCase):
                 "2026-06-26T00:00:00Z  WARN codex_rollout::state_db: state db discrepancy during read_repair_rollout_path: upsert_needed (slow path)\n"
             )
         )
+        self.assertTrue(
+            _should_suppress_child_log_line(
+                "2026-07-27T00:00:00Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5\n"
+            )
+        )
+        self.assertTrue(
+            _should_suppress_child_log_line(
+                "2026-07-27T00:00:00Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit\n"
+            )
+        )
+        self.assertTrue(
+            _should_suppress_child_log_line(
+                "2026-07-27T00:00:00Z WARN codex_analytics::client: failed to send events request: network error\n"
+            )
+        )
+        self.assertFalse(
+            _should_suppress_child_log_line(
+                "2026-07-27T00:00:00Z WARN codex_core::responses_retry: stream disconnected - retrying sampling request (1/5)\n"
+            )
+        )
         self.assertFalse(_should_suppress_child_log_line("2026-06-26T00:00:00Z ERROR codex_core::tools::router: failed\n"))
         self.assertFalse(_should_suppress_child_log_line("Traceback (most recent call last):\n"))
 
@@ -314,7 +334,9 @@ class Phase2TokenUsageTest(unittest.TestCase):
                 "import time\n"
                 "print('session id: 019ef5aa-0000-7000-9000-staleretry1', flush=True)\n"
                 "print('2026-06-28T00:00:00Z  WARN codex_core::responses_retry: stream disconnected - retrying sampling request (1/5 in 196ms)...', flush=True)\n"
-                "time.sleep(30)\n",
+                "for _ in range(200):\n"
+                "    print('2026-07-27T00:00:00Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5', flush=True)\n"
+                "    time.sleep(0.05)\n",
                 encoding="utf-8",
             )
             fake_codex.chmod(0o755)
@@ -345,9 +367,11 @@ class Phase2TokenUsageTest(unittest.TestCase):
                     os.environ["ALBILICH_UI_HEARTBEAT_SECONDS"] = old_heartbeat
 
             self.assertEqual(result["status"], "timeout")
+            self.assertEqual(result["failure_kind"], "stale_stream")
             self.assertLess(result["wall_time_seconds"], 3.0)
             log = Path(result["log_path"]).read_text(encoding="utf-8")
             self.assertIn("stream disconnected - retrying sampling request", log)
+            self.assertNotIn("supports_reasoning_summaries", log)
             self.assertIn("no log/token progress after a Codex stream retry", log)
             self.assertIn("Codex stream retry stalled", result["patch_error"])
 

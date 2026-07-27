@@ -44,6 +44,7 @@ from .writing.paper_contract import (
 )
 from .debt_canonicalizer import central_debt_clusters, central_obstruction_for_debt
 from .graph_policy import (
+    DebtCoverageIndex,
     FAR_FROM_ROOT_DISTANCE,
     _compact_text,
     active_frontier_pressure,
@@ -2398,12 +2399,17 @@ def _verifier_blocked_citation_action(
     web_search: str | None,
     parallel_companion: bool = False,
 ) -> Optional[Dict[str, Any]]:
+    debt_coverage_index = DebtCoverageIndex(state)
     debts = [
         row for row in state.get("debts", [])
         if row.get("status") == "active"
         and row.get("severity") == "blocking"
         and _is_exact_citation_debt(row)
-        and not _debt_covered_by_integrated_claim(state, row)
+        and not _debt_covered_by_integrated_claim(
+            state,
+            row,
+            debt_coverage_index=debt_coverage_index,
+        )
     ]
     if not debts:
         return None
@@ -4492,12 +4498,17 @@ def _recent_proof_spine_artifacts(state: Mapping[str, Any], *, limit: int) -> li
 def _bottleneck_lock_debt_candidates(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     debts: list[Mapping[str, Any]] = []
     artifact_index = _artifact_index(state)
+    debt_coverage_index = DebtCoverageIndex(state)
     for debt in state.get("debts", []):
         if str(debt.get("status") or "") != "active" or str(debt.get("severity") or "") != "blocking":
             continue
         if _debt_points_to_retired_graph(state, debt):
             continue
-        if _debt_covered_by_integrated_claim(state, debt):
+        if _debt_covered_by_integrated_claim(
+            state,
+            debt,
+            debt_coverage_index=debt_coverage_index,
+        ):
             continue
         target_id = _claim_target_for_debt(state, debt) or str(debt.get("owner_id") or "root")
         distance = root_distance_for_claim_id(state, target_id)
@@ -4525,8 +4536,17 @@ def _bottleneck_lock_debt_candidates(state: Mapping[str, Any]) -> list[Mapping[s
     return debts
 
 
-def _debt_covered_by_integrated_claim(state: Mapping[str, Any], debt: Mapping[str, Any]) -> bool:
-    return debt_covered_by_integrated_claim(state, debt)
+def _debt_covered_by_integrated_claim(
+    state: Mapping[str, Any],
+    debt: Mapping[str, Any],
+    *,
+    debt_coverage_index: DebtCoverageIndex | None = None,
+) -> bool:
+    return debt_covered_by_integrated_claim(
+        state,
+        debt,
+        debt_coverage_index=debt_coverage_index,
+    )
 
 
 def _artifact_index(state: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -5453,8 +5473,9 @@ def _recent_researcher_stream_stall(
             continue
         if str(row.get("status") or "") != "timeout":
             continue
+        failure_kind = str(row.get("failure_kind") or "")
         error_summary = str(row.get("error_summary") or "")
-        if STREAM_RETRY_STALL_FRAGMENT not in error_summary:
+        if failure_kind != "stale_stream" and STREAM_RETRY_STALL_FRAGMENT not in error_summary:
             continue
         if any(
             str(later.get("actor_role") or "") == "phd_advisor"
@@ -8345,12 +8366,17 @@ def _debt_points_to_retired_graph(state: Mapping[str, Any], debt: Mapping[str, A
 
 
 def _first_blocking_debt(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    debt_coverage_index = DebtCoverageIndex(state)
     debts = [
         row for row in state["debts"]
         if row["status"] == "active"
         and row["severity"] == "blocking"
         and not _debt_points_to_retired_graph(state, row)
-        and not _debt_covered_by_integrated_claim(state, row)
+        and not _debt_covered_by_integrated_claim(
+            state,
+            row,
+            debt_coverage_index=debt_coverage_index,
+        )
     ]
     claim_depth = {
         row["claim_id"]: int(row.get("reduction_depth", 99))

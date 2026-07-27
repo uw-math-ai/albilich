@@ -16,6 +16,7 @@ absolute paths are deliberately excluded from this public archive.
 | [Kourovka 17.91, CAS off](kourovka/17.91/cas-off-1h/) | GPT-5.6 Sol, xhigh, one-hour benchmark | 1h 3m 40s lifecycle | 1h 30m 11s | 9,981,614 | Certified partial progress |
 | [RealMath Math_arXiv](benchmarks/realmath-matharxiv-10/) | GPT-5.6 Sol, xhigh, CAS enabled | — | — | about 28.1M | 10/10 `solved_final`; 9 clear reference matches and 1 equivalence review |
 | [Kourovka 21.142](kourovka/21.142/) | GPT-5.6 Sol, xhigh | 5h 51m 23s | 6h 48m 48s | 29,684,464 | Exact solution certified |
+| [Kourovka 21.142, advisor off](kourovka/21.142/advisor-off-study-20260727/) | GPT-5.6 Sol, xhigh, `ALBILICH_ADVISOR_ENABLED=0` | — | 10h 26m | 54.9M | Unsolved at operator stop; 18 verified claims but no root route |
 | [Kourovka 20.2](kourovka/20.2/) | GPT-5.6 Sol, xhigh | 1h 16m 6s | 1h 39m 43s | 6,714,757 | Stronger theorem certified |
 | [Kourovka 20.2, advisor off](kourovka/20.2/advisor-off-5h-20260727/) | GPT-5.6 Sol, xhigh, `ALBILICH_ADVISOR_ENABLED=0` | 1h 46m 48s | 2h 8m 20s | 6,306,998 | Same stronger theorem certified with zero advisor runs |
 

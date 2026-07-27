@@ -80,7 +80,7 @@ DEFAULT_CODEX_CHILD_DISABLED_FEATURES = (
     "tool_suggest",
     "workspace_dependencies",
 )
-NOISY_CODEX_STARTUP_LOG_FRAGMENTS = (
+NOISY_CODEX_LOG_FRAGMENTS = (
     " WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt",
     " WARN codex_core_skills::loader: ignoring interface.icon_small",
     " WARN codex_core_skills::loader: ignoring interface.icon_large",
@@ -89,6 +89,12 @@ NOISY_CODEX_STARTUP_LOG_FRAGMENTS = (
     " WARN codex_rollout::list: state db discrepancy during find_thread_path_by_id_str_in_subdir",
     " WARN codex_rollout::state_db: state db discrepancy during read_repair_rollout_path",
     " WARN codex_rollout::state_db: state db reconcile_rollout extraction failed",
+    # Codex 0.144.x can emit these background cache/analytics messages while
+    # the requested model session continues normally. They are not child
+    # progress and must not postpone Albilich's stream-retry stall detector.
+    " codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries`",
+    " codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit",
+    " WARN codex_analytics::client: failed to send events request:",
 )
 STALE_RETRY_LOG_FRAGMENTS = (
     "codex_core::responses_retry",
@@ -1824,6 +1830,7 @@ def execute_session(
             "log_path": str(log_path),
             "final_message_path": str(final_path),
             "log_tail": log_tail,
+            "failure_kind": failure_kind,
         }
         try:
             progress_callback(payload)
@@ -2208,7 +2215,7 @@ def _install_gap_no_history_wrapper(env: Dict[str, str], tmp_root: Path) -> None
 
 
 def _should_suppress_child_log_line(line: str) -> bool:
-    return any(fragment in line for fragment in NOISY_CODEX_STARTUP_LOG_FRAGMENTS)
+    return any(fragment in line for fragment in NOISY_CODEX_LOG_FRAGMENTS)
 
 
 def _stream_child_log(pipe: Any, log_file: Any, log_lock: threading.Lock) -> None:

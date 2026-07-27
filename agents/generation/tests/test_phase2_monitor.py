@@ -202,6 +202,33 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(timeline[0]["recovered_by_run_id"], "strict-recovery")
         self.assertNotIn("failure_recovered", timeline[1])
 
+    def test_run_timeline_distinguishes_stream_stall_from_deadline_timeout(self) -> None:
+        timeline = _run_timeline(
+            [
+                {
+                    "run_id": "transport-stall",
+                    "actor_role": "researcher",
+                    "mode": "prove",
+                    "status": "timeout",
+                    "failure_kind": "stale_stream",
+                },
+                {
+                    "run_id": "deadline",
+                    "actor_role": "researcher",
+                    "mode": "prove",
+                    "status": "timeout",
+                    "failure_kind": "deadline",
+                },
+            ]
+        )
+
+        self.assertEqual(timeline[0]["status"], "timeout")
+        self.assertEqual(timeline[0]["display_status"], "stream stalled")
+        self.assertIn("not the configured session time limit", timeline[0]["status_detail"])
+        self.assertEqual(timeline[1]["display_status"], "time limit reached")
+        self.assertIn("configured Albilich time limit", timeline[1]["status_detail"])
+        self.assertIn("r.display_status || r.status", INDEX_HTML)
+
     def test_claim_ledger_prioritizes_retired_lifecycle_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(tmpdir)

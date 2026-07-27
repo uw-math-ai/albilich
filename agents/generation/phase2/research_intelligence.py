@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import Any, Dict, Mapping
 
 from .graph_policy import (
+    DebtCoverageIndex,
     VERIFIED_VALIDATION_STATUSES,
     claim_is_unresolved,
     debt_covered_by_integrated_claim,
@@ -323,6 +324,7 @@ def verifier_filtered_outcome_learning(
 def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the smallest active sufficient-route obligation cut near root."""
 
+    debt_coverage_index = DebtCoverageIndex(state)
     claims = {str(row.get("claim_id") or ""): row for row in state.get("claims", []) or []}
     inferences_by_route: Dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for inference in state.get("inferences", []) or []:
@@ -331,7 +333,11 @@ def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
         row
         for row in state.get("debts", []) or []
         if str(row.get("status") or "") == "active"
-        and not debt_covered_by_integrated_claim(state, row)
+        and not debt_covered_by_integrated_claim(
+            state,
+            row,
+            debt_coverage_index=debt_coverage_index,
+        )
     ]
     paused = paused_route_ids(state)
     route_cuts: list[Dict[str, Any]] = []
