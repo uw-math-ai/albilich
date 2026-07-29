@@ -1,0 +1,12 @@
+{
+  "experiment": "kourovka_problem_20_2_psl2_complete_classification",
+  "result_id": "kourovka/problem_20_2_classification_totally_3_closed_lie_type",
+  "scope": "all nonabelian simple PSL_2(q)",
+  "classification": "totally 3-closed iff q is prime and q >= 7",
+  "result_kind": "exact_classification",
+  "source_repository": "Rethlas-CAS",
+  "source_ref": "origin/main",
+  "source_ref_sha_at_publication": "b46d272d99dd44ed833bce2340e45c3ddcec56f8",
+  "source_archive_commit": "e0ce0ebf55ede6281e7b49e2d7d6318017baf4a0",
+  "archive_note": "The archived result has no terminal proof_state database or generated phase2 report; the public package preserves its committed proof, verification, and integration artifacts."
+}

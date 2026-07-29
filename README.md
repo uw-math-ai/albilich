@@ -71,9 +71,13 @@ route. It also makes the boundary between “promising,” “strictly verified,
 
 The [`experiments/`](experiments/) archive contains public, checksum-verified
 records for paired CAS-on/CAS-off Kourovka 17.91 runs, the ten-problem RealMath
-Math_arXiv benchmark, the long Kourovka 21.142 run, and the 1.5-hour-class
-Kourovka 20.2 run. Each record preserves the exact prompt, aggregate token and
-timing metrics, the generated report, and deduplicated proof or CAS evidence.
+Math_arXiv benchmark, the long Kourovka 21.142 run, and the Problem 20.2
+experiment series. Problem 20.2 now includes complete
+\(\operatorname{PSL}_2(q)\), \(\operatorname{PSL}_3(q)\), and
+\(\operatorname{PSL}_4(q)\) classifications together with the honestly
+partial broad \(\operatorname{PSL}_n(q)\) revision-610 study. Each leaf package
+preserves its exact source prompt, available aggregate metrics and report, and
+the proof or CAS evidence needed to audit its stated result.
 The archive also includes a matched-model 21.142 advisor-off study, clearly
 marked as unsolved at an operator stop rather than as a terminal negative
 result.

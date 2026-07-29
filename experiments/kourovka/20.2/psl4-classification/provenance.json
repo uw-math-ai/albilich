@@ -1,0 +1,13 @@
+{
+  "experiment": "kourovka_problem_20_2_psl4_complete_classification",
+  "derived_from_result_id": "kourovka/problem_20_2_psln_family_classification",
+  "scope": "all nonabelian simple PSL_4(q)",
+  "classification": "no PSL_4(q) is totally 3-closed",
+  "result_kind": "exact_classification_by_exhaustive_case_assembly",
+  "source_revision": 610,
+  "source_repository": "Rethlas-CAS",
+  "source_ref": "origin/main",
+  "source_ref_sha_at_publication": "b46d272d99dd44ed833bce2340e45c3ddcec56f8",
+  "source_archive_commit": "e0ce0ebf55ede6281e7b49e2d7d6318017baf4a0",
+  "assembly_note": "The q > 2 central-vector theorem and q = 2 Klein-quadric theorem were separately strictly verified and integrated in the revision-610 study."
+}

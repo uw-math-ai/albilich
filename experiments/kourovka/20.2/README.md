@@ -1,9 +1,22 @@
 # Kourovka Notebook Problem 20.2 — experiment series
 
-This directory contains the original advisor-on run and a controlled rerun with
-the PhD-advisor role disabled. Both use the byte-identical original Problem
-20.2 input and both certify `PSL(2,7)` as a totally 3-closed nonabelian simple
-group of Lie type.
+This directory contains the original advisor-on run, a controlled advisor-off
+rerun, and four later projective-special-linear classification packages. The
+two original-problem runs use a byte-identical Problem 20.2 input and both
+certify `PSL(2,7)` as a totally 3-closed nonabelian simple group of Lie type.
+
+## Classification packages
+
+- [Complete \(\operatorname{PSL}_2(q)\) classification](psl2-classification/):
+  total 3-closure holds exactly for prime \(q\geq7\).
+- [Complete \(\operatorname{PSL}_3(q)\) classification](psl3-classification/):
+  total 3-closure holds exactly when \(q\) is prime and either \(q=3\) or
+  \(q\equiv2\pmod3\).
+- [Complete \(\operatorname{PSL}_4(q)\) classification](psl4-classification/):
+  no member of the family is totally 3-closed.
+- [Broad \(\operatorname{PSL}_n(q)\) revision-610 study](psln-revision-610-study/):
+  certified partial progress with its unsolved root and blocking debts
+  preserved explicitly.
 
 ## Original advisor-on run
 
