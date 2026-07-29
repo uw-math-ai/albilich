@@ -10,6 +10,10 @@ absolute paths are deliberately excluded from this public archive.
 
 ## Included experiments
 
+The [AAAI-27 final-paper data index](aaai27-final-paper/) maps manuscript
+claims to these archives, records unmatched values explicitly, and includes
+the anonymized revision-1356 dashboard screenshot.
+
 | Experiment | Configuration | Wall clock | Active backend compute | Tokens | Outcome |
 | --- | --- | ---: | ---: | ---: | --- |
 | [Kourovka 17.91, CAS on](kourovka/17.91/cas-on-1h/) | GPT-5.6 Sol, xhigh, one-hour benchmark | 1h 0m 13s | 1h 30m 17s | 5,250,897 | Certified partial progress |

@@ -98,5 +98,7 @@ the public mainline.
 
 This package publishes the findings and aggregate comparison only. It excludes
 raw child logs, session identifiers, SQLite state, and local absolute paths.
+The same aggregate values are available in machine-readable form in
+`metrics.json`.
 The source findings were recorded in Rethlas-CAS commit
 `b46d272d99dd44ed833bce2340e45c3ddcec56f8`.

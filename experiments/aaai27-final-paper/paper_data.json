@@ -1,0 +1,143 @@
+{
+  "paper_title": "Albilich: Steerable Proof-State Orchestration for LLM-Based Mathematical Research with CAS Integration",
+  "audit_date": "2026-07-29",
+  "source_audit": {
+    "repository": "Rethlas-CAS",
+    "branch": "main",
+    "commit": "b46d272d99dd44ed833bce2340e45c3ddcec56f8",
+    "proof_state_databases_scanned": 40,
+    "history_searched_for_unmatched_values": true
+  },
+  "realmath_matharxiv": {
+    "cas_enabled": {
+      "status": "matches",
+      "paper_problem_count": 10,
+      "archived_problem_count": 10,
+      "paper_solved_final": 10,
+      "archived_solved_final": 10,
+      "paper_total_tokens": "28.10M",
+      "archived_total_tokens_approx": 28100000,
+      "clear_reference_matches": 9,
+      "equivalence_reviews": 1,
+      "public_artifact": "../benchmarks/realmath-matharxiv-10/"
+    },
+    "cas_disabled": {
+      "status": "not_found",
+      "paper_solved_final": "9/10",
+      "archived_run": null,
+      "note": "No RealMath no-CAS run or aggregate record was found in the Rethlas-CAS main checkout or its main-branch history."
+    }
+  },
+  "kourovka_17_91": {
+    "paper_summary_table": {
+      "status": "matches_rounded",
+      "cas_on": {
+        "runs": 20,
+        "paper_total_tokens": "5.25M",
+        "archived_total_tokens": 5250897,
+        "outcome": "certified_partial_progress"
+      },
+      "cas_off": {
+        "runs": 20,
+        "paper_total_tokens": "9.98M",
+        "archived_total_tokens": 9981614,
+        "outcome": "certified_partial_progress"
+      }
+    },
+    "paper_detailed_ablation": {
+      "status": "cas_on_mismatch",
+      "paper_cas_on": {
+        "input_tokens": "6.590M",
+        "output_tokens": "0.194M",
+        "total_tokens": "6.784M",
+        "active_backend_compute_seconds": 5244.145
+      },
+      "archived_cas_on": {
+        "input_tokens": 5031315,
+        "output_tokens": 219582,
+        "total_tokens": 5250897,
+        "active_backend_compute_seconds": 5417.175
+      },
+      "paper_cas_off": {
+        "input_tokens": "9.787M",
+        "output_tokens": "0.195M",
+        "total_tokens": "9.982M",
+        "active_backend_compute_seconds": 5410.717
+      },
+      "archived_cas_off": {
+        "input_tokens": 9787110,
+        "output_tokens": 194504,
+        "total_tokens": 9981614,
+        "active_backend_compute_seconds": 5410.717
+      },
+      "archived_total_token_reduction_percent": 47.394309,
+      "paper_claimed_total_token_reduction_percent": 32.0,
+      "alternative_matching_database_found": false
+    },
+    "controlled_comparison": {
+      "status": "not_supported_by_archived_protocol",
+      "note": "The archived README records different prompts/search settings between the historical arms."
+    },
+    "public_artifact": "../kourovka/17.91/"
+  },
+  "kourovka_21_142": {
+    "status": "matches",
+    "advisor_on": {
+      "root_solved": true,
+      "runs": 80,
+      "active_backend_compute_seconds": 24527.885,
+      "raw_tokens": 29684464,
+      "claims_total": 11,
+      "claims_verified": 10,
+      "root_concluding_routes": 1,
+      "patch_rejection_rate_paper": "1%"
+    },
+    "advisor_off": {
+      "root_solved_at_stop": false,
+      "runs": 110,
+      "active_backend_compute_hours": 10.44,
+      "raw_tokens_approx": 54900000,
+      "budget_consumed_tokens_approx": 9670000,
+      "claims_total": 20,
+      "claims_verified": 18,
+      "integrated_routes": 16,
+      "root_concluding_routes": 0,
+      "patch_rejection_rate": "8%"
+    },
+    "public_artifact": "../kourovka/21.142/"
+  },
+  "kourovka_20_2": {
+    "status": "matches",
+    "advisor_on": {
+      "root_solved": true,
+      "explicit_witness": "PSL(2,7)",
+      "runs": 23,
+      "lifecycle_wall_clock_seconds": 4566,
+      "active_backend_compute_seconds": 5983.210,
+      "raw_tokens": 6714757
+    },
+    "advisor_off": {
+      "root_solved": true,
+      "explicit_witness": "PSL(2,7)",
+      "runs": 18,
+      "lifecycle_wall_clock_seconds": 6408.161,
+      "active_backend_compute_seconds": 7699.857,
+      "raw_tokens": 6306998
+    },
+    "family_results": {
+      "psl2": "Totally 3-closed exactly for prime q >= 7.",
+      "psl3": "Complete classification archived; includes PSL(3,3) and the prime q congruent to 2 mod 3 family.",
+      "psl4": "No PSL(4,q) is totally 3-closed.",
+      "higher_rank": "The broad revision-610 study is archived as certified partial progress with its unsolved root preserved."
+    },
+    "public_artifact": "../kourovka/20.2/"
+  },
+  "dashboard": {
+    "file": "dashboard.png",
+    "width": 3000,
+    "height": 1520,
+    "sha256": "f428ddd6e4daa3444f58cfdc21f96dd6072ef1051bc6c09242ff09b29d4fb561",
+    "run": "kourovka/problem_20_2_psl3_family_classification",
+    "revision": 1356
+  }
+}

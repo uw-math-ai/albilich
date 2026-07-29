@@ -80,7 +80,11 @@ preserves its exact source prompt, available aggregate metrics and report, and
 the proof or CAS evidence needed to audit its stated result.
 The archive also includes a matched-model 21.142 advisor-off study, clearly
 marked as unsolved at an operator stop rather than as a terminal negative
-result.
+result. The
+[`experiments/aaai27-final-paper/`](experiments/aaai27-final-paper/) index maps
+the final manuscript's reported values to the available public artifacts,
+including explicit records for values that are not supported by the archived
+data.
 
 ## Quickstart
 
