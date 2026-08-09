@@ -10,7 +10,17 @@ from .audit import paper_audit_context_card
 from .branch_summary import build_branch_summaries, build_branch_workbench
 from .budget import estimate_tokens_from_text
 from .completion_policy import DEFAULT_COMPLETION_POLICY
-from .graph_policy import active_frontier_pressure, build_proof_spine, claim_type_label, frontier_claim_ids, proof_trunk_maturity, root_distance_for_claim_id, route_scoreboard
+from .graph_policy import (
+    GraphPolicyIndex,
+    active_frontier_pressure,
+    build_graph_policy_index,
+    build_proof_spine,
+    claim_type_label,
+    frontier_claim_ids,
+    proof_trunk_maturity,
+    root_distance_for_claim_id,
+    route_scoreboard,
+)
 from .memory_policy import (
     artifact_is_raw_log,
     artifact_memory_status,
@@ -147,12 +157,19 @@ def build_context_manifest(
     if duplicate_debts:
         state = dict(state)
         state["debts"] = list(deduped_debts)
+    policy_index = build_graph_policy_index(state)
     claims = {}
     for row in state["claims"]:
         card = _claim_card(row)
-        card["proof_trunk_maturity"] = proof_trunk_maturity(state, row["claim_id"])
-        card["root_distance"] = root_distance_for_claim_id(state, row["claim_id"])
-        card["claim_type_label"] = claim_type_label(state, row)
+        card["proof_trunk_maturity"] = proof_trunk_maturity(
+            state, row["claim_id"], policy_index=policy_index
+        )
+        card["root_distance"] = root_distance_for_claim_id(
+            state, row["claim_id"], policy_index=policy_index
+        )
+        card["claim_type_label"] = claim_type_label(
+            state, row, policy_index=policy_index
+        )
         claims[row["claim_id"]] = card
     routes = {row["route_id"]: _route_card(row) for row in state["routes"]}
     target = claims.get(target_id)
@@ -164,7 +181,12 @@ def build_context_manifest(
         selected_route = routes.get(route_id) if route_id else None
     else:
         selected_route = routes.get(route_id) if route_id else _best_route_for_target(routes.values(), target_id)
-    selected_claim_ids = _select_claim_ids(state, target_id, selected_route)
+    selected_claim_ids = _select_claim_ids(
+        state,
+        target_id,
+        selected_route,
+        policy_index=policy_index,
+    )
     selected_inferences = _select_inferences(state, selected_claim_ids, selected_route)
     branch_focus = str((action or {}).get("branch_focus") or "")
     preferred_debt_ids = _branch_packet_debt_ids(action)
@@ -332,7 +354,13 @@ def build_context_manifest(
         "artifacts": selected_artifacts,
         "retrieval_cards": retrieval_cards,
         "theorem_library": theorem_library,
-        "graph_focus": _graph_focus(state, selected_claim_ids, selected_inferences, selected_debts),
+        "graph_focus": _graph_focus(
+            state,
+            selected_claim_ids,
+            selected_inferences,
+            selected_debts,
+            policy_index=policy_index,
+        ),
         "proof_spine": proof_spine,
         "research_strategy": research_strategy,
         "active_context_compression": active_compression,
@@ -1947,8 +1975,18 @@ def _best_route_for_target(routes: Iterable[Mapping[str, Any]], target_id: str) 
     return sorted(candidates, key=lambda row: (row.get("status") != "active", row.get("route_id", "")))[0] if candidates else None
 
 
-def _select_claim_ids(state: Mapping[str, Any], target_id: str, route: Optional[Mapping[str, Any]]) -> List[str]:
-    claims_by_id = {row["claim_id"]: row for row in state["claims"]}
+def _select_claim_ids(
+    state: Mapping[str, Any],
+    target_id: str,
+    route: Optional[Mapping[str, Any]],
+    *,
+    policy_index: GraphPolicyIndex | None = None,
+) -> List[str]:
+    claims_by_id = (
+        policy_index.claims_by_id
+        if policy_index is not None
+        else {row["claim_id"]: row for row in state["claims"]}
+    )
     selected: list[str] = []
 
     def add(claim_id: str) -> None:
@@ -1987,17 +2025,27 @@ def _select_claim_ids(state: Mapping[str, Any], target_id: str, route: Optional[
             continue
         owner_id = str(debt.get("owner_id") or "")
         target = str(debt.get("suggested_next_target") or owner_id)
-        if owner_id in selected or target in selected or root_distance_for_claim_id(state, target) <= 5:
+        if owner_id in selected or target in selected or root_distance_for_claim_id(
+            state, target, policy_index=policy_index
+        ) <= 5:
             add(owner_id)
             add(target)
 
-    for claim_id in sorted(frontier_claim_ids(state), key=lambda cid: (root_distance_for_claim_id(state, cid), cid)):
+    for claim_id in sorted(
+        frontier_claim_ids(state, policy_index=policy_index),
+        key=lambda cid: (
+            root_distance_for_claim_id(state, cid, policy_index=policy_index),
+            cid,
+        ),
+    ):
         add(claim_id)
 
     for claim in sorted(
         state["claims"],
         key=lambda c: (
-            root_distance_for_claim_id(state, c["claim_id"]),
+            root_distance_for_claim_id(
+                state, c["claim_id"], policy_index=policy_index
+            ),
             -float(c.get("root_impact", 0)),
             int(c.get("reduction_depth", 99)),
             c["claim_id"],
@@ -3658,8 +3706,16 @@ def _graph_focus(
     claim_ids: List[str],
     inferences: List[Mapping[str, Any]],
     debts: List[Mapping[str, Any]],
+    *,
+    policy_index: GraphPolicyIndex | None = None,
 ) -> Dict[str, Any]:
-    frontier = sorted(frontier_claim_ids(state), key=lambda cid: (root_distance_for_claim_id(state, cid), cid))
+    frontier = sorted(
+        frontier_claim_ids(state, policy_index=policy_index),
+        key=lambda cid: (
+            root_distance_for_claim_id(state, cid, policy_index=policy_index),
+            cid,
+        ),
+    )
     return {
         "policy": "root-local frontier context",
         "frontier_claim_ids": frontier[:12],
@@ -3670,7 +3726,9 @@ def _graph_focus(
         "total_claim_count": len(state["claims"]),
         "total_route_count": len(state["routes"]),
         "total_active_debt_count": sum(1 for row in state["debts"] if row.get("status") == "active"),
-        "frontier_pressure": active_frontier_pressure(state),
+        "frontier_pressure": active_frontier_pressure(
+            state, policy_index=policy_index
+        ),
         "omits_unrelated_artifacts": True,
     }
 

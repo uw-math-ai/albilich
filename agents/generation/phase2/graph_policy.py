@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 from .models import fingerprint_text, json_loads, normalize_text
@@ -69,6 +70,24 @@ CLAIM_RESTATEMENT_NOVELTY_STOPWORDS = {
     "then",
     "top",
 }
+
+
+@dataclass(frozen=True)
+class GraphPolicyIndex:
+    """Derived graph lookups reused while building one immutable context.
+
+    Context construction asks the same graph-policy questions for every claim.
+    Keeping these revision-local lookups explicit avoids repeatedly rebuilding
+    claim maps and rescanning the artifact ledger without introducing a global
+    cache whose lifetime could outlive the proof-state revision.
+    """
+
+    claims_by_id: Mapping[str, Mapping[str, Any]]
+    superseded_claim_ids: frozenset[str]
+    blocking_debt_owner_ids: frozenset[str]
+    attempted_target_ids: frozenset[str]
+    routed_claim_ids: frozenset[str]
+    root_distances: Mapping[str, int]
 
 
 def claim_parent_ids(row: Mapping[str, Any]) -> list[str]:
@@ -439,10 +458,12 @@ def claim_map(state: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     return {str(row.get("claim_id")): row for row in state.get("claims", [])}
 
 
-def root_distance_for_claim_id(state: Mapping[str, Any], claim_id: str) -> int:
+def _root_distance_from_claims(
+    claims: Mapping[str, Mapping[str, Any]],
+    claim_id: str,
+) -> int:
     if claim_id == "root":
         return 0
-    claims = claim_map(state)
     row = claims.get(claim_id)
     if row is None:
         return 99
@@ -468,10 +489,63 @@ def root_distance_for_claim_id(state: Mapping[str, Any], claim_id: str) -> int:
     return depth if depth >= 0 else 99
 
 
-def frontier_claim_ids(state: Mapping[str, Any], *, max_items: int = 12) -> set[str]:
-    """Return claims that are closest to closing an active route to root."""
+def build_graph_policy_index(state: Mapping[str, Any]) -> GraphPolicyIndex:
+    """Build output-neutral graph lookups for repeated policy queries."""
     claims = claim_map(state)
-    superseded_claim_ids = set(supersession_index(state).get("superseded_claim_ids", []))
+    superseded_claim_ids = frozenset(
+        str(claim_id)
+        for claim_id in supersession_index(state).get("superseded_claim_ids", [])
+    )
+    root_distances = {
+        claim_id: _root_distance_from_claims(claims, claim_id)
+        for claim_id in claims
+    }
+    return GraphPolicyIndex(
+        claims_by_id=claims,
+        superseded_claim_ids=superseded_claim_ids,
+        blocking_debt_owner_ids=frozenset(
+            str(debt.get("owner_id") or "")
+            for debt in state.get("debts", [])
+            if debt.get("status") == "active" and debt.get("severity") == "blocking"
+        ),
+        attempted_target_ids=frozenset(
+            str(run.get("target_id") or "")
+            for run in list(state.get("runs", [])) + list(state.get("recent_runs", []))
+        ),
+        routed_claim_ids=frozenset(
+            str(route.get("conclusion_claim_id") or "")
+            for route in state.get("routes", [])
+        ),
+        root_distances=root_distances,
+    )
+
+
+def root_distance_for_claim_id(
+    state: Mapping[str, Any],
+    claim_id: str,
+    *,
+    policy_index: GraphPolicyIndex | None = None,
+) -> int:
+    if policy_index is not None:
+        if claim_id == "root":
+            return 0
+        return int(policy_index.root_distances.get(claim_id, 99))
+    return _root_distance_from_claims(claim_map(state), claim_id)
+
+
+def frontier_claim_ids(
+    state: Mapping[str, Any],
+    *,
+    max_items: int = 12,
+    policy_index: GraphPolicyIndex | None = None,
+) -> set[str]:
+    """Return claims that are closest to closing an active route to root."""
+    claims = policy_index.claims_by_id if policy_index is not None else claim_map(state)
+    superseded_claim_ids = (
+        set(policy_index.superseded_claim_ids)
+        if policy_index is not None
+        else set(supersession_index(state).get("superseded_claim_ids", []))
+    )
     route_inferences: dict[str, list[Mapping[str, Any]]] = {}
     for inf in state.get("inferences", []):
         route_inferences.setdefault(str(inf.get("route_id") or ""), []).append(inf)
@@ -487,7 +561,9 @@ def frontier_claim_ids(state: Mapping[str, Any], *, max_items: int = 12) -> set[
         if route.get("status") != "active" or route.get("relation_to_parent") != "sufficient":
             continue
         conclusion = str(route.get("conclusion_claim_id") or "")
-        if conclusion != "root" and root_distance_for_claim_id(state, conclusion) > FAR_FROM_ROOT_DISTANCE:
+        if conclusion != "root" and root_distance_for_claim_id(
+            state, conclusion, policy_index=policy_index
+        ) > FAR_FROM_ROOT_DISTANCE:
             continue
         inferences = route_inferences.get(str(route.get("route_id") or ""), [])
         if not inferences:
@@ -503,14 +579,20 @@ def frontier_claim_ids(state: Mapping[str, Any], *, max_items: int = 12) -> set[
         if debt.get("status") != "active":
             continue
         target_id = str(debt.get("suggested_next_target") or debt.get("owner_id") or "")
-        if root_distance_for_claim_id(state, target_id) <= FAR_FROM_ROOT_DISTANCE:
+        if root_distance_for_claim_id(
+            state, target_id, policy_index=policy_index
+        ) <= FAR_FROM_ROOT_DISTANCE:
             add_claim(target_id)
 
     if not selected:
         candidates = [row for row in state.get("claims", []) if claim_is_unresolved(row)]
         candidates.sort(
             key=lambda row: (
-                root_distance_for_claim_id(state, str(row.get("claim_id") or "")),
+                root_distance_for_claim_id(
+                    state,
+                    str(row.get("claim_id") or ""),
+                    policy_index=policy_index,
+                ),
                 -float(row.get("root_impact", 0.0)),
                 int(row.get("reduction_depth", 99)),
                 str(row.get("claim_id") or ""),
@@ -529,21 +611,30 @@ def active_frontier_pressure(
     *,
     claim_cap: int = FRONTIER_PRESSURE_CLAIM_CAP,
     compression_cap: int = FRONTIER_PRESSURE_COMPRESSION_CAP,
+    policy_index: GraphPolicyIndex | None = None,
 ) -> Dict[str, Any]:
     """Summarize whether root-local unresolved claims are getting too wide."""
     unresolved: list[Dict[str, Any]] = []
     root_local: list[Dict[str, Any]] = []
-    superseded_claim_ids = set(supersession_index(state).get("superseded_claim_ids", []))
+    superseded_claim_ids = (
+        set(policy_index.superseded_claim_ids)
+        if policy_index is not None
+        else set(supersession_index(state).get("superseded_claim_ids", []))
+    )
     for row in state.get("claims", []):
         claim_id = str(row.get("claim_id") or "")
         if claim_id == "root" or claim_id in superseded_claim_ids or not claim_is_unresolved(row):
             continue
-        root_distance = root_distance_for_claim_id(state, claim_id)
+        root_distance = root_distance_for_claim_id(
+            state, claim_id, policy_index=policy_index
+        )
         item = {
             "claim_id": claim_id,
             "root_distance": root_distance,
             "root_impact": float(row.get("root_impact", 0.0) or 0.0),
-            "maturity": proof_trunk_maturity(state, claim_id),
+            "maturity": proof_trunk_maturity(
+                state, claim_id, policy_index=policy_index
+            ),
         }
         unresolved.append(item)
         if root_distance <= FAR_FROM_ROOT_DISTANCE:
@@ -569,12 +660,22 @@ def active_frontier_pressure(
     }
 
 
-def proof_trunk_maturity(state: Mapping[str, Any], claim_id: str) -> str:
-    claims = claim_map(state)
+def proof_trunk_maturity(
+    state: Mapping[str, Any],
+    claim_id: str,
+    *,
+    policy_index: GraphPolicyIndex | None = None,
+) -> str:
+    claims = policy_index.claims_by_id if policy_index is not None else claim_map(state)
     claim = claims.get(claim_id)
     if claim is None:
         return "unknown"
-    if claim_id in set(supersession_index(state).get("superseded_claim_ids", [])):
+    superseded_claim_ids = (
+        policy_index.superseded_claim_ids
+        if policy_index is not None
+        else set(supersession_index(state).get("superseded_claim_ids", []))
+    )
+    if claim_id in superseded_claim_ids:
         return "superseded"
     if claim.get("lifecycle_status") == "integrated":
         return "integrated"
@@ -584,16 +685,37 @@ def proof_trunk_maturity(state: Mapping[str, Any], claim_id: str) -> str:
         return "abandoned"
     if claim_is_verified(claim):
         return "verified"
-    if any(
-        debt.get("status") == "active"
-        and debt.get("severity") == "blocking"
-        and str(debt.get("owner_id") or "") == claim_id
-        for debt in state.get("debts", [])
-    ):
+    has_blocking_debt = (
+        claim_id in policy_index.blocking_debt_owner_ids
+        if policy_index is not None
+        else any(
+            debt.get("status") == "active"
+            and debt.get("severity") == "blocking"
+            and str(debt.get("owner_id") or "") == claim_id
+            for debt in state.get("debts", [])
+        )
+    )
+    if has_blocking_debt:
         return "verifier_gap"
-    if any(str(run.get("target_id") or "") == claim_id for run in state.get("runs", []) + state.get("recent_runs", [])):
+    was_attempted = (
+        claim_id in policy_index.attempted_target_ids
+        if policy_index is not None
+        else any(
+            str(run.get("target_id") or "") == claim_id
+            for run in state.get("runs", []) + state.get("recent_runs", [])
+        )
+    )
+    if was_attempted:
         return "attempted"
-    if any(route.get("conclusion_claim_id") == claim_id for route in state.get("routes", [])):
+    is_routed = (
+        claim_id in policy_index.routed_claim_ids
+        if policy_index is not None
+        else any(
+            route.get("conclusion_claim_id") == claim_id
+            for route in state.get("routes", [])
+        )
+    )
+    if is_routed:
         return "routed"
     return "proposed"
 
@@ -612,7 +734,12 @@ def maturity_rank(maturity: str) -> int:
     }.get(maturity, 7)
 
 
-def claim_type_label(state: Mapping[str, Any], row: Mapping[str, Any]) -> str:
+def claim_type_label(
+    state: Mapping[str, Any],
+    row: Mapping[str, Any],
+    *,
+    policy_index: GraphPolicyIndex | None = None,
+) -> str:
     claim_id = str(row.get("claim_id") or "")
     if claim_id == "root":
         return "root_theorem"
@@ -625,7 +752,9 @@ def claim_type_label(state: Mapping[str, Any], row: Mapping[str, Any]) -> str:
         return "literature_fact"
     if claim_is_verified(row):
         return "partial_result"
-    root_distance = root_distance_for_claim_id(state, claim_id)
+    root_distance = root_distance_for_claim_id(
+        state, claim_id, policy_index=policy_index
+    )
     root_impact = float(row.get("root_impact", 0.0))
     if root_distance <= 1 or root_impact >= 0.75:
         return "main_trunk"

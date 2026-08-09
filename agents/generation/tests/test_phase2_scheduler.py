@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from agents.generation.phase2.graph_policy import active_frontier_pressure, build_proof_spine, decomposition_cooldown_active, obvious_duplicate_claim_id, route_scoreboard, supersession_index
+from agents.generation.phase2.graph_policy import active_frontier_pressure, build_graph_policy_index, build_proof_spine, claim_type_label, decomposition_cooldown_active, obvious_duplicate_claim_id, proof_trunk_maturity, root_distance_for_claim_id, route_scoreboard, supersession_index
 from agents.generation.phase2.codex_runner import _persist_normalized_final_patch, actor_role_for_action, attached_artifact_ids, build_session_prompt, extract_patch_from_text, prepare_session, run_metrics_operation
 from agents.generation.phase2.context_builder import _fit_manifest, _retrieval_card, _select_artifacts, build_context_manifest, build_resume_delta_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
@@ -340,6 +340,44 @@ class Phase2PartialReceiptTest(unittest.TestCase):
 
 
 class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
+    def test_graph_policy_index_preserves_claim_classification(self) -> None:
+        claims = [
+            claim("root", 0, root_impact=1.0),
+            claim("integrated", 1, validation_status="informally_verified", lifecycle_status="integrated", parent_ids=["root"]),
+            claim("blocked", 2, parent_ids=["integrated"]),
+            claim("attempted", 2, parent_ids=["integrated"]),
+            claim("routed", 2, parent_ids=["integrated"]),
+            claim("proposed", 7),
+        ]
+        for row in claims:
+            row["tags_json"] = "[]"
+            row["conditions_json"] = "[]"
+        state = {
+            "claims": claims,
+            "routes": [route("route-routed", conclusion_claim_id="routed")],
+            "inferences": [],
+            "debts": [debt("debt-blocked", owner_id="blocked")],
+            "runs": [{"target_id": "attempted"}],
+            "recent_runs": [],
+            "artifacts": [],
+        }
+        policy_index = build_graph_policy_index(state)
+
+        for row in claims:
+            claim_id = row["claim_id"]
+            self.assertEqual(
+                proof_trunk_maturity(state, claim_id),
+                proof_trunk_maturity(state, claim_id, policy_index=policy_index),
+            )
+            self.assertEqual(
+                root_distance_for_claim_id(state, claim_id),
+                root_distance_for_claim_id(state, claim_id, policy_index=policy_index),
+            )
+            self.assertEqual(
+                claim_type_label(state, row),
+                claim_type_label(state, row, policy_index=policy_index),
+            )
+
     def test_citation_first_is_balanced_compatibility_alias(self) -> None:
         self.assertEqual(normalize_research_mode("citation_first"), "balanced")
 

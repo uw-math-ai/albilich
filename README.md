@@ -25,7 +25,9 @@ verified result into a readable paper.
 - **Research intelligence is now proof-graph aware.** The scheduler computes
   the smallest active sufficient-route obligation cut, scores the decisive
   bottleneck, retrieves from eighteen reviewed method cards, and learns local
-  strategy-family outcomes only from later verifier-accepted evidence.
+  strategy-family outcomes only from later verifier-accepted evidence. Context
+  assembly now builds one revision-local graph-policy index and reuses it for
+  root distance, frontier, route, debt, and artifact decisions.
 - **Stalled attacks change mathematics, not just wording.** Repeated
   bottlenecks trigger a representation-switch contract, theorem-adaptation
   packets, proof-interface checks, or a new research philosophy. Multi-branch
@@ -58,7 +60,7 @@ verified result into a readable paper.
   location-specific editorial debts, compiles with restricted service paths,
   and exports the certificate, article source, and PDF as distinct artifacts.
 - **The public regression suite grew with the engine.** The synchronized
-  release passes 908 tests and 312 subtests across scheduling, retrieval,
+  release passes 910 tests and 324 subtests across scheduling, retrieval,
   research intelligence, proof-state mutation, parallel recovery, verifier
   gates, dashboard state, CAS contracts, and mathematical writing.
 

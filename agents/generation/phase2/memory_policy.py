@@ -14,6 +14,7 @@ role manifests and (b) reports duplicate debts/retrieval cards instead of
 silently dropping them.
 """
 
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 from .models import fingerprint_text, json_loads, normalize_text
@@ -221,25 +222,43 @@ def _debt_semantic_terms(row: Mapping[str, Any]) -> set[str]:
     }
 
 
-def _same_debt_obligation(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    if _debt_dedupe_key(left) == _debt_dedupe_key(right):
+@dataclass(frozen=True)
+class _DebtMatchSignature:
+    dedupe_key: Tuple[str, str]
+    is_writing: bool
+    status: str
+    semantic_scope: str
+    type_family: str
+    semantic_terms: frozenset[str]
+
+
+def _debt_match_signature(row: Mapping[str, Any]) -> _DebtMatchSignature:
+    return _DebtMatchSignature(
+        dedupe_key=_debt_dedupe_key(row),
+        is_writing=str(row.get("debt_type") or "") == "writing",
+        status=str(row.get("status") or "active"),
+        semantic_scope=_debt_semantic_scope(row),
+        type_family=_debt_type_family(row),
+        semantic_terms=frozenset(_debt_semantic_terms(row)),
+    )
+
+
+def _same_debt_signature(
+    left: _DebtMatchSignature,
+    right: _DebtMatchSignature,
+) -> bool:
+    if left.dedupe_key == right.dedupe_key:
         return True
-    # Writing debts are LOCATION-ANCHORED: one debt per violating place in the
-    # document, and same-rule obligations differ only in section title / line /
-    # excerpt (three sections missing their L4-HOUSE-07 opener are three
-    # distinct debts). Term-overlap merging would collapse them and truncate
-    # the writing-gate checklists, so only the exact owner+obligation
-    # fingerprint above may dedupe them.
-    if str(left.get("debt_type") or "") == "writing" or str(right.get("debt_type") or "") == "writing":
+    if left.is_writing or right.is_writing:
         return False
-    if str(left.get("status") or "active") != str(right.get("status") or "active"):
+    if left.status != right.status:
         return False
-    if _debt_semantic_scope(left) != _debt_semantic_scope(right):
+    if left.semantic_scope != right.semantic_scope:
         return False
-    if _debt_type_family(left) != _debt_type_family(right):
+    if left.type_family != right.type_family:
         return False
-    left_terms = _debt_semantic_terms(left)
-    right_terms = _debt_semantic_terms(right)
+    left_terms = left.semantic_terms
+    right_terms = right.semantic_terms
     if min(len(left_terms), len(right_terms)) < 7:
         return False
     shared = left_terms & right_terms
@@ -247,6 +266,16 @@ def _same_debt_obligation(left: Mapping[str, Any], right: Mapping[str, Any]) -> 
     jaccard = len(shared) / max(1, len(union))
     containment = len(shared) / max(1, min(len(left_terms), len(right_terms)))
     return (len(shared) >= 8 and jaccard >= 0.48) or containment >= 0.82
+
+
+def _same_debt_obligation(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    # Writing debts are LOCATION-ANCHORED: one debt per violating place in the
+    # document. The precomputed signature keeps that exact policy while
+    # avoiding repeated normalization for every pair in a large proof state.
+    return _same_debt_signature(
+        _debt_match_signature(left),
+        _debt_match_signature(right),
+    )
 
 
 def canonicalize_debts(
@@ -258,14 +287,22 @@ def canonicalize_debts(
     debt_id. Returns (canonical rows in input order, duplicate report cards) so
     manifests can report duplicates instead of silently dropping them.
     """
+    rows = list(rows)
     groups: List[List[Mapping[str, Any]]] = []
+    signature_groups: List[List[_DebtMatchSignature]] = []
     for row in rows:
-        for group in groups:
-            if any(_same_debt_obligation(row, existing) for existing in group):
+        signature = _debt_match_signature(row)
+        for index, group in enumerate(groups):
+            if any(
+                _same_debt_signature(signature, existing)
+                for existing in signature_groups[index]
+            ):
                 group.append(row)
+                signature_groups[index].append(signature)
                 break
         else:
             groups.append([row])
+            signature_groups.append([signature])
 
     canonical_by_debt_id: Dict[str, Mapping[str, Any]] = {}
     duplicate_ids: set[str] = set()
