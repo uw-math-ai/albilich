@@ -12,6 +12,7 @@ from .graph_policy import (
     debt_covered_by_integrated_claim,
 )
 from .models import json_loads
+from .research_strategy import root_leverage_metrics
 from .store import ProofStateStore
 
 
@@ -73,7 +74,14 @@ def compute_metrics(
         "runs": run_summary,
         "run_timing": store.get_run_timing(),
         "math_yield": _math_yield_metrics(claims, artifacts, run_summary),
-        "root_progress": _root_progress_metrics(claims, routes, open_debts, artifacts),
+        "root_progress": _root_progress_metrics(
+            claims,
+            routes,
+            state.get("inferences", []),
+            open_debts,
+            artifacts,
+        ),
+        "root_leverage": root_leverage_metrics(state),
         "benchmark_storage": _benchmark_storage_metrics(
             store,
             state_revision=int(problem.get("current_revision") or 0),
@@ -104,15 +112,33 @@ def _math_yield_metrics(claims: list[Dict[str, Any]], artifacts: list[Dict[str, 
 def _root_progress_metrics(
     claims: list[Dict[str, Any]],
     routes: list[Dict[str, Any]],
+    inferences: list[Dict[str, Any]],
     debts: list[Dict[str, Any]],
     artifacts: list[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    """Measure certified closure of a root proof, not nearby activity.
+
+    The former metric added points for every root-adjacent claim, killed route,
+    and support artifact.  It could therefore exceed 100 while the root had no
+    inference at all.  This staged metric is intentionally conservative: local
+    lemmas remain useful diagnostics, but only an assembled sufficient route
+    can move the proof through the closure stages.
+    """
     verified = {"informally_verified", "formally_verified"}
     claim_by_id = {str(row.get("claim_id") or ""): row for row in claims}
     root = claim_by_id.get("root", {})
 
     def parent_ids(row: Dict[str, Any]) -> list[str]:
+        value = row.get("parent_ids")
+        if isinstance(value, list):
+            return [str(item) for item in value]
         return [str(item) for item in json_loads(row.get("parent_ids_json"), [])]
+
+    def id_list(row: Dict[str, Any], key: str, json_key: str) -> list[str]:
+        value = row.get(key)
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        return [str(item) for item in json_loads(row.get(json_key), [])]
 
     def root_adjacent(row: Dict[str, Any]) -> bool:
         if str(row.get("claim_id") or "") == "root":
@@ -136,38 +162,115 @@ def _root_progress_metrics(
         if owner_id == "root" or suggested == "root" or (owner and root_adjacent(owner)):
             root_local_debts.append(debt)
 
-    killed_routes = [
-        row for row in routes
-        if row.get("status") in {"abandoned", "blocked", "refuted"} and (
-            str(row.get("conclusion_claim_id") or "") == "root"
-            or root_adjacent(claim_by_id.get(str(row.get("conclusion_claim_id") or ""), {}))
+    root_routes = [
+        row
+        for row in routes
+        if str(row.get("conclusion_claim_id") or "") == "root"
+        and str(row.get("relation_to_parent") or "sufficient") == "sufficient"
+        and str(row.get("status") or "active") not in {"abandoned", "superseded"}
+    ]
+    root_route_ids = {str(row.get("route_id") or "") for row in root_routes}
+    root_inferences = [
+        row
+        for row in inferences
+        if str(row.get("route_id") or "") in root_route_ids
+        and str(row.get("conclusion_claim_id") or "") == "root"
+    ]
+    terminal_verified = [
+        row for row in root_inferences
+        if str(row.get("validation_status") or "") in verified
+        and all(
+            str(claim_by_id.get(claim_id, {}).get("validation_status") or "") in verified
+            for claim_id in (
+                id_list(row, "premise_claim_ids", "premise_claim_ids_json")
+                + id_list(row, "condition_claim_ids", "condition_claim_ids_json")
+            )
         )
     ]
+    premise_ids = {
+        claim_id
+        for row in root_inferences
+        for claim_id in (
+            id_list(row, "premise_claim_ids", "premise_claim_ids_json")
+            + id_list(row, "condition_claim_ids", "condition_claim_ids_json")
+        )
+    }
+    verified_premise_ids = {
+        claim_id
+        for claim_id in premise_ids
+        if str(claim_by_id.get(claim_id, {}).get("validation_status") or "") in verified
+    }
+    root_owner_ids = {"root", *root_route_ids, *[str(row.get("inference_id") or "") for row in root_inferences]}
+    direct_root_blockers = [
+        debt
+        for debt in debts
+        if debt.get("status") == "active"
+        and debt.get("severity") == "blocking"
+        and (
+            str(debt.get("owner_id") or "") in root_owner_ids
+            or str(debt.get("suggested_next_target") or "") == "root"
+        )
+    ]
+
+    root_validation = str(root.get("validation_status") or "unknown")
+    root_lifecycle = str(root.get("lifecycle_status") or "unknown")
+    if root_lifecycle == "integrated":
+        closure_stage = "root_integrated"
+        score = 100
+    elif root_validation in verified:
+        closure_stage = "root_verified_integration_pending"
+        score = 90
+    elif not root_routes:
+        closure_stage = "no_sufficient_root_route"
+        score = 0
+    elif not root_inferences:
+        closure_stage = "root_route_unassembled"
+        score = 10
+    elif terminal_verified and direct_root_blockers:
+        closure_stage = "verified_root_inference_blocked"
+        score = 65
+    elif terminal_verified:
+        closure_stage = "root_route_ready_for_integration"
+        score = 75
+    else:
+        premise_fraction = (
+            len(verified_premise_ids) / len(premise_ids)
+            if premise_ids
+            else 0.0
+        )
+        all_premises_ready = bool(premise_ids) and premise_fraction == 1.0
+        closure_stage = (
+            "root_inference_ready_for_verification"
+            if all_premises_ready
+            else "root_inference_has_open_premises"
+        )
+        score = 55 if all_premises_ready else min(49, 20 + int(30 * premise_fraction))
+
     support_artifacts = [
         row for row in artifacts
         if row.get("artifact_type") in {"source_adaptation_notes", "source_synthesis_report", "cas_experiment_report"}
     ]
-    score = 0
-    if root.get("lifecycle_status") == "integrated":
-        score += 100
-    elif claim_is_verified(root):
-        score += 70
-    score += 8 * len(integrated_root_adjacent)
-    score += 4 * len(verified_root_adjacent)
-    score += 3 * len(killed_routes)
-    score += 2 * len(support_artifacts)
-    score -= 5 * len(root_local_debts)
 
     return {
-        "root_validation_status": root.get("validation_status", "unknown"),
-        "root_lifecycle_status": root.get("lifecycle_status", "unknown"),
+        "root_validation_status": root_validation,
+        "root_lifecycle_status": root_lifecycle,
+        "closure_stage": closure_stage,
+        "sufficient_root_route_count": len(root_routes),
+        "root_terminal_inference_count": len(root_inferences),
+        "verified_root_terminal_inference_count": len(terminal_verified),
+        "root_premise_count": len(premise_ids),
+        "verified_root_premise_count": len(verified_premise_ids),
+        "direct_root_blocking_debt_count": len(direct_root_blockers),
         "verified_root_adjacent_claim_count": len(verified_root_adjacent),
         "integrated_root_adjacent_claim_count": len(integrated_root_adjacent),
         "root_local_blocking_debt_count": len(root_local_debts),
-        "killed_root_route_count": len(killed_routes),
         "support_artifact_count": len(support_artifacts),
-        "score": max(0, score),
-        "score_interpretation": "higher means root theorem or root-adjacent bottlenecks moved, not merely that more claims were generated",
+        "score": score,
+        "score_is_stage_not_percentage": True,
+        "score_interpretation": (
+            "bounded closure stage for an assembled sufficient root route; "
+            "nearby lemmas, failed routes, and support artifacts do not add score"
+        ),
     }
 
 

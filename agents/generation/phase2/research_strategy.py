@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
+from .graph_policy import DebtCoverageIndex, debt_covered_by_integrated_claim
 from .models import fingerprint_text, json_loads, normalize_text
 from .research_intelligence import (
     DEEP_SESSION_ROI_VERSION,
@@ -14,18 +15,31 @@ from .research_intelligence import (
     deep_session_roi,
     infer_domain_tags,
     proof_interface_contract,
+    theorem_preflight_contract,
     representation_switch_contract,
     theorem_adaptation_contract,
     validate_deep_session_roi_metadata,
-    validate_proof_interface_metadata,
-    validate_representation_switch_metadata,
-    validate_theorem_adaptation_metadata,
+    validate_state_independent_artifact_metadata,
     verifier_filtered_outcome_learning,
 )
 
 
 STRATEGY_SCHEMA_VERSION = 1
+ROOT_CUT_GATE_VERSION = 2
+COUNTEREXAMPLE_PREFLIGHT_VERSION = 1
+CANONICAL_ROUTE_OWNER_VERSION = 1
+REFERENCE_SOLUTION_ARTIFACT_TYPE = "reference_solution"
+REFERENCE_RECONSTRUCTION_INTENT = "reference_solution_reconstruction"
+THREAT_ARTIFACT_TYPES = {
+    "candidate_counterexample",
+    "construction_failure",
+    "hypothesis_gap",
+    "key_failure_analysis",
+    "route_obstruction",
+}
+THREAT_REVALIDATION_REVISION_WINDOW = 24
 STRATEGIC_ARTIFACT_TYPES = {
+    "approach_portfolio",
     "advisor_synthesis",
     "bridge_lemma_search",
     "conjecture_portfolio",
@@ -36,6 +50,23 @@ STRATEGIC_ARTIFACT_TYPES = {
     "conceptual_invariant_report",
 }
 STRATEGIC_MARKDOWN_ARTIFACT_TYPES = set(STRATEGIC_ARTIFACT_TYPES)
+APPROACH_PORTFOLIO_INTENT = "approach_portfolio_brainstorming"
+APPROACH_REFRESH_INTENT = "approach_portfolio_refresh"
+APPROACH_PILOT_INTENT_PREFIX = "approach_pilot:"
+APPROACH_STATUSES = {"idea", "pilot", "selected", "active", "paused", "killed", "successful"}
+APPROACH_CONTRIBUTION_KINDS = {
+    "root_closing",
+    "major_bridge",
+    "major_case",
+    "route_killing",
+    "informative_probe",
+    "exploratory",
+    "unplaced",
+}
+APPROACH_COSTS = {"low", "medium", "high"}
+APPROACH_CONFIDENCE_LEVELS = {"low", "medium", "high"}
+BOTTLENECK_COMPLETED_NO_DELTA_LIMIT = 2
+BOTTLENECK_EXECUTION_FAILURE_LIMIT = 2
 BRIDGE_STATUSES = {"proposed", "prechecked", "selected", "viable", "rejected", "proved", "refuted"}
 CONJECTURE_STATUSES = {"candidate", "selected", "archived", "proved", "refuted"}
 CONJECTURE_CATEGORIES = {
@@ -152,6 +183,29 @@ def _artifact_rows(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [row for row in rows or [] if isinstance(row, Mapping)]
 
 
+def _all_artifact_rows(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return every artifact family exposed by either state representation."""
+    result: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for key in (
+        "artifacts",
+        "research_artifacts",
+        "audit_artifacts",
+        "confirmed_counterexamples",
+        "final_artifacts",
+    ):
+        for row in state.get(key, []) or []:
+            if not isinstance(row, Mapping):
+                continue
+            artifact_id = str(row.get("artifact_id") or "")
+            dedupe_key = artifact_id or f"{key}:{len(result)}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            result.append(row)
+    return result
+
+
 def _artifact_metadata(row: Mapping[str, Any]) -> Dict[str, Any]:
     return _json_object(row.get("metadata_json") if "metadata_json" in row else row.get("metadata"))
 
@@ -164,6 +218,658 @@ def _artifact_sort_key(row: Mapping[str, Any]) -> tuple[int, str, str]:
     )
 
 
+def _unique_strings(value: Any) -> list[str]:
+    values = _json_list(value)
+    if not values and isinstance(value, str) and value.strip():
+        values = [value]
+    result: list[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _artifact_route_id(row: Mapping[str, Any]) -> str:
+    metadata = _artifact_metadata(row)
+    return str(metadata.get("route_id") or metadata.get("target_route_id") or "")
+
+
+def _artifact_target_id(row: Mapping[str, Any]) -> str:
+    metadata = _artifact_metadata(row)
+    return str(
+        metadata.get("target_id")
+        or metadata.get("claim_id")
+        or metadata.get("conclusion_claim_id")
+        or ""
+    )
+
+
+def _claim_target_for_context(state: Mapping[str, Any], target_id: str) -> str:
+    """Map a graph-entity target to the claim accepted by context packets.
+
+    Decisive debts can legitimately belong to a route or inference, and that
+    owner should remain visible in the obligation metadata.  Workflow actions,
+    however, are built around a target claim.  Normalize only known graph
+    entities here so malformed unknown IDs still fail loudly downstream.
+    """
+    target_id = str(target_id or "")
+    if not target_id:
+        return ""
+    if any(str(row.get("claim_id") or "") == target_id for row in state.get("claims", [])):
+        return target_id
+    for row in state.get("routes", []):
+        if str(row.get("route_id") or "") == target_id:
+            return str(row.get("conclusion_claim_id") or target_id)
+    for row in state.get("inferences", []):
+        if str(row.get("inference_id") or "") == target_id:
+            return str(row.get("conclusion_claim_id") or target_id)
+    return target_id
+
+
+def minimal_active_debt_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
+    """Collapse semantic debt aliases for scheduling without erasing history.
+
+    Exact duplicates are already coalesced when inserted.  This view handles
+    differently worded descriptions of the same obstruction: the primary debt
+    stays on the active work frontier, while aliases remain visible evidence
+    and are not falsely marked mathematically resolved.
+    """
+    from .debt_canonicalizer import central_debt_clusters
+
+    coverage_index = DebtCoverageIndex(state)
+    active = [
+        row
+        for row in state.get("debts", [])
+        if str(row.get("status") or "") == "active"
+        and str(row.get("severity") or "") == "blocking"
+        and not debt_covered_by_integrated_claim(
+            state,
+            row,
+            debt_coverage_index=coverage_index,
+        )
+    ]
+    clusters = central_debt_clusters(active)
+    alias_to_primary: Dict[str, str] = {}
+    for cluster in clusters:
+        primary = str(cluster.get("primary_debt_id") or "")
+        for alias in cluster.get("alias_debt_ids", []):
+            alias_id = str(alias or "")
+            if alias_id and alias_id != primary:
+                alias_to_primary[alias_id] = primary
+    primary_ids = [
+        str(row.get("debt_id") or "")
+        for row in active
+        if str(row.get("debt_id") or "") not in alias_to_primary
+    ]
+    return {
+        "active_blocking_debt_count": len(active),
+        "minimal_frontier_count": len(primary_ids),
+        "primary_debt_ids": primary_ids,
+        "alias_to_primary": alias_to_primary,
+        "clusters": clusters[:6],
+        "aliases_suppressed_from_independent_scheduling": True,
+        "alias_database_status_unchanged": True,
+        "policy": (
+            "work one canonical obstruction; retain aliases as provenance until a verifier "
+            "certifies the mathematical resolution"
+        ),
+    }
+
+
+def threat_propagation_view(state: Mapping[str, Any]) -> Dict[str, Any]:
+    """Propagate fresh counterevidence through claim dependencies.
+
+    The view never downgrades a certified claim by itself.  It marks a
+    verifier-owned revalidation frontier, distinguishing a mathematical threat
+    from an already confirmed refutation.
+    """
+    current_revision = int(state.get("problem_state", {}).get("current_revision") or 0)
+    minimum_revision = max(0, current_revision - THREAT_REVALIDATION_REVISION_WINDOW)
+    claims = {str(row.get("claim_id") or ""): row for row in state.get("claims", [])}
+    routes = {str(row.get("route_id") or ""): row for row in state.get("routes", [])}
+    inferences = {str(row.get("inference_id") or ""): row for row in state.get("inferences", [])}
+    direct_claim_revisions: Dict[str, int] = {}
+    direct_route_revisions: Dict[str, int] = {}
+    source_ids: list[str] = []
+
+    for artifact in _artifact_rows(state):
+        if str(artifact.get("artifact_type") or "") not in THREAT_ARTIFACT_TYPES:
+            continue
+        revision = int(artifact.get("state_revision") or 0)
+        if revision < minimum_revision:
+            continue
+        metadata = _artifact_metadata(artifact)
+        disposition = str(
+            metadata.get("disposition")
+            or metadata.get("status")
+            or metadata.get("validation_status")
+            or ""
+        ).lower()
+        if disposition in {"dismissed", "resolved", "invalid", "refuted_as_counterexample"}:
+            continue
+        artifact_id = str(artifact.get("artifact_id") or "")
+        if artifact_id:
+            source_ids.append(artifact_id)
+        raw_ids = []
+        for key in (
+            "target_id",
+            "claim_id",
+            "inference_id",
+            "route_id",
+            "related_id",
+            "challenged_target_id",
+        ):
+            raw_ids.extend(_unique_strings(metadata.get(key)))
+        if not raw_ids:
+            fallback = _artifact_target_id(artifact)
+            if fallback:
+                raw_ids.append(fallback)
+        for target in raw_ids:
+            if target in claims:
+                direct_claim_revisions[target] = max(direct_claim_revisions.get(target, -1), revision)
+            elif target in routes:
+                direct_route_revisions[target] = max(direct_route_revisions.get(target, -1), revision)
+                conclusion = str(routes[target].get("conclusion_claim_id") or "")
+                if conclusion:
+                    direct_claim_revisions[conclusion] = max(direct_claim_revisions.get(conclusion, -1), revision)
+            elif target in inferences:
+                route_id = str(inferences[target].get("route_id") or "")
+                conclusion = str(inferences[target].get("conclusion_claim_id") or "")
+                if route_id:
+                    direct_route_revisions[route_id] = max(direct_route_revisions.get(route_id, -1), revision)
+                if conclusion:
+                    direct_claim_revisions[conclusion] = max(direct_claim_revisions.get(conclusion, -1), revision)
+
+    threatened_claim_revisions = dict(direct_claim_revisions)
+    changed = True
+    while changed:
+        changed = False
+        for inference in inferences.values():
+            premise_ids = [
+                *_unique_strings(inference.get("premise_claim_ids") or inference.get("premise_claim_ids_json")),
+                *_unique_strings(inference.get("condition_claim_ids") or inference.get("condition_claim_ids_json")),
+            ]
+            source_revision = max(
+                (threatened_claim_revisions.get(claim_id, -1) for claim_id in premise_ids),
+                default=-1,
+            )
+            if source_revision < 0:
+                continue
+            conclusion = str(inference.get("conclusion_claim_id") or "")
+            route_id = str(inference.get("route_id") or "")
+            if conclusion and source_revision > threatened_claim_revisions.get(conclusion, -1):
+                threatened_claim_revisions[conclusion] = source_revision
+                changed = True
+            if route_id:
+                direct_route_revisions[route_id] = max(direct_route_revisions.get(route_id, -1), source_revision)
+
+    verified_statuses = {"informally_verified", "formally_verified"}
+    threatened_verified = sorted(
+        claim_id
+        for claim_id in threatened_claim_revisions
+        if str(claims.get(claim_id, {}).get("validation_status") or "") in verified_statuses
+        or str(claims.get(claim_id, {}).get("lifecycle_status") or "") == "integrated"
+    )
+    last_verifier_by_route: Dict[str, int] = {}
+    for run in state.get("recent_runs", []):
+        if str(run.get("actor_role") or "") != "strict_informal_verifier":
+            continue
+        if str(run.get("status") or "").lower() in {"failed", "timeout", "cancelled", "patch_rejected"}:
+            continue
+        route_id = str(run.get("route_id") or "")
+        if route_id:
+            last_verifier_by_route[route_id] = max(
+                last_verifier_by_route.get(route_id, -1), int(run.get("state_revision") or 0)
+            )
+    pending_routes: list[Dict[str, Any]] = []
+    for route_id, route in routes.items():
+        conclusion = str(route.get("conclusion_claim_id") or "")
+        threat_revision = max(
+            direct_route_revisions.get(route_id, -1),
+            threatened_claim_revisions.get(conclusion, -1),
+        )
+        if threat_revision < 0 or conclusion not in threatened_verified:
+            continue
+        if last_verifier_by_route.get(route_id, -1) >= threat_revision:
+            continue
+        pending_routes.append(
+            {
+                "route_id": route_id,
+                "target_id": conclusion,
+                "threat_revision": threat_revision,
+                "route_status": str(route.get("status") or ""),
+            }
+        )
+    pending_routes.sort(key=lambda row: (-int(row["threat_revision"]), str(row["route_id"])))
+    return {
+        "source_artifact_ids": sorted(set(source_ids)),
+        "direct_threatened_claim_ids": sorted(direct_claim_revisions),
+        "threatened_claim_ids": sorted(threatened_claim_revisions),
+        "threatened_route_ids": sorted(direct_route_revisions),
+        "threatened_verified_claim_ids": threatened_verified,
+        "pending_revalidation_routes": pending_routes,
+        "certification_unchanged_pending_verifier": True,
+        "lookback_revisions": THREAT_REVALIDATION_REVISION_WINDOW,
+    }
+
+
+def reference_solution_state(state: Mapping[str, Any]) -> Dict[str, Any]:
+    references = [
+        row
+        for row in _artifact_rows(state)
+        if str(row.get("artifact_type") or "") == REFERENCE_SOLUTION_ARTIFACT_TYPE
+    ]
+    if not references:
+        return {"available": False, "pending_reconstruction": False}
+    reference = max(references, key=_artifact_sort_key)
+    artifact_id = str(reference.get("artifact_id") or "")
+    revision = int(reference.get("state_revision") or 0)
+    reconstructions = []
+    for artifact in _artifact_rows(state):
+        if str(artifact.get("artifact_type") or "") not in {"proof_dossier", "proof_blueprint"}:
+            continue
+        metadata = _artifact_metadata(artifact)
+        if str(metadata.get("reference_solution_artifact_id") or "") != artifact_id:
+            continue
+        if int(artifact.get("state_revision") or 0) >= revision:
+            reconstructions.append(artifact)
+    reconstruction = max(reconstructions, key=_artifact_sort_key) if reconstructions else None
+    metadata = _artifact_metadata(reference)
+    return {
+        "available": True,
+        "artifact_id": artifact_id,
+        "path": str(reference.get("path") or ""),
+        "source_title": str(metadata.get("title") or ""),
+        "source_statement": str(metadata.get("source_statement") or ""),
+        "reference_revision": revision,
+        "pending_reconstruction": reconstruction is None,
+        "reconstruction_artifact_id": str(reconstruction.get("artifact_id") or "") if reconstruction else "",
+        "verification_authority": False,
+        "policy": (
+            "reconstruct the argument in local notation, check every hypothesis and case, and then submit the "
+            "resulting route to the ordinary strict verifier"
+        ),
+    }
+
+
+def proof_program_view(state: Mapping[str, Any]) -> Dict[str, Any]:
+    """Build compact proof programs from routes and existing artifact metadata."""
+    routes = [
+        row
+        for row in state.get("routes", [])
+        if str(row.get("status") or "") not in {"abandoned", "superseded"}
+    ]
+    artifacts = list(_artifact_rows(state))
+    programs: list[Dict[str, Any]] = []
+    for route in routes:
+        route_id = str(route.get("route_id") or "")
+        target_id = str(route.get("conclusion_claim_id") or "")
+        related = [
+            artifact
+            for artifact in artifacts
+            if _artifact_route_id(artifact) == route_id
+            or (not _artifact_route_id(artifact) and _artifact_target_id(artifact) == target_id)
+        ]
+        related.sort(key=_artifact_sort_key, reverse=True)
+        metadata_rows = [_artifact_metadata(row) for row in related]
+
+        def newest_value(*keys: str, default: Any = "") -> Any:
+            for metadata in metadata_rows:
+                for key in keys:
+                    value = metadata.get(key)
+                    if value not in (None, "", [], {}):
+                        return value
+            return default
+
+        covered_cases: list[str] = []
+        open_cases: list[str] = []
+        for metadata in metadata_rows:
+            for item in _unique_strings(metadata.get("covered_cases") or metadata.get("cases_covered")):
+                if item not in covered_cases:
+                    covered_cases.append(item)
+            for item in _unique_strings(metadata.get("open_cases") or metadata.get("uncovered_cases")):
+                if item not in open_cases:
+                    open_cases.append(item)
+        cases_exhaustive = bool(newest_value("cases_exhaustive", "case_coverage_complete", default=False))
+        program_id = str(newest_value("proof_program_id", default=f"program:{route_id}"))
+        programs.append(
+            {
+                "program_id": program_id,
+                "route_id": route_id,
+                "target_id": target_id,
+                "status": str(route.get("status") or "active"),
+                "relation_to_parent": str(route.get("relation_to_parent") or "sufficient"),
+                "proof_philosophy": str(
+                    newest_value("proof_philosophy", "research_philosophy", default=route.get("strategy") or route.get("label") or route_id)
+                ),
+                "root_implication": str(
+                    newest_value(
+                        "root_implication",
+                        "root_consequence",
+                        default=("route concludes the root" if target_id == "root" else "must be spliced into a root route"),
+                    )
+                ),
+                "decisive_obligation": str(newest_value("decisive_obligation", "next_decisive_step", default="")),
+                "validation_criteria": _unique_strings(
+                    newest_value(
+                        "validation_criteria",
+                        default=["strict verifier accepts the terminal inference and every dependency interface"],
+                    )
+                ),
+                "abandonment_criteria": _unique_strings(
+                    newest_value(
+                        "abandonment_criteria",
+                        "route_reset_criteria",
+                        default=["a named counterexample or refuted decisive implication invalidates the program"],
+                    )
+                ),
+                "covered_cases": covered_cases,
+                "open_cases": open_cases,
+                "cases_exhaustive": cases_exhaustive,
+                "case_coverage_status": (
+                    "exhaustive" if cases_exhaustive and not open_cases else "open" if open_cases else "unspecified"
+                ),
+                "canonical_artifact_id": str(related[0].get("artifact_id") or "") if related else "",
+                "long_session_continuation_allowed": True,
+                "wall_clock_expiration": None,
+            }
+        )
+    if not programs:
+        programs.append(
+            {
+                "program_id": "program:root-unrouted",
+                "route_id": "",
+                "target_id": "root",
+                "status": "forming",
+                "relation_to_parent": "sufficient",
+                "proof_philosophy": "unrouted root-program discovery",
+                "root_implication": "must produce an explicit sufficient root route",
+                "decisive_obligation": "",
+                "validation_criteria": ["an explicit root route and terminal inference pass strict verification"],
+                "abandonment_criteria": ["replace only after mathematical counterevidence or a strictly stronger program emerges"],
+                "covered_cases": [],
+                "open_cases": [],
+                "cases_exhaustive": False,
+                "case_coverage_status": "unspecified",
+                "canonical_artifact_id": "",
+                "long_session_continuation_allowed": True,
+                "wall_clock_expiration": None,
+            }
+        )
+    case_status_counts: Dict[str, int] = {}
+    for program in programs:
+        status = str(program.get("case_coverage_status") or "unspecified")
+        case_status_counts[status] = case_status_counts.get(status, 0) + 1
+    return {
+        "programs": programs[:8],
+        "program_count": len(programs),
+        "root_closing_program_count": sum(
+            1
+            for row in programs
+            if str(row.get("target_id") or "") == "root"
+            and str(row.get("route_id") or "")
+            and str(row.get("relation_to_parent") or "sufficient") == "sufficient"
+        ),
+        "case_coverage_status_counts": case_status_counts,
+        "uncovered_or_unspecified_program_ids": [
+            str(row.get("program_id") or "")
+            for row in programs
+            if str(row.get("case_coverage_status") or "") != "exhaustive"
+        ],
+        "comparison_policy": (
+            "compare genuinely different proof philosophies by root implication, decisive obligation, case coverage, "
+            "validation evidence, and mathematical reset criteria"
+        ),
+        "no_wall_clock_abandonment": True,
+    }
+
+
+def long_session_workspace(state: Mapping[str, Any], action: Mapping[str, Any] | None = None) -> Dict[str, Any]:
+    action = action or {}
+    target_id = str(action.get("target_id") or "root")
+    route_id = str(action.get("route_id") or "")
+    candidates = []
+    for artifact in _artifact_rows(state):
+        if str(artifact.get("artifact_type") or "") not in {
+            "proof_dossier",
+            "proof_blueprint",
+            "proof_compression",
+            "deep_session_report",
+        }:
+            continue
+        artifact_route = _artifact_route_id(artifact)
+        artifact_target = _artifact_target_id(artifact)
+        if route_id and artifact_route == route_id:
+            candidates.append(artifact)
+        elif artifact_target in {"", target_id}:
+            candidates.append(artifact)
+    canonical = max(candidates, key=_artifact_sort_key) if candidates else None
+    recent_target_runs = [
+        row
+        for row in state.get("recent_runs", [])
+        if str(row.get("actor_role") or "") == "researcher"
+        and str(row.get("target_id") or "root") == target_id
+        and str(row.get("status") or "").lower() not in {"failed", "error", "cancelled", "timeout"}
+    ]
+    return {
+        "target_id": target_id,
+        "route_id": route_id,
+        "canonical_artifact_id": str(canonical.get("artifact_id") or "") if canonical else "",
+        "canonical_artifact_type": str(canonical.get("artifact_type") or "") if canonical else "",
+        "successful_target_passes": len(recent_target_runs),
+        "continue_in_place": canonical is not None,
+        "wall_clock_expiration": None,
+        "continuation_policy": (
+            "continue a coherent long proof indefinitely while it produces or sharpens mathematical deltas; "
+            "review only on evidence of contradiction, interface failure, duplication, or a stalled decisive obligation"
+        ),
+        "create_new_management_artifact": False,
+    }
+
+
+def canonical_route_ownership(
+    state: Mapping[str, Any], action: Mapping[str, Any] | None = None
+) -> Dict[str, Any]:
+    action = action or {}
+    workspace = long_session_workspace(state, action)
+    frontier = decisive_obligation_frontier(state)
+    route_id = str(action.get("route_id") or frontier.get("selected_route_id") or "")
+    target_id = str(action.get("target_id") or "root")
+    canonical_id = str(workspace.get("canonical_artifact_id") or "")
+    ownership_required = bool(route_id)
+    continuity_required = bool(canonical_id)
+    if ownership_required:
+        required_metadata_fields = [
+            "canonical_route_owner_version",
+            "canonical_route_id",
+            "root_implication_update",
+            "root_cut_signature_before",
+            "root_cut_signature_after",
+            "creates_parallel_dossier",
+        ]
+    elif continuity_required:
+        required_metadata_fields = [
+            "supersedes_artifact_id",
+            "root_implication_update",
+            "root_cut_signature_before",
+            "root_cut_signature_after",
+            "creates_parallel_dossier",
+        ]
+    else:
+        required_metadata_fields = []
+    return {
+        "canonical_route_owner_version": CANONICAL_ROUTE_OWNER_VERSION,
+        "route_id": route_id,
+        "target_id": target_id,
+        "canonical_artifact_id": canonical_id,
+        "canonical_artifact_type": str(workspace.get("canonical_artifact_type") or ""),
+        "ownership_required": ownership_required,
+        "continuity_required": continuity_required,
+        "supersede_or_update_required": continuity_required,
+        "parallel_dossier_creation_forbidden": continuity_required,
+        "required_metadata_fields": required_metadata_fields,
+        "policy": (
+            "One proof program owns one canonical dossier. Continue it by explicit supersession, "
+            "or state why the route is replaced; do not accumulate parallel proof paperwork."
+        ),
+    }
+
+
+def root_cut_progress_gate(state: Mapping[str, Any]) -> Dict[str, Any]:
+    frontier = decisive_obligation_frontier(state)
+    obligations = list(frontier.get("minimal_cut_obligations") or [])
+    cut_signature = [
+        f"{item.get('obligation_type')}:{item.get('obligation_id')}"
+        for item in obligations
+        if str(item.get("obligation_id") or "")
+    ]
+    used_as_premise = {
+        str(item)
+        for inference in state.get("inferences", [])
+        for item in inference.get("premise_claim_ids", []) or []
+        if str(item)
+    }
+    verified = {"informally_verified", "formally_verified"}
+    unplaced_verified = [
+        str(claim.get("claim_id") or "")
+        for claim in state.get("claims", [])
+        if str(claim.get("claim_id") or "") != "root"
+        and (
+            str(claim.get("validation_status") or "") in verified
+            or str(claim.get("lifecycle_status") or "") == "integrated"
+        )
+        and str(claim.get("claim_id") or "") not in used_as_premise
+    ]
+    research_streak = 0
+    for run in state.get("recent_runs", []):
+        role = str(run.get("actor_role") or "")
+        status = str(run.get("status") or "").lower()
+        if status in {"failed", "error", "cancelled", "timeout", "patch_rejected"}:
+            continue
+        if role in {"strict_informal_verifier", "integration_verifier"}:
+            break
+        if role == "researcher":
+            research_streak += 1
+    metrics = root_leverage_metrics(state)
+    selected_route_id = str(frontier.get("selected_route_id") or "")
+    has_inference_frontier = bool(state.get("inferences", []))
+    has_consolidatable_material = bool(
+        selected_route_id or has_inference_frontier or unplaced_verified
+    )
+    claim_cap_reached = len(state.get("claims", [])) >= 24
+    research_streak_pressure = research_streak >= 3 and has_consolidatable_material
+    active = bool(
+        obligations
+        and int(metrics.get("verified_root_terminal_inference_count") or 0) == 0
+        and (research_streak_pressure or len(unplaced_verified) >= 3 or claim_cap_reached)
+    )
+    return {
+        "root_cut_gate_version": ROOT_CUT_GATE_VERSION,
+        "active": active,
+        "selected_route_id": selected_route_id,
+        "cut_signature": cut_signature,
+        "minimal_cut_count": len(obligations),
+        "decisive_obligation": dict(frontier.get("decisive_obligation") or {}),
+        "recent_research_passes_without_verifier_handoff": research_streak,
+        "has_consolidatable_material": has_consolidatable_material,
+        "claim_cap_reached": claim_cap_reached,
+        "activation_blocker": (
+            ""
+            if active or research_streak < 3 or has_consolidatable_material or claim_cap_reached
+            else "no_route_inference_or_verified_claim_to_consolidate"
+        ),
+        "unplaced_verified_claim_ids": unplaced_verified[:12],
+        "claim_creation_frozen": active,
+        "allowed_moves": [
+            "assemble_existing_claims_into_root_route",
+            "prove_or_refute_one_cut_obligation",
+            "validate_a_counterexample",
+            "abandon_or_replace_the_selected_route_with_evidence",
+        ],
+        "release_condition": (
+            "create a verifier-ready terminal inference, complete verifier handoff, "
+            "or remove the consolidatable frontier below the claim cap"
+        ),
+    }
+
+
+def counterexample_preflight_state(state: Mapping[str, Any]) -> Dict[str, Any]:
+    evidence_types = {
+        "candidate_counterexample",
+        "confirmed_counterexample",
+        "cas_experiment_report",
+        "route_obstruction",
+        "construction_failure",
+    }
+    evidence = []
+    for artifact in _artifact_rows(state):
+        if str(artifact.get("artifact_type") or "") not in evidence_types:
+            continue
+        metadata = _artifact_metadata(artifact)
+        target_id = str(
+            metadata.get("target_id")
+            or metadata.get("claim_id")
+            or metadata.get("challenged_target_id")
+            or "root"
+        )
+        if target_id == "root":
+            evidence.append(str(artifact.get("artifact_id") or ""))
+    root = next(
+        (row for row in state.get("claims", []) if str(row.get("claim_id") or "") == "root"),
+        {},
+    )
+    solved = (
+        str(root.get("validation_status") or "") in {"informally_verified", "formally_verified", "refuted"}
+        or str(root.get("lifecycle_status") or "") in {"integrated", "refuted"}
+    )
+    return {
+        "counterexample_preflight_version": COUNTEREXAMPLE_PREFLIGHT_VERSION,
+        "due": not solved and not evidence,
+        "completed_evidence_artifact_ids": evidence[:8],
+        "full_original_hypotheses_required": True,
+        "boundary_and_small_case_sweep_required": True,
+        "bounded_cas_plan_required_when_available": True,
+        "no_counterexample_is_not_a_proof": True,
+    }
+
+
+def root_leverage_metrics(state: Mapping[str, Any]) -> Dict[str, Any]:
+    programs = proof_program_view(state)
+    debts = minimal_active_debt_frontier(state)
+    threats = threat_propagation_view(state)
+    root_routes = [
+        row
+        for row in state.get("routes", [])
+        if str(row.get("conclusion_claim_id") or "") == "root"
+        and str(row.get("relation_to_parent") or "sufficient") == "sufficient"
+        and str(row.get("status") or "") not in {"abandoned", "superseded"}
+    ]
+    root_route_ids = {str(row.get("route_id") or "") for row in root_routes}
+    terminal = [
+        row
+        for row in state.get("inferences", [])
+        if str(row.get("route_id") or "") in root_route_ids
+        and str(row.get("conclusion_claim_id") or "") == "root"
+    ]
+    verified = {"informally_verified", "formally_verified"}
+    return {
+        "root_closing_program_count": int(programs.get("root_closing_program_count") or 0),
+        "root_terminal_inference_count": len(terminal),
+        "verified_root_terminal_inference_count": sum(
+            1 for row in terminal if str(row.get("validation_status") or "") in verified
+        ),
+        "programs_with_exhaustive_case_coverage": int(
+            (programs.get("case_coverage_status_counts") or {}).get("exhaustive", 0)
+        ),
+        "minimal_active_blocking_frontier_count": int(debts.get("minimal_frontier_count") or 0),
+        "semantic_debt_alias_count": len(debts.get("alias_to_primary") or {}),
+        "threatened_verified_claim_count": len(threats.get("threatened_verified_claim_ids") or []),
+        "pending_threat_revalidation_count": len(threats.get("pending_revalidation_routes") or []),
+        "artifact_count_is_not_root_progress": True,
+    }
+
+
 def latest_artifact(state: Mapping[str, Any], artifact_type: str) -> Optional[Dict[str, Any]]:
     rows = [row for row in _artifact_rows(state) if str(row.get("artifact_type") or "") == artifact_type]
     if not rows:
@@ -171,6 +877,392 @@ def latest_artifact(state: Mapping[str, Any], artifact_type: str) -> Optional[Di
     row = dict(max(rows, key=_artifact_sort_key))
     row["metadata"] = _artifact_metadata(row)
     return row
+
+
+def _approach_candidates(metadata: Mapping[str, Any]) -> list[Dict[str, Any]]:
+    raw = metadata.get("approaches")
+    if raw is None:
+        raw = _json_object(metadata.get("approach_portfolio")).get("approaches", [])
+    return [dict(item) for item in raw or [] if isinstance(item, Mapping)]
+
+
+def approach_alignment_evidence(
+    state: Mapping[str, Any], *, portfolio_revision: int
+) -> list[Dict[str, Any]]:
+    """Verified root-relevant developments newer than a portfolio baseline.
+
+    A speculative portfolio is a view of the current mathematical landscape,
+    not permanent proof state.  Once a verified or integrated root-adjacent
+    claim gains newer evidence, every displayed root consequence must be
+    recomputed before the scheduler returns to local approach pilots.
+    """
+    artifacts = {
+        str(row.get("artifact_id") or ""): row
+        for row in _all_artifact_rows(state)
+        if str(row.get("artifact_id") or "")
+    }
+    developments: list[Dict[str, Any]] = []
+    verified = {"informally_verified", "formally_verified"}
+    for claim in state.get("claims", []) or []:
+        if not isinstance(claim, Mapping):
+            continue
+        claim_id = str(claim.get("claim_id") or "")
+        status = str(claim.get("validation_status") or "")
+        lifecycle = str(claim.get("lifecycle_status") or "")
+        if lifecycle in {"superseded", "abandoned", "blocked"}:
+            continue
+        parent_ids = {
+            str(item)
+            for item in _json_list(claim.get("parent_ids") or claim.get("parent_ids_json"))
+            if str(item)
+        }
+        try:
+            root_impact = float(claim.get("root_impact") or 0.0)
+        except (TypeError, ValueError):
+            root_impact = 0.0
+        if status not in verified and lifecycle != "integrated":
+            continue
+        if claim_id != "root" and "root" not in parent_ids and root_impact < 0.5:
+            continue
+        evidence_rows = [
+            artifacts[artifact_id]
+            for artifact_id in _unique_strings(claim.get("evidence_artifact_ids_json"))
+            if artifact_id in artifacts
+            and int(artifacts[artifact_id].get("state_revision") or 0) > int(portfolio_revision)
+        ]
+        if not evidence_rows:
+            continue
+        newest = max(evidence_rows, key=_artifact_sort_key)
+        developments.append(
+            {
+                "claim_id": claim_id,
+                "statement": str(claim.get("statement") or ""),
+                "validation_status": status,
+                "lifecycle_status": lifecycle,
+                "root_impact": root_impact,
+                "evidence_artifact_ids": [str(row.get("artifact_id") or "") for row in evidence_rows],
+                "newest_evidence_revision": int(newest.get("state_revision") or 0),
+                "newest_evidence_summary": str(newest.get("content_summary") or ""),
+            }
+        )
+    developments.sort(
+        key=lambda row: (
+            -int(row.get("newest_evidence_revision") or 0),
+            -float(row.get("root_impact") or 0.0),
+            str(row.get("claim_id") or ""),
+        )
+    )
+    return developments[:12]
+
+
+def approach_portfolio_view(state: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the latest speculative approach portfolio without granting proof authority."""
+    artifact = latest_artifact(state, "approach_portfolio")
+    candidates = _approach_candidates(artifact["metadata"]) if artifact else []
+    selected_ids = {
+        str(item)
+        for item in _json_list((artifact or {}).get("metadata", {}).get("selected_approach_ids"))
+        if str(item)
+    }
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            0 if str(item.get("approach_id") or "") in selected_ids else 1,
+            -int(item.get("contribution_level") or 0),
+            -float(item.get("novelty_score") or 0.0),
+            str(item.get("approach_id") or ""),
+        ),
+    )
+    portfolio_revision = int(artifact.get("state_revision") or 0) if artifact else 0
+    alignment_evidence = (
+        approach_alignment_evidence(state, portfolio_revision=portfolio_revision) if artifact else []
+    )
+    return {
+        "artifact_id": str(artifact.get("artifact_id") or "") if artifact else "",
+        "state_revision": int(artifact.get("state_revision") or 0) if artifact else 0,
+        "portfolio_kind": str((artifact or {}).get("metadata", {}).get("portfolio_kind") or ""),
+        "brainstorming_summary": str((artifact or {}).get("metadata", {}).get("brainstorming_summary") or ""),
+        "approaches": ranked,
+        "approach_count": len(ranked),
+        "selected_approach_ids": sorted(selected_ids),
+        "research_questions": _json_list((artifact or {}).get("metadata", {}).get("research_questions")),
+        "alignment_status": "stale" if alignment_evidence else ("current" if artifact else "uninitialized"),
+        "alignment_evidence": alignment_evidence,
+        "contribution_legend": {
+            "5": "root-closing if its exact bridge is verified",
+            "4": "major bridge into a sufficient root route",
+            "3": "closes a major case or decisively kills a route",
+            "2": "informative probe that changes the next decision",
+            "1": "exploratory but mathematically placed",
+            "0": "unplaced idea; no claimed root contribution",
+        },
+        "portfolio_policy": {
+            "exploit_percent": 50,
+            "explore_percent": 30,
+            "adversarial_percent": 20,
+            "qualitative_scores_only": True,
+            "ideas_are_not_proof_evidence": True,
+            "proof_debts_remain_strict": True,
+        },
+    }
+
+
+def _run_output_artifacts(state: Mapping[str, Any], run: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    artifact_ids = {
+        str(item)
+        for item in _json_list(run.get("output_artifact_ids_json") or run.get("output_artifact_ids"))
+        if str(item)
+    }
+    if not artifact_ids:
+        return []
+    return [row for row in _artifact_rows(state) if str(row.get("artifact_id") or "") in artifact_ids]
+
+
+def _run_has_productive_delta(state: Mapping[str, Any], run: Mapping[str, Any]) -> bool:
+    for artifact in _run_output_artifacts(state, run):
+        metadata = _artifact_metadata(artifact)
+        if str(metadata.get("mathematical_delta_kind") or "") in PRODUCTIVE_DELTA_KINDS:
+            return True
+        if metadata.get("changed_proof_state") is True or metadata.get("root_relevant_fact_added") is True:
+            return True
+        if str(metadata.get("artifact_roi") or "") in {
+            "productive",
+            "verifier_ready_route",
+            "route_repaired",
+            "root_cut_shrunk",
+        }:
+            return True
+        before = _json_list(metadata.get("root_cut_signature_before"))
+        after = _json_list(metadata.get("root_cut_signature_after"))
+        if before and after and before != after:
+            return True
+    return False
+
+
+def bottleneck_lease_state(
+    state: Mapping[str, Any], action: Optional[Mapping[str, Any]] = None
+) -> Dict[str, Any]:
+    """Bound repeated local work by mathematical outcomes, never wall-clock time."""
+    action = action or {}
+    target_id = str(action.get("target_id") or "")
+    debt_id = str(action.get("debt_id") or _json_object(action.get("bottleneck_lock_signal")).get("debt_id") or "")
+    inferred_from_state = False
+    if not target_id and not debt_id:
+        blocking = sorted(
+            (
+                row
+                for row in state.get("debts", [])
+                if str(row.get("status") or "active") == "active"
+                and str(row.get("severity") or "") == "blocking"
+            ),
+            key=lambda row: (-int(row.get("repeated_count") or 0), str(row.get("debt_id") or "")),
+        )
+        if blocking:
+            selected = blocking[0]
+            debt_id = str(selected.get("debt_id") or "")
+            owner_id = str(selected.get("suggested_next_target") or selected.get("owner_id") or "root")
+            target_id = _claim_target_for_context(state, owner_id) or "root"
+            inferred_from_state = True
+    if not target_id and not debt_id:
+        return {
+            "active": False,
+            "escape_required": False,
+            "completed_no_delta_passes": 0,
+            "consecutive_execution_failures": 0,
+            "completed_no_delta_limit": BOTTLENECK_COMPLETED_NO_DELTA_LIMIT,
+            "execution_failure_limit": BOTTLENECK_EXECUTION_FAILURE_LIMIT,
+            "wall_clock_timeout": None,
+        }
+    reset_intents = {
+        APPROACH_PORTFOLIO_INTENT,
+        APPROACH_REFRESH_INTENT,
+        CONCEPTUAL_INVARIANT_INTENT,
+        "creative_proof_attack",
+        "global_synthesis",
+        "advisor_global_synthesis",
+        "active_proof_compression",
+    }
+    completed_no_delta = 0
+    execution_failures = 0
+    failure_window_open = True
+    examined_run_ids: list[str] = []
+    for run in state.get("recent_runs", []):
+        intent = str(run.get("search_intent") or "")
+        if intent in reset_intents or intent.startswith(APPROACH_PILOT_INTENT_PREFIX):
+            break
+        same_target = not target_id or str(run.get("target_id") or "") == target_id
+        if (
+            not same_target
+            or str(run.get("actor_role") or "") != "researcher"
+            or str(run.get("mode") or "") not in {"prove", "reduce", "strengthen", "weaken"}
+        ):
+            continue
+        status = str(run.get("status") or "").lower()
+        examined_run_ids.append(str(run.get("run_id") or ""))
+        if status in {"failed", "error", "cancelled", "timeout"}:
+            if failure_window_open:
+                execution_failures += 1
+            continue
+        if status not in {"completed", "succeeded", "success"}:
+            continue
+        failure_window_open = False
+        if _run_has_productive_delta(state, run):
+            break
+        completed_no_delta += 1
+    escape_required = (
+        completed_no_delta >= BOTTLENECK_COMPLETED_NO_DELTA_LIMIT
+        or execution_failures >= BOTTLENECK_EXECUTION_FAILURE_LIMIT
+    )
+    if execution_failures >= BOTTLENECK_EXECUTION_FAILURE_LIMIT:
+        reason = "the same local bottleneck reached the execution-failure retry cap"
+    elif completed_no_delta >= BOTTLENECK_COMPLETED_NO_DELTA_LIMIT:
+        reason = "two completed passes produced no mathematical root-relevant delta"
+    else:
+        reason = "the local bottleneck still has an evidence-based lease"
+    return {
+        "active": True,
+        "target_id": target_id,
+        "debt_id": debt_id,
+        "inferred_from_state": inferred_from_state,
+        "escape_required": escape_required,
+        "reason": reason,
+        "completed_no_delta_passes": completed_no_delta,
+        "consecutive_execution_failures": execution_failures,
+        "completed_no_delta_limit": BOTTLENECK_COMPLETED_NO_DELTA_LIMIT,
+        "execution_failure_limit": BOTTLENECK_EXECUTION_FAILURE_LIMIT,
+        "examined_run_ids": [item for item in examined_run_ids if item][:8],
+        "required_escape": "refresh the approach portfolio and change mechanism, representation, or proof direction",
+        "wall_clock_timeout": None,
+    }
+
+
+def approach_brainstorming_trigger(
+    state: Mapping[str, Any],
+    primary_action: Mapping[str, Any],
+    *,
+    steering_alignment: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    root_claim = next(
+        (row for row in state.get("claims", []) if str(row.get("claim_id") or "") == "root"),
+        {},
+    )
+    if (
+        str(root_claim.get("lifecycle_status") or "") == "integrated"
+        or str(root_claim.get("validation_status") or "") in {"informally_verified", "formally_verified"}
+    ):
+        return {"due": False, "reason": "the root has left discovery mode"}
+    research_mode = str(primary_action.get("research_mode") or "")
+    parallel_mode = str(state.get("problem_state", {}).get("research_parallel_mode") or "")
+    explicitly_enabled = bool(primary_action.get("approach_brainstorming_enabled"))
+    if research_mode != "hard_problem" and parallel_mode != "multi_branch_research" and not explicitly_enabled:
+        if not (steering_alignment or {}).get("required"):
+            return {"due": False, "reason": "initial portfolios are reserved for hard or multi-branch research runs"}
+    portfolio = approach_portfolio_view(state)
+    alignment_evidence = list(portfolio.get("alignment_evidence") or [])
+    if (steering_alignment or {}).get("required") or alignment_evidence:
+        kind = "refresh" if portfolio.get("artifact_id") else "initial"
+        source_steering_ids = [
+            str(item)
+            for item in (steering_alignment or {}).get("source_steering_ids", [])
+            if str(item)
+        ]
+        return {
+            "due": True,
+            "kind": kind,
+            "reason": (
+                "processed human steering and newer verified root evidence require every approach's root effect to be recomputed"
+                if source_steering_ids and alignment_evidence
+                else "processed human steering requires a dedicated global approach-alignment pass"
+                if source_steering_ids
+                else "newer verified root-relevant evidence makes the displayed approach portfolio stale"
+            ),
+            "supersedes_artifact_id": str(portfolio.get("artifact_id") or ""),
+            "alignment_required": True,
+            "candidate_minimum": 6,
+            "approach_alignment": {
+                "required": True,
+                "source_steering_ids": source_steering_ids,
+                "directives": list((steering_alignment or {}).get("directives") or []),
+                "baseline_portfolio_artifact_id": str(portfolio.get("artifact_id") or ""),
+                "baseline_portfolio_revision": int(portfolio.get("state_revision") or 0),
+                "current_revision": int(state.get("problem_state", {}).get("current_revision") or 0),
+                "verified_root_developments": alignment_evidence,
+                "evidence_artifact_ids": list(
+                    dict.fromkeys(
+                        artifact_id
+                        for development in alignment_evidence
+                        for artifact_id in development.get("evidence_artifact_ids", [])
+                        if str(artifact_id)
+                    )
+                ),
+                "root_effect_recomputation_required": True,
+                "every_approach_must_explain_steering_impact": True,
+            },
+        }
+    if not portfolio.get("artifact_id"):
+        lease = bottleneck_lease_state(state, primary_action)
+        if primary_action.get("bottleneck_lock_required") and not lease.get("escape_required"):
+            return {
+                "due": False,
+                "reason": "the already-selected bottleneck receives its evidence-based lease before a portfolio refresh",
+                "bottleneck_lease": lease,
+            }
+        if lease.get("escape_required"):
+            return {
+                "due": True,
+                "kind": "initial",
+                "reason": str(lease.get("reason") or "the first local bottleneck lease expired"),
+                "bottleneck_lease": lease,
+            }
+        return {
+            "due": True,
+            "kind": "initial",
+            "reason": "a hard research question should begin with globally different approaches before local proof work",
+        }
+    lease = bottleneck_lease_state(state, primary_action)
+    if lease.get("escape_required"):
+        return {
+            "due": True,
+            "kind": "refresh",
+            "reason": str(lease.get("reason") or "the bottleneck lease expired"),
+            "supersedes_artifact_id": str(portfolio.get("artifact_id") or ""),
+            "bottleneck_lease": lease,
+        }
+    revision = int(portfolio.get("state_revision") or 0)
+    later_completed = [
+        run
+        for run in state.get("recent_runs", [])
+        if int(run.get("state_revision") or 0) >= revision
+        and str(run.get("actor_role") or "") == "researcher"
+        and str(run.get("status") or "").lower() in {"completed", "succeeded", "success"}
+    ]
+    if len(later_completed) >= 6 and not any(_run_has_productive_delta(state, run) for run in later_completed):
+        return {
+            "due": True,
+            "kind": "refresh",
+            "reason": "six completed research passes since the portfolio produced no mathematical root-relevant delta",
+            "supersedes_artifact_id": str(portfolio.get("artifact_id") or ""),
+            "bottleneck_lease": lease,
+        }
+    return {"due": False, "reason": "the current portfolio still has untested or productive approaches", "bottleneck_lease": lease}
+
+
+def selected_approach_candidate(state: Mapping[str, Any]) -> Dict[str, Any]:
+    portfolio = approach_portfolio_view(state)
+    selected_ids = set(portfolio.get("selected_approach_ids") or [])
+    if not selected_ids:
+        return {}
+    attempted = {
+        str(run.get("search_intent") or "").removeprefix(APPROACH_PILOT_INTENT_PREFIX)
+        for run in state.get("recent_runs", [])
+        if str(run.get("search_intent") or "").startswith(APPROACH_PILOT_INTENT_PREFIX)
+        and int(run.get("state_revision") or 0) >= int(portfolio.get("state_revision") or 0)
+    }
+    for candidate in portfolio.get("approaches", []):
+        approach_id = str(candidate.get("approach_id") or "")
+        if approach_id in selected_ids and approach_id not in attempted and str(candidate.get("status") or "") not in {"killed", "successful"}:
+            return dict(candidate)
+    return {}
 
 
 def latest_conceptual_invariant_artifact(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -577,6 +1669,31 @@ def advisor_synthesis_trigger(state: Mapping[str, Any]) -> Dict[str, Any]:
     ]
     if len(substantive) >= 3 and len(active_claims) >= max(8, 3 * max(1, len(verified_claims))):
         reasons.append("active_claim_growth_without_verified_core_growth")
+    root_route_ids = {
+        str(route.get("route_id") or "")
+        for route in state.get("routes", [])
+        if str(route.get("conclusion_claim_id") or "") == "root"
+        and str(route.get("relation_to_parent") or "sufficient") == "sufficient"
+        and str(route.get("status") or "active") not in {"abandoned", "superseded"}
+    }
+    root_terminal_inferences = [
+        inference
+        for inference in state.get("inferences", [])
+        if str(inference.get("route_id") or "") in root_route_ids
+        and str(inference.get("conclusion_claim_id") or "") == "root"
+    ]
+    active_blockers = [
+        debt
+        for debt in state.get("debts", [])
+        if str(debt.get("status") or "") == "active"
+        and str(debt.get("severity") or "") == "blocking"
+    ]
+    if (
+        len(substantive) >= 5
+        and not root_terminal_inferences
+        and len(active_blockers) >= max(8, 2 * max(1, len(verified_claims)))
+    ):
+        reasons.append("blocking_debt_growth_without_root_assembly")
     bridge = latest_artifact(state, "bridge_lemma_search")
     if bridge and int(bridge.get("state_revision") or 0) >= latest_revision:
         if any(str(candidate.get("status") or "") == "refuted" for candidate in _bridge_candidates(bridge["metadata"])):
@@ -589,11 +1706,69 @@ def advisor_synthesis_trigger(state: Mapping[str, Any]) -> Dict[str, Any]:
     ]
     if len(verifier_rejections) >= 2:
         reasons.append("repeated_verifier_rejection_is_strategic")
+    program_view = proof_program_view(state)
+    root_programs = [
+        row
+        for row in program_view.get("programs", [])
+        if str(row.get("target_id") or "") == "root"
+        and str(row.get("route_id") or "")
+    ]
+    philosophies = {
+        normalize_text(str(row.get("proof_philosophy") or ""))
+        for row in root_programs
+        if str(row.get("proof_philosophy") or "").strip()
+    }
+    proof_shaped_artifacts = [
+        artifact
+        for artifact in _artifact_rows(state)
+        if str(artifact.get("artifact_type") or "") in {"proof_dossier", "proof_blueprint", "proof_compression"}
+    ]
+    mature_program_review = len(substantive) >= 3 or len(proof_shaped_artifacts) >= 2
+    if mature_program_review and len(root_programs) >= 2 and len(philosophies) >= 2:
+        reasons.append("multiple_root_proof_philosophies_need_comparison")
+    if mature_program_review and root_programs and all(
+        str(row.get("case_coverage_status") or "") != "exhaustive"
+        for row in root_programs
+    ):
+        reasons.append("root_case_coverage_not_exhaustive")
+    threat_view = threat_propagation_view(state)
+    if threat_view.get("pending_revalidation_routes"):
+        reasons.append("certified_dependency_threat_requires_revalidation")
+    debt_frontier = minimal_active_debt_frontier(state)
+    if len(substantive) >= 3 and debt_frontier.get("alias_to_primary"):
+        reasons.append("semantic_debt_aliases_need_one_canonical_program")
+    successful_research = [
+        run
+        for run in substantive
+        if str(run.get("actor_role") or "") == "researcher"
+    ]
+    target_counts: Dict[str, int] = {}
+    for run in successful_research[:8]:
+        target_id = str(run.get("target_id") or "root")
+        target_counts[target_id] = target_counts.get(target_id, 0) + 1
+    repeated_targets = sorted(target_id for target_id, count in target_counts.items() if count >= 3)
+    if repeated_targets:
+        verifier_targets = {
+            str(run.get("target_id") or "root")
+            for run in recent_runs
+            if str(run.get("actor_role") or "") == "strict_informal_verifier"
+            and str(run.get("status") or "").lower() not in {"failed", "error", "cancelled", "timeout"}
+        }
+        if any(target_id not in verifier_targets for target_id in repeated_targets):
+            reasons.append("repeated_research_without_verifier_handoff")
     if len(substantive) >= 15:
         reasons.append("meaningful_action_cadence")
     if latest:
         valid_until = int(latest["metadata"].get("valid_until_revision") or latest_revision + 12)
-        major_new_event = "central_bridge_refuted" in reasons or any(
+        major_new_event = any(
+            reason in reasons
+            for reason in {
+                "central_bridge_refuted",
+                "certified_dependency_threat_requires_revalidation",
+                "multiple_root_proof_philosophies_need_comparison",
+                "repeated_research_without_verifier_handoff",
+            }
+        ) or any(
             int(run.get("state_revision") or 0) > latest_revision for run in verifier_rejections
         )
         if current_revision <= valid_until and not major_new_event:
@@ -604,6 +1779,12 @@ def advisor_synthesis_trigger(state: Mapping[str, Any]) -> Dict[str, Any]:
         "latest_synthesis_artifact_id": str(latest.get("artifact_id") or "") if latest else "",
         "latest_synthesis_revision": latest_revision,
         "substantive_actions_since_synthesis": len(substantive),
+        "evidence_based_only": True,
+        "wall_clock_trigger_used": False,
+        "long_proofs_may_continue": True,
+        "proof_program_count": int(program_view.get("program_count") or 0),
+        "pending_threat_revalidation_count": len(threat_view.get("pending_revalidation_routes") or []),
+        "minimal_active_debt_frontier_count": int(debt_frontier.get("minimal_frontier_count") or 0),
     }
 
 
@@ -726,28 +1907,163 @@ def research_cycle_state(state: Mapping[str, Any]) -> Dict[str, Any]:
 
 def _protected_primary_action(action: Mapping[str, Any]) -> bool:
     mode = str(action.get("mode") or "")
-    if mode in {"integrate", "formalize", "validate_counterexample", "write", "review_writing", "stop_solved", "stop_with_partial_results"}:
+    if mode in {"integrate", "formalize", "validate_counterexample", "write", "review_writing", "await_human", "stop_solved", "stop_with_partial_results"}:
         return True
-    if mode == "prove" and (action.get("route_id") or action.get("citation_certification_required") or action.get("citation_triage_required")):
+    if str(action.get("search_intent") or "") == "branch_nearby_lemma":
+        return True
+    if mode == "retrieve" and (
+        action.get("retrieval_required")
+        or action.get("citation_certification_required")
+        or action.get("citation_triage_required")
+        or action.get("source_certification_packet_required")
+    ):
+        return True
+    research_route_action = bool(
+        action.get("bottleneck_lock_required")
+        or action.get("bridge_lemma_workbench_required")
+        or action.get("hard_theorem_attack_required")
+        or action.get("creative_proof_attack_required")
+        or action.get("proof_construction_required")
+    )
+    if mode == "prove" and (
+        action.get("citation_certification_required")
+        or action.get("citation_triage_required")
+        or (action.get("route_id") and not research_route_action)
+    ):
         return True
     if mode in {"triage_routes", "regulate_decomposition"}:
         return True
     return bool(
         action.get("proof_repair_verification_required")
-        or action.get("proof_repair_required")
+        or (action.get("proof_repair_required") and not research_route_action)
         or action.get("root_alignment_audit")
-        or action.get("debt_id")
+        or (action.get("debt_id") and not research_route_action)
+        or action.get("branch_persistence")
+        or action.get("nearby_lemma_directive")
         or action.get("parallel_wave_summary")
         or action.get("retrieve_reduce_loop_guard")
-        or action.get("research_synthesis_required")
+        or action.get("source_adaptation_digest_required")
+        or (action.get("research_synthesis_required") and not action.get("creative_proof_attack_required"))
         or action.get("global_synthesis_required")
         or action.get("advisor_evidence_synthesis_required")
     )
 
 
-def next_strategy_operation(state: Mapping[str, Any], primary_action: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+def _approach_strategy_operation(brainstorming: Mapping[str, Any]) -> Dict[str, Any]:
+    kind = str(brainstorming.get("kind") or "initial")
+    operation = "approach_portfolio_refresh" if kind == "refresh" else "approach_portfolio_brainstorming"
+    alignment = dict(brainstorming.get("approach_alignment") or {})
+    return {
+        "operation": operation,
+        "mode": "reduce",
+        "target_id": "root",
+        "route_id": "",
+        "search_intent": APPROACH_REFRESH_INTENT if kind == "refresh" else APPROACH_PORTFOLIO_INTENT,
+        "reason": str(brainstorming.get("reason") or "compare globally different approaches before local work"),
+        "approach_brainstorming_required": True,
+        "approach_portfolio_required": True,
+        "approach_portfolio_kind": kind,
+        "approach_candidate_minimum": int(
+            brainstorming.get("candidate_minimum") or (6 if kind == "initial" else 3)
+        ),
+        "approach_candidate_maximum": 12,
+        "approach_selection_minimum": 2,
+        "approach_selection_maximum": 3,
+        "supersedes_artifact_id": str(brainstorming.get("supersedes_artifact_id") or ""),
+        "bottleneck_lease": dict(brainstorming.get("bottleneck_lease") or {}),
+        "approach_alignment": alignment,
+        "exclusive_wave_required": bool(brainstorming.get("alignment_required")),
+        "proof_claim_creation_forbidden": True,
+        "blocking_proof_debt_creation_forbidden": True,
+        "nonblocking_research_questions_allowed": True,
+        "research_question_debt_cap": 6,
+        "research_question_debt_types": [
+            "conceptual_question",
+            "representation_question",
+            "counterexample_program",
+            "experiment_question",
+            "source_question",
+            "possible_bridge",
+        ],
+        "verification_authority": False,
+        "deep_research_required": False,
+        "long_mathematical_session_required": False,
+        "preferred_work_mode": "offline",
+        "research_philosophy": "global_approach_generation",
+        "research_attack_stage": "breadth_first",
+    }
+
+
+def next_strategy_operation(
+    state: Mapping[str, Any],
+    primary_action: Mapping[str, Any],
+    *,
+    steering_alignment: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    brainstorming = approach_brainstorming_trigger(
+        state,
+        primary_action,
+        steering_alignment=steering_alignment,
+    )
+    protected_alignment_modes = {
+        "integrate",
+        "formalize",
+        "validate_counterexample",
+        "stop_with_partial_results",
+        "stop_solved",
+        "await_human",
+    }
+    if (
+        brainstorming.get("due")
+        and brainstorming.get("alignment_required")
+        and str(primary_action.get("mode") or "") not in protected_alignment_modes
+    ):
+        return _approach_strategy_operation(brainstorming)
     if _protected_primary_action(primary_action):
         return None
+    reference = reference_solution_state(state)
+    if reference.get("pending_reconstruction"):
+        return {
+            "operation": "reference_solution_reconstruction",
+            "mode": "reduce",
+            "target_id": "root",
+            "route_id": str(primary_action.get("route_id") or ""),
+            "search_intent": REFERENCE_RECONSTRUCTION_INTENT,
+            "reason": (
+                "a human-supplied reference solution must be reconstructed into the local proof graph "
+                "before independent search repeats solved architecture"
+            ),
+            "reference_solution_reconstruction_required": True,
+            "reference_solution": reference,
+            "canonical_full_proof_reconstruction_required": True,
+            "proof_spine_mode_required": True,
+            "theorem_preflight_required": True,
+            "case_coverage_map_required": True,
+            "deep_research_required": True,
+            "long_mathematical_session_required": True,
+            "verification_authority": False,
+            "preferred_work_mode": "offline",
+        }
+    if brainstorming.get("due"):
+        return _approach_strategy_operation(brainstorming)
+    approach = selected_approach_candidate(state)
+    if approach:
+        approach_id = str(approach.get("approach_id") or "")
+        return {
+            "operation": "approach_pilot",
+            "mode": "reduce",
+            "target_id": str(approach.get("target_id") or primary_action.get("target_id") or "root"),
+            "route_id": str(approach.get("target_route_id") or primary_action.get("route_id") or ""),
+            "search_intent": f"{APPROACH_PILOT_INTENT_PREFIX}{approach_id}",
+            "reason": f"run the decisive low-cost test for selected approach {approach_id} before committing to local proof construction",
+            "selected_approach": approach,
+            "approach_pilot_required": True,
+            "decisive_test_required": True,
+            "root_consequence_required": True,
+            "proof_claim_creation_forbidden_unless_test_succeeds": True,
+            "preferred_work_mode": "cas" if str(approach.get("estimated_cost") or "") == "low" and approach.get("computational_probe") else "offline",
+            "research_philosophy": str(approach.get("mechanism") or "selected_approach_pilot"),
+        }
     fingerprints = _claim_statement_fingerprints(state)
     bridge = selected_bridge_candidate(state)
     if bridge and fingerprint_text(str(bridge.get("statement") or "")) not in fingerprints:
@@ -797,6 +2113,24 @@ def next_strategy_operation(state: Mapping[str, Any], primary_action: Mapping[st
             "research_attack_stage": "deep",
             "preferred_work_mode": "offline",
         }
+    authorization = active_invention_authorization(state)
+    if authorization:
+        return {
+            "operation": "definition_invention",
+            "mode": "reduce",
+            "target_id": str(primary_action.get("target_id") or "root"),
+            "route_id": str(primary_action.get("route_id") or ""),
+            "search_intent": "definition_invention",
+            "reason": "a bounded PhD-advisor authorization permits one exceptional auxiliary-object invention pass",
+            "definition_invention_required": True,
+            "invention_authorization": {
+                "artifact_id": authorization.get("artifact_id", ""),
+                **authorization.get("metadata", {}),
+                "passes_used": authorization.get("passes_used", 0),
+                "candidate_count": authorization.get("candidate_count", 0),
+            },
+            "preferred_work_mode": "offline",
+        }
     trigger = advisor_synthesis_trigger(state)
     if trigger.get("due"):
         if _compression_would_help(state) and not _compression_is_fresh_for_trigger(state, trigger):
@@ -828,32 +2162,45 @@ def next_strategy_operation(state: Mapping[str, Any], primary_action: Mapping[st
             "global_synthesis_required": True,
             "synthesis_trigger": trigger,
         }
-    authorization = active_invention_authorization(state)
-    if authorization:
-        return {
-            "operation": "definition_invention",
-            "mode": "reduce",
-            "target_id": str(primary_action.get("target_id") or "root"),
-            "route_id": str(primary_action.get("route_id") or ""),
-            "search_intent": "definition_invention",
-            "reason": "a bounded PhD-advisor authorization permits one exceptional auxiliary-object invention pass",
-            "definition_invention_required": True,
-            "invention_authorization": {
-                "artifact_id": authorization.get("artifact_id", ""),
-                **authorization.get("metadata", {}),
-                "passes_used": authorization.get("passes_used", 0),
-                "candidate_count": authorization.get("candidate_count", 0),
-            },
-            "preferred_work_mode": "offline",
-        }
     return None
 
 
 def _target_root_impact(state: Mapping[str, Any], target_id: str) -> float:
+    if target_id == "root":
+        return 1.0
     claim = _claim_for_id(state, target_id)
-    if claim:
-        return float(claim.get("root_impact") or (1.0 if target_id == "root" else 0.4))
-    return 1.0 if target_id == "root" else 0.4
+    if not claim:
+        return 0.3
+
+    root_route_ids = {
+        str(route.get("route_id") or "")
+        for route in state.get("routes", [])
+        if str(route.get("conclusion_claim_id") or "") == "root"
+        and str(route.get("relation_to_parent") or "sufficient") == "sufficient"
+        and str(route.get("status") or "active") not in {"abandoned", "superseded"}
+    }
+    for inference in state.get("inferences", []):
+        if str(inference.get("route_id") or "") not in root_route_ids:
+            continue
+        dependencies = {
+            str(item)
+            for item in [
+                *_json_list(inference.get("premise_claim_ids") or inference.get("premise_claim_ids_json")),
+                *_json_list(inference.get("condition_claim_ids") or inference.get("condition_claim_ids_json")),
+            ]
+        }
+        if target_id in dependencies:
+            return 0.9
+
+    parent_ids = {
+        str(item)
+        for item in _json_list(claim.get("parent_ids") or claim.get("parent_ids_json"))
+    }
+    if "root" in parent_ids or int(claim.get("reduction_depth") or 99) <= 1:
+        return 0.55
+    # Self-reported root impact remains a weak tie-breaker only; an unplaced
+    # lemma cannot score like an assembled premise of the root theorem.
+    return min(0.4, max(0.1, float(claim.get("root_impact") or 0.3)))
 
 
 def score_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[str, Any]:
@@ -868,7 +2215,27 @@ def score_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[st
     refuting = 0.82 if is_experiment else 0.55 if mode == "refute" else 0.18
     root_progress = min(1.0, max(0.0, _target_root_impact(state, target_id)))
     information = 0.9 if is_experiment else 0.76 if mode in {"triage_routes", "regulate_decomposition"} else 0.58
-    reuse = 0.85 if action.get("proof_compression_operation_required") else 0.68 if action.get("advisor_global_synthesis_required") else 0.35
+    if action.get("approach_brainstorming_required"):
+        closing = 0.22
+        refuting = 0.45
+        information = 0.92
+        root_progress = 0.72
+    selected_approach = _json_object(action.get("selected_approach"))
+    if selected_approach:
+        contribution = max(0, min(5, int(selected_approach.get("contribution_level") or 0)))
+        closing = max(closing, 0.3 + 0.11 * contribution)
+        information = max(information, 0.7)
+        root_progress = max(root_progress, min(1.0, 0.16 * contribution))
+    reference_used = bool(reference_solution_state(state).get("available"))
+    reuse = (
+        0.95
+        if action.get("reference_solution_reconstruction_required")
+        else 0.85
+        if action.get("proof_compression_operation_required")
+        else 0.68
+        if action.get("advisor_global_synthesis_required")
+        else 0.35
+    )
     duplicate_count = sum(
         1
         for run in state.get("recent_runs", [])[:8]
@@ -887,7 +2254,7 @@ def score_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[st
     compact_outcome_learning = {
         "outcome_learning_version": outcome_learning.get("outcome_learning_version"),
         "policy": outcome_learning.get("policy"),
-        "reference_solution_used": False,
+        "reference_solution_used": reference_used,
         "private_cross_problem_cache_used": False,
         "current_strategy_family": outcome_learning.get("current_strategy_family", ""),
         "current_family": outcome_learning.get("current_family", {}),
@@ -920,13 +2287,15 @@ def score_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[st
         ),
         "verifier_filtered_outcome_learning": compact_outcome_learning,
         "outcome_score_adjustment": round(outcome_adjustment, 4),
-        "reference_solution_used": False,
+        "reference_solution_used": reference_used,
         "rotation_tie_break_rule": "when scores differ by at most 0.25, prefer the least-recent researcher work mode",
         "protected_verification_budget": "never charged to speculative research actions",
     }
 
 
 def _deep_session_context(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[str, Any]:
+    if action.get("approach_brainstorming_required") or action.get("approach_pilot_required"):
+        return {}
     mode = str(action.get("mode") or "")
     if mode not in {"prove", "reduce", "strengthen", "weaken"}:
         return {}
@@ -1025,7 +2394,84 @@ def _deep_session_context(state: Mapping[str, Any], action: Mapping[str, Any]) -
 
 def enrich_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[str, Any]:
     enriched = dict(action)
+    program_view = proof_program_view(state)
+    threat_view = threat_propagation_view(state)
+    debt_frontier = minimal_active_debt_frontier(state)
+    workspace = long_session_workspace(state, enriched)
+    enriched["proof_program_view"] = program_view
+    enriched["case_coverage_map"] = {
+        "programs": [
+            {
+                "program_id": row.get("program_id", ""),
+                "route_id": row.get("route_id", ""),
+                "covered_cases": row.get("covered_cases", []),
+                "open_cases": row.get("open_cases", []),
+                "cases_exhaustive": bool(row.get("cases_exhaustive")),
+                "status": row.get("case_coverage_status", "unspecified"),
+            }
+            for row in program_view.get("programs", [])
+        ],
+        "exhaustiveness_required_for_root_closure": True,
+    }
+    enriched["threat_propagation"] = threat_view
+    enriched["minimal_active_debt_frontier"] = debt_frontier
+    enriched["long_session_workspace"] = workspace
+    enriched["root_leverage_metrics"] = root_leverage_metrics(state)
+    portfolio = approach_portfolio_view(state)
+    if portfolio.get("artifact_id") or enriched.get("approach_brainstorming_required"):
+        enriched["approach_portfolio"] = portfolio
+    if enriched.get("bottleneck_lock_required") or enriched.get("approach_brainstorming_required"):
+        enriched["bottleneck_lease"] = {
+            **bottleneck_lease_state(state, enriched),
+            **dict(enriched.get("bottleneck_lease") or {}),
+        }
+    selected_debt_obligation = _selected_action_debt_obligation(state, enriched)
+    cut_gate = root_cut_progress_gate(state)
+    if selected_debt_obligation:
+        cut_gate = _align_frontier_to_selected_debt(cut_gate, selected_debt_obligation)
+    enriched["root_cut_progress_gate"] = cut_gate
+    ownership = canonical_route_ownership(state, enriched)
+    enriched["canonical_route_ownership"] = ownership
+    if (
+        cut_gate.get("active")
+        and not enriched.get("approach_brainstorming_required")
+        and not enriched.get("approach_pilot_required")
+        and not enriched.get("strict_verifier_scope")
+        and str(enriched.get("mode") or "") in {
+        "prove", "reduce", "weaken", "strengthen", "triage_routes"
+        }
+    ):
+        decisive = _json_object(cut_gate.get("decisive_obligation"))
+        enriched["root_cut_consolidation_required"] = True
+        enriched["claim_creation_frozen"] = True
+        enriched["forbidden_outputs"] = list(
+            dict.fromkeys([
+                *_json_list(enriched.get("forbidden_outputs")),
+                "new route-less claims",
+                "parallel proof dossiers",
+                "management-only inventories",
+            ])
+        )
+        if decisive and not enriched.get("role_starvation_recovery"):
+            decisive_target_id = str(decisive.get("target_id") or enriched.get("target_id") or "root")
+            enriched["target_id"] = _claim_target_for_context(state, decisive_target_id)
+            enriched["route_id"] = str(decisive.get("route_id") or enriched.get("route_id") or "")
+            enriched["reason"] = (
+                "root-cut consolidation gate: close, refute, or strictly shrink the decisive obligation "
+                f"{decisive.get('obligation_id') or ''} before creating another claim"
+            )
+    enriched["no_wall_clock_strategy_timeout"] = True
+    if enriched.get("advisor_global_synthesis_required"):
+        enriched["proof_program_comparison_required"] = True
+        enriched["evidence_based_strategic_review_required"] = True
+        enriched["strategy_review_trigger"] = enriched.get("synthesis_trigger") or {}
+        enriched["continue_long_proof_when_coherent"] = True
     graph_frontier = decisive_obligation_frontier(state)
+    if selected_debt_obligation:
+        graph_frontier = _align_frontier_to_selected_debt(
+            graph_frontier,
+            selected_debt_obligation,
+        )
     enriched["decisive_obligation_frontier"] = graph_frontier
     decisive = _json_object(graph_frontier.get("decisive_obligation"))
     if decisive:
@@ -1048,6 +2494,30 @@ def enrich_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[s
             "weakened_shadow_tests_are_diagnostic_only": True,
         }
         enriched.setdefault("research_philosophy", "adversarial_probe")
+        counterexample_preflight = counterexample_preflight_state(state)
+        if counterexample_preflight.get("due"):
+            enriched["initial_counterexample_preflight_required"] = True
+            enriched["counterexample_preflight_contract"] = counterexample_preflight
+    preflight = theorem_preflight_contract(state, enriched)
+    if preflight:
+        enriched["theorem_preflight_required"] = True
+        enriched["theorem_preflight_contract"] = preflight
+        # Research passes test high-risk statements before investing in a long
+        # universal proof.  Verifiers receive the same signature as an audit
+        # lens but are not converted into research workers.
+        verifier_like = str(enriched.get("mode") or "") in {"integrate", "formalize"} or (
+            str(enriched.get("mode") or "") == "prove" and bool(enriched.get("route_id"))
+        )
+        if preflight.get("risk_level") == "high" and not verifier_like:
+            enriched["counterexample_probe_required"] = True
+            existing_probe = _json_object(enriched.get("counterexample_probe_contract"))
+            enriched["counterexample_probe_contract"] = {
+                **existing_probe,
+                "full_original_hypotheses_required": True,
+                "boundary_and_degenerate_cases_required": True,
+                "outcome_dependent_next_actions_required": True,
+                "management_only_artifact_forbidden": True,
+            }
     bridge_like = bool(enriched.get("bridge_lemma_workbench_required")) or "bridge" in str(
         enriched.get("reason") or ""
     ).lower()
@@ -1105,13 +2575,93 @@ def enrich_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[s
     if adaptation_contract:
         enriched["theorem_adaptation_required"] = True
         enriched["theorem_adaptation_contract"] = adaptation_contract
-    interface_contract = proof_interface_contract(enriched)
+    interface_contract = proof_interface_contract(enriched, state=state)
     if interface_contract:
         enriched["proof_interface_check_required"] = True
         enriched["proof_interface_contract"] = interface_contract
     enriched["research_cycle"] = research_cycle_state(state)
     enriched["information_gain_score"] = score_action(state, enriched)
     return enriched
+
+
+def _selected_action_debt_obligation(
+    state: Mapping[str, Any],
+    action: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Return the active debt that the scheduler explicitly selected.
+
+    Enrichment adds graph-wide strategy context after the scheduler has chosen
+    an action.  It must not silently retarget a bottleneck/decisive-theorem
+    action to whichever debt happens to sort first in the global frontier.
+    """
+    candidate_ids: list[str] = []
+
+    def add_candidate(value: Any) -> None:
+        debt_id = str(value or "")
+        if debt_id and debt_id not in candidate_ids:
+            candidate_ids.append(debt_id)
+
+    add_candidate(action.get("debt_id"))
+    for key in ("decisive_theorem_test", "bottleneck_lock_signal", "central_obstruction"):
+        add_candidate(_json_object(action.get(key)).get("debt_id"))
+    if not candidate_ids:
+        return {}
+
+    coverage_index = DebtCoverageIndex(state)
+    debts = {
+        str(row.get("debt_id") or ""): row
+        for row in state.get("debts", [])
+        if str(row.get("status") or "") == "active"
+    }
+    for debt_id in candidate_ids:
+        debt = debts.get(debt_id)
+        if not debt or debt_covered_by_integrated_claim(
+            state,
+            debt,
+            debt_coverage_index=coverage_index,
+        ):
+            continue
+        severity = str(debt.get("severity") or "major")
+        return {
+            "obligation_type": "debt",
+            "obligation_id": debt_id,
+            "target_id": str(
+                action.get("target_id")
+                or debt.get("suggested_next_target")
+                or debt.get("owner_id")
+                or "root"
+            ),
+            "route_id": str(action.get("route_id") or ""),
+            "severity": severity,
+            "statement": str(debt.get("obligation") or ""),
+            "weight": {"blocking": 5, "major": 3, "minor": 1}.get(severity, 2),
+        }
+    return {}
+
+
+def _align_frontier_to_selected_debt(
+    frontier: Mapping[str, Any],
+    selected: Mapping[str, Any],
+) -> Dict[str, Any]:
+    aligned = dict(frontier)
+    selected_id = str(selected.get("obligation_id") or "")
+    obligations = [
+        dict(row)
+        for row in frontier.get("minimal_cut_obligations", []) or []
+        if str(row.get("obligation_id") or "") != selected_id
+    ]
+    aligned["minimal_cut_obligations"] = [dict(selected), *obligations][:6]
+    aligned["decisive_obligation"] = dict(selected)
+    aligned["selected_route_id"] = str(selected.get("route_id") or "")
+    if "cut_signature" in aligned:
+        aligned["cut_signature"] = [
+            f"{row.get('obligation_type')}:{row.get('obligation_id')}"
+            for row in aligned["minimal_cut_obligations"]
+            if str(row.get("obligation_id") or "")
+        ]
+        aligned["minimal_cut_count"] = len(aligned["minimal_cut_obligations"])
+    aligned["action_selected_debt_aligned"] = True
+    return aligned
 
 
 def apply_active_compression(
@@ -1151,6 +2701,14 @@ def strategy_context_card(state: Mapping[str, Any], action: Mapping[str, Any]) -
     conjecture = selected_conjecture_candidate(state)
     authorization = active_invention_authorization(state)
     conceptual = latest_artifact(state, "conceptual_invariant_report")
+    approach_portfolio = approach_portfolio_view(state)
+    if not approach_portfolio.get("artifact_id") and not action.get("approach_brainstorming_required"):
+        approach_portfolio = {"artifact_id": "", "approach_count": 0, "approaches": []}
+    bottleneck_lease = (
+        bottleneck_lease_state(state, action)
+        if action.get("bottleneck_lock_required") or action.get("approach_brainstorming_required")
+        else {"active": False, "escape_required": False}
+    )
     query = " ".join(
         [
             str(state.get("problem_state", {}).get("root_statement") or ""),
@@ -1202,6 +2760,30 @@ def strategy_context_card(state: Mapping[str, Any], action: Mapping[str, Any]) -
             "qualitative_not_hidden_solution_score": True,
         },
         "research_cycle": research_cycle_state(state),
+        "approach_portfolio": approach_portfolio,
+        "bottleneck_lease": bottleneck_lease,
+        "proof_programs": proof_program_view(state),
+        "case_coverage_map": dict(action.get("case_coverage_map") or {}),
+        "threat_propagation": threat_propagation_view(state),
+        "minimal_active_debt_frontier": minimal_active_debt_frontier(state),
+        "reference_solution": reference_solution_state(state),
+        "long_session_workspace": long_session_workspace(state, action),
+        "root_leverage_metrics": root_leverage_metrics(state),
+        "root_cut_progress_gate": root_cut_progress_gate(state),
+        "canonical_route_ownership": canonical_route_ownership(state, action),
+        "counterexample_preflight": counterexample_preflight_state(state),
+        "strategy_review_policy": {
+            "evidence_based_only": True,
+            "wall_clock_timeout": None,
+            "long_proof_may_continue_indefinitely": True,
+            "review_events": [
+                "new contradiction or dependency threat",
+                "repeated mathematical work without verifier handoff",
+                "semantic debt duplication",
+                "uncovered root cases",
+                "multiple genuinely different proof philosophies",
+            ],
+        },
         "selected_bridge": bridge or {},
         "selected_conjecture": conjecture or {},
         "active_invention_authorization": (
@@ -1235,11 +2817,15 @@ def strategy_observability(state: Mapping[str, Any], action: Optional[Mapping[st
     conjecture_artifact = latest_artifact(state, "conjecture_portfolio")
     conceptual_artifact = latest_artifact(state, "conceptual_invariant_report")
     authorization = active_invention_authorization(state)
+    approach_portfolio = approach_portfolio_view(state)
     bridge_candidates = _bridge_candidates(bridge_artifact["metadata"]) if bridge_artifact else []
     conjectures = _conjecture_candidates(conjecture_artifact["metadata"]) if conjecture_artifact else []
     selected_bridge = next((item for item in bridge_candidates if str(item.get("status") or "") == "selected"), {})
     selected_conjecture = next((item for item in conjectures if str(item.get("status") or "") == "selected"), {})
     return {
+        "latest_approach_portfolio_artifact_id": str(approach_portfolio.get("artifact_id") or ""),
+        "approach_portfolio": approach_portfolio,
+        "bottleneck_lease": bottleneck_lease_state(state, action or {}),
         "latest_advisor_synthesis_artifact_id": str(synthesis.get("artifact_id") or "") if synthesis else "",
         "latest_proof_compression_artifact_id": str(compression.get("artifact_id") or "") if compression else "",
         "latest_bridge_search_artifact_id": str(bridge_artifact.get("artifact_id") or "") if bridge_artifact else "",
@@ -1258,6 +2844,12 @@ def strategy_observability(state: Mapping[str, Any], action: Optional[Mapping[st
         "verifier_filtered_outcome_learning": verifier_filtered_outcome_learning(state, action or {}),
         "deep_session_roi": deep_session_roi(state, action or {}),
         "advisor_synthesis_trigger": advisor_synthesis_trigger(state),
+        "proof_programs": proof_program_view(state),
+        "threat_propagation": threat_propagation_view(state),
+        "minimal_active_debt_frontier": minimal_active_debt_frontier(state),
+        "reference_solution": reference_solution_state(state),
+        "long_session_workspace": long_session_workspace(state, action or {}),
+        "root_leverage_metrics": root_leverage_metrics(state),
     }
 
 
@@ -1694,21 +3286,183 @@ def _validate_experiment(metadata: Mapping[str, Any]) -> list[str]:
     return errors
 
 
+def _validate_approach_portfolio(metadata: Mapping[str, Any], conn: sqlite3.Connection) -> list[str]:
+    errors = _require_fields(
+        metadata,
+        ("portfolio_kind", "brainstorming_summary", "approaches", "selected_approach_ids"),
+        prefix="approach_portfolio",
+    )
+    kind = str(metadata.get("portfolio_kind") or "")
+    if kind not in {"initial", "refresh", "challenge"}:
+        errors.append("approach_portfolio portfolio_kind must be initial, refresh, or challenge")
+    alignment_source_ids = _unique_strings(metadata.get("alignment_source_steering_ids"))
+    alignment_evidence_ids = _unique_strings(metadata.get("alignment_evidence_artifact_ids"))
+    alignment_required = bool(
+        alignment_source_ids
+        or alignment_evidence_ids
+        or "root_effect_recomputed" in metadata
+        or "alignment_summary" in metadata
+    )
+    if alignment_required:
+        errors.extend(
+            _require_fields(
+                metadata,
+                ("alignment_summary", "root_effect_recomputed"),
+                prefix="approach_portfolio steering alignment",
+            )
+        )
+        if metadata.get("root_effect_recomputed") is not True:
+            errors.append("steer-aligned approach_portfolio requires root_effect_recomputed=true")
+        if not alignment_source_ids and not alignment_evidence_ids:
+            errors.append(
+                "steer-aligned approach_portfolio requires alignment_source_steering_ids or alignment_evidence_artifact_ids"
+            )
+        for artifact_id in alignment_evidence_ids:
+            row = conn.execute(
+                "SELECT artifact_id FROM artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+            if row is None:
+                errors.append(
+                    f"approach_portfolio alignment_evidence_artifact_ids contains unknown artifact {artifact_id}"
+                )
+    candidates = _approach_candidates(metadata)
+    minimum = 6 if kind == "initial" else 3
+    if not minimum <= len(candidates) <= 12:
+        errors.append(f"approach_portfolio requires {minimum} to 12 approaches for portfolio_kind={kind or 'unknown'}")
+        return errors
+    approach_ids: set[str] = set()
+    semantic_signatures: set[str] = set()
+    for index, candidate in enumerate(candidates):
+        prefix = f"approaches[{index}]"
+        errors.extend(
+            _require_fields(
+                candidate,
+                (
+                    "approach_id",
+                    "title",
+                    "mechanism",
+                    "mathematical_objects",
+                    "representation_or_invariant",
+                    "root_consequence",
+                    "bridge_statement",
+                    "contribution_level",
+                    "contribution_kind",
+                    "evidence",
+                    "likely_failure_mode",
+                    "decisive_test",
+                    "estimated_cost",
+                    "novelty_score",
+                    "confidence",
+                    "confidence_basis",
+                    "status",
+                    "semantic_signature",
+                    *(("steering_impact",) if alignment_required else ()),
+                ),
+                prefix=prefix,
+            )
+        )
+        approach_id = str(candidate.get("approach_id") or "")
+        if approach_id in approach_ids:
+            errors.append(f"duplicate approach id: {approach_id}")
+        approach_ids.add(approach_id)
+        if not _nonempty_list(candidate.get("mathematical_objects")):
+            errors.append(f"{prefix} mathematical_objects must be a nonempty list")
+        try:
+            contribution = int(candidate.get("contribution_level"))
+        except (TypeError, ValueError):
+            contribution = -1
+        if not 0 <= contribution <= 5:
+            errors.append(f"{prefix} contribution_level must be an integer from 0 to 5")
+        if str(candidate.get("contribution_kind") or "") not in APPROACH_CONTRIBUTION_KINDS:
+            errors.append(f"{prefix} has invalid contribution_kind")
+        if str(candidate.get("estimated_cost") or "") not in APPROACH_COSTS:
+            errors.append(f"{prefix} estimated_cost must be low, medium, or high")
+        try:
+            novelty = float(candidate.get("novelty_score"))
+        except (TypeError, ValueError):
+            novelty = -1.0
+        if not 0.0 <= novelty <= 1.0:
+            errors.append(f"{prefix} novelty_score must lie in [0, 1]")
+        if str(candidate.get("confidence") or "") not in APPROACH_CONFIDENCE_LEVELS:
+            errors.append(f"{prefix} confidence must be low, medium, or high")
+        if str(candidate.get("status") or "") not in APPROACH_STATUSES:
+            errors.append(f"{prefix} has invalid status")
+        signature = _json_object(candidate.get("semantic_signature"))
+        errors.extend(
+            _require_fields(
+                signature,
+                ("mechanism", "representation", "proof_direction", "theorem_family", "root_obligation", "failure_mode"),
+                prefix=f"{prefix}.semantic_signature",
+            )
+        )
+        fingerprint = normalize_text(json.dumps(signature, sort_keys=True, ensure_ascii=True))
+        if fingerprint and fingerprint in semantic_signatures:
+            errors.append(f"{prefix} duplicates another semantic_signature")
+        semantic_signatures.add(fingerprint)
+    selected = _unique_strings(metadata.get("selected_approach_ids"))
+    if not 2 <= len(selected) <= 3:
+        errors.append("approach_portfolio requires two or three selected_approach_ids")
+    unknown = [item for item in selected if item not in approach_ids]
+    if unknown:
+        errors.append("approach_portfolio selected_approach_ids must name portfolio approaches")
+    supersedes = str(metadata.get("supersedes_artifact_id") or "")
+    if kind in {"refresh", "challenge"} and not supersedes:
+        errors.append("refreshed approach_portfolio requires supersedes_artifact_id")
+    if supersedes:
+        row = conn.execute(
+            "SELECT artifact_type FROM artifacts WHERE artifact_id = ?",
+            (supersedes,),
+        ).fetchone()
+        if row is None or str(row[0]) != "approach_portfolio":
+            errors.append("approach_portfolio supersedes_artifact_id must name an existing approach_portfolio")
+    questions = metadata.get("research_questions", [])
+    if not isinstance(questions, list):
+        errors.append("approach_portfolio research_questions must be a list")
+    return errors
+
+
 def strategic_artifact_errors(
     conn: sqlite3.Connection,
     *,
     artifact_type: str,
     metadata: Mapping[str, Any],
+    content: Any = None,
     actor_role: str,
     base_revision: int,
 ) -> list[str]:
     errors: list[str] = []
-    errors.extend(validate_proof_interface_metadata(metadata))
-    errors.extend(validate_theorem_adaptation_metadata(metadata))
-    errors.extend(validate_representation_switch_metadata(metadata))
-    if artifact_type in {"proof_dossier", "proof_blueprint"}:
-        errors.extend(validate_deep_session_roi_metadata(metadata))
+    errors.extend(
+        validate_state_independent_artifact_metadata(
+            artifact_type=artifact_type,
+            metadata=metadata,
+            content=content,
+        )
+    )
+    if artifact_type in {"proof_dossier", "proof_blueprint"} and int(
+        metadata.get("canonical_route_owner_version") or 0
+    ) == CANONICAL_ROUTE_OWNER_VERSION:
+        for field in (
+            "canonical_route_id",
+            "root_implication_update",
+            "root_cut_signature_before",
+            "root_cut_signature_after",
+            "creates_parallel_dossier",
+        ):
+            if field not in metadata or metadata.get(field) in (None, ""):
+                errors.append(f"canonical route dossier requires {field}")
+        if metadata.get("creates_parallel_dossier") is not False:
+            errors.append("canonical route dossier requires creates_parallel_dossier=false")
+        supersedes = str(metadata.get("supersedes_artifact_id") or "")
+        if supersedes:
+            row = conn.execute(
+                "SELECT artifact_id FROM artifacts WHERE artifact_id = ?",
+                (supersedes,),
+            ).fetchone()
+            if row is None:
+                errors.append("canonical route dossier supersedes_artifact_id must name an existing artifact")
     allowed_roles = {
+        "approach_portfolio": {"researcher"},
         "advisor_synthesis": {"phd_advisor", "advisor"},
         "invention_authorization": {"phd_advisor", "advisor"},
         "bridge_lemma_search": {"researcher"},
@@ -1722,7 +3476,9 @@ def strategic_artifact_errors(
         errors.append(f"{actor_role} cannot attach {artifact_type}; expected {', '.join(sorted(allowed_roles[artifact_type]))}")
     if artifact_type in STRATEGIC_ARTIFACT_TYPES and int(metadata.get("strategy_schema_version") or 0) != STRATEGY_SCHEMA_VERSION:
         errors.append(f"{artifact_type} requires strategy_schema_version={STRATEGY_SCHEMA_VERSION}")
-    if artifact_type == "bridge_lemma_search":
+    if artifact_type == "approach_portfolio":
+        errors.extend(_validate_approach_portfolio(metadata, conn))
+    elif artifact_type == "bridge_lemma_search":
         errors.extend(_validate_bridge_metadata(metadata, conn))
     elif artifact_type == "advisor_synthesis":
         errors.extend(_validate_advisor_synthesis(metadata, conn))

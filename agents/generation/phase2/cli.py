@@ -31,13 +31,19 @@ from .patches import apply_patch, reconcile_integrated_claims
 from .report import build_markdown_report, write_markdown_report
 from .result_status import classify_result
 from .research_policy import DEFAULT_RESEARCH_MODE, DEFAULT_WEB_SEARCH, RESEARCH_MODES
+from .reference_solution import ingest_reference_solution
 from .scheduler import DEFAULT_MULTI_BRANCH_WORKERS, next_action
+from .scope_state import import_certified_scope
 from .store import GENERATION_ROOT, ProofStateStore
 from .workflow import run_workflow
 from .writing.revision import WRITING_REVISION_RESEARCH_MODE, ingest_writing_revision
 
-DEFAULT_ATTEMPT_STEPS = 48
-DEFAULT_ATTEMPT_WALL_SECONDS = 24 * 60 * 60
+DEFAULT_ATTEMPT_STEPS = 0
+# Mathematical strategy has no default wall-clock expiration.  Operators may
+# still supply --max-wall-sec as an explicit resource budget for a particular
+# invocation; evidence-based scheduler checkpoints decide whether a proof
+# program continues, pivots, or is revalidated.
+DEFAULT_ATTEMPT_WALL_SECONDS: int | None = None
 DEFAULT_INIT_TOTAL_TOKEN_BUDGET = 80_000_000
 DEFAULT_INIT_VERIFICATION_RESERVE = 12_000_000
 DEFAULT_ATTEMPT_TOTAL_TOKEN_BUDGET = 80_000_000
@@ -100,6 +106,37 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_reconcile.add_argument("problem")
 
+    p_scope = sub.add_parser(
+        "scope-import",
+        help="merge a certified theorem subgraph into a differently rooted paused proof state",
+    )
+    p_scope.add_argument("source_problem")
+    p_scope.add_argument("target_problem")
+    p_scope.add_argument(
+        "--claim-id-pattern",
+        action="append",
+        default=[],
+        help="case-insensitive regex selecting integrated source claim ids; repeatable",
+    )
+    p_scope.add_argument(
+        "--include-claim",
+        action="append",
+        default=[],
+        help="explicit integrated source claim id to include; repeatable",
+    )
+    p_scope.add_argument(
+        "--artifact-pattern",
+        action="append",
+        default=[],
+        help="case-insensitive regex selecting additional in-scope evidence artifacts; repeatable",
+    )
+    p_scope.add_argument(
+        "--exclude-pattern",
+        action="append",
+        default=[],
+        help="case-insensitive regex forbidden anywhere in the imported dependency closure; repeatable",
+    )
+
     p_snapshot = sub.add_parser("snapshot", help="write an explicit JSON snapshot of the SQLite proof state")
     p_snapshot.add_argument("problem")
 
@@ -151,7 +188,12 @@ def main(argv: list[str] | None = None) -> None:
 
     p_attempt = sub.add_parser("attempt", help="one-command Albilich v1 proof attempt")
     p_attempt.add_argument("problem")
-    p_attempt.add_argument("--steps", type=int, default=DEFAULT_ATTEMPT_STEPS)
+    p_attempt.add_argument(
+        "--steps",
+        type=int,
+        default=DEFAULT_ATTEMPT_STEPS,
+        help="number of scheduler steps; 0 (default) continues until a terminal state, budget, or operator stop",
+    )
     p_attempt.add_argument("--dry-run", action="store_true", help="plan sessions without launching Codex")
     p_attempt.add_argument("--max-context-chars", type=int, default=12_000)
     p_attempt.add_argument("--model-profile", default="default")
@@ -164,7 +206,12 @@ def main(argv: list[str] | None = None) -> None:
     p_attempt.add_argument("--research-mode", choices=sorted(RESEARCH_MODES), default=DEFAULT_RESEARCH_MODE)
     _add_completion_policy_arg(p_attempt)
     p_attempt.add_argument("--timeout-sec", type=int, default=DEFAULT_CHILD_TIMEOUT_SECONDS)
-    p_attempt.add_argument("--max-wall-sec", type=int, default=DEFAULT_ATTEMPT_WALL_SECONDS)
+    p_attempt.add_argument(
+        "--max-wall-sec",
+        type=int,
+        default=DEFAULT_ATTEMPT_WALL_SECONDS,
+        help="optional explicit operator wall-clock budget; no wall-clock cap by default",
+    )
     p_attempt.add_argument("--parallel-librarian-verifier", dest="parallel_librarian_verifier", action="store_true", default=True)
     p_attempt.add_argument("--no-parallel-librarian-verifier", dest="parallel_librarian_verifier", action="store_false")
     _add_parallel_branches_arg(p_attempt)
@@ -201,6 +248,19 @@ def main(argv: list[str] | None = None) -> None:
     p_revise.add_argument("--title", default="", help="manuscript title (default: derived from the document)")
     p_revise.add_argument("--total-token-budget", type=int, default=DEFAULT_INIT_TOTAL_TOKEN_BUDGET)
     p_revise.add_argument("--reserved-verification-budget", type=int, default=DEFAULT_INIT_VERIFICATION_RESERVE)
+
+    p_reference = sub.add_parser(
+        "ingest-reference-solution",
+        help="attach a human-supplied solution to an existing theorem run for local reconstruction and strict verification",
+    )
+    p_reference.add_argument("problem", help="existing data/*.md problem or problem id")
+    p_reference.add_argument("document", help="reference solution (.md, .tex, .txt, or text-extractable .pdf)")
+    p_reference.add_argument("--title", default="", help="reference title (default: derived from filename)")
+    p_reference.add_argument(
+        "--source-statement",
+        default="",
+        help="optional exact theorem statement claimed by the reference",
+    )
 
     p_patch = sub.add_parser("apply-patch", help="apply a structured Albilich v1 patch JSON file")
     p_patch.add_argument("problem")
@@ -282,6 +342,22 @@ def main(argv: list[str] | None = None) -> None:
         )
         _print(result)
         return
+    if args.command == "scope-import":
+        source_store = _store(args.source_problem)
+        target_store = _store(args.target_problem)
+        _ensure_initialized_if_problem_file(source_store, args.source_problem)
+        _ensure_initialized_if_problem_file(target_store, args.target_problem)
+        _print(
+            import_certified_scope(
+                source_store,
+                target_store,
+                claim_id_patterns=args.claim_id_pattern,
+                include_claim_ids=args.include_claim,
+                artifact_patterns=args.artifact_pattern,
+                exclude_patterns=args.exclude_pattern,
+            )
+        )
+        return
     if args.command == "revise-paper":
         problem_id = args.problem_id or ("writing/" + sanitize_problem_id(Path(args.document).stem))
         store = ProofStateStore(problem_id)
@@ -316,6 +392,15 @@ def main(argv: list[str] | None = None) -> None:
         payload = compute_metrics(store)
         payload["result_status"] = classify_result(store)
         _print(payload)
+    elif args.command == "ingest-reference-solution":
+        _print(
+            ingest_reference_solution(
+                store,
+                Path(args.document),
+                title=args.title,
+                source_statement=args.source_statement,
+            )
+        )
     elif args.command == "check":
         with store.connect() as conn:
             errors = validate_conn(conn)
@@ -513,6 +598,13 @@ def _add_backend_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--claude-max-turns", type=int, default=None, help="optional Claude Code --max-turns cap per session")
     parser.add_argument(
+        "--cas",
+        dest="cas_mode",
+        choices=["on", "off"],
+        default="on",
+        help="enable or disable CAS scheduling and CAS access for every child session (default: on)",
+    )
+    parser.add_argument(
         "--cas-asset",
         action="append",
         default=[],
@@ -633,7 +725,8 @@ def _executor_for(args: argparse.Namespace) -> Optional[Callable[..., Any]]:
 
 
 def _apply_cas_assets(args: argparse.Namespace) -> None:
-    """Expose --cas-asset paths to context_builder via the environment."""
+    """Apply whole-run CAS policy and expose approved assets to context_builder."""
+    os.environ["ALBILICH_CAS_ENABLED"] = "0" if getattr(args, "cas_mode", "on") == "off" else "1"
     assets = getattr(args, "cas_asset", None)
     if assets:
         # Newline-separated: paths/descriptions can contain ':' (os.pathsep) and

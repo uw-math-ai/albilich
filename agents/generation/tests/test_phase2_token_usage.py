@@ -309,6 +309,11 @@ class Phase2TokenUsageTest(unittest.TestCase):
         )
         self.assertTrue(
             _should_suppress_child_log_line(
+                "2026-08-20T00:00:00Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `base_instructions` at line 97 column 5\n"
+            )
+        )
+        self.assertTrue(
+            _should_suppress_child_log_line(
                 "2026-07-27T00:00:00Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit\n"
             )
         )
@@ -335,7 +340,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
                 "print('session id: 019ef5aa-0000-7000-9000-staleretry1', flush=True)\n"
                 "print('2026-06-28T00:00:00Z  WARN codex_core::responses_retry: stream disconnected - retrying sampling request (1/5 in 196ms)...', flush=True)\n"
                 "for _ in range(200):\n"
-                "    print('2026-07-27T00:00:00Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5', flush=True)\n"
+                "    print('2026-08-20T00:00:00Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `base_instructions` at line 97 column 5', flush=True)\n"
                 "    time.sleep(0.05)\n",
                 encoding="utf-8",
             )
@@ -345,8 +350,10 @@ class Phase2TokenUsageTest(unittest.TestCase):
             action = {"mode": "prove", "target_id": "root"}
             plan = prepare_session(store, action)
             old_stale = os.environ.get("ALBILICH_CODEX_STALE_RETRY_SECONDS")
+            old_retry_grace = os.environ.get("ALBILICH_CODEX_ACTIVE_RETRY_GRACE_SECONDS")
             old_heartbeat = os.environ.get("ALBILICH_UI_HEARTBEAT_SECONDS")
             os.environ["ALBILICH_CODEX_STALE_RETRY_SECONDS"] = "0.2"
+            os.environ["ALBILICH_CODEX_ACTIVE_RETRY_GRACE_SECONDS"] = "0.2"
             os.environ["ALBILICH_UI_HEARTBEAT_SECONDS"] = "0.1"
             try:
                 result = execute_session(
@@ -361,6 +368,10 @@ class Phase2TokenUsageTest(unittest.TestCase):
                     os.environ.pop("ALBILICH_CODEX_STALE_RETRY_SECONDS", None)
                 else:
                     os.environ["ALBILICH_CODEX_STALE_RETRY_SECONDS"] = old_stale
+                if old_retry_grace is None:
+                    os.environ.pop("ALBILICH_CODEX_ACTIVE_RETRY_GRACE_SECONDS", None)
+                else:
+                    os.environ["ALBILICH_CODEX_ACTIVE_RETRY_GRACE_SECONDS"] = old_retry_grace
                 if old_heartbeat is None:
                     os.environ.pop("ALBILICH_UI_HEARTBEAT_SECONDS", None)
                 else:
@@ -371,9 +382,76 @@ class Phase2TokenUsageTest(unittest.TestCase):
             self.assertLess(result["wall_time_seconds"], 3.0)
             log = Path(result["log_path"]).read_text(encoding="utf-8")
             self.assertIn("stream disconnected - retrying sampling request", log)
-            self.assertNotIn("supports_reasoning_summaries", log)
+            self.assertNotIn("base_instructions", log)
             self.assertIn("no log/token progress after a Codex stream retry", log)
             self.assertIn("Codex stream retry stalled", result["patch_error"])
+
+    def test_active_codex_retry_gets_bounded_reconnect_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_codex = root / "fake_codex.py"
+            patch = {
+                "schema_version": 1,
+                "problem_id": "codex-active-retry-grace-test",
+                "base_revision": 0,
+                "actor_role": "researcher",
+                "target_id": "root",
+                "operations": [
+                    {
+                        "op": "attach_artifact",
+                        "artifact_id": "recovered-after-reconnect",
+                        "artifact_type": "proof_dossier",
+                        "content": "The child recovered within its bounded reconnect grace.",
+                        "metadata": {"target_id": "root"},
+                    }
+                ],
+            }
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, time\n"
+                "print('session id: 019ef5aa-0000-7000-9000-retrygrace1', flush=True)\n"
+                "print('2026-08-24T00:00:00Z WARN codex_core::responses_retry: stream disconnected - retrying sampling request (2/5 in 374ms)...', flush=True)\n"
+                "time.sleep(0.4)\n"
+                f"print({json.dumps(json.dumps(patch))}, flush=True)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            store = ProofStateStore("codex-active-retry-grace-test", generation_root=root / "generation")
+            store.init_problem("Prove the target theorem.")
+            action = {"mode": "prove", "target_id": "root"}
+            plan = prepare_session(store, action)
+            old_stale = os.environ.get("ALBILICH_CODEX_STALE_RETRY_SECONDS")
+            old_retry_grace = os.environ.get("ALBILICH_CODEX_ACTIVE_RETRY_GRACE_SECONDS")
+            old_heartbeat = os.environ.get("ALBILICH_UI_HEARTBEAT_SECONDS")
+            os.environ["ALBILICH_CODEX_STALE_RETRY_SECONDS"] = "0.1"
+            os.environ["ALBILICH_CODEX_ACTIVE_RETRY_GRACE_SECONDS"] = "0.8"
+            os.environ["ALBILICH_UI_HEARTBEAT_SECONDS"] = "0.05"
+            try:
+                result = execute_session(
+                    store,
+                    action,
+                    plan,
+                    codex_bin=str(fake_codex),
+                    timeout_sec=5,
+                )
+            finally:
+                if old_stale is None:
+                    os.environ.pop("ALBILICH_CODEX_STALE_RETRY_SECONDS", None)
+                else:
+                    os.environ["ALBILICH_CODEX_STALE_RETRY_SECONDS"] = old_stale
+                if old_retry_grace is None:
+                    os.environ.pop("ALBILICH_CODEX_ACTIVE_RETRY_GRACE_SECONDS", None)
+                else:
+                    os.environ["ALBILICH_CODEX_ACTIVE_RETRY_GRACE_SECONDS"] = old_retry_grace
+                if old_heartbeat is None:
+                    os.environ.pop("ALBILICH_UI_HEARTBEAT_SECONDS", None)
+                else:
+                    os.environ["ALBILICH_UI_HEARTBEAT_SECONDS"] = old_heartbeat
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["patch"]["operations"][0]["artifact_id"], "recovered-after-reconnect")
+            log = Path(result["log_path"]).read_text(encoding="utf-8")
+            self.assertNotIn("no log/token progress after a Codex stream retry", log)
 
     def test_old_codex_retry_warning_does_not_poison_later_quiet_period(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -438,6 +516,45 @@ class Phase2TokenUsageTest(unittest.TestCase):
             log = Path(result["log_path"]).read_text(encoding="utf-8")
             self.assertIn("ordinary progress after the retry warning", log)
             self.assertNotIn("no log/token progress after a Codex stream retry", log)
+
+    def test_nonzero_codex_exits_record_actionable_failure_kinds(self) -> None:
+        cases = {
+            "usage-limit": ("ERROR: You've hit your usage limit. Try again later.", "usage_limit"),
+            "transport": (
+                "ERROR: stream disconnected before completion: error sending request for url (https://example.invalid)",
+                "transport_error",
+            ),
+            "launch": ("[albilich] failed to launch Codex session: no such file", "launch_error"),
+            "generic": ("ERROR: child backend exited unexpectedly", "process_exit"),
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            store = ProofStateStore("codex-failure-kind-test", generation_root=root / "generation")
+            store.init_problem("Prove the target theorem.")
+            action = {"mode": "prove", "target_id": "root"}
+            plan = prepare_session(store, action)
+
+            for name, (message, expected) in cases.items():
+                with self.subTest(name=name):
+                    fake_codex = root / f"fake_codex_{name}.py"
+                    fake_codex.write_text(
+                        "#!/usr/bin/env python3\n"
+                        f"print({message!r}, flush=True)\n"
+                        "raise SystemExit(1)\n",
+                        encoding="utf-8",
+                    )
+                    fake_codex.chmod(0o755)
+
+                    result = execute_session(
+                        store,
+                        action,
+                        plan,
+                        codex_bin=str(fake_codex),
+                        timeout_sec=5,
+                    )
+
+                    self.assertEqual(result["status"], "failed")
+                    self.assertEqual(result["failure_kind"], expected)
 
     def test_malformed_final_json_gets_one_session_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

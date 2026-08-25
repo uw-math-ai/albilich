@@ -4,6 +4,7 @@ import json
 from typing import Any, Dict, Mapping
 
 from .result_status import normalize_result_relation
+from .role_capabilities import cas_globally_enabled
 from .writing.revision import WRITING_REVISION_RESEARCH_MODE
 
 RESEARCH_MODES = {
@@ -347,8 +348,15 @@ def researcher_work_mode_decision(
     """
     mode = normalize_research_mode(research_mode)
     online_allowed = normalize_web_search(web_search) == "live" and mode != "independent"
+    cas_allowed = cas_globally_enabled()
     explicit = str(action.get("researcher_work_mode") or "").strip().lower()
     if explicit in RESEARCHER_WORK_MODES:
+        if explicit == "cas" and not cas_allowed:
+            return {
+                "work_mode": "offline",
+                "source": "cas_disabled",
+                "reason": "the workflow was launched with CAS disabled; using offline proof work",
+            }
         return {
             "work_mode": explicit,
             "source": str(action.get("work_mode_source") or "action_explicit"),
@@ -357,13 +365,17 @@ def researcher_work_mode_decision(
     if action_expects_villain_session(action):
         return _villain_work_mode_decision(state, action, online_allowed=online_allowed)
     if action.get("parallel_companion"):
-        if action.get("cas_check_recommended"):
+        if action.get("cas_check_recommended") and cas_allowed:
             return {
                 "work_mode": "cas",
                 "source": "companion_structural",
                 "reason": "parallel researcher companion has a bounded computation assigned",
             }
-        cycle = [m for m in RESEARCHER_WORK_MODE_CYCLE if m != "online" or online_allowed]
+        cycle = [
+            m
+            for m in RESEARCHER_WORK_MODE_CYCLE
+            if (m != "online" or online_allowed) and (m != "cas" or cas_allowed)
+        ]
         history = _researcher_work_mode_history(state, include_companions=True)
         last = history[0]["work_mode"] if history else ""
         start = (cycle.index(last) + 1) % len(cycle) if last in cycle else 0
@@ -383,6 +395,13 @@ def researcher_work_mode_decision(
     directive = advisor_mode_directive(state)
     if directive:
         directed = str(directive.get("work_mode") or "")
+        if directed == "cas" and not cas_allowed:
+            return {
+                "work_mode": "offline",
+                "source": "advisor_directive_downgraded",
+                "reason": "the advisor directed a CAS pass but the workflow was launched with CAS disabled; using offline proof work",
+                "advisor_mode_directive_artifact_id": str(directive.get("artifact_id") or ""),
+            }
         if directed == "online" and not online_allowed:
             return {
                 "work_mode": "offline",
@@ -397,7 +416,11 @@ def researcher_work_mode_decision(
             or f"PhD advisor directed the researcher to work in {directed} mode",
             "advisor_mode_directive_artifact_id": str(directive.get("artifact_id") or ""),
         }
-    cycle = [m for m in RESEARCHER_WORK_MODE_CYCLE if m != "online" or online_allowed]
+    cycle = [
+        m
+        for m in RESEARCHER_WORK_MODE_CYCLE
+        if (m != "online" or online_allowed) and (m != "cas" or cas_allowed)
+    ]
     history = _researcher_work_mode_history(state)
     recent_completed = [
         item["work_mode"]
@@ -410,7 +433,7 @@ def researcher_work_mode_decision(
     # short window to use the evidence before computing again. Explicit advisor
     # directives and assigned parallel CAS companions are handled above and
     # intentionally remain authoritative.
-    if action.get("cas_check_recommended") and "cas" not in recent_completed:
+    if cas_allowed and action.get("cas_check_recommended") and "cas" not in recent_completed:
         return {
             "work_mode": "cas",
             "source": "structural",
@@ -466,9 +489,17 @@ def _villain_work_mode_decision(
     researcher companions they rotate on their own history (there is no primary
     villain stream for rotation to act on otherwise).
     """
+    cas_allowed = cas_globally_enabled()
     directive = advisor_mode_directive(state, role="villain")
     if directive:
         directed = str(directive.get("work_mode") or "")
+        if directed == "cas" and not cas_allowed:
+            return {
+                "work_mode": "offline",
+                "source": "advisor_directive_downgraded",
+                "reason": "the advisor directed a CAS refutation pass but the workflow was launched with CAS disabled; using offline work",
+                "advisor_mode_directive_artifact_id": str(directive.get("artifact_id") or ""),
+            }
         if directed == "online" and not online_allowed:
             return {
                 "work_mode": "offline",
@@ -482,13 +513,17 @@ def _villain_work_mode_decision(
             "reason": directive.get("reason") or f"PhD advisor directed the villain to work in {directed} mode",
             "advisor_mode_directive_artifact_id": str(directive.get("artifact_id") or ""),
         }
-    if action.get("cas_check_recommended"):
+    if cas_allowed and action.get("cas_check_recommended"):
         return {
             "work_mode": "cas",
             "source": "structural",
             "reason": "the scheduled refutation action recommends a bounded CAS computation",
         }
-    cycle = [m for m in VILLAIN_WORK_MODE_CYCLE if m != "online" or online_allowed]
+    cycle = [
+        m
+        for m in VILLAIN_WORK_MODE_CYCLE
+        if (m != "online" or online_allowed) and (m != "cas" or cas_allowed)
+    ]
     history = _researcher_work_mode_history(state, actor_role="villain", include_companions=True)
     last = history[0]["work_mode"] if history else ""
     if last in cycle:

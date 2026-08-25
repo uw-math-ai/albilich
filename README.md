@@ -27,12 +27,15 @@ verified result into a readable paper.
   bottleneck, retrieves from eighteen reviewed method cards, and learns local
   strategy-family outcomes only from later verifier-accepted evidence. Context
   assembly now builds one revision-local graph-policy index and reuses it for
-  root distance, frontier, route, debt, and artifact decisions.
+  root distance, frontier, route, debt, and artifact decisions. Evidence-driven
+  proof programs add explicit case coverage, continuation and abandonment
+  criteria, verifier handoffs, threat propagation, and root-leverage accounting.
 - **Stalled attacks change mathematics, not just wording.** Repeated
   bottlenecks trigger a representation-switch contract, theorem-adaptation
-  packets, proof-interface checks, or a new research philosophy. Multi-branch
-  waves must use genuinely different strategy families rather than launch
-  paraphrases of the same attempt.
+  packets, proof-interface checks, a creative proof portfolio, or a new research
+  philosophy. Operator steering now forces a fresh approach-alignment wave and
+  carries the selected strategy into its decisive pilot instead of being lost
+  at the next scheduler boundary.
 - **Literature search has a dedicated high-signal path.** Optional Matlas and
   UW TheoremSearch adapters give the literature reviewer bounded theorem
   candidates. Provider text is normalized, size-limited, origin-checked, and
@@ -41,26 +44,35 @@ verified result into a readable paper.
 - **Parallel research and verification are substantially more robust.** Hard
   problems use three research branches with shared compact summaries and
   negative evidence. Fresh source handoffs are prioritized, strict verifier
-  proof evidence survives context compaction, and compatible stale verifier
-  patches are recovered and revalidated instead of silently discarded.
+  targets and proof evidence survive root cuts and context compaction, locally
+  proved lemmas are recovered for verification, and compatible stale verifier
+  patches are revalidated instead of silently discarded.
 - **Proof closure is stricter and more accurate.** Integration debts remain
-  authoritative, repaired routes return to verification, integrated claims and
-  routes leave the active frontier, and a strictly verified root is displayed
-  as integration-pending until the final alignment gate actually accepts it.
+  authoritative, confirmed counterexamples close the debts they settle without
+  duplicate validation, quantitative claim strengthenings are preserved, and
+  repaired routes return to verification. Integrated claims and routes leave
+  the active frontier, while a strictly verified root remains visibly
+  integration-pending until the final alignment gate accepts it.
 - **The live dashboard tells the truth about a large proof tree.** It shows
   claim hierarchy and containment, lifecycle colors, recovered verification,
   active debts, branch work, verifier capacity, run progress, and
   cached-versus-new token accounting without presenting retired work as open.
+  Mathematical notation is rendered as LaTeX, steering delivery is visible,
+  and cumulative human-readable papers can be opened in the embedded viewer.
 - **Long-running sessions recover more safely.** Structured-output repair
-  handles malformed JSON and LaTeX escapes, parallel patch recovery preserves
-  compatible evidence, abnormal child exits remain visible, duplicate advisor
-  loops are suppressed, and solved runs stop before optional publication work.
+  handles malformed JSON, LaTeX commands, and inequality escapes; reconnecting
+  Codex sessions receive bounded grace; monitor refreshes cannot pile up; and
+  abnormal child exits remain visible. Terminal, steering, and branch dispatch
+  priorities are protected so optional writing cannot preempt required work.
 - **Verified mathematics now has a stronger publication path.** The writing
   gate normalizes LaTeX, detects thin or fragmented exposition, preserves
   location-specific editorial debts, compiles with restricted service paths,
   and exports the certificate, article source, and PDF as distinct artifacts.
+  A non-blocking writer sidecar also produces a cumulative HMT paper after each
+  ten newly integrated claims without spending research budget or mutating the
+  proof revision.
 - **The public regression suite grew with the engine.** The synchronized
-  release passes 910 tests and 324 subtests across scheduling, retrieval,
+  release passes 1,012 tests and 333 subtests across scheduling, retrieval,
   research intelligence, proof-state mutation, parallel recovery, verifier
   gates, dashboard state, CAS contracts, and mathematical writing.
 
@@ -102,7 +114,9 @@ problem file under `agents/generation/data/`; `example.md` is a runnable demo.
 
 An `attempt` run serves a live dashboard at `http://127.0.0.1:8765/` showing the
 proof graph, route scores, verifier health, the active bottleneck, token and
-wall-clock use, and the current work modes. Pass `--no-dashboard` to disable it.
+wall-clock use, and the current work modes. Routes and artifacts use readable
+mathematical notation, and cumulative HMT papers are available in the embedded
+viewer. Pass `--no-dashboard` to disable it.
 
 ## Proof state
 
@@ -295,11 +309,11 @@ use `--model` and `--reasoning-effort` to override either setting for a run.
 python3 -m agents.generation.phase2.cli init    agents/generation/data/example.md
 python3 -m agents.generation.phase2.cli attempt agents/generation/data/example.md
 
-# a long hard-problem run to the wall-clock cap, dashboard on a chosen port
+# a long hard-problem run with no wall-clock cap, dashboard on a chosen port
 ALBILICH_UI_HEARTBEAT_SECONDS=5 \
 python3 -m agents.generation.phase2.cli attempt \
   agents/generation/data/example.md \
-  --steps 0 --timeout-sec 7200 --max-wall-sec 86400 \
+  --steps 0 --timeout-sec 7200 \
   --research-mode hard_problem --web-search live \
   --dashboard-port 8793 --no-open-dashboard
 
@@ -314,13 +328,20 @@ python3 -m agents.generation.phase2.cli report  agents/generation/data/example.m
 python3 -m agents.generation.phase2.cli monitor agents/generation/data/example.md --port 8793 --no-open
 ```
 
-`--steps 0` runs until the wall-clock cap, the token budget, or a terminal
-scheduler state stops the attempt. If the backend binary is off `PATH`, pass it
+`--steps 0` runs until the token budget, an operator stop, or a terminal
+scheduler state stops the attempt. `--max-wall-sec` remains available as an
+explicit operator resource cap. If the backend binary is off `PATH`, pass it
 with `--codex-bin` or `--claude-bin`. Default `attempt` settings:
 
+The periodic writer produces one cumulative HMT partial paper after every ten
+newly integrated claims. Set `ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL` to another
+positive integer to change the cadence, or to `0` to disable periodic HMT
+snapshots. The deprecated `ALBILICH_HMT_REVISION_INTERVAL` name remains a
+compatibility alias and is interpreted as an integrated-claim interval.
+
 ```text
-research_mode = hard_problem      steps = 48              web_search = live
-timeout_sec = 7200                max_wall_sec = 86400    max_reduction_depth = 4
+research_mode = hard_problem      steps = 0               web_search = live
+timeout_sec = 7200                max_wall_sec = none     max_reduction_depth = 4
 total_token_budget = 80000000     reserved_verification_budget = 12000000
 parallel_branches = 3
 ```
@@ -349,7 +370,7 @@ Role prompts are assembled in `agents/generation/phase2/codex_runner.py`.
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s agents/generation/tests -t .
 ```
 
-The public suite currently passes 890 tests and 312 subtests covering the
+The public suite currently passes 1,012 tests and 333 subtests covering the
 scheduler, patch validator, proof store, parallel workflow, theorem retrieval,
 research intelligence, runners, dashboard, work-mode loops, verification gates,
 recovery paths, and paper-writing checks.

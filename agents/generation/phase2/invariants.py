@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 from typing import Any, Dict, List, Set
 
+from .artifacts import artifact_hash
 from .models import (
     DEBT_SEVERITIES,
     DEBT_STATUSES,
@@ -14,6 +16,7 @@ from .models import (
     VALIDATION_STATUSES,
     json_loads,
 )
+from .verification import ZERO_GAP_VERIFICATION_VERDICTS, clean_verification_metadata
 
 VERIFIED_STATUSES = {"informally_verified", "formally_verified"}
 
@@ -36,6 +39,18 @@ def validate_conn(conn: sqlite3.Connection) -> List[str]:
     route_ids: Set[str] = {row["route_id"] for row in conn.execute("SELECT route_id FROM routes")}
     inference_ids: Set[str] = {row["inference_id"] for row in conn.execute("SELECT inference_id FROM inferences")}
     artifact_ids: Set[str] = {row["artifact_id"] for row in conn.execute("SELECT artifact_id FROM artifacts")}
+
+    for artifact in conn.execute("SELECT artifact_id, path, sha256, metadata_json FROM artifacts"):
+        metadata = json_loads(artifact["metadata_json"], {})
+        integrity = metadata.get("integrity", {}) if isinstance(metadata, dict) else {}
+        if not isinstance(integrity, dict) or integrity.get("scope") != "file_bytes":
+            continue
+        path = Path(str(artifact["path"] or ""))
+        if not path.is_file():
+            errors.append(f"artifact {artifact['artifact_id']} integrity file is missing")
+            continue
+        if artifact_hash(path=path) != str(artifact["sha256"] or ""):
+            errors.append(f"artifact {artifact['artifact_id']} file hash does not match recorded sha256")
 
     for route in conn.execute("SELECT * FROM routes"):
         if route["status"] not in ROUTE_STATUSES:
@@ -129,7 +144,11 @@ def validate_conn(conn: sqlite3.Connection) -> List[str]:
             inf["validation_status"] in VERIFIED_STATUSES
             and not premises
             and inf["conclusion_claim_id"] != "root"
-            and not _has_premiseless_verification_evidence(conn, json_loads(inf["evidence_artifact_ids_json"]))
+            and not _has_verification_evidence(
+                conn,
+                json_loads(inf["evidence_artifact_ids_json"]),
+                outcome="positive",
+            )
         ):
             errors.append(f"verified inference {inf['inference_id']} has no premises")
         for premise_id in premises:
@@ -180,7 +199,7 @@ def validate_conn(conn: sqlite3.Connection) -> List[str]:
             if not any(_artifact_type(conn, aid) == "formal_backend_result" for aid in evidence_ids):
                 errors.append(f"claim {claim['claim_id']} formally verified without formal evidence")
         if claim["validation_status"] == "refuted":
-            if not any(_artifact_type(conn, aid) == "confirmed_counterexample" for aid in evidence_ids) and not _has_premiseless_verification_evidence(conn, evidence_ids):
+            if not any(_artifact_type(conn, aid) == "confirmed_counterexample" for aid in evidence_ids) and not _has_verification_evidence(conn, evidence_ids, outcome="refutation"):
                 errors.append(f"claim {claim['claim_id']} refuted without confirmed counterexample or strict verification evidence")
         if claim["lifecycle_status"] == "integrated":
             if claim["validation_status"] not in VERIFIED_STATUSES:
@@ -197,17 +216,12 @@ def _artifact_type(conn: sqlite3.Connection, artifact_id: str) -> str:
     return row["artifact_type"] if row else ""
 
 
-ZERO_GAP_VERIFICATION_VERDICTS = {
-    "correct",
-    "correct_no_gaps",
-    "correct_refutation",
-    "informally_verified",
-    "pass",
-    "verified",
-}
-
-
-def _has_premiseless_verification_evidence(conn: sqlite3.Connection, artifact_ids: List[str]) -> bool:
+def _has_verification_evidence(
+    conn: sqlite3.Connection,
+    artifact_ids: List[str],
+    *,
+    outcome: str,
+) -> bool:
     for artifact_id in artifact_ids:
         row = conn.execute(
             "SELECT artifact_type, producer_role, metadata_json FROM artifacts WHERE artifact_id = ?",
@@ -218,10 +232,6 @@ def _has_premiseless_verification_evidence(conn: sqlite3.Connection, artifact_id
         metadata = json_loads(row["metadata_json"], {})
         if not isinstance(metadata, dict):
             continue
-        report = metadata.get("verification_report", {})
-        if not isinstance(report, dict):
-            report = {}
-        verdict = str(metadata.get("verdict") or report.get("verdict") or "").strip().lower()
-        if verdict in ZERO_GAP_VERIFICATION_VERDICTS and not report.get("critical_errors") and not report.get("gaps") and not report.get("blocking_gap"):
+        if clean_verification_metadata(metadata, outcome=outcome):
             return True
     return False

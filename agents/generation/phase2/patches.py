@@ -33,10 +33,18 @@ from .models import (
 )
 from .budget import run_spend_from_operation
 from .receipt import compile_latex_artifact, format_partial_receipt_appendix, receipt_appendix_present, write_latex_pdf_sidecars
+from .research_intelligence import validate_state_independent_artifact_metadata
 from .research_strategy import STRATEGIC_MARKDOWN_ARTIFACT_TYPES, strategic_artifact_errors
 from .research_policy import normalize_retrieval_relation, theorem_matching_confidence
 from .result_status import SOLVED_RELATIONS, root_alignment_from_metadata
 from .store import ProofStateStore
+from .verification import (
+    POSITIVE_VERIFICATION_VERDICTS,
+    clean_verification_metadata,
+    evidence_matches_target,
+    evidence_targets,
+    verification_blockers,
+)
 from .writing.latex_template import normalize_paper_template
 from .writing.linter import run_paper_lint, run_residue_scan
 from .writing.paper_contract import SUPPORTED_WRITING_REVIEW_LENSES
@@ -52,6 +60,40 @@ class PatchRejected(Exception):
         super().__init__("; ".join(self.errors))
 
 
+class _ArtifactFileJournal:
+    """Undo filesystem mutations when the enclosing SQLite patch rolls back."""
+
+    def __init__(self) -> None:
+        self._before: Dict[Path, Optional[bytes]] = {}
+
+    def capture(self, path: Path) -> None:
+        path = path.resolve()
+        if path not in self._before:
+            self._before[path] = path.read_bytes() if path.is_file() else None
+
+    def write_text(self, path: Path, content: str) -> None:
+        self.capture(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def write_bytes(self, path: Path, content: bytes) -> None:
+        self.capture(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    def rollback(self) -> None:
+        for path, content in reversed(list(self._before.items())):
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+        self._before.clear()
+
+    def commit(self) -> None:
+        self._before.clear()
+
+
 ARTIFACT_PRODUCER_ROLES = {
     "verification_report": {"strict_informal_verifier"},
     "formal_backend_result": {"formal_backend"},
@@ -60,9 +102,11 @@ ARTIFACT_PRODUCER_ROLES = {
     "referee_report": {"writer"},
     "writing_review": {"writing_critic"},
     "final_paper": {"writer"},
+    "human_readable_mathematical_text": {"writer"},
     REVISION_DOCUMENT_ARTIFACT_TYPE: {"writer"},
     "advisor_synthesis": {"phd_advisor", "advisor"},
     "invention_authorization": {"phd_advisor", "advisor"},
+    "approach_portfolio": {"researcher"},
     "bridge_lemma_search": {"researcher"},
     "conjecture_portfolio": {"researcher", "villain"},
     "definition_candidate": {"researcher"},
@@ -82,12 +126,16 @@ WRITER_RESIDUE_SCANNED_ARTIFACT_TYPES = {
     "final_proof",
     "partial_proof_report",
     "final_paper",
+    "human_readable_mathematical_text",
     REVISION_DOCUMENT_ARTIFACT_TYPE,
 }
 # Artifact types whose file extension is not the markdown/txt default; the
 # final_paper's content IS complete LaTeX source, so it ships as a .tex file
 # that the attach-time sidecar compiles directly (no markdown->LaTeX pass).
-ARTIFACT_CONTENT_EXTENSIONS = {"final_paper": ".tex"}
+ARTIFACT_CONTENT_EXTENSIONS = {
+    "final_paper": ".tex",
+    "human_readable_mathematical_text": ".tex",
+}
 LITERATURE_RESEARCHER_ROLE = "literature_researcher"
 GRAPH_OWNER_ROLE_NAMES = VERIFYING_ROLES | NON_VERIFYING_ROLES | {
     "strict_verifier",
@@ -154,6 +202,53 @@ def preflight_patch_errors(patch: Mapping[str, Any], actor_role: str) -> List[st
         if str(op.get("op") or "") in {"attach_artifact", "add_artifact"}
     }
     errors: List[str] = []
+    for op in attached_ops.values():
+        metadata = op.get("metadata") if isinstance(op.get("metadata"), Mapping) else {}
+        errors.extend(
+            validate_state_independent_artifact_metadata(
+                artifact_type=str(op.get("artifact_type") or ""),
+                metadata=metadata,
+                content=op.get("content"),
+            )
+        )
+        if str(op.get("artifact_type") or "") not in {"proof_dossier", "proof_blueprint"}:
+            continue
+        if (
+            actor_role == "researcher"
+            and str(metadata.get("mathematical_delta_kind") or "") == "proved_lemma"
+            and metadata.get("changed_proof_state") is True
+        ):
+            artifact_id = str(op.get("artifact_id") or "")
+            linked_inference = any(
+                str(candidate.get("op") or "") in {"add_inference", "update_inference"}
+                and artifact_id in {str(item) for item in candidate.get("evidence_artifact_ids") or []}
+                for candidate in operations
+            )
+            if not linked_inference:
+                errors.append(
+                    f"proved_lemma artifact {artifact_id} is not materialized in the proof graph: add or update an "
+                    "inference whose evidence_artifact_ids cites it (and add the exact lemma claim and sufficient "
+                    "route when they do not already exist); otherwise use a non-proof delta kind such as "
+                    "narrowed_obligation"
+                )
+        try:
+            owner_version = int(metadata.get("canonical_route_owner_version") or 0)
+        except (TypeError, ValueError):
+            errors.append("canonical_route_owner_version must be an integer")
+            continue
+        if owner_version != 1:
+            continue
+        for field in (
+            "canonical_route_id",
+            "root_implication_update",
+            "root_cut_signature_before",
+            "root_cut_signature_after",
+            "creates_parallel_dossier",
+        ):
+            if field not in metadata or metadata.get(field) in (None, ""):
+                errors.append(f"canonical route dossier requires {field}")
+        if metadata.get("creates_parallel_dossier") is not False:
+            errors.append("canonical route dossier requires creates_parallel_dossier=false")
     for op in operations:
         if str(op.get("op") or "") != "propose_status_transition":
             continue
@@ -206,16 +301,25 @@ def preflight_patch_errors(patch: Mapping[str, Any], actor_role: str) -> List[st
                     else {}
                 )
                 verdict = str(metadata.get("verdict") or report.get("verdict") or "").strip().lower()
-                if verdict not in ZERO_GAP_VERIFICATION_VERDICTS:
+                if verdict not in POSITIVE_VERIFICATION_VERDICTS:
                     dirty_reason = (
                         f"verification_report verdict '{verdict or 'missing'}' does not certify; use one of "
-                        f"{sorted(ZERO_GAP_VERIFICATION_VERDICTS)} only when errors and gaps are genuinely empty"
+                        f"{sorted(POSITIVE_VERIFICATION_VERDICTS)} only when errors and gaps are genuinely empty"
                     )
                     continue
-                if report.get("critical_errors") or report.get("gaps") or report.get("blocking_gap"):
+                if verification_blockers(metadata):
                     dirty_reason = (
                         "verification_report still lists critical_errors/gaps/blocking_gap; do not propose "
                         "informally_verified — attach the report and add precise debts instead"
+                    )
+                    continue
+                if not evidence_matches_target(
+                    metadata,
+                    target_type=str(op.get("target_type") or "claim"),
+                    target_id=target_id,
+                ):
+                    dirty_reason = (
+                        f"verification_report is not bound to {op.get('target_type') or 'claim'} {target_id}"
                     )
                     continue
                 clean = True
@@ -252,6 +356,9 @@ REBASE_SAFE_VERIFYING_TRANSITIONS = {
     ("strict_informal_verifier", "refuted"),
     ("formal_backend", "formally_verified"),
     ("counterexample_validator", "refuted"),
+    # Independent integrations produced by one parallel wave touch distinct
+    # claim/route/debt rows and rerun every integration guard after rebasing.
+    ("integration_verifier", "integrated"),
 }
 
 
@@ -289,6 +396,19 @@ def _op_touched_ids(op: Mapping[str, Any]) -> tuple[set[str], bool]:
         target_type = str(op.get("target_type") or "claim")
         if not _add(target_type, target):
             return ids, True
+        if (
+            target_type == "claim"
+            and str(op.get("status_type") or "validation") == "lifecycle"
+            and str(op.get("new_status") or "") == "integrated"
+        ):
+            # Integration also mutates the selected route and every explicitly
+            # resolved debt.  Include those implicit writes in stale-patch
+            # conflict detection so only truly row-disjoint integrations rebase.
+            if not _add("route", op.get("route_id")):
+                return ids, True
+            for debt_id in op.get("resolved_debt_ids") or []:
+                if not _add("debt", debt_id):
+                    return ids, True
     elif kind == "cache_retrieval_card":
         if not _add("card", op.get("card_id")):
             return ids, True
@@ -545,24 +665,45 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
         _record_patch_rejection(store, patch, patch_id, errors, kind="invalid_shape")
         return PatchOutcome(False, _safe_revision(store), patch_id, errors)
 
+    artifact_files = _ArtifactFileJournal()
     with store.connect() as conn:
-        current_revision = store.get_revision(conn)
+        # Serialize the revision check with the mutation.  Reading the revision
+        # before taking the write lock lets two simultaneous patches both accept
+        # the same base revision and then commit conflicting revision N+1 rows.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current_revision = store.get_revision(conn)
+        except Exception as exc:
+            conn.rollback()
+            current_revision = _safe_revision(store)
+            lock_errors = [str(exc)]
+            _record_patch_rejection(store, patch, patch_id, lock_errors, kind="exception")
+            return PatchOutcome(False, current_revision, patch_id, lock_errors)
         if int(patch["base_revision"]) != current_revision:
             stale_errors = [f"stale patch: base_revision {patch['base_revision']} != current_revision {current_revision}"]
+            conn.rollback()
             _record_patch_rejection(store, patch, patch_id, stale_errors, kind="stale_base_revision")
             return PatchOutcome(False, current_revision, patch_id, stale_errors)
 
         try:
-            conn.execute("BEGIN IMMEDIATE")
             verification_debt_reconciliations = _resolve_stale_verified_entity_debts(conn)
+            counterexample_debt_reconciliations = _resolve_confirmed_counterexample_debts(conn)
             pending_owners = _owners_created_by_patch(patch["operations"])
             for op in patch["operations"]:
-                _apply_operation(conn, store, patch, op, pending_owners=pending_owners)
+                _apply_operation(
+                    conn,
+                    store,
+                    patch,
+                    op,
+                    pending_owners=pending_owners,
+                    artifact_files=artifact_files,
+                )
 
             # No-hanging-proofs invariant: every proven claim is kept verifier-ready.
             _ensure_proven_claims_routed(conn)
             _ensure_verified_statement_repairs_supersede_stale_work(conn)
             verification_debt_reconciliations.extend(_resolve_stale_verified_entity_debts(conn))
+            counterexample_debt_reconciliations.extend(_resolve_confirmed_counterexample_debts(conn))
             integration_reconciliations = _reconcile_invalid_integrations(conn)
 
             invariant_errors = validate_conn(conn)
@@ -612,13 +753,23 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
                     "stale_verification_debt_resolved",
                     {"changes": verification_debt_reconciliations},
                 )
+            if counterexample_debt_reconciliations:
+                store.write_event(
+                    conn,
+                    new_revision,
+                    "confirmed_counterexample_debt_resolved",
+                    {"changes": counterexample_debt_reconciliations},
+                )
             conn.commit()
+            artifact_files.commit()
         except PatchRejected as exc:
             conn.rollback()
+            artifact_files.rollback()
             _record_patch_rejection(store, patch, patch_id, exc.errors, kind="guard_rejected")
             return PatchOutcome(False, current_revision, patch_id, exc.errors)
         except Exception as exc:  # keep caller-facing error structured
             conn.rollback()
+            artifact_files.rollback()
             _record_patch_rejection(store, patch, patch_id, [str(exc)], kind="exception")
             return PatchOutcome(False, current_revision, patch_id, [str(exc)])
 
@@ -638,10 +789,14 @@ def reconcile_integrated_claims(store: ProofStateStore) -> Dict[str, Any]:
 
     patch_id = f"integration-reconcile-{uuid.uuid4().hex[:12]}"
     with store.connect() as conn:
-        current_revision = store.get_revision(conn)
         try:
+            # Reconciliation writes a synthetic patch and advances the same
+            # revision counter as normal patches, so its revision read must be
+            # serialized with those writers as well.
             conn.execute("BEGIN IMMEDIATE")
+            current_revision = store.get_revision(conn)
             changes = _resolve_stale_verified_entity_debts(conn)
+            changes.extend(_resolve_confirmed_counterexample_debts(conn))
             changes.extend(_reconcile_invalid_integrations(conn))
             if not changes:
                 conn.rollback()
@@ -886,6 +1041,7 @@ def _normalize_patch_aliases(patch: Dict[str, Any]) -> Dict[str, Any]:
 
     normalized_operations: list[Any] = []
     integration_evidence_ids: list[str] = []
+    integration_resolved_debt_ids: list[str] = []
     blocking_verification_evidence_ids: list[str] = []
     for op in operations:
         if not isinstance(op, dict):
@@ -969,6 +1125,9 @@ def _normalize_patch_aliases(patch: Dict[str, Any]) -> Dict[str, Any]:
                         blocking_verification_evidence_ids.append(artifact_id)
             if normalized_op.get("artifact_type") == "integration_report" and normalized_op.get("artifact_id"):
                 integration_evidence_ids.append(str(normalized_op["artifact_id"]))
+                metadata = normalized_op.get("metadata")
+                if isinstance(metadata, Mapping):
+                    integration_resolved_debt_ids.extend(_string_list(metadata.get("resolved_debt_ids")))
         if kind in {"add_claim", "add_route", "add_inference"}:
             nested_key = {"add_claim": "claim", "add_route": "route", "add_inference": "inference"}[kind]
             if isinstance(normalized_op.get(nested_key), dict):
@@ -1017,6 +1176,16 @@ def _normalize_patch_aliases(patch: Dict[str, Any]) -> Dict[str, Any]:
                 and integration_evidence_ids
             ):
                 normalized_op["evidence_artifact_ids"] = list(integration_evidence_ids)
+            if (
+                normalized_op.get("target_type") == "claim"
+                and normalized_op.get("status_type") == "lifecycle"
+                and normalized_op.get("new_status") == "integrated"
+                and not normalized_op.get("resolved_debt_ids")
+                and integration_resolved_debt_ids
+            ):
+                # Keep stale-row conflict detection aligned with the apply-time
+                # fallback that reads resolved ids from integration metadata.
+                normalized_op["resolved_debt_ids"] = sorted(set(integration_resolved_debt_ids))
         normalized_operations.append(normalized_op)
     if str(normalized.get("actor_role") or "") == "strict_informal_verifier" and blocking_verification_evidence_ids:
         target_id = str(normalized.get("target_id") or "")
@@ -1041,8 +1210,78 @@ def _normalize_patch_aliases(patch: Dict[str, Any]) -> Dict[str, Any]:
                     "reason": "strict verification found a blocking error or gap",
                 }
             )
+    _bind_evidence_targets(normalized_operations, normalized)
     normalized["operations"] = normalized_operations
     return normalized
+
+
+def _bind_evidence_targets(operations: Sequence[Any], patch: Mapping[str, Any]) -> None:
+    """Stamp evidence with the exact entities it is allowed to certify.
+
+    The stamp is derived only from transitions that cite the artifact.  This
+    preserves convenient same-patch verifier output while preventing a report
+    from being replayed later against an unrelated claim or inference.
+    """
+
+    transitions = [
+        op
+        for op in operations
+        if isinstance(op, dict) and str(op.get("op") or "") == "propose_status_transition"
+    ]
+    patch_evidence = {str(item) for item in (patch.get("evidence_artifact_ids") or []) if str(item)}
+    for op in operations:
+        if not isinstance(op, dict) or str(op.get("op") or "") not in {"attach_artifact", "add_artifact"}:
+            continue
+        if str(op.get("artifact_type") or "") not in _VERIFICATION_EVIDENCE_ARTIFACT_TYPES:
+            continue
+        artifact_id = str(op.get("artifact_id") or "")
+        if not artifact_id:
+            continue
+        metadata = dict(op.get("metadata") or {}) if isinstance(op.get("metadata"), Mapping) else {}
+        targets = list(evidence_targets(metadata))
+        for transition in transitions:
+            cited = {
+                str(item)
+                for item in (transition.get("evidence_artifact_ids") or patch_evidence)
+                if str(item)
+            }
+            if artifact_id not in cited:
+                continue
+            target_id = str(transition.get("target_id") or "").strip()
+            if not target_id:
+                continue
+            targets.append(
+                {
+                    "target_type": str(transition.get("target_type") or "claim"),
+                    "target_id": target_id,
+                    "route_id": str(transition.get("route_id") or ""),
+                }
+            )
+        if not targets:
+            patch_target = str(op.get("target_id") or patch.get("target_id") or "").strip()
+            if patch_target:
+                targets.append(
+                    {
+                        "target_type": "claim",
+                        "target_id": patch_target,
+                        "route_id": str(op.get("route_id") or patch.get("route_id") or ""),
+                    }
+                )
+        if targets:
+            unique = {
+                (
+                    str(target.get("target_type") or "claim"),
+                    str(target.get("target_id") or ""),
+                    str(target.get("route_id") or ""),
+                )
+                for target in targets
+                if str(target.get("target_id") or "")
+            }
+            metadata["evidence_targets"] = [
+                {"target_type": target_type, "target_id": target_id, "route_id": route_id}
+                for target_type, target_id, route_id in sorted(unique)
+            ]
+            op["metadata"] = metadata
 
 
 def _derive_artifact_id(op: Mapping[str, Any], patch: Mapping[str, Any]) -> str:
@@ -1217,13 +1456,13 @@ def _backfill_verification_metadata(op: Dict[str, Any]) -> None:
 
 def _normalize_route_fields(op: Dict[str, Any]) -> None:
     if "conclusion_claim_id" not in op:
-        for alias in ("target_claim_id", "claim_id", "target_id"):
+        for alias in ("conclusion_id", "target_claim_id", "claim_id", "target_id"):
             value = op.get(alias)
             if isinstance(value, str) and value:
                 op["conclusion_claim_id"] = value
                 break
     if "strategy" not in op:
-        for alias in ("proof_obligation", "argument_summary", "summary"):
+        for alias in ("proof_obligation", "argument_summary", "summary", "description", "method", "justification"):
             value = op.get(alias)
             if isinstance(value, str) and value.strip():
                 op["strategy"] = value
@@ -1234,20 +1473,38 @@ def _normalize_route_fields(op: Dict[str, Any]) -> None:
             if isinstance(value, str) and value.strip():
                 op["label"] = value
                 break
+    if "relation_to_parent" not in op:
+        for alias in ("sufficiency", "relation_to_target"):
+            value = op.get(alias)
+            if isinstance(value, str) and value.strip() in ROUTE_RELATIONS:
+                op["relation_to_parent"] = value.strip()
+                break
+    if "status" not in op:
+        value = op.get("lifecycle_status")
+        if isinstance(value, str) and value.strip() in ROUTE_STATUSES:
+            op["status"] = value.strip()
 
 
 def _normalize_inference_fields(op: Dict[str, Any]) -> None:
     if "conclusion_claim_id" not in op:
-        for alias in ("target_claim_id", "claim_id", "target_id"):
+        for alias in ("conclusion_id", "target_claim_id", "claim_id", "target_id"):
             value = op.get(alias)
             if isinstance(value, str) and value:
                 op["conclusion_claim_id"] = value
                 break
     if "explanation" not in op:
-        for alias in ("argument_summary", "proof_obligation", "summary"):
+        for alias in ("argument_summary", "proof_obligation", "summary", "description", "method", "justification"):
             value = op.get(alias)
             if isinstance(value, str) and value.strip():
                 op["explanation"] = value
+                break
+    if "premise_claim_ids" not in op and isinstance(op.get("premise_ids"), list):
+        op["premise_claim_ids"] = list(op["premise_ids"])
+    if "validation_status" not in op:
+        for alias in ("status", "lifecycle_status"):
+            value = op.get(alias)
+            if isinstance(value, str) and value.strip() in INFERENCE_STATUSES:
+                op["validation_status"] = value.strip()
                 break
 
 
@@ -1372,12 +1629,13 @@ def _apply_operation(
     op: Dict[str, Any],
     *,
     pending_owners: Mapping[str, set[str]] | None = None,
+    artifact_files: _ArtifactFileJournal,
 ) -> None:
     kind = op["op"]
     if kind == "attach_artifact":
-        _attach_artifact(conn, store, patch, _normalize_artifact_operation(op))
+        _attach_artifact(conn, store, patch, _normalize_artifact_operation(op), artifact_files=artifact_files)
     elif kind == "add_artifact":
-        _attach_artifact(conn, store, patch, _normalize_artifact_operation(op))
+        _attach_artifact(conn, store, patch, _normalize_artifact_operation(op), artifact_files=artifact_files)
     elif kind == "add_claim":
         if isinstance(op.get("claim"), dict):
             normalized = dict(op["claim"])
@@ -1421,7 +1679,7 @@ def _apply_operation(
     elif kind == "certify_external_citation":
         if patch["actor_role"] != "strict_informal_verifier":
             raise PatchRejected(["certify_external_citation requires strict_informal_verifier actor"])
-        _certify_external_citation(conn, store, patch, op)
+        _certify_external_citation(conn, store, patch, op, artifact_files=artifact_files)
     else:
         raise PatchRejected([f"unknown operation: {kind}"])
 
@@ -1457,6 +1715,8 @@ def _certify_external_citation(
     store: ProofStateStore,
     patch: Dict[str, Any],
     op: Dict[str, Any],
+    *,
+    artifact_files: _ArtifactFileJournal,
 ) -> None:
     """Turn an exact, checked theorem citation into ordinary verifier evidence.
 
@@ -1545,6 +1805,10 @@ def _certify_external_citation(
         "implication_verified": True,
         "hidden_assumptions": False,
         "extra_assumptions": [],
+        "evidence_targets": [
+            {"target_type": "claim", "target_id": target_id, "route_id": route_id},
+            {"target_type": "inference", "target_id": inference_id, "route_id": route_id},
+        ],
         "verification_report": {
             "summary": summary,
             "checked_items": checked_items,
@@ -1566,6 +1830,7 @@ def _certify_external_citation(
             "metadata": metadata,
             "content_summary": summary,
         },
+        artifact_files=artifact_files,
     )
 
     now = utc_now()
@@ -1709,7 +1974,14 @@ def _resolve_external_citation_debts(
         )
 
 
-def _attach_artifact(conn: sqlite3.Connection, store: ProofStateStore, patch: Dict[str, Any], op: Dict[str, Any]) -> None:
+def _attach_artifact(
+    conn: sqlite3.Connection,
+    store: ProofStateStore,
+    patch: Dict[str, Any],
+    op: Dict[str, Any],
+    *,
+    artifact_files: _ArtifactFileJournal,
+) -> None:
     artifact_id = _required(op, "artifact_id")
     if store.row_exists(conn, "artifacts", "artifact_id", artifact_id):
         raise PatchRejected([f"artifact already exists: {artifact_id}"])
@@ -1723,17 +1995,25 @@ def _attach_artifact(conn: sqlite3.Connection, store: ProofStateStore, patch: Di
         raise PatchRejected(["artifact metadata must be an object"])
     metadata = _compact_artifact_metadata(artifact_type, metadata)
     metadata = _prepare_revision_document_metadata(conn, actor, artifact_type, metadata)
+    content = _artifact_inline_content(op)
     strategy_errors = strategic_artifact_errors(
         conn,
         artifact_type=artifact_type,
         metadata=metadata,
+        content=content,
         actor_role=actor,
         base_revision=int(patch["base_revision"]),
     )
     if strategy_errors:
         raise PatchRejected(strategy_errors)
-    content = _artifact_inline_content(op)
-    path = _validated_artifact_path(store, op.get("path", ""))
+    path = _validated_artifact_path(
+        store,
+        op.get("path", ""),
+        allow_writer_context_staging=(
+            actor == "writer" and artifact_type in WRITER_PATH_ATTACH_ARTIFACT_TYPES
+        ),
+        artifact_id=artifact_id,
+    )
     if content is not None and path:
         raise PatchRejected(["attach_artifact with inline content must omit path; the proof-state store writes artifacts under state_dir/artifacts"])
     if path and actor == "writer" and artifact_type == REVISION_DOCUMENT_ARTIFACT_TYPE:
@@ -1762,9 +2042,18 @@ def _attach_artifact(conn: sqlite3.Connection, store: ProofStateStore, patch: Di
     _guard_writer_generation_residue(actor, artifact_type, content)
     _guard_writer_paper_register(artifact_type, content)
     _guard_writing_review_metadata(artifact_type, artifact_id, metadata)
+    if content is not None or path:
+        metadata = {
+            **metadata,
+            "integrity": {"algorithm": "sha256", "scope": "file_bytes", "version": 1},
+        }
     # Always recompute the digest: a caller-supplied sha256 was trusted verbatim
     # here, letting an agent bypass duplicate-artifact rejection with a bogus hash.
-    digest = artifact_hash(content=content, metadata=metadata)
+    digest = artifact_hash(
+        path=Path(path) if path and content is None else None,
+        content=content,
+        metadata=metadata,
+    )
     if _should_dedupe_artifact(artifact_type, metadata):
         duplicate = conn.execute(
             """
@@ -1780,15 +2069,41 @@ def _attach_artifact(conn: sqlite3.Connection, store: ProofStateStore, patch: Di
         # Inline content, or a writer's staged file: the recorded artifact must
         # point at the store-managed copy under state_dir/artifacts with the
         # standard naming/extension, never at the mutable staging file.
-        path = str(_write_artifact_content(store, artifact_id, artifact_type, content, metadata=metadata))
+        path = str(
+            _write_artifact_content(
+                store,
+                artifact_id,
+                artifact_type,
+                content,
+                metadata=metadata,
+                artifact_files=artifact_files,
+            )
+        )
+    elif content is None and path:
+        path = str(
+            _copy_artifact_file(
+                store,
+                artifact_id,
+                artifact_type,
+                Path(path),
+                artifact_files=artifact_files,
+            )
+        )
     if actor == "writer" and content is not None and path:
-        if artifact_type == "final_paper" or (
+        artifact_path = Path(path)
+        for sidecar_path in (
+            artifact_path.with_suffix(".tex"),
+            artifact_path.with_suffix(".pdf"),
+            artifact_path.with_suffix(".latex.log"),
+        ):
+            artifact_files.capture(sidecar_path)
+        if artifact_type in {"final_paper", "human_readable_mathematical_text"} or (
             artifact_type == REVISION_DOCUMENT_ARTIFACT_TYPE
             and str(metadata.get("document_format") or "") == "tex"
         ):
             # The final_paper's content IS LaTeX source already stored as .tex;
             # compile it directly — no markdown->LaTeX conversion pass.
-            sidecars = compile_latex_artifact(Path(path), Path(path).with_suffix(".pdf"))
+            sidecars = compile_latex_artifact(artifact_path, artifact_path.with_suffix(".pdf"))
         else:
             sidecars = write_latex_pdf_sidecars(path, content, title=_writer_artifact_title(artifact_id, artifact_type))
         # Persist the LaTeX compile outcome so the writing gate can tell whether
@@ -1797,6 +2112,9 @@ def _attach_artifact(conn: sqlite3.Connection, store: ProofStateStore, patch: Di
         pdf_status = str(sidecars.get("pdf_status") or "")
         if pdf_status:
             metadata = {**metadata, "pdf_status": pdf_status}
+            pdf_path = str(sidecars.get("pdf_path") or "")
+            if pdf_path:
+                metadata["pdf_path"] = pdf_path
             log_path = str(sidecars.get("latex_log_path") or "")
             if log_path:
                 metadata["latex_log_path"] = log_path
@@ -1960,7 +2278,9 @@ def _guard_writer_references(actor: str, artifact_type: str, content: Optional[s
 def _guard_writer_mathematical_exposition(actor: str, artifact_type: str, content: Optional[str]) -> None:
     if actor != "writer" or content is None:
         return
-    if artifact_type not in WRITER_REFERENCE_REQUIRED_ARTIFACT_TYPES:
+    if artifact_type not in (
+        WRITER_REFERENCE_REQUIRED_ARTIFACT_TYPES | {"human_readable_mathematical_text"}
+    ):
         return
     if _looks_like_raw_writer_ledger_dump(content):
         raise PatchRejected(
@@ -2014,7 +2334,7 @@ def _normalize_writer_latex_escaping(artifact_type: str, content: Optional[str])
     (doubled tabular row breaks) are protected so they collapse back to the
     row-break double backslash.
     """
-    if artifact_type != "final_paper" or not content:
+    if artifact_type not in {"final_paper", "human_readable_mathematical_text"} or not content:
         return content
     if "\\\\documentclass" not in content:
         return content
@@ -2034,7 +2354,7 @@ def _normalize_writer_paper_template(artifact_type: str, content: Optional[str])
     stored .tex, the compile sidecar, and the writing gate all see the
     normalized document. Idempotent: an already-house paper is unchanged.
     """
-    if artifact_type != "final_paper" or not content:
+    if artifact_type not in {"final_paper", "human_readable_mathematical_text"} or not content:
         return content
     return normalize_paper_template(content)
 
@@ -2755,15 +3075,43 @@ def _status_transition(conn: sqlite3.Connection, patch: Dict[str, Any], op: Dict
 
     if new_status in {"informally_verified", "formally_verified", "refuted"}:
         _guard_verifying_actor(actor, new_status, target_type, target_id)
-    if new_status == "informally_verified" and not _has_correct_verification(conn, evidence_ids, producer_role="strict_informal_verifier"):
+    if new_status == "informally_verified" and not _has_clean_verification(
+        conn,
+        evidence_ids,
+        outcome="positive",
+        target_type=target_type,
+        target_id=target_id,
+        producer_role="strict_informal_verifier",
+    ):
         raise PatchRejected(["informally_verified requires a strict_informal_verifier verification_report artifact with zero errors and gaps"])
-    if new_status == "formally_verified" and not _has_artifact_type(conn, evidence_ids, "formal_backend_result", producer_role="formal_backend"):
+    if new_status == "formally_verified" and not _has_artifact_type(
+        conn,
+        evidence_ids,
+        "formal_backend_result",
+        target_type=target_type,
+        target_id=target_id,
+        producer_role="formal_backend",
+    ):
         raise PatchRejected(["formally_verified requires formal_backend_result evidence produced by formal_backend"])
     if new_status == "refuted":
-        has_confirmed_counterexample = _has_artifact_type(conn, evidence_ids, "confirmed_counterexample", producer_role="counterexample_validator")
+        has_confirmed_counterexample = _has_artifact_type(
+            conn,
+            evidence_ids,
+            "confirmed_counterexample",
+            target_type=target_type,
+            target_id=target_id,
+            producer_role="counterexample_validator",
+        )
         has_strict_refutation_report = (
             actor == "strict_informal_verifier"
-            and _has_correct_verification(conn, evidence_ids, producer_role="strict_informal_verifier")
+            and _has_clean_verification(
+                conn,
+                evidence_ids,
+                outcome="refutation",
+                target_type=target_type,
+                target_id=target_id,
+                producer_role="strict_informal_verifier",
+            )
         )
         if not has_confirmed_counterexample and not has_strict_refutation_report:
             raise PatchRejected(["refuted requires confirmed_counterexample evidence or a zero-gap strict_informal_verifier verification_report"])
@@ -2774,7 +3122,18 @@ def _status_transition(conn: sqlite3.Connection, patch: Dict[str, Any], op: Dict
         if target_type != "claim":
             raise PatchRejected(["only claims can receive integrated lifecycle status"])
         resolved_debt_ids = _integration_resolved_debt_ids(conn, op, evidence_ids)
-        _guard_integration(conn, target_id, op.get("route_id"), evidence_ids, resolved_debt_ids=resolved_debt_ids)
+        resolved_debt_justifications = _integration_resolved_debt_justifications(
+            conn,
+            evidence_ids,
+        )
+        _guard_integration(
+            conn,
+            target_id,
+            op.get("route_id"),
+            evidence_ids,
+            resolved_debt_ids=resolved_debt_ids,
+            resolved_debt_justifications=resolved_debt_justifications,
+        )
         conn.execute("UPDATE routes SET status = 'integrated', updated_at = ? WHERE route_id = ?", (utc_now(), op.get("route_id")))
         _resolve_integration_debts(
             conn,
@@ -2782,6 +3141,7 @@ def _status_transition(conn: sqlite3.Connection, patch: Dict[str, Any], op: Dict
             claim_id=target_id,
             route_id=str(op.get("route_id") or ""),
             evidence_ids=evidence_ids,
+            resolved_debt_justifications=resolved_debt_justifications,
         )
 
     if target_type == "claim":
@@ -2828,6 +3188,7 @@ def _guard_integration(
     evidence_ids: Sequence[str],
     *,
     resolved_debt_ids: Sequence[str] = (),
+    resolved_debt_justifications: Mapping[str, str] | None = None,
 ) -> None:
     if not route_id:
         raise PatchRejected(["integration requires route_id"])
@@ -2856,6 +3217,22 @@ def _guard_integration(
         )
     )
     resolved = set(resolved_debt_ids)
+    justifications = resolved_debt_justifications or {}
+    route_inference_ids = {str(inf["inference_id"] or "") for inf in inferences}
+    for debt_id in sorted(resolved):
+        debt = conn.execute(
+            "SELECT * FROM debts WHERE debt_id = ?",
+            (debt_id,),
+        ).fetchone()
+        if debt is None:
+            raise PatchRejected([f"unknown resolved_debt_id for integration: {debt_id}"])
+        _guard_integration_debt_resolution(
+            debt,
+            claim_id=claim_id,
+            route_id=route_id,
+            route_inference_ids=route_inference_ids,
+            justification=str(justifications.get(debt_id) or ""),
+        )
     clean_verification_by_owner = _clean_verification_times_for_route(conn, conclusion, inferences)
     if any(
         _debt_blocks_integration(
@@ -2907,6 +3284,61 @@ def _integration_resolved_debt_ids(conn: sqlite3.Connection, op: Mapping[str, An
     return sorted(set(ids))
 
 
+def _integration_resolved_debt_justifications(
+    conn: sqlite3.Connection,
+    evidence_ids: Sequence[str],
+) -> Dict[str, str]:
+    """Read verifier-authored debt explanations from integration evidence."""
+
+    result: Dict[str, str] = {}
+    for artifact_id in evidence_ids:
+        row = conn.execute(
+            "SELECT artifact_type, metadata_json FROM artifacts WHERE artifact_id = ?",
+            (artifact_id,),
+        ).fetchone()
+        if not row or row["artifact_type"] != "integration_report":
+            continue
+        metadata = json_loads(row["metadata_json"], {})
+        raw = metadata.get("resolved_debt_justifications") if isinstance(metadata, Mapping) else None
+        if not isinstance(raw, Mapping):
+            continue
+        for debt_id, explanation in raw.items():
+            text = str(explanation or "").strip()
+            if text:
+                result[str(debt_id)] = text
+    return result
+
+
+def _guard_integration_debt_resolution(
+    debt: sqlite3.Row,
+    *,
+    claim_id: str,
+    route_id: str,
+    route_inference_ids: set[str],
+    justification: str,
+) -> None:
+    debt_id = str(debt["debt_id"] or "")
+    owner_id = str(debt["owner_id"] or "")
+    suggested = str(debt["suggested_next_target"] or "")
+    directly_owned = owner_id in {claim_id, route_id, *route_inference_ids} or suggested in {
+        claim_id,
+        route_id,
+        *route_inference_ids,
+    }
+    if directly_owned:
+        return
+    root_owned = owner_id == "root" or suggested == "root"
+    if not root_owned:
+        raise PatchRejected([f"integration cannot resolve unrelated debt: {debt_id}"])
+    if len(" ".join(justification.split())) < 40:
+        raise PatchRejected(
+            [
+                f"integration resolving upstream/root debt {debt_id} requires a precise "
+                "integration_report metadata.resolved_debt_justifications explanation"
+            ]
+        )
+
+
 def _resolve_integration_debts(
     conn: sqlite3.Connection,
     debt_ids: Sequence[str],
@@ -2914,6 +3346,7 @@ def _resolve_integration_debts(
     claim_id: str,
     route_id: str,
     evidence_ids: Sequence[str],
+    resolved_debt_justifications: Mapping[str, str] | None = None,
 ) -> None:
     if not debt_ids:
         return
@@ -2921,7 +3354,7 @@ def _resolve_integration_debts(
         row["inference_id"]
         for row in conn.execute("SELECT inference_id FROM inferences WHERE route_id = ?", (route_id,))
     }
-    allowed_owner_ids = {claim_id, route_id, *route_inference_ids}
+    justifications = resolved_debt_justifications or {}
     now = utc_now()
     for debt_id in debt_ids:
         row = conn.execute("SELECT * FROM debts WHERE debt_id = ?", (debt_id,)).fetchone()
@@ -2929,8 +3362,13 @@ def _resolve_integration_debts(
             raise PatchRejected([f"unknown resolved_debt_id for integration: {debt_id}"])
         suggested = str(row["suggested_next_target"] or "")
         owner_id = str(row["owner_id"] or "")
-        if owner_id not in allowed_owner_ids and suggested not in {claim_id, route_id, *route_inference_ids}:
-            raise PatchRejected([f"integration cannot resolve unrelated debt: {debt_id}"])
+        _guard_integration_debt_resolution(
+            row,
+            claim_id=claim_id,
+            route_id=route_id,
+            route_inference_ids={str(item) for item in route_inference_ids},
+            justification=str(justifications.get(str(debt_id)) or ""),
+        )
         evidence = json_loads(row["resolution_evidence_json"], {})
         if not isinstance(evidence, dict):
             evidence = {}
@@ -2941,6 +3379,7 @@ def _resolve_integration_debts(
                 "claim_id": claim_id,
                 "route_id": route_id,
                 "evidence_artifact_ids": list(evidence_ids),
+                "resolution_justification": str(justifications.get(str(debt_id)) or ""),
             }
         )
         conn.execute(
@@ -2952,6 +3391,9 @@ def _resolve_integration_debts(
 def _latest_clean_claim_verification_at(
     conn: sqlite3.Connection,
     evidence_ids: Sequence[str],
+    *,
+    target_type: str,
+    target_id: str,
 ) -> str:
     """Timestamp of the newest clean verifier/formal certificate on an entity."""
     latest = ""
@@ -2967,9 +3409,12 @@ def _latest_clean_claim_verification_at(
         clean = (
             artifact_type == "verification_report"
             and producer_role == "strict_informal_verifier"
-            and _has_correct_verification(
+            and _has_clean_verification(
                 conn,
                 [artifact_id],
+                outcome="positive",
+                target_type=target_type,
+                target_id=target_id,
                 producer_role="strict_informal_verifier",
             )
         ) or (
@@ -2991,13 +3436,138 @@ def _clean_verification_times_for_route(
         times[str(claim["claim_id"] or "")] = _latest_clean_claim_verification_at(
             conn,
             json_loads(claim["evidence_artifact_ids_json"], []),
+            target_type="claim",
+            target_id=str(claim["claim_id"] or ""),
         )
     for inference in inferences:
         times[str(inference["inference_id"] or "")] = _latest_clean_claim_verification_at(
             conn,
             json_loads(inference["evidence_artifact_ids_json"], []),
+            target_type="inference",
+            target_id=str(inference["inference_id"] or ""),
         )
     return times
+
+
+def _resolve_confirmed_counterexample_debts(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Close candidate-validation debts covered by a durable confirmation.
+
+    Legacy validator packets did not record ``candidate_artifact_id``.  For
+    those packets, associate the confirmation only with the newest earlier
+    candidate for the same target.  A later candidate remains independent and
+    must still be validated.
+    """
+
+    candidates = list(
+        conn.execute(
+            """
+            SELECT artifact_id, state_revision, metadata_json
+            FROM artifacts
+            WHERE artifact_type = 'candidate_counterexample'
+            ORDER BY state_revision ASC, created_at ASC
+            """
+        )
+    )
+    candidate_by_id = {str(row["artifact_id"] or ""): row for row in candidates}
+    confirmations = list(
+        conn.execute(
+            """
+            SELECT artifact_id, state_revision, metadata_json
+            FROM artifacts
+            WHERE artifact_type = 'confirmed_counterexample'
+            ORDER BY state_revision ASC, created_at ASC
+            """
+        )
+    )
+    changes: List[Dict[str, Any]] = []
+    for confirmation in confirmations:
+        metadata = json_loads(confirmation["metadata_json"], {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        raw_refs: list[Any] = []
+        for key in (
+            "candidate_artifact_id",
+            "candidate_counterexample_artifact_id",
+            "source_artifact_id",
+            "source_artifact_ids",
+            "evidence_artifact_ids",
+            "evidence_paths",
+        ):
+            raw = metadata.get(key)
+            raw_refs.extend(raw if isinstance(raw, list) else [raw])
+        candidate_ids = {
+            candidate_id
+            for candidate_id in candidate_by_id
+            if any(candidate_id == str(ref or "") or candidate_id in str(ref or "") for ref in raw_refs)
+        }
+        target_id = str(metadata.get("target_claim_id") or metadata.get("target_id") or "")
+        if not candidate_ids:
+            eligible = []
+            for candidate in candidates:
+                candidate_metadata = json_loads(candidate["metadata_json"], {})
+                if not isinstance(candidate_metadata, dict):
+                    continue
+                if str(candidate_metadata.get("target_id") or "") != target_id:
+                    continue
+                if int(candidate["state_revision"] or 0) > int(confirmation["state_revision"] or 0):
+                    continue
+                eligible.append(candidate)
+            if eligible:
+                newest = max(
+                    eligible,
+                    key=lambda row: (int(row["state_revision"] or 0), str(row["artifact_id"] or "")),
+                )
+                candidate_ids.add(str(newest["artifact_id"] or ""))
+        for candidate_id in sorted(candidate_ids):
+            candidate = candidate_by_id.get(candidate_id)
+            if not candidate:
+                continue
+            candidate_metadata = json_loads(candidate["metadata_json"], {})
+            if not isinstance(candidate_metadata, dict):
+                candidate_metadata = {}
+            candidate_target = str(candidate_metadata.get("target_id") or target_id)
+            debts = list(
+                conn.execute(
+                    """
+                    SELECT * FROM debts
+                    WHERE status = 'active'
+                      AND debt_type = 'counterexample_validation'
+                      AND (owner_id = ? OR suggested_next_target = ?)
+                    """,
+                    (candidate_target, candidate_target),
+                )
+            )
+            for debt in debts:
+                source_ids = {str(item) for item in json_loads(debt["source_artifact_ids_json"], [])}
+                if candidate_id not in source_ids and candidate_id not in str(debt["obligation"] or ""):
+                    continue
+                evidence = json_loads(debt["resolution_evidence_json"], {})
+                if not isinstance(evidence, dict):
+                    evidence = {}
+                evidence.update(
+                    {
+                        "resolved_by": "system",
+                        "resolution_status": "closed_by_confirmed_counterexample",
+                        "candidate_artifact_id": candidate_id,
+                        "confirmed_counterexample_artifact_id": str(confirmation["artifact_id"] or ""),
+                    }
+                )
+                conn.execute(
+                    "UPDATE debts SET status = 'resolved', last_seen = ?, resolution_evidence_json = ? WHERE debt_id = ?",
+                    (utc_now(), json_dumps(evidence), debt["debt_id"]),
+                )
+                changes.append(
+                    {
+                        "entity_type": "debt",
+                        "entity_id": str(debt["debt_id"] or ""),
+                        "from_status": "active",
+                        "to_status": "resolved",
+                        "reason": "covered by durable confirmed counterexample",
+                        "candidate_artifact_id": candidate_id,
+                        "confirmed_counterexample_artifact_id": str(confirmation["artifact_id"] or ""),
+                    }
+                )
+    return changes
 
 
 def _resolve_stale_verified_entity_debts(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -3025,6 +3595,8 @@ def _resolve_stale_verified_entity_debts(conn: sqlite3.Connection) -> List[Dict[
             clean_verification_at = _latest_clean_claim_verification_at(
                 conn,
                 json_loads(row["evidence_artifact_ids_json"], []),
+                target_type=owner_type,
+                target_id=entity_id,
             )
             if not clean_verification_at:
                 continue
@@ -3420,12 +3992,37 @@ def _update_route(conn: sqlite3.Connection, op: Dict[str, Any]) -> None:
         if status == "abandoned":
             _guard_debt_bearing_route_not_abandoned(conn, route_id)
 
+    relation = op.get("relation_to_parent")
+    if relation is not None and relation not in ROUTE_RELATIONS:
+        raise PatchRejected([f"invalid route relation: {relation}"])
+
+    strategy = op.get("strategy")
+    if isinstance(strategy, str) and strategy.strip() and strategy != row["strategy"]:
+        existing_routes = [
+            dict(existing)
+            for existing in conn.execute(
+                "SELECT route_id, conclusion_claim_id, relation_to_parent, strategy FROM routes WHERE conclusion_claim_id = ? AND route_id != ?",
+                (row["conclusion_claim_id"], route_id),
+            ).fetchall()
+        ]
+        duplicate_route = obvious_duplicate_route_id(
+            existing_routes,
+            conclusion_claim_id=row["conclusion_claim_id"],
+            relation_to_parent=relation or row["relation_to_parent"],
+            strategy=strategy,
+        )
+        if duplicate_route:
+            raise PatchRejected([f"duplicate route strategy matches existing route {duplicate_route}; reuse or repair that route"])
+
     evidence_ids = sorted(set(json_loads(row["evidence_artifact_ids_json"]) + list(op.get("evidence_artifact_ids", []))))
     new_failure_fingerprint = str(op.get("failure_fingerprint") or row["failure_fingerprint"] or "")
     conn.execute(
         """
         UPDATE routes
         SET status = COALESCE(?, status),
+            label = COALESCE(?, label),
+            strategy = COALESCE(?, strategy),
+            relation_to_parent = COALESCE(?, relation_to_parent),
             failure_fingerprint = ?,
             evidence_artifact_ids_json = ?,
             updated_at = ?
@@ -3433,6 +4030,9 @@ def _update_route(conn: sqlite3.Connection, op: Dict[str, Any]) -> None:
         """,
         (
             status,
+            op.get("label"),
+            strategy,
+            relation,
             new_failure_fingerprint,
             json_dumps(evidence_ids),
             utc_now(),
@@ -3780,7 +4380,12 @@ def _compact_artifact_metadata(artifact_type: str, metadata: Dict[str, Any]) -> 
         if "notes" in compact:
             compact["notes"] = _compact_text(compact["notes"], 600)
         return compact
-    if artifact_type in {"final_proof", "final_paper", REVISION_DOCUMENT_ARTIFACT_TYPE}:
+    if artifact_type in {
+        "final_proof",
+        "final_paper",
+        "human_readable_mathematical_text",
+        REVISION_DOCUMENT_ARTIFACT_TYPE,
+    }:
         compact = dict(metadata)
         compact["source_artifact_ids"] = _compact_list(compact.get("source_artifact_ids", []), item_chars=120, max_items=24)
         return compact
@@ -3806,12 +4411,16 @@ def _compact_verification_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     report = compact.get("verification_report", {})
     if not isinstance(report, dict):
         report = {}
+    critical_errors = [*_string_list(compact.get("critical_errors")), *_string_list(report.get("critical_errors"))]
+    gaps = [*_string_list(compact.get("gaps")), *_string_list(report.get("gaps"))]
     compact_report = {
         "summary": _compact_text(report.get("summary", compact.get("summary", "")), 900),
         "checked_items": _compact_list(report.get("checked_items", []), item_chars=160, max_items=12),
-        "critical_errors": _compact_list(report.get("critical_errors", []), item_chars=500, max_items=8),
-        "gaps": _compact_list(report.get("gaps", []), item_chars=500, max_items=8),
+        "critical_errors": _compact_list(critical_errors, item_chars=500, max_items=8),
+        "gaps": _compact_list(gaps, item_chars=500, max_items=8),
     }
+    if report.get("verdict"):
+        compact_report["verdict"] = str(report["verdict"])
     notes = report.get("notes")
     if notes:
         compact_report["notes"] = _compact_text(notes, 700)
@@ -3877,6 +4486,7 @@ def _write_artifact_content(
     artifact_type: str,
     content: str,
     *,
+    artifact_files: _ArtifactFileJournal,
     metadata: Optional[Mapping[str, Any]] = None,
 ) -> str:
     markdown_types = {
@@ -3913,11 +4523,33 @@ def _write_artifact_content(
     artifact_dir = store.state_dir / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     path = artifact_dir / f"{safe_id}{suffix}"
-    path.write_text(content, encoding="utf-8")
+    artifact_files.write_text(path, content)
     return str(path)
 
 
-def _validated_artifact_path(store: ProofStateStore, raw_path: Any) -> str:
+def _copy_artifact_file(
+    store: ProofStateStore,
+    artifact_id: str,
+    artifact_type: str,
+    source_path: Path,
+    *,
+    artifact_files: _ArtifactFileJournal,
+) -> Path:
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", artifact_id).strip("._") or "artifact"
+    suffix = ARTIFACT_CONTENT_EXTENSIONS.get(artifact_type) or source_path.suffix or ".txt"
+    destination = store.state_dir / "artifacts" / f"{safe_id}{suffix}"
+    if source_path.resolve() != destination.resolve():
+        artifact_files.write_bytes(destination, source_path.read_bytes())
+    return destination.resolve()
+
+
+def _validated_artifact_path(
+    store: ProofStateStore,
+    raw_path: Any,
+    *,
+    allow_writer_context_staging: bool = False,
+    artifact_id: str = "",
+) -> str:
     if raw_path in (None, ""):
         return ""
     text = str(raw_path).strip()
@@ -3929,11 +4561,35 @@ def _validated_artifact_path(store: ProofStateStore, raw_path: Any) -> str:
         candidate = store.state_dir / candidate
     try:
         resolved = candidate.resolve(strict=False)
+    except OSError:
+        raise PatchRejected([f"artifact path cannot be resolved: {candidate}"])
+    under_artifact_root = True
+    try:
         resolved.relative_to(artifact_root)
-    except (OSError, ValueError):
-        raise PatchRejected([f"artifact path must resolve under proof-state artifacts directory: {artifact_root}"])
+    except ValueError:
+        under_artifact_root = False
+    if not under_artifact_root:
+        context_root = (store.state_dir / "contexts").resolve()
+        try:
+            context_relative = resolved.relative_to(context_root)
+        except ValueError:
+            context_relative = None
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", artifact_id).strip("._") or "artifact"
+        context_staging_is_safe = bool(
+            allow_writer_context_staging
+            and context_relative is not None
+            and len(context_relative.parts) >= 2
+            and resolved.stem == safe_id
+        )
+        if not context_staging_is_safe:
+            raise PatchRejected(
+                [
+                    "artifact path must resolve under the proof-state artifacts directory, or for a path-based "
+                    f"writer artifact use a matching <artifact_id> file under {context_root}"
+                ]
+            )
     if not resolved.is_file():
-        raise PatchRejected([f"artifact path does not exist under proof-state artifacts directory: {resolved}"])
+        raise PatchRejected([f"artifact path does not exist in an allowed proof-state staging directory: {resolved}"])
     return str(resolved)
 
 
@@ -3959,29 +4615,35 @@ def _has_artifact_type(
     evidence_ids: Sequence[str],
     artifact_type: str,
     *,
+    target_type: str,
+    target_id: str,
     producer_role: Optional[str] = None,
 ) -> bool:
     for aid in evidence_ids:
-        row = conn.execute("SELECT artifact_type, producer_role FROM artifacts WHERE artifact_id = ?", (aid,)).fetchone()
+        row = conn.execute(
+            "SELECT artifact_type, producer_role, metadata_json FROM artifacts WHERE artifact_id = ?",
+            (aid,),
+        ).fetchone()
         if not row or row["artifact_type"] != artifact_type:
             continue
         if producer_role is not None and row["producer_role"] != producer_role:
+            continue
+        metadata = json_loads(row["metadata_json"], {})
+        if not _artifact_is_bound_to_entity(conn, aid, metadata, target_type=target_type, target_id=target_id):
             continue
         return True
     return False
 
 
-ZERO_GAP_VERIFICATION_VERDICTS = {
-    "correct",
-    "correct_no_gaps",
-    "correct_refutation",
-    "informally_verified",
-    "pass",
-    "verified",
-}
-
-
-def _has_correct_verification(conn: sqlite3.Connection, evidence_ids: Sequence[str], *, producer_role: Optional[str] = None) -> bool:
+def _has_clean_verification(
+    conn: sqlite3.Connection,
+    evidence_ids: Sequence[str],
+    *,
+    outcome: str,
+    target_type: str,
+    target_id: str,
+    producer_role: Optional[str] = None,
+) -> bool:
     for aid in evidence_ids:
         row = conn.execute("SELECT artifact_type, producer_role, metadata_json FROM artifacts WHERE artifact_id = ?", (aid,)).fetchone()
         if not row or row["artifact_type"] != "verification_report":
@@ -3989,11 +4651,37 @@ def _has_correct_verification(conn: sqlite3.Connection, evidence_ids: Sequence[s
         if producer_role is not None and row["producer_role"] != producer_role:
             continue
         metadata = json_loads(row["metadata_json"], {})
-        report = metadata.get("verification_report", {}) if isinstance(metadata, dict) else {}
-        verdict = str(metadata.get("verdict") or report.get("verdict") or "").strip().lower()
-        if verdict in ZERO_GAP_VERIFICATION_VERDICTS and not report.get("critical_errors") and not report.get("gaps") and not report.get("blocking_gap"):
+        if not _artifact_is_bound_to_entity(conn, aid, metadata, target_type=target_type, target_id=target_id):
+            continue
+        if clean_verification_metadata(metadata, outcome=outcome):
             return True
     return False
+
+
+def _artifact_is_bound_to_entity(
+    conn: sqlite3.Connection,
+    artifact_id: str,
+    metadata: Mapping[str, Any],
+    *,
+    target_type: str,
+    target_id: str,
+) -> bool:
+    declared_targets = evidence_targets(metadata)
+    if declared_targets:
+        return evidence_matches_target(metadata, target_type=target_type, target_id=target_id)
+    table_info = {
+        "claim": ("claims", "claim_id"),
+        "inference": ("inferences", "inference_id"),
+        "route": ("routes", "route_id"),
+    }.get(target_type)
+    if table_info is None:
+        return False
+    table, id_column = table_info
+    row = conn.execute(
+        f"SELECT evidence_artifact_ids_json FROM {table} WHERE {id_column} = ?",
+        (target_id,),
+    ).fetchone()
+    return bool(row and artifact_id in json_loads(row["evidence_artifact_ids_json"], []))
 
 
 def _integration_report_errors(
@@ -4015,6 +4703,24 @@ def _integration_report_errors(
         metadata = json_loads(row["metadata_json"], {})
         if not (metadata.get("integrates") is True or metadata.get("outcome") == "integrates"):
             continue
+        route_id = str(route["route_id"] or "")
+        bound = evidence_matches_target(
+            metadata,
+            target_type="claim",
+            target_id=claim_id,
+            route_id=route_id,
+        )
+        if not bound:
+            route_evidence = json_loads(route["evidence_artifact_ids_json"], [])
+            bound = aid in route_evidence and _artifact_is_bound_to_entity(
+                conn,
+                aid,
+                metadata,
+                target_type="claim",
+                target_id=claim_id,
+            )
+        if not bound:
+            continue
         if claim_id != "root":
             return []
         alignment = root_alignment_from_metadata(metadata)
@@ -4034,7 +4740,7 @@ def _integration_report_errors(
             return ["root integration route has extra assumptions or conditions; prove they are part of the root statement or keep the result partial"]
         return []
     if saw_report:
-        return ["integration_report evidence did not certify integrates=true"]
+        return ["integration_report evidence did not certify integrates=true for this exact claim and route"]
     return ["integration requires an integration_verifier integration_report artifact with integrates=true"]
 
 

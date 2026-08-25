@@ -39,6 +39,7 @@ RESEARCH_ARTIFACT_TYPES = {
     "verification_report",
     "integration_report",
     "final_proof",
+    "human_readable_mathematical_text",
     "partial_proof_report",
     "stop_summary_report",
     "writer_report",
@@ -876,7 +877,8 @@ def _research_artifacts(state: Mapping[str, Any]) -> list[dict[str, Any]]:
     artifacts = [row for row in state.get("artifacts", []) if row.get("artifact_type") in RESEARCH_ARTIFACT_TYPES]
     priority = {
         "final_proof": 0,
-        "partial_proof_report": 1,
+        "human_readable_mathematical_text": 1,
+        "partial_proof_report": 2,
         "integration_report": 2,
         "verification_report": 3,
         "proof_dossier": 4,

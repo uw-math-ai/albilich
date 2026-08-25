@@ -5,18 +5,17 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2 import metrics as metrics_module
-from agents.generation.phase2.console import build_run_console, build_run_console_payload
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.console import build_run_console_payload
+from agents.generation.phase2.patches import _stale_rebase_assessment, apply_patch
 from agents.generation.phase2.receipt import format_receipt_latex
 from agents.generation.phase2.report import build_markdown_report
 from agents.generation.phase2.store import ProofStateStore
@@ -47,24 +46,147 @@ def add_debt_patch(*, problem_id: str, base_revision: int, debt_id: str, obligat
 
 
 class Phase2PatchDebtTest(unittest.TestCase):
-    def test_metrics_reuses_directory_sizes_for_unchanged_revision(self) -> None:
+    def test_confirmed_counterexample_resolves_only_matching_candidate_validation_debts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = ProofStateStore("patch-metrics-cache-test", generation_root=Path(tmpdir) / "generation")
-            store.init_problem("prove the root theorem")
-            metrics_module._directory_size_at_revision.cache_clear()
-            original = metrics_module._directory_size
-            with mock.patch.object(
-                metrics_module,
-                "_directory_size",
-                wraps=original,
-            ) as directory_size:
-                first = metrics_module.compute_metrics(store)
-                first_call_count = directory_size.call_count
-                second = metrics_module.compute_metrics(store)
+            store = ProofStateStore(
+                "patch-counterexample-debt-reconciliation-test",
+                generation_root=Path(tmpdir) / "generation",
+            )
+            store.init_problem("Does an absolute bound exist? Find its minimum value.")
+            candidate = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "villain",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "candidate-k-two",
+                            "artifact_type": "candidate_counterexample",
+                            "content": "A concrete candidate against k at most two.",
+                            "metadata": {"target_id": "root", "concrete_instance": "K"},
+                        },
+                        {
+                            "op": "add_debt",
+                            "debt_id": "validate-candidate-k-two",
+                            "owner_type": "claim",
+                            "owner_id": "root",
+                            "debt_type": "counterexample_validation",
+                            "severity": "blocking",
+                            "status": "active",
+                            "obligation": "Independently validate candidate-k-two.",
+                            "source_artifact_ids": ["candidate-k-two"],
+                            "suggested_next_target": "root",
+                        },
+                    ],
+                    "rationale": "record a candidate and its validation debt",
+                },
+            )
+            self.assertTrue(candidate.accepted, candidate.errors)
+            confirmation = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 1,
+                    "actor_role": "counterexample_validator",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "legacy-confirmation-k-two",
+                            "artifact_type": "confirmed_counterexample",
+                            "content": "The candidate is independently confirmed.",
+                            "metadata": {
+                                "target_claim_id": "root",
+                                "validation_result": "confirmed",
+                                "confirmed": True,
+                            },
+                        }
+                    ],
+                    "rationale": "simulate a legacy confirmation without a candidate id",
+                },
+            )
+            self.assertTrue(confirmation.accepted, confirmation.errors)
 
-            self.assertGreater(first_call_count, 0)
-            self.assertEqual(directory_size.call_count, first_call_count)
-            self.assertEqual(first["benchmark_storage"], second["benchmark_storage"])
+            duplicate_debt = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 2,
+                    "actor_role": "counterexample_validator",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "add_debt",
+                            "debt_id": "duplicate-validation-debt",
+                            "owner_type": "claim",
+                            "owner_id": "root",
+                            "debt_type": "counterexample_validation",
+                            "severity": "blocking",
+                            "status": "active",
+                            "obligation": "Revalidate candidate-k-two without its earlier certificate.",
+                            "suggested_next_target": "root",
+                        }
+                    ],
+                    "rationale": "simulate the duplicate legacy handoff",
+                },
+            )
+            self.assertTrue(duplicate_debt.accepted, duplicate_debt.errors)
+
+            newer = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 3,
+                    "actor_role": "villain",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "newer-candidate-k-three",
+                            "artifact_type": "candidate_counterexample",
+                            "content": "A genuinely newer candidate against k at most three.",
+                            "metadata": {"target_id": "root", "concrete_instance": "L"},
+                        },
+                        {
+                            "op": "add_debt",
+                            "debt_id": "validate-newer-candidate",
+                            "owner_type": "claim",
+                            "owner_id": "root",
+                            "debt_type": "counterexample_validation",
+                            "severity": "blocking",
+                            "status": "active",
+                            "obligation": "Independently validate newer-candidate-k-three.",
+                            "source_artifact_ids": ["newer-candidate-k-three"],
+                            "suggested_next_target": "root",
+                        },
+                    ],
+                    "rationale": "record a different later candidate",
+                },
+            )
+            self.assertTrue(newer.accepted, newer.errors)
+
+            with sqlite3.connect(store.db_path) as conn:
+                rows = dict(
+                    conn.execute(
+                        "SELECT debt_id, status FROM debts WHERE debt_id IN (?, ?, ?)",
+                        (
+                            "validate-candidate-k-two",
+                            "duplicate-validation-debt",
+                            "validate-newer-candidate",
+                        ),
+                    ).fetchall()
+                )
+
+        self.assertEqual(rows["validate-candidate-k-two"], "resolved")
+        self.assertEqual(rows["duplicate-validation-debt"], "resolved")
+        self.assertEqual(rows["validate-newer-candidate"], "active")
 
     def test_interrogative_root_cannot_be_marked_refuted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -159,6 +281,54 @@ class Phase2PatchDebtTest(unittest.TestCase):
                 row = conn.execute("SELECT source_artifact_ids_json FROM debts WHERE debt_id = 'debt-source-card-mixed'").fetchone()
 
             self.assertEqual(json.loads(row["source_artifact_ids_json"]), ["source-adaptation"])
+
+    def test_theorem_adaptation_accepts_required_fields_as_keyed_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore(
+                "patch-theorem-adaptation-keyed-content-test",
+                generation_root=Path(tmpdir) / "generation",
+            )
+            store.init_problem("prove the root theorem")
+            content = "\n".join(
+                [
+                    "source_location: Theorem 4.19",
+                    "exact_source_statement: The source proves the local threshold formula.",
+                    "local_statement_translation: Specialize the dimension and degree parameters.",
+                    "definition_dictionary: local delta = the local stability threshold.",
+                    "hypothesis_dictionary: smooth Fano hypersurface = the target cubic.",
+                    "checked_hypotheses: Smoothness, degree, dimension, and characteristic were checked.",
+                    "missing_hypotheses: []",
+                    "local_deduction: The distinguished point has local threshold greater than one.",
+                    "reusable_proof_moves: Blow up the point and use inversion of adjunction.",
+                    "failure_boundary: The source does not cover the complementary point stratum.",
+                ]
+            )
+
+            outcome = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "literature_researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "keyed-theorem-adaptation",
+                            "artifact_type": "source_adaptation_notes",
+                            "content": content,
+                            "metadata": {
+                                "target_id": "root",
+                                "theorem_adaptation_version": 1,
+                            },
+                        }
+                    ],
+                    "rationale": "return a complete keyed theorem-adaptation packet",
+                },
+            )
+
+        self.assertTrue(outcome.accepted, outcome.errors)
 
     def test_debt_severity_high_is_normalized_to_major(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -311,54 +481,6 @@ class Phase2PatchDebtTest(unittest.TestCase):
             self.assertNotIn("Prior/stopped carry-over", report)
             self.assertIn("| Stored memory artifacts |", report)
             self.assertIn("| Reported tokens | 579 |", report)
-
-    def test_console_separates_current_budget_window_from_lifetime_charge(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = ProofStateStore("patch-budget-reset-test", generation_root=Path(tmpdir) / "generation")
-            store.init_problem("prove the root theorem", total_token_budget=100_000, reserved_verification_budget=10_000)
-            recorded = apply_patch(
-                store,
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "problem_id": store.problem_id,
-                    "base_revision": 0,
-                    "actor_role": "scheduler",
-                    "target_id": "root",
-                    "operations": [
-                        {
-                            "op": "record_run_metrics",
-                            "run_id": "run-before-budget-reset",
-                            "actor_role": "researcher",
-                            "mode": "prove",
-                            "target_id": "root",
-                            "input_tokens": 10_000,
-                            "cached_input_tokens": 8_000,
-                            "output_tokens": 1_000,
-                            "reasoning_output_tokens": 500,
-                            "total_tokens": 11_000,
-                            "status": "completed",
-                        }
-                    ],
-                    "rationale": "record charged usage before resetting the allocation window",
-                },
-            )
-            self.assertTrue(recorded.accepted, recorded.errors)
-            with store.connect() as conn:
-                conn.execute(
-                    "UPDATE problem_state SET remaining_token_budget = total_token_budget WHERE problem_id = ?",
-                    (store.problem_id,),
-                )
-                conn.commit()
-
-            payload = build_run_console_payload(store)
-            snapshot = payload["snapshot"]
-            self.assertEqual(snapshot["tokens_budget_window_spent"], 0)
-            self.assertEqual(snapshot["tokens_charged_lifetime"], 3_500)
-            self.assertEqual(snapshot["tokens_spent_reported"], 11_000)
-
-            console = build_run_console(store)
-            self.assertIn("Current token budget window: `0` charged", console)
-            self.assertIn("Lifetime charged usage: `3500` tokens", console)
 
     def test_console_verifier_audit_counts_report_artifacts_without_run_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -932,6 +1054,69 @@ class Phase2PatchDebtTest(unittest.TestCase):
             self.assertEqual(route[1], "Check the obstruction proof.")
             self.assertEqual(inference[0], "alias-target")
             self.assertEqual(inference[1], "The obstruction follows from the dossier.")
+
+    def test_generated_route_and_inference_aliases_are_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("patch-generated-route-alias-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("prove the root theorem")
+
+            outcome = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "add_claim",
+                            "claim_id": "generated-alias-target",
+                            "kind": "lemma",
+                            "statement": "A generated proof candidate.",
+                            "parent_ids": ["root"],
+                        },
+                        {
+                            "op": "add_route",
+                            "route_id": "route-generated-alias-target",
+                            "conclusion_claim_id": "generated-alias-target",
+                            "description": "Prove the generated candidate from its dossier.",
+                            "premise_ids": [],
+                            "status": "active",
+                            "sufficiency": "sufficient",
+                        },
+                        {
+                            "op": "add_inference",
+                            "inference_id": "inf-generated-alias-target",
+                            "route_id": "route-generated-alias-target",
+                            "conclusion_id": "generated-alias-target",
+                            "premise_ids": ["root"],
+                            "status": "plausible",
+                            "method": "Apply the argument written in the dossier.",
+                            "evidence_artifact_ids": [],
+                        },
+                    ],
+                    "rationale": "reproduce aliases emitted by a proof-producing run",
+                },
+            )
+
+            self.assertTrue(outcome.accepted, outcome.errors)
+            with sqlite3.connect(store.db_path) as conn:
+                route = conn.execute(
+                    "SELECT conclusion_claim_id, strategy, relation_to_parent, status FROM routes WHERE route_id = ?",
+                    ("route-generated-alias-target",),
+                ).fetchone()
+                inference = conn.execute(
+                    "SELECT conclusion_claim_id, explanation, validation_status FROM inferences WHERE inference_id = ?",
+                    ("inf-generated-alias-target",),
+                ).fetchone()
+                premises = conn.execute(
+                    "SELECT premise_claim_id FROM inference_premises WHERE inference_id = ? ORDER BY position",
+                    ("inf-generated-alias-target",),
+                ).fetchall()
+            self.assertEqual(route, ("generated-alias-target", "Prove the generated candidate from its dossier.", "sufficient", "active"))
+            self.assertEqual(inference, ("generated-alias-target", "Apply the argument written in the dossier.", "plausible"))
+            self.assertEqual(premises, [("root",)])
 
     def test_structured_artifact_content_metadata_is_promoted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4016,7 +4201,6 @@ class Phase2VerifierPatchAliasTest(unittest.TestCase):
                     "route_id": "route-x",
                     "operations": [
                         {"op": "attach_artifact", "artifact_id": "vr-refute-x", "artifact_type": "verification_report", "metadata": {}, "content": content},
-                        {"op": "set_inference_validation_status", "inference_id": "inf-x", "validation_status": "informally_verified", "evidence_artifact_ids": ["vr-refute-x"]},
                         {"op": "set_claim_validation_status", "claim_id": "lemma-x", "validation_status": "refuted", "evidence_artifact_ids": ["vr-refute-x"]},
                         {"op": "set_debt_status", "debt_id": "debt-lemma-x", "status": "resolved", "resolution": "Strict verifier proved the negation."},
                     ],
@@ -4030,7 +4214,7 @@ class Phase2VerifierPatchAliasTest(unittest.TestCase):
                 inf = conn.execute("SELECT validation_status FROM inferences WHERE inference_id=?", ("inf-x",)).fetchone()
                 debt = conn.execute("SELECT status FROM debts WHERE debt_id=?", ("debt-lemma-x",)).fetchone()
             self.assertEqual(claim["validation_status"], "refuted")
-            self.assertEqual(inf["validation_status"], "informally_verified")
+            self.assertEqual(inf["validation_status"], "plausible")
             self.assertEqual(debt["status"], "resolved")
 
     def test_report_with_real_gap_is_rejected(self) -> None:
@@ -4123,6 +4307,9 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
                             "op": "update_route",
                             "route_id": "route-root",
                             "status": "blocked",
+                            "label": "repaired route",
+                            "strategy": "repair the route using new evidence",
+                            "relation_to_parent": "variant",
                             "failure_fingerprint": "common maximal subgroup obstruction",
                             "evidence_artifact_ids": ["route-blocker"],
                         }
@@ -4133,8 +4320,11 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
             self.assertTrue(outcome.accepted, outcome.errors)
             with sqlite3.connect(store.db_path) as conn:
                 conn.row_factory = sqlite3.Row
-                route = conn.execute("SELECT status, failure_fingerprint, evidence_artifact_ids_json FROM routes WHERE route_id=?", ("route-root",)).fetchone()
+                route = conn.execute("SELECT status, label, strategy, relation_to_parent, failure_fingerprint, evidence_artifact_ids_json FROM routes WHERE route_id=?", ("route-root",)).fetchone()
             self.assertEqual(route["status"], "blocked")
+            self.assertEqual(route["label"], "repaired route")
+            self.assertEqual(route["strategy"], "repair the route using new evidence")
+            self.assertEqual(route["relation_to_parent"], "variant")
             self.assertEqual(route["failure_fingerprint"], "common maximal subgroup obstruction")
             self.assertIn("route-blocker", json.loads(route["evidence_artifact_ids_json"]))
 
@@ -4472,6 +4662,198 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
             self.assertIn("duplicate claim", " ".join(duplicate.errors))
             self.assertIn("closed-psl2-branch", " ".join(duplicate.errors))
 
+    def test_add_claim_rejects_concise_symbolic_restatement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("concise-symbolic-duplicate-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("root")
+            seed = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "add_claim",
+                            "claim_id": "central-vector-theorem",
+                            "kind": "theorem",
+                            "statement": (
+                                "Let X be an admissible object with parameters n>=4 and q>2. Let A(X) be "
+                                "its canonical faithful action on Omega(X). In that action X is properly "
+                                "contained in E(X), and E(X) is contained in the third closure C_3(X). "
+                                "Consequently X is not 3-rigid."
+                            ),
+                            "parent_ids": ["root"],
+                        }
+                    ],
+                    "rationale": "seed integrated symbolic theorem",
+                },
+            )
+            self.assertTrue(seed.accepted, seed.errors)
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute(
+                    "UPDATE claims SET validation_status='informally_verified', lifecycle_status='integrated' "
+                    "WHERE claim_id='central-vector-theorem'"
+                )
+
+            duplicate = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "add_claim",
+                            "claim_id": "concise-symbolic-restatement",
+                            "kind": "theorem",
+                            "statement": (
+                                "Let X be an admissible object with parameters n>=4 and q>2. Let A(X) be "
+                                "its canonical faithful action on Omega(X). In that action X is properly "
+                                "contained in E(X), and E(X) is contained in the third closure C_3(X). "
+                                "Thus X is not 3-rigid."
+                            ),
+                            "parent_ids": ["root"],
+                        }
+                    ],
+                    "rationale": "attempt concise duplicate",
+                },
+            )
+
+            self.assertFalse(duplicate.accepted)
+            self.assertIn("duplicate claim", " ".join(duplicate.errors))
+            self.assertIn("central-vector-theorem", " ".join(duplicate.errors))
+
+    def test_distinct_parallel_integration_transition_is_rebase_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("parallel-integration-rebase-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("root")
+            intervening = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "integration_verifier",
+                    "target_id": "claim-a",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "integration-a",
+                            "artifact_type": "integration_report",
+                            "content": "First independent integration report.",
+                            "metadata": {"integrates": False},
+                        }
+                    ],
+                    "rationale": "an independent sibling integration landed first",
+                },
+            )
+            self.assertTrue(intervening.accepted, intervening.errors)
+            stale_patch = {
+                "schema_version": SCHEMA_VERSION,
+                "problem_id": store.problem_id,
+                "base_revision": 0,
+                "actor_role": "integration_verifier",
+                "target_id": "claim-b",
+                "operations": [
+                    {
+                        "op": "attach_artifact",
+                        "artifact_id": "integration-b",
+                        "artifact_type": "integration_report",
+                        "content": "Second independent integration report.",
+                        "metadata": {"integrates": True},
+                    },
+                    {
+                        "op": "propose_status_transition",
+                        "target_type": "claim",
+                        "target_id": "claim-b",
+                        "status_type": "lifecycle",
+                        "new_status": "integrated",
+                        "route_id": "route-b",
+                        "resolved_debt_ids": ["debt-b"],
+                        "evidence_artifact_ids": ["integration-b"],
+                    },
+                ],
+                "rationale": "integrate the row-disjoint sibling route",
+            }
+
+            assessment = _stale_rebase_assessment(store, stale_patch)
+
+        self.assertTrue(assessment["ok"], assessment)
+        self.assertEqual(assessment["current_revision"], 1)
+
+    def test_integration_report_metadata_debts_block_stale_rebase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("integration-metadata-debt-rebase-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("root")
+            seed = apply_patch(
+                store,
+                add_debt_patch(
+                    problem_id=store.problem_id,
+                    base_revision=0,
+                    debt_id="debt-root",
+                    obligation="Original integration blocker.",
+                ),
+            )
+            self.assertTrue(seed.accepted, seed.errors)
+            stale_base = store.get_revision()
+            refreshed = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": stale_base,
+                    "actor_role": "strict_informal_verifier",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "update_debt",
+                            "debt_id": "debt-root",
+                            "status": "active",
+                            "severity": "blocking",
+                            "resolution_note": "A later audit refreshed this blocker.",
+                        }
+                    ],
+                    "rationale": "refresh the blocker after integration started",
+                },
+            )
+            self.assertTrue(refreshed.accepted, refreshed.errors)
+            stale_integration = {
+                "schema_version": SCHEMA_VERSION,
+                "problem_id": store.problem_id,
+                "base_revision": stale_base,
+                "actor_role": "integration_verifier",
+                "target_id": "root",
+                "operations": [
+                    {
+                        "op": "attach_artifact",
+                        "artifact_id": "integration-old",
+                        "artifact_type": "integration_report",
+                        "content": "An integration decision predating the refreshed debt.",
+                        "metadata": {"integrates": True, "resolved_debt_ids": ["debt-root"]},
+                    },
+                    {
+                        "op": "propose_status_transition",
+                        "target_type": "claim",
+                        "target_id": "root",
+                        "status_type": "lifecycle",
+                        "new_status": "integrated",
+                        "route_id": "route-root",
+                        "evidence_artifact_ids": ["integration-old"],
+                    },
+                ],
+                "rationale": "stale integration must not close a refreshed blocker",
+            }
+
+            assessment = _stale_rebase_assessment(store, stale_integration)
+
+        self.assertFalse(assessment["ok"], assessment)
+        self.assertIn("debt:debt-root", assessment["reason"])
+
     def test_add_claim_allows_substantive_extension_of_integrated_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("integrated-claim-extension-test", generation_root=Path(tmpdir) / "generation")
@@ -4712,6 +5094,192 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
             self.assertEqual(route_row["status"], "integrated")
             self.assertIn("closed_by_integrated_route", debt_row["resolution_evidence_json"])
 
+    def test_nonroot_integration_can_reconcile_root_debt_only_with_report_justification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore(
+                "patch-integration-root-debt-reconciliation-test",
+                generation_root=Path(tmpdir) / "generation",
+            )
+            store.init_problem("Classify all objects with property P.")
+            setup = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "add_claim",
+                            "claim_id": "classification-slice",
+                            "kind": "theorem",
+                            "statement": "Objects of type X have property P exactly in case Q.",
+                            "parent_ids": ["root"],
+                        },
+                        {
+                            "op": "add_route",
+                            "route_id": "route-classification-slice",
+                            "conclusion_claim_id": "classification-slice",
+                            "relation_to_parent": "sufficient",
+                            "strategy": "Use the complete type-X classification.",
+                        },
+                        {
+                            "op": "add_inference",
+                            "inference_id": "inf-classification-slice",
+                            "route_id": "route-classification-slice",
+                            "conclusion_claim_id": "classification-slice",
+                            "premise_claim_ids": [],
+                            "validation_status": "plausible",
+                            "explanation": "The dossier proves the stated type-X iff classification.",
+                        },
+                        {
+                            "op": "add_debt",
+                            "debt_id": "debt-root-type-x-classification",
+                            "owner_type": "claim",
+                            "owner_id": "root",
+                            "debt_type": "missing_theorem",
+                            "severity": "blocking",
+                            "status": "active",
+                            "obligation": "Give the exact iff classification for all objects of type X.",
+                            "suggested_next_target": "root",
+                        },
+                    ],
+                    "rationale": "seed a non-root classification theorem and its older root debt",
+                },
+            )
+            self.assertTrue(setup.accepted, setup.errors)
+            verified = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "strict_informal_verifier",
+                    "target_id": "classification-slice",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "verification-classification-slice",
+                            "artifact_type": "verification_report",
+                            "content": "verdict: correct_no_gaps\ncritical_errors: []\ngaps: []",
+                            "metadata": {
+                                "verdict": "correct_no_gaps",
+                                "verification_report": {
+                                    "critical_errors": [],
+                                    "gaps": [],
+                                    "blocking_gap": False,
+                                },
+                            },
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "inference",
+                            "target_id": "inf-classification-slice",
+                            "status_type": "validation",
+                            "new_status": "informally_verified",
+                            "evidence_artifact_ids": ["verification-classification-slice"],
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "claim",
+                            "target_id": "classification-slice",
+                            "status_type": "validation",
+                            "new_status": "informally_verified",
+                            "evidence_artifact_ids": ["verification-classification-slice"],
+                        },
+                    ],
+                    "rationale": "strictly verify the classification slice",
+                },
+            )
+            self.assertTrue(verified.accepted, verified.errors)
+
+            missing_justification = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "integration_verifier",
+                    "target_id": "classification-slice",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "integration-classification-slice-unjustified",
+                            "artifact_type": "integration_report",
+                            "content": "The route integrates and claims to close the older root debt.",
+                            "metadata": {
+                                "integrates": True,
+                                "resolved_debt_ids": ["debt-root-type-x-classification"],
+                            },
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "claim",
+                            "target_id": "classification-slice",
+                            "status_type": "lifecycle",
+                            "new_status": "integrated",
+                            "route_id": "route-classification-slice",
+                            "evidence_artifact_ids": ["integration-classification-slice-unjustified"],
+                            "resolved_debt_ids": ["debt-root-type-x-classification"],
+                        },
+                    ],
+                    "rationale": "an unexplained upstream debt closure must fail",
+                },
+            )
+            self.assertFalse(missing_justification.accepted)
+            self.assertIn("resolved_debt_justifications", " ".join(missing_justification.errors))
+
+            explanation = (
+                "The integrated theorem is exactly the requested type-X iff classification: its domain is all "
+                "objects of type X and its two directions establish property P exactly in case Q."
+            )
+            integrated = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "integration_verifier",
+                    "target_id": "classification-slice",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "integration-classification-slice",
+                            "artifact_type": "integration_report",
+                            "content": explanation,
+                            "metadata": {
+                                "integrates": True,
+                                "resolved_debt_ids": ["debt-root-type-x-classification"],
+                                "resolved_debt_justifications": {
+                                    "debt-root-type-x-classification": explanation,
+                                },
+                            },
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "claim",
+                            "target_id": "classification-slice",
+                            "status_type": "lifecycle",
+                            "new_status": "integrated",
+                            "route_id": "route-classification-slice",
+                            "evidence_artifact_ids": ["integration-classification-slice"],
+                            "resolved_debt_ids": ["debt-root-type-x-classification"],
+                        },
+                    ],
+                    "rationale": "integration verifier explains the complete root-debt discharge",
+                },
+            )
+            self.assertTrue(integrated.accepted, integrated.errors)
+            with sqlite3.connect(store.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                debt = conn.execute(
+                    "SELECT status, resolution_evidence_json FROM debts WHERE debt_id = ?",
+                    ("debt-root-type-x-classification",),
+                ).fetchone()
+            self.assertEqual(debt["status"], "resolved")
+            self.assertIn(explanation, debt["resolution_evidence_json"])
+
     def test_integration_blocks_unresolved_route_inference_debt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("patch-integration-inference-debt-test", generation_root=Path(tmpdir) / "generation")
@@ -4875,9 +5443,8 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
 class Phase2StatusTransitionGraphIdAliasTest(unittest.TestCase):
     """propose_status_transition must accept concrete graph-id fields as target aliases.
 
-    Observed in a live integration run: the integration verifier emitted
-    claim_id/route_id instead of target_id and the whole integrate patch was
-    rejected for a missing target.
+    A live integration verifier can emit claim_id/route_id instead of target_id;
+    normalization must preserve that otherwise-valid transition.
     """
 
     def test_claim_id_wins_over_route_id_and_sets_target_type(self) -> None:
@@ -4960,11 +5527,10 @@ class Phase2StatusTransitionGraphIdAliasTest(unittest.TestCase):
 
 class Phase2RootAlignmentMatcherTest(unittest.TestCase):
     ROOT = (
-        "# Problem 1.1: Perfectly 5-covered connected graphs of prime order\n\n"
+        "# Synthetic classification question\n\n"
         "## Problem\n\n"
-        "Let G be a finite graph; define the k-cover as usual.\n\n"
-        "**Question (Problem 1.1).** Are there any connected graphs of prime order\n"
-        "which are perfectly 5-covered?\n\n"
+        "Let X be an admissible object and let P be a fixed property.\n\n"
+        "**Question.** Does every admissible object X satisfy property P?\n\n"
         "## Instructions\n\n"
         "Treat this as a serious research problem.\n"
     )
@@ -4973,17 +5539,17 @@ class Phase2RootAlignmentMatcherTest(unittest.TestCase):
         from agents.generation.phase2.patches import _root_alignment_target_matches
 
         self.assertTrue(_root_alignment_target_matches(self.ROOT, self.ROOT))
-        question = "**Question (Problem 1.1).** Are there any connected graphs of prime order\nwhich are perfectly 5-covered?"
+        question = "**Question.** Does every admissible object X satisfy property P?"
         self.assertTrue(_root_alignment_target_matches(question, self.ROOT))
-        section = "Let G be a finite graph; define the k-cover as usual.\n\n" + question
+        section = "Let X be an admissible object and let P be a fixed property.\n\n" + question
         self.assertTrue(_root_alignment_target_matches(section, self.ROOT))
         self.assertTrue(
-            _root_alignment_target_matches("Problem 1.1: Perfectly 5-covered connected graphs of prime order", self.ROOT)
+            _root_alignment_target_matches("Synthetic classification question", self.ROOT)
         )
         # Paraphrases still fail.
         self.assertFalse(
             _root_alignment_target_matches(
-                "Does there exist a perfectly 5-covered connected graph of prime order?", self.ROOT
+                "Can one find an exceptional object without property P?", self.ROOT
             )
         )
 
@@ -5059,6 +5625,210 @@ class Phase2PreflightPatchTest(unittest.TestCase):
             "strict_informal_verifier",
         )
         self.assertEqual(errors, [])
+
+    def test_canonical_route_dossier_without_route_id_fails_preflight(self) -> None:
+        from agents.generation.phase2.patches import preflight_patch_errors
+
+        patch = {
+            "schema_version": SCHEMA_VERSION,
+            "problem_id": "p",
+            "base_revision": 3,
+            "actor_role": "researcher",
+            "target_id": "root",
+            "operations": [
+                {
+                    "op": "attach_artifact",
+                    "artifact_id": "dossier-root-v2",
+                    "artifact_type": "proof_dossier",
+                    "content": "A route-level proof attempt.",
+                    "metadata": {
+                        "canonical_route_owner_version": 1,
+                        "canonical_route_id": "",
+                        "root_implication_update": "The route would imply the root.",
+                        "root_cut_signature_before": [],
+                        "root_cut_signature_after": ["claim:lemma-a"],
+                        "creates_parallel_dossier": False,
+                    },
+                }
+            ],
+            "rationale": "continue the proof",
+        }
+
+        errors = preflight_patch_errors(patch, "researcher")
+        self.assertIn("canonical route dossier requires canonical_route_id", errors)
+
+    def test_route_less_dossier_continuation_passes_preflight(self) -> None:
+        from agents.generation.phase2.patches import preflight_patch_errors
+
+        patch = {
+            "schema_version": SCHEMA_VERSION,
+            "problem_id": "p",
+            "base_revision": 3,
+            "actor_role": "researcher",
+            "target_id": "root",
+            "operations": [
+                {
+                    "op": "attach_artifact",
+                    "artifact_id": "dossier-root-v2",
+                    "artifact_type": "proof_dossier",
+                    "content": "A route-less proof-program continuation.",
+                    "metadata": {
+                        "supersedes_artifact_id": "dossier-root-v1",
+                        "root_implication_update": "No named sufficient route exists yet.",
+                        "root_cut_signature_before": [],
+                        "root_cut_signature_after": ["claim:lemma-a"],
+                        "creates_parallel_dossier": False,
+                    },
+                }
+            ],
+            "rationale": "continue the route-less proof program",
+        }
+
+        self.assertEqual(preflight_patch_errors(patch, "researcher"), [])
+
+    def test_source_technique_contract_is_caught_before_patch_application(self) -> None:
+        from agents.generation.phase2.patches import preflight_patch_errors
+
+        patch = {
+            "schema_version": SCHEMA_VERSION,
+            "problem_id": "p",
+            "base_revision": 182,
+            "actor_role": "researcher",
+            "target_id": "root",
+            "operations": [
+                {
+                    "op": "attach_artifact",
+                    "artifact_id": "incomplete-source-technique",
+                    "artifact_type": "source_adaptation_notes",
+                    "content": "A useful source was located, but its proof technique was not compiled.",
+                    "metadata": {"source_technique_compiler_version": 1},
+                }
+            ],
+            "rationale": "reproduce the revision-182 rejection",
+        }
+
+        errors = preflight_patch_errors(patch, "researcher")
+
+        self.assertEqual(
+            errors,
+            [
+                "source technique compiler requires source_proof_skeleton",
+                "source technique compiler requires key_constructions",
+                "source technique compiler requires reusable_proof_moves",
+                "source technique compiler requires hypothesis_necessity",
+                "source technique compiler requires failure_examples",
+                "source technique compiler requires local_translation_steps",
+                "source technique compiler requires next_local_deduction",
+            ],
+        )
+
+    def test_complete_source_technique_contract_passes_preflight(self) -> None:
+        from agents.generation.phase2.patches import preflight_patch_errors
+
+        metadata = {
+            "source_technique_compiler_version": 1,
+            "source_proof_skeleton": ["reduce", "apply", "lift"],
+            "key_constructions": ["local section"],
+            "reusable_proof_moves": ["quotient lift"],
+            "hypothesis_necessity": {"finite": "used for counting"},
+            "failure_examples": ["the infinite analogue"],
+            "local_translation_steps": ["identify the local stabilizer"],
+            "next_local_deduction": "Apply the compiled quotient lift.",
+        }
+        patch = {
+            "schema_version": SCHEMA_VERSION,
+            "problem_id": "p",
+            "base_revision": 182,
+            "actor_role": "researcher",
+            "target_id": "root",
+            "operations": [
+                {
+                    "op": "attach_artifact",
+                    "artifact_id": "complete-source-technique",
+                    "artifact_type": "source_adaptation_notes",
+                    "content": "Compiled source technique.",
+                    "metadata": metadata,
+                }
+            ],
+            "rationale": "accept a complete source-technique packet",
+        }
+
+        self.assertEqual(preflight_patch_errors(patch, "researcher"), [])
+
+    def test_proved_lemma_dossier_requires_evidence_linked_inference(self) -> None:
+        from agents.generation.phase2.patches import preflight_patch_errors
+
+        patch = {
+            "schema_version": SCHEMA_VERSION,
+            "problem_id": "p",
+            "base_revision": 3,
+            "actor_role": "researcher",
+            "target_id": "root",
+            "operations": [
+                {
+                    "op": "attach_artifact",
+                    "artifact_id": "proved-local-lemma",
+                    "artifact_type": "proof_dossier",
+                    "content": "A complete proof of the local lemma.",
+                    "metadata": {
+                        "mathematical_delta_kind": "proved_lemma",
+                        "changed_proof_state": True,
+                    },
+                },
+                {
+                    "op": "add_debt",
+                    "debt_id": "next-gap",
+                    "owner_type": "claim",
+                    "owner_id": "root",
+                    "debt_type": "gap",
+                    "severity": "blocking",
+                    "status": "active",
+                    "obligation": "Prove the next case.",
+                },
+            ],
+            "rationale": "persist a proved local lemma",
+        }
+
+        errors = preflight_patch_errors(patch, "researcher")
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("is not materialized in the proof graph", errors[0])
+
+    def test_proved_lemma_dossier_with_evidence_linked_inference_passes_preflight(self) -> None:
+        from agents.generation.phase2.patches import preflight_patch_errors
+
+        patch = {
+            "schema_version": SCHEMA_VERSION,
+            "problem_id": "p",
+            "base_revision": 3,
+            "actor_role": "researcher",
+            "target_id": "lemma-x",
+            "operations": [
+                {
+                    "op": "attach_artifact",
+                    "artifact_id": "proved-local-lemma",
+                    "artifact_type": "proof_dossier",
+                    "content": "A complete proof of the local lemma.",
+                    "metadata": {
+                        "mathematical_delta_kind": "proved_lemma",
+                        "changed_proof_state": True,
+                    },
+                },
+                {
+                    "op": "add_inference",
+                    "inference_id": "inf-lemma-x",
+                    "route_id": "route-lemma-x",
+                    "conclusion_claim_id": "lemma-x",
+                    "premise_claim_ids": [],
+                    "validation_status": "plausible",
+                    "explanation": "The dossier proves the lemma.",
+                    "evidence_artifact_ids": ["proved-local-lemma"],
+                },
+            ],
+            "rationale": "materialize a proved local lemma",
+        }
+
+        self.assertEqual(preflight_patch_errors(patch, "researcher"), [])
 
     def test_blocking_verification_report_marks_claim_challenged(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5276,6 +6046,79 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
             )
             self.assertIn("First independent delta", row["explanation"])
             self.assertIn("Second independent delta", row["explanation"])
+
+    def test_simultaneous_patch_revision_check_is_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("simultaneous-patch-lock-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("root")
+            begin_barrier = threading.Barrier(2)
+            original_connect = store.connect
+
+            class BarrierConnection:
+                def __init__(self, raw: sqlite3.Connection) -> None:
+                    self.raw = raw
+
+                def __enter__(self):
+                    self.raw.__enter__()
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return self.raw.__exit__(exc_type, exc, tb)
+
+                def __getattr__(self, name):
+                    return getattr(self.raw, name)
+
+                def execute(self, sql, parameters=()):
+                    if str(sql).strip().upper() == "BEGIN IMMEDIATE":
+                        begin_barrier.wait(timeout=5)
+                    return self.raw.execute(sql, parameters)
+
+            def synchronized_connect():
+                return BarrierConnection(original_connect())
+
+            store.connect = synchronized_connect  # type: ignore[method-assign]
+            outcomes = []
+            outcome_lock = threading.Lock()
+
+            def worker(index: int) -> None:
+                outcome = apply_patch(
+                    store,
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "problem_id": store.problem_id,
+                        "base_revision": 0,
+                        "actor_role": "researcher",
+                        "target_id": f"lemma-{index}",
+                        "operations": [
+                            {
+                                "op": "add_claim",
+                                "claim_id": f"lemma-{index}",
+                                "kind": "lemma",
+                                "statement": f"Lemma {index}.",
+                                "parent_ids": ["root"],
+                            }
+                        ],
+                        "rationale": "simultaneous revision audit",
+                    },
+                )
+                with outcome_lock:
+                    outcomes.append(outcome)
+
+            threads = [threading.Thread(target=worker, args=(index,)) for index in (1, 2)]
+            try:
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+            finally:
+                store.connect = original_connect  # type: ignore[method-assign]
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(sum(outcome.accepted for outcome in outcomes), 1)
+            self.assertEqual(sum("stale patch" in " ".join(outcome.errors) for outcome in outcomes), 1)
+            self.assertEqual(store.get_revision(), 1)
+            with sqlite3.connect(store.db_path) as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM patches").fetchone()[0], 1)
 
     def test_concurrent_identical_verifier_transitions_rebase_and_merge(self) -> None:
         from agents.generation.phase2.patches import apply_patch_with_stale_retry

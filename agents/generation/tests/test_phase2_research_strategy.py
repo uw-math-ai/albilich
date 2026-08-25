@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from agents.generation.phase2.context_builder import build_context_manifest
+from agents.generation.phase2.codex_runner import _base_mode_guidance
 from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.patches import apply_patch
 from agents.generation.phase2.research_strategy import (
@@ -14,6 +15,9 @@ from agents.generation.phase2.research_strategy import (
     PROOF_COMPRESSION_SKELETON_REQUIRED_FIELDS,
     advisor_synthesis_trigger,
     apply_active_compression,
+    approach_alignment_evidence,
+    approach_portfolio_view,
+    bottleneck_lease_state,
     conceptual_invariant_trigger,
     enrich_action,
     latest_active_advisor_synthesis,
@@ -119,6 +123,52 @@ def _valid_experiment_metadata() -> dict:
     }
 
 
+def _approach_candidate(index: int, *, status: str = "idea") -> dict:
+    return {
+        "approach_id": f"approach-{index}",
+        "title": f"Approach {index}",
+        "mechanism": f"Use mechanism family {index} to attack the root obstruction.",
+        "mathematical_objects": [f"object-{index}"],
+        "representation_or_invariant": f"representation-{index}",
+        "target_id": "root",
+        "target_route_id": "none_yet",
+        "root_consequence": "If the bridge is proved, the original theorem follows.",
+        "bridge_statement": f"Exact bridge statement {index}.",
+        "contribution_level": 5 if index == 0 else max(1, 5 - index),
+        "contribution_kind": "root_closing" if index == 0 else "exploratory",
+        "evidence": "A neighboring theorem suggests this mechanism.",
+        "likely_failure_mode": f"Obstruction family {index} may survive.",
+        "decisive_test": f"Test boundary family {index}.",
+        "estimated_cost": "low" if index < 2 else "medium",
+        "novelty_score": round(0.9 - 0.08 * index, 2),
+        "confidence": "medium",
+        "confidence_basis": "The analogy matches the main hypotheses but not yet the endpoint.",
+        "status": status,
+        "semantic_signature": {
+            "mechanism": f"mechanism-{index}",
+            "representation": f"representation-{index}",
+            "proof_direction": "forward" if index % 2 == 0 else "adversarial",
+            "theorem_family": f"theorem-family-{index}",
+            "root_obligation": f"root-obligation-{index}",
+            "failure_mode": f"failure-{index}",
+        },
+    }
+
+
+def _approach_portfolio_metadata(*, kind: str = "initial", supersedes: str = "") -> dict:
+    metadata = {
+        "strategy_schema_version": 1,
+        "portfolio_kind": kind,
+        "brainstorming_summary": "Six genuinely different mechanisms were compared against the root.",
+        "approaches": [_approach_candidate(index, status="selected" if index < 2 else "idea") for index in range(6)],
+        "selected_approach_ids": ["approach-0", "approach-1"],
+        "research_questions": ["Which boundary family distinguishes the first two mechanisms?"],
+    }
+    if supersedes:
+        metadata["supersedes_artifact_id"] = supersedes
+    return metadata
+
+
 def _pure_strategy_state(*, revision: int = 10) -> dict:
     claims = [
         {
@@ -209,6 +259,356 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         self.assertTrue(cards[0]["known_failure_modes"])
         self.assertTrue(cards[0]["advisory_only"])
 
+    def test_hard_problem_starts_with_approach_portfolio_before_local_reduction(self) -> None:
+        state = _pure_strategy_state()
+        state["recent_runs"] = []
+        action = next_strategy_operation(
+            state,
+            {"mode": "reduce", "target_id": "root", "route_id": "", "research_mode": "hard_problem"},
+        )
+
+        self.assertEqual(action["operation"], "approach_portfolio_brainstorming")
+        self.assertTrue(action["approach_brainstorming_required"])
+        self.assertTrue(action["proof_claim_creation_forbidden"])
+        self.assertTrue(action["blocking_proof_debt_creation_forbidden"])
+        self.assertEqual(action["approach_candidate_minimum"], 6)
+
+    def test_bottleneck_receives_two_no_delta_passes_then_forces_creative_escape(self) -> None:
+        state = _pure_strategy_state()
+        primary = {
+            "mode": "reduce",
+            "target_id": "root",
+            "route_id": "route-root",
+            "debt_id": "debt-root",
+            "proof_repair_required": True,
+            "bottleneck_lock_required": True,
+            "research_mode": "hard_problem",
+        }
+
+        lease = bottleneck_lease_state(state, primary)
+        action = next_strategy_operation(state, primary)
+
+        self.assertTrue(lease["escape_required"])
+        self.assertGreaterEqual(lease["completed_no_delta_passes"], 2)
+        self.assertEqual(action["operation"], "approach_portfolio_brainstorming")
+        self.assertIn("no mathematical root-relevant delta", action["reason"])
+        self.assertIsNone(lease["wall_clock_timeout"])
+
+    def test_fresh_bottleneck_is_not_preempted_only_because_portfolio_is_missing(self) -> None:
+        state = _pure_strategy_state()
+        state["recent_runs"] = []
+        action = next_strategy_operation(
+            state,
+            {
+                "mode": "reduce",
+                "target_id": "root",
+                "route_id": "route-root",
+                "debt_id": "debt-root",
+                "proof_repair_required": True,
+                "bottleneck_lock_required": True,
+                "research_mode": "hard_problem",
+            },
+        )
+
+        self.assertIsNone(action)
+
+    def test_approach_portfolio_validation_and_selected_pilot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-approach-portfolio")
+            accepted = self._attach(
+                store,
+                "researcher",
+                "portfolio-initial",
+                "approach_portfolio",
+                _approach_portfolio_metadata(),
+            )
+            self.assertTrue(accepted.accepted, accepted.errors)
+            state = store.get_scheduler_state()
+            view = approach_portfolio_view(state)
+            action = next_strategy_operation(
+                state,
+                {"mode": "reduce", "target_id": "root", "route_id": "", "research_mode": "hard_problem"},
+            )
+
+        self.assertEqual(view["approach_count"], 6)
+        self.assertEqual(view["selected_approach_ids"], ["approach-0", "approach-1"])
+        self.assertEqual(action["operation"], "approach_pilot")
+        self.assertTrue(action["search_intent"].startswith("approach_pilot:"))
+
+    def test_approach_portfolio_rejects_semantic_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-approach-duplicate")
+            metadata = _approach_portfolio_metadata()
+            metadata["approaches"][1]["semantic_signature"] = dict(metadata["approaches"][0]["semantic_signature"])
+            rejected = self._attach(
+                store,
+                "researcher",
+                "portfolio-duplicate",
+                "approach_portfolio",
+                metadata,
+            )
+
+        self.assertFalse(rejected.accepted)
+        self.assertTrue(any("duplicates another semantic_signature" in error for error in rejected.errors))
+
+    def test_new_verified_root_evidence_forces_exclusive_portfolio_refresh(self) -> None:
+        state = _pure_strategy_state(revision=30)
+        state["research_artifacts"] = [
+            {
+                "artifact_id": "portfolio-old",
+                "artifact_type": "approach_portfolio",
+                "state_revision": 4,
+                "metadata_json": _approach_portfolio_metadata(),
+            },
+            {
+                "artifact_id": "proof-gap-three",
+                "artifact_type": "proof_dossier",
+                "state_revision": 24,
+                "content_summary": "A verified example proves every universal constant is at least three.",
+                "metadata_json": {},
+            },
+        ]
+        state["claims"].append(
+            {
+                "claim_id": "claim-gap-three",
+                "statement": "There is a maximal pair with derived-length gap three.",
+                "validation_status": "informally_verified",
+                "lifecycle_status": "integrated",
+                "root_impact": 0.5,
+                "parent_ids_json": '["root"]',
+                "evidence_artifact_ids_json": '["proof-gap-three"]',
+            }
+        )
+
+        evidence = approach_alignment_evidence(state, portfolio_revision=4)
+        action = next_strategy_operation(
+            state,
+            {"mode": "retrieve", "target_id": "root", "route_id": "", "research_mode": "hard_problem"},
+        )
+
+        self.assertEqual([row["claim_id"] for row in evidence], ["claim-gap-three"])
+        self.assertEqual(action["operation"], "approach_portfolio_refresh")
+        self.assertTrue(action["exclusive_wave_required"])
+        self.assertEqual(action["approach_candidate_minimum"], 6)
+        self.assertEqual(
+            action["approach_alignment"]["evidence_artifact_ids"],
+            ["proof-gap-three"],
+        )
+
+    def test_processed_steering_forces_alignment_even_without_new_verified_claim(self) -> None:
+        state = _pure_strategy_state()
+        state["research_artifacts"] = [
+            {
+                "artifact_id": "portfolio-old",
+                "artifact_type": "approach_portfolio",
+                "state_revision": 4,
+                "metadata_json": _approach_portfolio_metadata(),
+            }
+        ]
+        action = next_strategy_operation(
+            state,
+            {"mode": "retrieve", "target_id": "root", "route_id": "", "research_mode": "hard_problem"},
+            steering_alignment={
+                "required": True,
+                "source_steering_ids": ["steer-1"],
+                "directives": [{"id": "steer-1", "text": "Reconsider the sharp bound."}],
+            },
+        )
+
+        self.assertEqual(action["operation"], "approach_portfolio_refresh")
+        self.assertEqual(action["approach_alignment"]["source_steering_ids"], ["steer-1"])
+        self.assertTrue(action["exclusive_wave_required"])
+
+    def test_pending_alignment_preempts_periodic_writing_after_failed_refresh(self) -> None:
+        state = _pure_strategy_state(revision=30)
+        state["research_artifacts"] = [
+            {
+                "artifact_id": "portfolio-old",
+                "artifact_type": "approach_portfolio",
+                "state_revision": 4,
+                "metadata_json": _approach_portfolio_metadata(),
+            }
+        ]
+        action = next_strategy_operation(
+            state,
+            {
+                "mode": "write",
+                "target_id": "root",
+                "route_id": "",
+                "research_mode": "hard_problem",
+                "periodic_hmt": True,
+                "search_intent": "periodic_human_readable_mathematical_text",
+            },
+            steering_alignment={
+                "required": True,
+                "source_steering_ids": ["steer-1"],
+                "directives": [{"id": "steer-1", "text": "Refresh the root effects."}],
+            },
+        )
+
+        self.assertEqual(action["operation"], "approach_portfolio_refresh")
+        self.assertTrue(action["exclusive_wave_required"])
+        self.assertEqual(action["approach_alignment"]["source_steering_ids"], ["steer-1"])
+
+    def test_alignment_portfolio_requires_recomputed_root_effects_for_every_approach(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-aligned-portfolio-contract")
+            initial = self._attach(
+                store,
+                "researcher",
+                "portfolio-initial",
+                "approach_portfolio",
+                _approach_portfolio_metadata(),
+            )
+            self.assertTrue(initial.accepted, initial.errors)
+            missing = _approach_portfolio_metadata(kind="refresh", supersedes="portfolio-initial")
+            missing["alignment_source_steering_ids"] = ["steer-1"]
+            missing["alignment_summary"] = "The sharp lower bound changed."
+            missing["root_effect_recomputed"] = True
+            rejected = self._attach(
+                store,
+                "researcher",
+                "portfolio-refresh-missing-impact",
+                "approach_portfolio",
+                missing,
+            )
+            self.assertFalse(rejected.accepted)
+            self.assertTrue(any("steering_impact" in error for error in rejected.errors))
+
+            aligned = _approach_portfolio_metadata(kind="refresh", supersedes="portfolio-initial")
+            aligned["alignment_source_steering_ids"] = ["steer-1"]
+            aligned["alignment_evidence_artifact_ids"] = []
+            aligned["alignment_summary"] = "Every route is recomputed after the new lower bound."
+            aligned["root_effect_recomputed"] = True
+            for candidate in aligned["approaches"]:
+                candidate["steering_impact"] = "The route now targets a bound compatible with the new lower bound."
+            accepted = self._attach(
+                store,
+                "researcher",
+                "portfolio-refresh-aligned",
+                "approach_portfolio",
+                aligned,
+            )
+
+        self.assertTrue(accepted.accepted, accepted.errors)
+
+    def test_brainstorming_manifest_keeps_ideas_questions_and_debts_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-approach-contract")
+            action = enrich_action(
+                store.get_scheduler_state(),
+                {
+                    "mode": "reduce",
+                    "target_id": "root",
+                    "research_mode": "hard_problem",
+                    "approach_brainstorming_required": True,
+                    "approach_portfolio_kind": "initial",
+                    "approach_candidate_minimum": 6,
+                },
+            )
+            manifest = build_context_manifest(store, action=action, max_chars=30_000)
+
+        contract = manifest["approach_portfolio_contract"]
+        self.assertEqual(contract["layer_policy"]["ideas"].split()[0], "live")
+        self.assertIn("nonblocking", contract["layer_policy"]["research_questions"])
+        self.assertIn("strict", contract["layer_policy"]["proof_debts"])
+        self.assertTrue(any("manifest.approach_portfolio_contract exactly" in line for line in manifest["instructions"]))
+
+    def test_alignment_manifest_exposes_directives_evidence_and_per_approach_impact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-alignment-manifest")
+            action = {
+                "mode": "reduce",
+                "target_id": "root",
+                "approach_brainstorming_required": True,
+                "approach_portfolio_kind": "refresh",
+                "approach_candidate_minimum": 6,
+                "supersedes_artifact_id": "portfolio-old",
+                "approach_alignment": {
+                    "required": True,
+                    "source_steering_ids": ["steer-1"],
+                    "directives": [{"id": "steer-1", "text": "Use the gap-three example."}],
+                    "evidence_artifact_ids": ["proof-gap-three"],
+                    "verified_root_developments": [{"claim_id": "claim-gap-three"}],
+                },
+            }
+            manifest = build_context_manifest(store, action=action, max_chars=30_000)
+
+        contract = manifest["approach_portfolio_contract"]
+        self.assertEqual(contract["metadata_shape"]["alignment_source_steering_ids"], ["steer-1"])
+        self.assertTrue(contract["metadata_shape"]["root_effect_recomputed"])
+        self.assertIn("steering_impact", contract["metadata_shape"]["approaches"][0])
+        self.assertIn("verified_root_developments", contract["steering_alignment"])
+
+    def test_selected_approach_manifest_keeps_the_full_pilot_contract(self) -> None:
+        selected = {
+            "approach_id": "approach-deep-core",
+            "title": "Deep-core metabelianity",
+            "mechanism": "Prove the ambient deep derived core is metabelian.",
+            "decisive_test": "Check the critical chief lift after crown localization.",
+            "root_consequence": "This proves the universal upper bound three.",
+            "steering_impact": "The verified gap-three example makes metabelianity the sharp target.",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-selected-approach-manifest")
+            manifest = build_context_manifest(
+                store,
+                action={
+                    "mode": "reduce",
+                    "target_id": "root",
+                    "search_intent": "approach_pilot:approach-deep-core",
+                    "approach_pilot_required": True,
+                    "selected_approach": selected,
+                    "decisive_test_required": True,
+                    "root_consequence_required": True,
+                    "proof_claim_creation_forbidden_unless_test_succeeds": True,
+                },
+                max_chars=30_000,
+            )
+
+        card = manifest["workflow_action"]
+        self.assertTrue(card["approach_pilot_required"])
+        self.assertEqual(card["selected_approach"], selected)
+        self.assertTrue(card["decisive_test_required"])
+        self.assertTrue(card["root_consequence_required"])
+        self.assertTrue(card["proof_claim_creation_forbidden_unless_test_succeeds"])
+
+    def test_brainstorming_uses_a_short_dedicated_researcher_prompt(self) -> None:
+        guidance = _base_mode_guidance(
+            "reduce",
+            "researcher",
+            "",
+            {"approach_brainstorming_required": True, "researcher_work_mode": "offline"},
+        )
+
+        self.assertLess(len(guidance), 5_000)
+        self.assertIn("dedicated breadth-first mathematical brainstorming pass", guidance)
+        self.assertIn("ideas live only in the advisory portfolio", guidance)
+        self.assertIn("blocking proof debts arise only later", guidance)
+        self.assertNotIn("closure_pipeline_required", guidance)
+
+    def test_source_adaptation_digest_is_not_preempted_by_selected_bridge(self) -> None:
+        state = _pure_strategy_state()
+        state["research_artifacts"] = [
+            {
+                "artifact_id": "older-selected-bridge",
+                "artifact_type": "bridge_lemma_search",
+                "state_revision": 10,
+                "metadata_json": _bridge_metadata(
+                    _bridge_candidate("bridge-before-source", "An older selected bridge theorem.")
+                ),
+            }
+        ]
+        primary_action = {
+            "mode": "reduce",
+            "target_id": "root",
+            "route_id": "",
+            "source_adaptation_digest_required": True,
+            "source_artifact_id": "fresh-source-adaptation",
+        }
+
+        self.assertIsNone(next_strategy_operation(state, primary_action))
+
     def test_bridge_search_enforces_limit_and_sufficiency_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(tmpdir, "strategy-bridge-limits")
@@ -241,43 +641,6 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
                     _bridge_candidate("bridge-close", "The route-closing bridge theorem."),
                     side,
                 ),
-            )
-            self.assertTrue(accepted.accepted, accepted.errors)
-
-    def test_manifest_viable_bridge_status_is_accepted_by_validator(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = self._store(tmpdir, "strategy-bridge-viable-status")
-            manifest = build_context_manifest(
-                store,
-                target_id="root",
-                max_chars=30_000,
-                action={
-                    "mode": "reduce",
-                    "target_id": "root",
-                    "bidirectional_bridge_search_required": True,
-                },
-            )
-            status_contract = manifest["bridge_lemma_search_contract"]["metadata_shape"]["bridge_candidates"][0]["status"]
-            self.assertIn("viable", status_contract.split("|"))
-
-            selected = _bridge_candidate(
-                "bridge-selected",
-                "The selected route-closing bridge theorem.",
-                leverage=0.9,
-            )
-            runner_up = _bridge_candidate(
-                "bridge-runner-up",
-                "A distinct viable bridge theorem.",
-                status="viable",
-                closes=True,
-                leverage=0.3,
-            )
-            accepted = self._attach(
-                store,
-                "researcher",
-                "bridge-with-viable-runner-up",
-                "bridge_lemma_search",
-                _bridge_metadata(selected, runner_up),
             )
             self.assertTrue(accepted.accepted, accepted.errors)
 

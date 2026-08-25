@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from argparse import Namespace
 from unittest.mock import patch
@@ -58,6 +59,14 @@ class MonitorTest(unittest.TestCase):
         with patch.dict(os.environ, {"ALBILICH_MONITOR_REFRESH_INTERVAL_SECONDS": ""}):
             self.assertEqual(_monitor_refresh_interval_seconds(3000), 60.0)
             self.assertEqual(_monitor_refresh_interval_seconds(120000), 120.0)
+
+    def test_dashboard_serializes_slow_browser_refresh_work(self) -> None:
+        self.assertIn("let tickInFlight = false;", INDEX_HTML)
+        self.assertIn("if (paused || tickInFlight) return;", INDEX_HTML)
+        self.assertIn("signal:controller.signal", INDEX_HTML)
+        self.assertIn("await typesetPending(document);", INDEX_HTML)
+        self.assertIn("let mathJaxQueue = Promise.resolve();", INDEX_HTML)
+        self.assertIn("let tailFetchInFlight = false;", INDEX_HTML)
 
     def _store(self, tmpdir: str) -> ProofStateStore:
         store = ProofStateStore("monitor-test", generation_root=Path(tmpdir) / "generation")
@@ -127,8 +136,8 @@ class MonitorTest(unittest.TestCase):
                            hypotheses, conditions_json, validation_status, lifecycle_status,
                            root_impact, reduction_depth, parent_ids_json, source_ids_json,
                            tags_json, evidence_artifact_ids_json, created_at, updated_at
-                       ) VALUES ('claim-psl-bridge', 'lemma', 'The completed PSL bridge.',
-                                 'the completed psl bridge', 'fp-psl-bridge', '', '[]',
+                       ) VALUES ('claim-completed-bridge', 'lemma', 'The completed outer bridge.',
+                                 'the completed outer bridge', 'fp-completed-bridge', '', '[]',
                                  'informally_verified', 'integrated', 0.8, 1, '["root"]',
                                  '[]', '[]', '[]', ?, ?)""",
                     (now, now),
@@ -138,8 +147,8 @@ class MonitorTest(unittest.TestCase):
                            debt_id, owner_type, owner_id, obligation, fingerprint, debt_type,
                            severity, status, first_seen, last_seen, repeated_count,
                            source_artifact_ids_json, suggested_next_target, resolution_evidence_json
-                       ) VALUES ('debt-psl-bridge', 'claim', 'root',
-                                 'Prove the PSL bridge in all outer cosets.', 'fp-psl-debt', 'gap',
+                       ) VALUES ('debt-completed-bridge', 'claim', 'root',
+                                 'Prove the completed bridge in every remaining case.', 'fp-completed-debt', 'gap',
                                  'blocking', 'active', ?, ?, 1, '[]', 'root', '{}')""",
                     (now, now),
                 )
@@ -156,6 +165,27 @@ class MonitorTest(unittest.TestCase):
         self.assertIn('cached/input*100', INDEX_HTML)
         self.assertIn('>Processed</th>', INDEX_HTML)
         self.assertIn('budget spend excludes cached input and includes reasoning', INDEX_HTML)
+
+    def test_dashboard_exposes_approach_portfolio_contributions_and_controls(self) -> None:
+        self.assertIn('id="approachPortfolio"', INDEX_HTML)
+        self.assertIn("function renderApproachPortfolio", INDEX_HTML)
+        self.assertIn("Root effect", INDEX_HTML)
+        self.assertIn("Decisive test", INDEX_HTML)
+        self.assertIn("50% exploit", INDEX_HTML)
+        self.assertIn("30% explore", INDEX_HTML)
+        self.assertIn("20% adversarial", INDEX_HTML)
+        self.assertIn("Generate new approaches", INDEX_HTML)
+        self.assertIn("Ideas are advisory; research questions are nonblocking; proof debts remain strict.", INDEX_HTML)
+        self.assertIn("Portfolio refresh queued", INDEX_HTML)
+        self.assertIn("Root effect${alignmentPending?' (stale)':''}", INDEX_HTML)
+        self.assertIn("Steering impact", INDEX_HTML)
+
+    def test_steering_ui_distinguishes_queued_processing_and_processed(self) -> None:
+        self.assertIn('`${processing} processing`', INDEX_HTML)
+        self.assertIn('m.delivery_status === "processing"', INDEX_HTML)
+        self.assertIn('status === "processed"', INDEX_HTML)
+        self.assertIn("portfolio refresh pending", INDEX_HTML)
+        self.assertIn("portfolio aligned", INDEX_HTML)
 
     def test_run_timeline_marks_integration_failures_recovered_by_later_success(self) -> None:
         runs = [
@@ -744,6 +774,152 @@ class MonitorTest(unittest.TestCase):
             finally:
                 httpd.shutdown()
                 httpd.server_close()
+
+    def test_cumulative_paper_and_artifact_endpoints_are_safe_and_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            artifact_dir = store.state_dir / "artifacts"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            tex_path = artifact_dir / "hmt-rev-10.tex"
+            pdf_path = artifact_dir / "hmt-rev-10.pdf"
+            dossier_path = artifact_dir / "proof-dossier.md"
+            tex_path.write_text("\\documentclass{article}\\begin{document}Partial theorem.\\end{document}", encoding="utf-8")
+            pdf_bytes = b"%PDF-1.4\n% dashboard fixture\n"
+            pdf_path.write_bytes(pdf_bytes)
+            dossier_path.write_text(
+                "# A useful lemma\n\nIf $G$ is cyclic, then every subgroup of $G$ is normal.",
+                encoding="utf-8",
+            )
+            sidecar_dir = store.state_dir / "hmt_snapshots"
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            sidecar_tex = sidecar_dir / "hmt-sidecar.tex"
+            sidecar_pdf = sidecar_dir / "hmt-sidecar.pdf"
+            sidecar_tex.write_text("\\documentclass{article}\\begin{document}Sidecar.\\end{document}", encoding="utf-8")
+            sidecar_pdf_bytes = b"%PDF-1.4\n% sidecar fixture\n"
+            sidecar_pdf.write_bytes(sidecar_pdf_bytes)
+            (sidecar_dir / "catalog.json").write_text(
+                json.dumps(
+                    {
+                        "catalog_version": 1,
+                        "papers": [
+                            {
+                                "artifact_id": "hmt-sidecar",
+                                "artifact_type": "human_readable_mathematical_text",
+                                "title": "A non-blocking sidecar paper",
+                                "source_revision": 20,
+                                "sequence": 2,
+                                "created_at": utc_now(),
+                                "tex_path": str(sidecar_tex),
+                                "pdf_path": str(sidecar_pdf),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            now = utc_now()
+            with store.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO artifacts(
+                        artifact_id, artifact_type, path, sha256, producer_role, run_id,
+                        state_revision, content_summary, metadata_json, created_at
+                    ) VALUES (?, ?, ?, 'sha-hmt', 'writer', 'writer-1', 10, ?, ?, ?)
+                    """,
+                    (
+                        "hmt-rev-10",
+                        "human_readable_mathematical_text",
+                        str(tex_path),
+                        "The cyclic case satisfies the target property.",
+                        json.dumps(
+                            {
+                                "title": "Partial classification in the cyclic case",
+                                "source_revision": 10,
+                                "sequence": 1,
+                                "pdf_status": "compiled",
+                                "pdf_path": str(pdf_path),
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO artifacts(
+                        artifact_id, artifact_type, path, sha256, producer_role, run_id,
+                        state_revision, content_summary, metadata_json, created_at
+                    ) VALUES (?, 'proof_dossier', ?, 'sha-dossier', 'researcher', 'research-1', 9, ?, ?, ?)
+                    """,
+                    (
+                        "proof-dossier",
+                        str(dossier_path),
+                        "Every subgroup of a cyclic group is normal.",
+                        json.dumps({"title": "Normality of subgroups of a cyclic group"}),
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            handler = _make_handler(store, poll_ms=2000)
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            port = httpd.server_address[1]
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/papers") as response:
+                    papers = json.loads(response.read().decode("utf-8"))["papers"]
+                self.assertEqual(len(papers), 2)
+                self.assertEqual(papers[0]["source_revision"], 10)
+                self.assertEqual(papers[0]["title"], "Partial classification in the cyclic case")
+                self.assertTrue(papers[1]["non_blocking"])
+                self.assertEqual(papers[1]["title"], "A non-blocking sidecar paper")
+
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/artifacts") as response:
+                    artifacts = json.loads(response.read().decode("utf-8"))["artifacts"]
+                self.assertEqual({row["artifact_id"] for row in artifacts}, {"hmt-rev-10", "proof-dossier"})
+                dossier_card = next(row for row in artifacts if row["artifact_id"] == "proof-dossier")
+                self.assertEqual(dossier_card["display_title"], "Normality of subgroups of a cyclic group")
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/paper?id=hmt-rev-10"
+                ) as response:
+                    self.assertEqual(response.headers.get_content_type(), "application/pdf")
+                    self.assertEqual(response.read(), pdf_bytes)
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/paper?id=hmt-sidecar"
+                ) as response:
+                    self.assertEqual(response.headers.get_content_type(), "application/pdf")
+                    self.assertEqual(response.read(), sidecar_pdf_bytes)
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/artifact?id=proof-dossier"
+                ) as response:
+                    document = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(document["title"], "Normality of subgroups of a cyclic group")
+                self.assertIn("every subgroup of $G$", document["content"])
+
+                with self.assertRaises(urllib.error.HTTPError) as rejected:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/api/paper?id=proof-dossier"
+                    )
+                self.assertEqual(rejected.exception.code, 404)
+                rejected.exception.close()
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+        self.assertIn('id="paperFrame"', INDEX_HTML)
+        self.assertIn('id="paperSelect"', INDEX_HTML)
+        self.assertIn("Mathematical Artifact Library", INDEX_HTML)
+        self.assertIn("https://cdn.jsdelivr.net/npm/mathjax@4/tex-svg.js", INDEX_HTML)
+        self.assertIn("function latexCompat", INDEX_HTML)
+        self.assertIn("function typesetPending", INDEX_HTML)
+        self.assertIn("function setStableHTML", INDEX_HTML)
+        self.assertIn('.math-tex[data-math-pending="1"]', INDEX_HTML)
+        self.assertIn("UNICODE_MATH_GLYPHS", INDEX_HTML)
+        self.assertIn("mathHTML(a.mathematical_statement)", INDEX_HTML)
+        self.assertIn("mathHTML(r.conclusion_statement)", INDEX_HTML)
 
     def test_background_monitor_starts_on_ephemeral_port(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

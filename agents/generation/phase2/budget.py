@@ -197,6 +197,11 @@ def run_spend_from_operation(op: Mapping[str, Any]) -> int:
     The budget is spent on new input + output + reasoning. When no breakdown is
     available (a collapsed CLI footer carrying only a total), fall back to total.
     """
+    # Periodic HMT is an expository sidecar, not mathematical research.  Keep
+    # its usage visible in the sidecar catalog without consuming the proof
+    # run's token allocation if an older workflow records such a run in SQLite.
+    if str(op.get("search_intent") or "") == "periodic_human_readable_mathematical_text":
+        return 0
     input_tokens = _first_int(op, "input_tokens")
     cached_input_tokens = min(_first_int(op, "cached_input_tokens"), input_tokens)
     effective = (

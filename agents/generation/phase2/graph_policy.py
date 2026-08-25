@@ -1258,6 +1258,7 @@ def build_proof_spine(
     blocking_debts.sort(key=lambda row: (-row["repeated_count"], row["debt_id"]))
 
     route_rows = route_scoreboard(state, limit=8)
+    canonical_skeleton = canonical_root_proof_skeleton(state)
     decisive = _action_decisive_theorem_test_signal(
         state, action, target_id=target_id
     ) or decisive_theorem_test_signal(state, target_id=target_id)
@@ -1271,6 +1272,7 @@ def build_proof_spine(
         "verified_partial_results": verified[:8],
         "current_bottlenecks": blocking_debts[:6],
         "route_scoreboard": route_rows[:6],
+        "canonical_root_skeleton": canonical_skeleton,
         "supersession": {
             "superseded_claim_ids": list(supersession.get("superseded_claim_ids", []))[:8],
             "superseded_route_ids": list(supersession.get("superseded_route_ids", []))[:8],
@@ -1284,12 +1286,109 @@ def build_proof_spine(
             "Do not retry superseded claims or stale route wording unless explicitly repairing the supersession record.",
             "Prefer proving, refuting, citing, or narrowing the decisive theorem test over writing broad inventories.",
             "When a verifier finds an exact-statement mismatch, create the repaired theorem and supersede the stale wording.",
+            "Only claims connected to a sufficient root-route inference count as proof closure; other verified claims remain library results.",
         ],
         "workflow_action": {
             "search_intent": str((action or {}).get("search_intent") or ""),
             "mode": str((action or {}).get("mode") or ""),
             "target_id": str((action or {}).get("target_id") or target_id),
         },
+    }
+
+
+def canonical_root_proof_skeleton(state: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return an executable, automatically derived skeleton for the root.
+
+    This is deliberately smaller than a manuscript and stricter than a list of
+    nearby lemmas.  It shows only sufficient routes concluding the root, their
+    terminal inferences, and the exact premise/condition statuses.  Verified
+    claims not cited by any root inference are reported as unplaced rather than
+    counted as progress.
+    """
+
+    claims = claim_map(state)
+
+    def id_list(row: Mapping[str, Any], key: str, json_key: str) -> list[str]:
+        value = row.get(key)
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        return [str(item) for item in json_loads(row.get(json_key), [])]
+
+    routes = [
+        route
+        for route in state.get("routes", [])
+        if str(route.get("conclusion_claim_id") or "") == "root"
+        and str(route.get("relation_to_parent") or "sufficient") == "sufficient"
+        and str(route.get("status") or "active") not in {"abandoned", "superseded"}
+    ]
+    route_ids = {str(route.get("route_id") or "") for route in routes}
+    inferences_by_route: dict[str, list[Mapping[str, Any]]] = {}
+    placed_claim_ids: set[str] = set()
+    for inference in state.get("inferences", []):
+        route_id = str(inference.get("route_id") or "")
+        if route_id not in route_ids or str(inference.get("conclusion_claim_id") or "") != "root":
+            continue
+        inferences_by_route.setdefault(route_id, []).append(inference)
+        placed_claim_ids.update(id_list(inference, "premise_claim_ids", "premise_claim_ids_json"))
+        placed_claim_ids.update(id_list(inference, "condition_claim_ids", "condition_claim_ids_json"))
+
+    route_steps: list[Dict[str, Any]] = []
+    for route in routes:
+        route_id = str(route.get("route_id") or "")
+        terminal_steps: list[Dict[str, Any]] = []
+        for inference in inferences_by_route.get(route_id, []):
+            premise_ids = id_list(inference, "premise_claim_ids", "premise_claim_ids_json")
+            condition_ids = id_list(inference, "condition_claim_ids", "condition_claim_ids_json")
+            dependencies = []
+            for claim_id in [*premise_ids, *condition_ids]:
+                claim = claims.get(claim_id, {})
+                dependencies.append(
+                    {
+                        "claim_id": claim_id,
+                        "validation_status": str(claim.get("validation_status") or "missing"),
+                        "lifecycle_status": str(claim.get("lifecycle_status") or "missing"),
+                    }
+                )
+            terminal_steps.append(
+                {
+                    "inference_id": str(inference.get("inference_id") or ""),
+                    "validation_status": str(inference.get("validation_status") or "untested"),
+                    "dependencies": dependencies,
+                    "explanation": _compact_text(str(inference.get("explanation") or ""), 220),
+                }
+            )
+        route_steps.append(
+            {
+                "route_id": route_id,
+                "status": str(route.get("status") or "active"),
+                "strategy": _compact_text(str(route.get("strategy") or route.get("label") or ""), 220),
+                "terminal_inferences": terminal_steps,
+                "assembled": bool(terminal_steps),
+            }
+        )
+
+    unplaced_verified = [
+        claim_id
+        for claim_id, claim in claims.items()
+        if claim_id != "root"
+        and str(claim.get("validation_status") or "") in VERIFIED_VALIDATION_STATUSES
+        and str(claim.get("lifecycle_status") or "") not in RETIRED_CLAIM_LIFECYCLES
+        and claim_id not in placed_claim_ids
+    ]
+    unplaced_verified.sort()
+    return {
+        "policy": "inference-connected-root-skeleton",
+        "root_routes": route_steps,
+        "has_sufficient_root_route": bool(routes),
+        "has_terminal_root_inference": any(step["terminal_inferences"] for step in route_steps),
+        "placed_verified_claim_count": sum(
+            1
+            for claim_id in placed_claim_ids
+            if str(claims.get(claim_id, {}).get("validation_status") or "") in VERIFIED_VALIDATION_STATUSES
+        ),
+        "unplaced_verified_claim_count": len(unplaced_verified),
+        "unplaced_verified_claim_ids": unplaced_verified[:12],
+        "unplaced_rule": "unplaced verified claims are library results, not root-proof progress",
     }
 
 
@@ -1330,6 +1429,18 @@ def _claim_signature_tokens(statement: str) -> set[str]:
     return tokens
 
 
+def _claim_numeric_signature(statement: str) -> set[str]:
+    """Keep explicit integer parameters for high-confidence claim matching.
+
+    The ordinary word signature deliberately drops numbers.  That is useful for
+    broad retrieval, but unsafe when deciding whether two concise mathematical
+    statements are the same theorem: changing ``n>=4`` to ``n>=3`` can be the
+    entire mathematical delta.  The concise-restatement guard below therefore
+    requires the visible integer parameters to agree exactly.
+    """
+    return set(re.findall(r"(?<![A-Za-z_])\d+(?![A-Za-z_])", str(statement or "")))
+
+
 def _is_integrated_claim_row(row: Mapping[str, Any]) -> bool:
     return str(row.get("lifecycle_status") or "") == "integrated"
 
@@ -1341,9 +1452,35 @@ def _near_integrated_claim_restatement(
 ) -> bool:
     new_tokens = _claim_signature_tokens(statement)
     existing_tokens = _claim_signature_tokens(existing_statement)
+    shared = new_tokens & existing_tokens
+    # A changed explicit constant or dimension can be the entire content of a
+    # strengthening even when the surrounding theorem template is almost
+    # identical.  Preserve that distinction for ordinary-length claims too,
+    # not only for the concise-restatement branch below.
+    if _claim_numeric_signature(statement) != _claim_numeric_signature(existing_statement):
+        return False
+
+    # Concise mathematical formulations often have fewer than fifteen word
+    # tokens because most of their content lives in notation.  The older floor
+    # let a short restatement of an integrated theorem bypass the duplicate
+    # guard.  Accept this narrow containment case only when the *new* statement
+    # is the concise one, almost all of its semantic words are already present,
+    # the longer theorem is still substantially covered, and all explicit
+    # integer parameters agree.  A longer proposed theorem may contain a real
+    # strengthening, so it continues through the conservative general test.
+    if 10 <= len(new_tokens) < 15 and len(new_tokens) <= len(existing_tokens):
+        new_coverage = len(shared) / max(1, len(new_tokens))
+        existing_coverage = len(shared) / max(1, len(existing_tokens))
+        if (
+            len(shared) >= 10
+            and new_coverage >= 0.80
+            and existing_coverage >= 0.50
+            and _claim_numeric_signature(statement) == _claim_numeric_signature(existing_statement)
+        ):
+            return True
+
     if len(new_tokens) < 15 or len(existing_tokens) < 15:
         return False
-    shared = new_tokens & existing_tokens
     if len(shared) < 12:
         return False
     novel_tokens = new_tokens - existing_tokens - CLAIM_RESTATEMENT_NOVELTY_STOPWORDS
@@ -1387,9 +1524,18 @@ def integrated_claim_covering_debt_id(
             if _is_integrated_claim_row(row)
         )
     for claim_id, claim_tokens in claim_signatures:
+        shared = debt_tokens & claim_tokens
+        # A concise closing lemma can legitimately discharge a much more
+        # verbose research obligation.  The old 15-token floor left those
+        # audit-ledger debts on the live frontier forever, even when nearly
+        # every word of the integrated lemma occurred in the obligation.
+        if len(claim_tokens) >= 10 and len(shared) >= 10:
+            debt_coverage = len(shared) / max(1, len(debt_tokens))
+            claim_coverage = len(shared) / max(1, len(claim_tokens))
+            if debt_coverage >= 0.15 and claim_coverage >= 0.85:
+                return claim_id
         if len(claim_tokens) < 15:
             continue
-        shared = debt_tokens & claim_tokens
         if len(shared) < 16:
             continue
         debt_coverage = len(shared) / max(1, len(debt_tokens))

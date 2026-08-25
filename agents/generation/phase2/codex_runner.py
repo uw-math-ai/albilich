@@ -31,7 +31,7 @@ from .completion_policy import (
 from .context_builder import build_context_manifest, build_resume_delta_manifest, manifest_hash, render_manifest
 from .models import sha256_text, utc_now
 from .patches import preflight_patch_errors
-from .role_capabilities import role_can_use_cas, session_cas_enabled
+from .role_capabilities import advisor_enabled, role_can_use_cas, session_cas_enabled
 from .store import ProofStateStore
 from .writing.paper_contract import (
     EDITOR_DIRECTIVE,
@@ -53,6 +53,7 @@ LIVE_LOG_TAIL_BYTES = 12_000
 CODEX_SESSION_ROOT_ENV = "ALBILICH_CODEX_SESSION_ROOT"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 15.0
 DEFAULT_CODEX_STALE_RETRY_SECONDS = 90.0
+DEFAULT_CODEX_ACTIVE_RETRY_GRACE_SECONDS = 300.0
 DEFAULT_CODEX_CHILD_TMPDIR = Path(__file__).resolve().parents[3] / ".albilich" / "tmp" / "codex-child"
 DEFAULT_CODEX_CHILD_RUST_LOG = (
     "warn,codex_core_plugins::manifest=error,codex_core_skills::loader=error,"
@@ -93,6 +94,7 @@ NOISY_CODEX_LOG_FRAGMENTS = (
     # the requested model session continues normally. They are not child
     # progress and must not postpone Albilich's stream-retry stall detector.
     " codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries`",
+    " codex_models_manager::manager: failed to renew cache TTL: missing field `base_instructions`",
     " codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit",
     " WARN codex_analytics::client: failed to send events request:",
 )
@@ -100,6 +102,18 @@ STALE_RETRY_LOG_FRAGMENTS = (
     "codex_core::responses_retry",
     "stream disconnected - retrying sampling request",
     "retrying sampling request",
+)
+USAGE_LIMIT_LOG_FRAGMENTS = (
+    "you've hit your usage limit",
+    "usage limit reached",
+    "rate limit exceeded",
+)
+TRANSPORT_FAILURE_LOG_FRAGMENTS = (
+    "stream disconnected before completion",
+    "error sending request for url",
+    "failed to connect to",
+    "couldn't connect to server",
+    "connection reset by peer",
 )
 # Writing-review subsystem: rubric source of truth and lens roster. The rubric
 # lives outside the package (math-writing-harness/) and is parsed by the
@@ -131,8 +145,12 @@ def actor_role_for_action(action: Mapping[str, Any]) -> str:
     if mode == "audit_definitions":
         return "literature_researcher"
     if mode == "triage_routes":
+        if not advisor_enabled():
+            raise RuntimeError("advisor-only action escaped the disabled-advisor scheduler guard")
         return "phd_advisor"
     if mode == "regulate_decomposition":
+        if not advisor_enabled():
+            raise RuntimeError("advisor-only action escaped the disabled-advisor scheduler guard")
         return "phd_advisor"
     if mode == "refute":
         return "villain"
@@ -388,6 +406,44 @@ _WRITER_PAPER_PATH_ATTACH_CONTRACT = (
     "\\documentclass, you over-escaped; tabular row breaks are the one construct that stays a double backslash in "
     "the parsed LaTeX). "
 )
+
+
+def _writer_hmt_guidance(action: Mapping[str, Any]) -> str:
+    source_revision = int(action.get("hmt_source_revision") or 0)
+    source_integrated_claim_count = int(
+        action.get("hmt_source_integrated_claim_count") or 0
+    )
+    integrated_claim_interval = int(action.get("hmt_integrated_claim_interval") or 10)
+    sequence = int(action.get("hmt_sequence") or 1)
+    return (
+        "PERIODIC HUMAN-READABLE MATHEMATICAL TEXT (HMT): produce one cumulative partial paper for a human "
+        f"mathematician after {source_integrated_claim_count} claims have been integrated, using accepted proof "
+        f"state revision {source_revision} (snapshot {sequence}; cadence {integrated_claim_interval} newly "
+        "integrated claims). This is a "
+        "non-certifying ONE-SHOT exposition pass: do not open writing debts, request critic passes, revise an older HMT, do new "
+        "research, or change any claim, route, inference, debt, or certification status. Use "
+        "manifest.human_readable_text_packet as the status map and manifest-listed mathematical artifacts as the "
+        "evidence. Write a complete standalone LaTeX article with a descriptive title, abstract, precise problem "
+        "statement, notation, an organized account of established results and their proofs, a coherent explanation "
+        "of the best proof route, and a final section that states the remaining gap and failed or conditional routes "
+        "honestly. The prose must read as ordinary research mathematics, not a run log: never expose internal claim "
+        "ids, route ids, revision machinery, confidence scores, agent roles, prompts, token data, or artifact paths in "
+        "the mathematical narrative. State hypotheses before conclusions; use theorem/lemma/proof environments where "
+        "appropriate; explain each implication in sentences; distinguish proved or integrated statements from "
+        "plausible, challenged, refuted, and open statements; do not invent a proof or citation to make the paper feel "
+        "complete. Avoid canned section summaries, choppy fragments, fake quotations, inflated novelty claims, and "
+        "generic filler. The source must compile with pdflatex using conventional packages available in a standard "
+        "TeX installation. The staging directory is explicitly writable. Write it to "
+        "manifest.human_readable_text_packet.staging_dir/<artifact_id>.tex, verify that exact file exists, and return "
+        "one Albilich patch containing exactly one attach_artifact operation. Do not include record_run_metrics; "
+        "the non-blocking HMT sidecar records usage outside the proof run. The attachment "
+        "must have artifact_type='human_readable_mathematical_text', a new artifact_id, path (not inline content), a "
+        f"human-readable mathematical content_summary, and metadata including source_revision={source_revision}, "
+        f"source_integrated_claim_count={source_integrated_claim_count}, "
+        f"integrated_claim_interval={integrated_claim_interval}, sequence={sequence}, title, "
+        "snapshot_kind='cumulative_partial_paper', and non_certifying=true. Attach no "
+        "final_paper, final_proof, report, debt, status transition, or other artifact."
+    )
 
 
 def _writer_external_revision_path_contract(document_format: str) -> str:
@@ -783,9 +839,19 @@ def _paper_audit_guidance(actor_role: str, action: Mapping[str, Any]) -> str:
 def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[Mapping[str, Any]] = None) -> str:
     action = action or {}
     audit_prefix = _paper_audit_guidance(actor_role, action)
-    if audit_prefix:
-        return audit_prefix + _base_mode_guidance(mode, actor_role, route_id, action)
-    return _base_mode_guidance(mode, actor_role, route_id, action)
+    base = _base_mode_guidance(mode, actor_role, route_id, action)
+    readable_state_contract = (
+        " READABLE PROOF-STATE CONTRACT: write every stored claim as a complete mathematical statement with all "
+        "essential hypotheses; give every route a descriptive mathematical label and a strategy that explains the "
+        "deduction in prose; give every inference a self-contained mathematical explanation. For every attached "
+        "mathematical artifact, make content_summary a sentence stating its main theorem, obstruction, computation, "
+        "or unresolved gap, and put a human-readable title in metadata when the artifact has a natural title. Never "
+        "use an internal id, workflow action, or confidence label as the only description of stored mathematics. "
+        "Encode mathematical notation as LaTeX delimited by \\(...\\) inline or \\[...\\] in display mode. Do not "
+        "use Unicode mathematical operators, arrows, Greek letters, or superscript/subscript glyphs in readable "
+        "titles, statements, route descriptions, inference explanations, or content summaries."
+    )
+    return audit_prefix + base + readable_state_contract
 
 
 def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mapping[str, Any]) -> str:
@@ -843,10 +909,10 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "add a missing_reference or missing_hypothesis debt. "
             "CAS experiment reports may support examples, counterexamples, or bounded finite computations only when the finite scope, code, "
             "output, and deduction to the claimed step are explicit; otherwise ask for a sharper computation or a proof. "
-            "If manifest.workflow_action.proof_interface_check_required=true, put proof_interface_check_version=1 in the verification_report "
+            "If manifest.workflow_action.proof_interface_check_required=true, put proof_interface_check_version=2 in the verification_report "
             "metadata and explicitly set quantifiers_preserved, hypotheses_matched, cases_exhaustive, reduction_direction_valid, "
             "finite_scope_not_overclaimed, and dependencies_assemble. A zero-gap verdict requires all six to be true; otherwise report the "
-            "failed interface as a precise gap. Lean 4 is not required. "
+            "failed interface as a precise gap. Also set mathematical_interface_version=1, give nonempty interface_checks comparing object/category, field/ring, action type, finiteness, quantifier order, subgroup/quotient/section scope, normalization, and ranges, and set unresolved_interface_mismatches to a list. A zero-gap verdict requires that list to be empty. Lean 4 is not required. "
             "For a correct proof use critical_errors=[] and gaps=[], then propose informally_verified for the checked inference(s) "
             "and the target claim. If there is any gap or error, do not verify; attach the short report and add precise active "
             "proof debts. Put long prose only in an external artifact path when truly needed."
@@ -880,12 +946,17 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
         + "|".join(sorted(LANGUAGE_DEBT_TYPES))
         + " while alignment keeps targeting the strongest corrected reading. If and only if integration is valid, "
             "attach an integration_report artifact with concise metadata integrates=true, route_id, claim_id, missing, outcome, resolved_debt_ids, "
-            "proof_interface_check_version=1, quantifiers_preserved, hypotheses_matched, cases_exhaustive, reduction_direction_valid, "
-            "finite_scope_not_overclaimed, dependencies_assemble, "
+            "resolved_debt_justifications, "
+            "proof_interface_check_version=2, quantifiers_preserved, hypotheses_matched, cases_exhaustive, reduction_direction_valid, "
+            "finite_scope_not_overclaimed, dependencies_assemble, mathematical_interface_version=1, interface_checks, unresolved_interface_mismatches=[], "
             "and root_alignment={relation_to_root: exact|equivalent|stronger, target_statement, proved_statement, "
             "implication_verified: true, hidden_assumptions: false, extra_assumptions: []}; then propose lifecycle integrated "
             "for the target claim with the route_id and copy resolved_debt_ids onto that status-transition operation. "
-            "Only list debts that the integrated route genuinely closes. Otherwise add a blocking debt or leave the result as certified partial progress."
+            "Only list debts shown in manifest.debts that the integrated route genuinely closes. A debt marked "
+            "integration_resolution_candidate=true is an optional upstream/root reconciliation candidate rather than a blocker: "
+            "close it only if the theorem fully discharges its exact obligation, and include a precise explanation under that "
+            "debt id in resolved_debt_justifications. Do not close a debt for partial overlap or related vocabulary. Otherwise "
+            "add a blocking debt or leave the result as certified partial progress."
         )
     if actor_role == "formal_backend":
         return (
@@ -904,11 +975,13 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             return (
                 "Validate the candidate independently. The root is an interrogative problem, not a declarative theorem, so a checked "
                 "example may answer or constrain the problem without refuting the root. Attach confirmed_counterexample with metadata "
-                "naming the exact narrower hypothesis it falsifies, but do not propose refuted for root; keep the root active."
+                "candidate_artifact_id copied exactly from workflow_action.candidate_counterexample_artifact_id and name the exact narrower "
+                "hypothesis it falsifies, but do not propose refuted for root; keep the root active."
             )
         return (
             "Validate candidate counterexamples independently. If the counterexample is fully checked, attach one "
-            "confirmed_counterexample and propose validation_status=refuted for the falsified claim in the same patch, "
+            "confirmed_counterexample with metadata candidate_artifact_id copied exactly from "
+            "workflow_action.candidate_counterexample_artifact_id and propose validation_status=refuted for the falsified claim in the same patch, "
             "using that exact artifact as evidence; do not leave a confirmed falsification merely challenged. If validation "
             "is incomplete, attach no confirmed_counterexample and add one precise blocking validation debt instead."
         )
@@ -922,6 +995,8 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             )
         if action.get("paper_authoring"):
             return _writer_paper_authoring_guidance(action)
+        if action.get("periodic_hmt"):
+            return _writer_hmt_guidance(action)
         return (
             _writer_writing_revision_guidance(action)
             + "Act as a mathematically careful proof-writing agent, not a ledger dumper. Write polished, LaTeX-friendly mathematical "
@@ -1005,7 +1080,8 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
                 "When manifest.workflow_action.theorem_adaptation_required=true, every usable source handoff must be a theorem-adaptation packet: "
                 "set theorem_adaptation_version=1 and record source_location, exact_source_statement, local_statement_translation, "
                 "definition_dictionary, hypothesis_dictionary, checked_hypotheses, missing_hypotheses (an empty list is allowed), local_deduction, "
-                "reusable_proof_moves, and failure_boundary. A bibliography or abstract summary alone is not an accepted handoff. "
+                "reusable_proof_moves, and failure_boundary. Put these either in artifact metadata or as explicit keyed lines in the artifact "
+                "content; do not duplicate them merely to satisfy both locations. A bibliography or abstract summary alone is not an accepted handoff. "
                 "the root theorem as well as the selected local "
                 "obligation, because a result that reframes the root theorem is often more valuable than a narrow lemma hit. Download or "
                 "cache source text/PDF metadata when the source is plausibly relevant, record source_version/content_hash, and make the "
@@ -1202,9 +1278,36 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "and conclusion when the computation matters. When you find an obstruction, make it actionable for route conversion: include "
             "metadata target_id, route_id when known, obstruction_type, failed_hypothesis or example_family, and the exact claim or route "
             "it threatens. Do not verify, refute, or integrate anything; confirmed "
-            "refutations belong to counterexample_validator."
+            "refutations belong to counterexample_validator. If workflow_action.initial_counterexample_preflight_required=true, stamp counterexample_preflight_version=1 in the primary artifact, test the full root hypotheses and minimal/boundary families, and say explicitly that a null sweep is not a proof."
         )
     if actor_role == "researcher":
+        if action.get("approach_brainstorming_required"):
+            alignment_guidance = (
+                "This pass is the mandatory post-steering alignment gate. Use manifest.workflow_action.approach_alignment "
+                "and manifest.approach_portfolio_contract.steering_alignment as binding inputs. Recompute the root consequence "
+                "of every approach against every processed directive and newer verified root development, and fill the required "
+                "steering_impact for every approach. Do not preserve a stale numerical bound, sharpness claim, root effect, or pilot. "
+                if action.get("approach_alignment")
+                else ""
+            )
+            return (
+                _researcher_work_mode_guidance(action)
+                + alignment_guidance
+                + "This is a dedicated breadth-first mathematical brainstorming pass. Read the exact root theorem and the verified state, "
+                "then stop before local calculation. Follow manifest.approach_portfolio_contract exactly and attach one strategy_schema_version=1 "
+                "approach_portfolio artifact. Generate the required number of semantically different approaches across mechanisms such as direct "
+                "proof, equivalent reformulation, invariant or representation change, structural reduction, neighboring-theorem transfer, bounded "
+                "experiment, and counterexample architecture. Do not include a category merely to fill a quota: every approach must name its actual "
+                "mathematical objects, weakest bridge to the root, likely failure, and cheapest decisive test. Score contribution qualitatively from "
+                "0 to 5 and select two or three complementary pilots, balancing root leverage, novelty, test cost, and adversarial value. Distinguish "
+                "three layers rigorously: ideas live only in the advisory portfolio; conceptual or experimental questions may be recorded as "
+                "nonblocking research_questions and, when they would change selection, as at most six minor debts of the allowed question types "
+                "owned by an existing graph object; blocking proof debts arise only later from an exact obligation on a selected proof route. You may "
+                "be generous and speculative in the first two layers, but do not create one debt per idea and do not add claims, routes, inferences, "
+                "or blocking debts in this pass. "
+                "Do not present confidence or novelty as calibrated probability, and do not disguise paraphrases as different approaches. The "
+                "portfolio has no verification authority."
+            )
         direct_solve_guidance = ""
         if mode == "prove" and not route_id:
             direct_solve_guidance = (
@@ -1265,6 +1368,10 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "temporarily assume each one, list every hidden obligation, and give every candidate a nonempty forward_support list naming the "
             "concrete current claim or inference that motivates it; never emit forward_support=[]. Reject restatements/duplicates/gap-moving statements, and attach one "
             "bridge_lemma_search artifact (strategy_schema_version=1) selecting at most two candidates by root leverage and sufficiency. "
+            "If workflow_action.approach_pilot_required=true, work only workflow_action.selected_approach and run its named cheapest decisive test "
+            "before investing in a full local proof. State which possible outcomes select, revise, or kill the approach and the exact consequence "
+            "for the root route. A successful test may produce a proof_dossier or exact route material; a failed test should produce the precise "
+            "obstruction or decision change, not another broad inventory. "
             "If workflow_action.experiment_workflow_required=true or workflow_action.researcher_work_mode='cas', use the precise obstruction -> "
             "discriminating experiment -> structured observations -> candidate pattern -> counterexample search -> sharpened conjecture -> proof-attempt "
             "loop. Follow manifest.cas_experiment_contract exactly when stamping experiment_workflow_version=1: include mathematical_question, "
@@ -1280,6 +1387,8 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "bridge theorem may enter proof search. If workflow_action.deep_session_required=true, stay on the one root-critical branch for a coherent "
             "session and attach deep_session_report with every required deliverable field. In particular, metadata.candidate_lemmas must be a nonempty "
             "list containing at least one exact local lemma, hypothesis, or falsifiable subclaim from the session; never emit candidate_lemmas=[]. "
+            "When complete_local_argument proves one or more of those local lemmas even though the enclosing bottleneck remains open, also set "
+            "metadata.proved_lemma_statements to exactly the proved statements; exclude conjectures, bridges to test, and remaining obligations. "
             "Ordinary patch and verifier gates still apply. "
             "If workflow_action.closure_pressure_required=true, do not request another "
             "broad search; prove the bridge, refute it, or make a strictly narrower theorem/case split. Consult manifest.negative_result_ledger "
@@ -1314,7 +1423,11 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "mathematically different representations, give the translation dictionary and round-trip implication checks, choose the one that "
             "strictly simplifies the bottleneck, and put representation_switch_version=1 plus all required fields in the primary artifact metadata. "
             "If workflow_action.theorem_adaptation_required=true, return an exact source-to-local theorem packet, not a survey: put "
-            "theorem_adaptation_version=1 and every required theorem-adaptation field in source_adaptation_notes or the primary proof_dossier. "
+            "theorem_adaptation_version=1 in metadata and put every required theorem-adaptation field either in metadata or as an explicit keyed "
+            "line in source_adaptation_notes or the primary proof_dossier; do not duplicate the packet across both locations. Compile proof technique, not only theorem text: stamp source_technique_compiler_version=1 and record the source proof skeleton, key constructions, why each hypothesis is used, failure examples, local translation steps, and the next local deduction. "
+            "If workflow_action.root_cut_consolidation_required=true, the claim frontier is frozen: do not add route-less claims or parallel dossiers. Close, refute, or strictly shrink the named cut obligation and record the before/after cut signatures. "
+            "If workflow_action.canonical_route_ownership.ownership_required=true, keep exactly one canonical route dossier; explicitly supersede the named canonical artifact and set canonical_route_owner_version=1, canonical_route_id, root_implication_update, root_cut_signature_before, root_cut_signature_after, and creates_parallel_dossier=false. "
+            "If workflow_action.canonical_route_ownership.continuity_required=true but ownership_required=false, continue the named route-less canonical artifact by supersession and set root_implication_update, root_cut_signature_before, root_cut_signature_after, and creates_parallel_dossier=false; do not set canonical_route_owner_version or canonical_route_id until a nonempty route exists. "
             "If workflow_action.decisive_theorem_test_required=true, work only the theorem-level obligation in "
             "manifest.workflow_action.decisive_theorem_test: state the exact theorem/counterexample test, then prove it, refute it, "
             "find a precise citation with checked hypotheses, or replace it with one strictly narrower theorem-level debt. Do not write "
@@ -1338,7 +1451,8 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "If any lemma is already locally proved, create or repair a route/inference so strict verification can run; do not leave it as "
             "mere research progress. "
             "If workflow_action.duplicate_math_guard_required=true, compare against recent proof artifacts and do not restate an already "
-            "accepted theorem unless you use it to attack the newest child debt. "
+            "accepted theorem unless you use it to attack the newest child debt. If an integrated theorem already proves part of a new result, "
+            "reuse that claim_id as a premise and state only the strict mathematical delta; do not bundle the accepted theorem into a new claim. "
             "If workflow_action.near_miss_memory_required=true, name the strongest failed route in one sentence and either remove that "
             "obstruction, promote it to a lemma, or abandon the route precisely. "
             "If workflow_action.villain_obstruction_to_lemma_required=true, try to convert construction failures or counterexample pressure "
@@ -1349,7 +1463,9 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "Read the named proof_candidate_artifact_id and either create exactly one active sufficient route plus one untested/plausible "
             "inference whose evidence_artifact_ids include that proof dossier, or attach one short research_diagnostic explaining why the "
             "candidate is not verifier-ready and add one precise blocking debt. Do not request literature or decompose before making that "
-            "route/diagnostic decision. "
+            "route/diagnostic decision. If workflow_action.proved_lemma_claim_extraction_required=true, create an exact child claim for the "
+            "locally proved lemma (unless an equivalent claim already exists), and make the sufficient route and evidence-linked inference "
+            "conclude that lemma rather than falsely asserting a route to the root. "
             "If workflow_action.research_synthesis_required=true, this is not another small patch pass. Act as the mathematical owner of the "
             "target: read the recent proof, literature, counterexample, CAS, and decomposition signals; compare the approaches; state what "
             "changed mathematically; kill, merge, or prioritize routes; and produce one paper-like synthesis note with the next serious proof "
@@ -1405,7 +1521,9 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "at most one simple script error, stop runs that no longer change the mathematical next step, and attach cas_experiment_report "
             "with backend, code, output summary, scope, conclusion, and proof relevance. Treat CAS output as evidence, examples, or checked "
             "finite computation; explain any theorem-level use in the proof dossier. Reuse existing claim_ids when a proposed statement is an "
-            "obvious restatement or duplicate. For a selected route or proof_repair_required action, repair the route first: attach a "
+            "obvious restatement or duplicate. A proof rewrite is an artifact or inference update, not a new claim. When extending an integrated "
+            "theorem, make the existing claim a premise and formulate only the genuinely stronger conclusion as the new claim. For a selected route "
+            "or proof_repair_required action, repair the route first: attach a "
             "proof_dossier/proof_blueprint and add or update the inference that the verifier should check. Before emitting a verifier-ready "
             "inference, include a self_check section saying which hypotheses, definitions, boundary cases, and dependencies were checked. "
             "For an existing decomposition branch, stop the branch once you have one of four concrete outcomes: a verifier-ready proof candidate, "
@@ -1681,6 +1799,23 @@ def _materialize_evidence_capsule(
         for asset in cas_tooling["assets"]:
             if isinstance(asset, dict) and asset.get("path"):
                 asset["path"] = capsule_path_for(str(asset["path"]))
+
+    # Artifact cards can be repeated in role packets, decomposition summaries,
+    # proof-spine views, and research-strategy cards.  Rewrite every exact
+    # occurrence of a path that was materialized above.  Otherwise the child
+    # sees both the approved capsule copy and the original proof-state path,
+    # can follow the latter, and is then rejected by the evidence-boundary
+    # guard for reading a path that Albilich itself supplied.
+    def rewrite_materialized_paths(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: rewrite_materialized_paths(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [rewrite_materialized_paths(item) for item in value]
+        if isinstance(value, str):
+            return path_map.get(value, value)
+        return value
+
+    child_manifest = rewrite_materialized_paths(child_manifest)
     context_in_capsule = capsule_dir / "context.json"
     return {"manifest": child_manifest, "context_path": context_in_capsule, "workdir": capsule_dir}
 
@@ -1737,8 +1872,15 @@ def _context_char_budget_for_action(max_context_chars: int, action: Mapping[str,
         return max(max_context_chars, 30_000)
     if actor_role == "writing_critic":
         return max(max_context_chars, 60_000)
-    if actor_role == "writer" and (action.get("writing_revision") or action.get("paper_authoring")):
+    if actor_role == "writer" and (
+        action.get("writing_revision")
+        or action.get("paper_authoring")
+    ):
         return max(max_context_chars, 60_000)
+    if actor_role == "writer" and action.get("periodic_hmt"):
+        # A cumulative HMT needs the accepted statements and routes across the
+        # whole run, not just one selected branch packet.
+        return max(max_context_chars, 120_000)
     return max_context_chars
 
 
@@ -1773,11 +1915,25 @@ def execute_session(
     workdir = codex_workdir or (Path(plan_workdir) if plan_workdir else store.generation_root.parents[1])
     resume_session_id = str(session_plan.get("resume_session_id") or "")
     prompt = build_session_prompt(context_path=context_path, action=action, actor_role=actor_role, resume=bool(resume_session_id))
+    session_extra_args = list(extra_args or ())
+    if actor_role == "writer" and (
+        action.get("paper_authoring")
+        or action.get("paper_revision")
+        or action.get("external_writing_revision")
+        or action.get("periodic_hmt")
+    ):
+        staging_dir = (store.state_dir / "artifacts" / "staging").resolve()
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        # The generated context directory is the writer's primary workspace.
+        # Manifest permissions govern evidence access but do not make this
+        # sibling proof-state directory writable inside the Codex sandbox.
+        if str(staging_dir) not in session_extra_args:
+            session_extra_args.extend(["--add-dir", str(staging_dir)])
     command = build_codex_command(
         context_path=context_path,
         mode=mode,
         model_profile=model_profile,
-        extra_args=_codex_child_exec_args(extra_args),
+        extra_args=_codex_child_exec_args(session_extra_args),
         prompt=prompt,
         actor_role=actor_role,
         codex_bin=codex_bin,
@@ -1875,6 +2031,8 @@ def execute_session(
                 deadline = time.monotonic() + max(1, timeout_sec)
                 progress_interval = _progress_interval_seconds()
                 stale_retry_seconds = _stale_retry_timeout_seconds(timeout_sec)
+                active_retry_grace_seconds = _active_retry_grace_seconds(timeout_sec)
+                stale_retry_observation_grace = min(5.0, max(0.1, 2.0 * progress_interval))
                 last_progress_signature = _codex_live_progress_signature(log_path)
                 last_progress_at = time.monotonic()
                 active_retry_marker = _codex_retry_stall_marker(log_path)
@@ -1915,7 +2073,9 @@ def execute_session(
                     elif (
                         stale_retry_seconds > 0
                         and retry_stall_started_at is not None
-                        and time.monotonic() - retry_stall_started_at >= stale_retry_seconds
+                        and time.monotonic() - retry_stall_started_at
+                        >= max(stale_retry_seconds, active_retry_grace_seconds)
+                        + stale_retry_observation_grace
                     ):
                         status = "timeout"
                         failure_kind = "stale_stream"
@@ -1960,6 +2120,8 @@ def execute_session(
     log_head = _read_text_head(log_path)
     log_tail = _read_text_tail(log_path)
     parse_log = _join_log_samples(log_head, log_tail)
+    if status == "failed" and not failure_kind:
+        failure_kind = _failed_process_kind(log_tail)
     final_text = final_path.read_text(encoding="utf-8") if final_path.exists() else log_tail
     patch, patch_error = extract_patch_from_text(final_text)
     _persist_normalized_final_patch(final_path, final_text, patch)
@@ -2111,6 +2273,18 @@ def _session_failure_summary(*, status: str, returncode: int, log_tail: str, fal
             return f"{reason} Last log line: {last_line}"
         return reason
     return fallback or f"Codex session ended with status {status} before a patch was produced."
+
+
+def _failed_process_kind(log_tail: str) -> str:
+    """Classify a nonzero Codex exit from the bounded diagnostic log tail."""
+    lowered = (log_tail or "").casefold()
+    if any(fragment in lowered for fragment in USAGE_LIMIT_LOG_FRAGMENTS):
+        return "usage_limit"
+    if any(fragment in lowered for fragment in TRANSPORT_FAILURE_LOG_FRAGMENTS):
+        return "transport_error"
+    if "failed to launch codex session" in lowered:
+        return "launch_error"
+    return "process_exit"
 
 
 def _last_nonempty_line(text: str) -> str:
@@ -2446,7 +2620,7 @@ def extract_patch_from_text(text: str) -> Tuple[Optional[Dict[str, Any]], str]:
     for index, char in enumerate(stripped):
         if char != "{":
             continue
-        candidate = stripped[index:]
+        candidate = _protect_known_latex_json_escapes(stripped[index:])
         try:
             obj, _ = decoder.raw_decode(candidate)
         except json.JSONDecodeError as exc:
@@ -2475,6 +2649,7 @@ _LATEX_COMMANDS_WITH_JSON_ESCAPE_PREFIX = (
     "frac",
     "nabla",
     "neq",
+    "nleq",
     "nolimits",
     "not",
     "rho",
@@ -2490,6 +2665,24 @@ _LATEX_COMMANDS_WITH_JSON_ESCAPE_PREFIX = (
 )
 
 
+def _protect_known_latex_json_escapes(candidate: str) -> str:
+    r"""Escape known LaTeX commands before JSON consumes valid control escapes.
+
+    A model can emit an otherwise valid JSON string containing ``\neq`` with
+    only one JSON backslash.  Unlike ``\overline``, this is not a JSON parse
+    error: the decoder silently turns the ``\n`` prefix into a newline.  The
+    same problem affects commands beginning with ``\b``, ``\f``, ``\r``, and
+    ``\t``.  Protect the narrow command allowlist before the first decode while
+    leaving ordinary JSON newline and tab escapes unchanged.
+    """
+    command_pattern = "|".join(re.escape(command) for command in _LATEX_COMMANDS_WITH_JSON_ESCAPE_PREFIX)
+    return re.sub(
+        rf"(?<!\\)\\({command_pattern})(?![A-Za-z])",
+        lambda match: "\\\\" + match.group(1),
+        candidate,
+    )
+
+
 def _repair_invalid_json_escapes(
     candidate: str,
     exc: json.JSONDecodeError,
@@ -2498,12 +2691,7 @@ def _repair_invalid_json_escapes(
     """Recover model JSON containing unescaped LaTeX backslashes in strings."""
     if exc.msg != "Invalid \\escape":
         return None
-    command_pattern = "|".join(re.escape(command) for command in _LATEX_COMMANDS_WITH_JSON_ESCAPE_PREFIX)
-    repaired = re.sub(
-        rf"(?<!\\)\\({command_pattern})(?![A-Za-z])",
-        lambda match: "\\\\" + match.group(1),
-        candidate,
-    )
+    repaired = _protect_known_latex_json_escapes(candidate)
     # Each repair doubles one backslash that was already present in the model
     # response, so the original backslash count is a natural upper bound.  A
     # fixed cap of 64 discarded otherwise valid proof patches containing many
@@ -2745,6 +2933,28 @@ def _stale_retry_timeout_seconds(timeout_sec: int) -> float:
     return max(0.1, min(value, max(1.0, float(timeout_sec))))
 
 
+def _active_retry_grace_seconds(timeout_sec: int) -> float:
+    """Bound the grace given to Codex's own in-flight reconnect sequence.
+
+    A retry warning is positive transport activity, not proof that the child is
+    dead.  Codex may spend longer than the ordinary quiet-period threshold in
+    a websocket reconnect before emitting its next retry marker or resuming
+    model output.  Keep the overall session deadline authoritative while
+    allowing that internal recovery a separate, bounded window.
+    """
+    raw = os.environ.get("ALBILICH_CODEX_ACTIVE_RETRY_GRACE_SECONDS", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = DEFAULT_CODEX_ACTIVE_RETRY_GRACE_SECONDS
+    else:
+        value = DEFAULT_CODEX_ACTIVE_RETRY_GRACE_SECONDS
+    if value <= 0:
+        return 0.0
+    return max(0.1, min(value, max(1.0, float(timeout_sec))))
+
+
 def _codex_live_progress_signature(path: Path) -> tuple[int, int, int, int]:
     try:
         size = path.stat().st_size
@@ -2794,7 +3004,34 @@ def _codex_retry_stall_marker(path: Path) -> tuple[int, str, str] | None:
     if line_end < 0:
         line_end = len(data)
     line = data[line_start:line_end].decode("utf-8", errors="replace").strip()
+    # A retry warning and later ordinary child output can arrive between two
+    # Albilich heartbeat polls.  In that case file growth alone cannot tell us
+    # whether the latest bytes are the retry or genuine resumed work.  Clear
+    # the marker when the suffix contains meaningful progress; reconnect and
+    # transport diagnostics remain part of the same stalled retry episode.
+    if _retry_suffix_has_meaningful_progress(data[line_end + 1 :]):
+        return None
     return (base_offset + best_index, best_fragment, line[:500])
+
+
+def _retry_suffix_has_meaningful_progress(data: bytes) -> bool:
+    ignored_fragments = tuple(
+        fragment.lower()
+        for fragment in (
+            *STALE_RETRY_LOG_FRAGMENTS,
+            *TRANSPORT_FAILURE_LOG_FRAGMENTS,
+            *NOISY_CODEX_LOG_FRAGMENTS,
+            "error: reconnecting",
+        )
+    )
+    for raw_line in data.decode("utf-8", errors="replace").splitlines():
+        line = raw_line.strip().lower()
+        if not line:
+            continue
+        if any(fragment in line for fragment in ignored_fragments):
+            continue
+        return True
+    return False
 
 
 def _read_text_tail(path: Path, max_bytes: int = LOG_PARSE_TAIL_BYTES) -> str:

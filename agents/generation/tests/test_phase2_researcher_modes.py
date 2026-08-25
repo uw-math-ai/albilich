@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -719,6 +721,21 @@ class ResearcherWorkModeGatesTest(unittest.TestCase):
         self.assertFalse(session_cas_enabled("villain", {"researcher_work_mode": "offline"}))
         self.assertFalse(session_cas_enabled("villain", {"researcher_work_mode": "online"}))
         self.assertFalse(session_cas_enabled("strict_informal_verifier", {"researcher_work_mode": "cas"}))
+
+    def test_global_cas_off_suppresses_scheduling_and_child_access(self) -> None:
+        state = {"recent_runs": [], "research_artifacts": []}
+        action = {"mode": "prove", "researcher_work_mode": "cas", "cas_check_recommended": True}
+        with patch.dict(os.environ, {"ALBILICH_CAS_ENABLED": "0"}):
+            decision = researcher_work_mode_decision(
+                state,
+                action,
+                research_mode="hard_problem",
+                web_search="live",
+            )
+            self.assertEqual(decision["work_mode"], "offline")
+            self.assertEqual(decision["source"], "cas_disabled")
+            self.assertFalse(session_cas_enabled("researcher", action))
+            self.assertFalse(session_cas_enabled("villain", action))
 
     def test_researcher_prompt_carries_work_mode_contract(self) -> None:
         base = {"mode": "prove", "target_id": "root", "route_id": ""}

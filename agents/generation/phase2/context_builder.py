@@ -10,6 +10,7 @@ from .audit import paper_audit_context_card
 from .branch_summary import build_branch_summaries, build_branch_workbench
 from .budget import estimate_tokens_from_text
 from .completion_policy import DEFAULT_COMPLETION_POLICY
+from .certified_memory import certified_cross_run_candidates
 from .graph_policy import (
     GraphPolicyIndex,
     active_frontier_pressure,
@@ -30,10 +31,11 @@ from .memory_policy import (
     debt_memory_status,
     inference_memory_status,
     retrieval_card_memory_status,
+    role_memory_view_policy,
     route_memory_status,
     theorem_library_memory_status,
 )
-from .models import fingerprint_text, json_loads, sha256_text, utc_now
+from .models import fingerprint_text, json_loads, normalize_text, sha256_text, utc_now
 from .receipt import build_partial_receipt_inventory
 from .retrieval import (
     INFORMAL_SEARCH_ENABLE_ENV,
@@ -82,6 +84,7 @@ FULL_PROOF_ARTIFACT_TYPES = {
     "proof_dossier",
     "research_notebook",
     "verified_blueprint",
+    "reference_solution",
 }
 SOURCE_ADAPTATION_ARTIFACT_TYPES = {
     "definition_audit_report",
@@ -106,6 +109,7 @@ ADVISOR_ARTIFACT_TYPES = {
     "advisor_synthesis",
 }
 STRATEGY_ARTIFACT_TYPES = {
+    "approach_portfolio",
     "bridge_lemma_search",
     "conjecture_portfolio",
     "deep_session_report",
@@ -122,6 +126,53 @@ RESEARCH_HANDOFF_ARTIFACT_TYPES = (
     | STRATEGY_ARTIFACT_TYPES
     | {"literature_search_request"}
 )
+
+_INTEGRATION_DEBT_MATCH_STOPWORDS = {
+    "all",
+    "and",
+    "claim",
+    "classification",
+    "classify",
+    "complete",
+    "criterion",
+    "even",
+    "every",
+    "exact",
+    "exactly",
+    "finite",
+    "fixed",
+    "for",
+    "from",
+    "give",
+    "group",
+    "groups",
+    "iff",
+    "index",
+    "into",
+    "let",
+    "length",
+    "must",
+    "necessary",
+    "normal",
+    "order",
+    "over",
+    "prove",
+    "root",
+    "show",
+    "simple",
+    "soluble",
+    "structural",
+    "subgroup",
+    "sufficient",
+    "such",
+    "that",
+    "the",
+    "then",
+    "theorem",
+    "this",
+    "through",
+    "with",
+}
 ROOT_SYNTHESIS_CONTEXT_ARTIFACT_TYPES = {
     "route_obstruction",
     "construction_failure",
@@ -131,6 +182,7 @@ ROOT_SYNTHESIS_CONTEXT_ARTIFACT_TYPES = {
     "research_diagnostic",
     "advisor_report",
     "advisor_synthesis",
+    "approach_portfolio",
     "bridge_lemma_search",
     "conjecture_portfolio",
     "proof_compression",
@@ -245,12 +297,13 @@ def build_context_manifest(
     )
     if ordinary_integration_packet:
         # Integration certifies one already-verified sufficient route.  Root
-        # and sibling debts are useful to researchers, but exposing them here
-        # invites the integrator to list a semantically related upstream debt
-        # in resolved_debt_ids.  The patch guard must then reject the entire
-        # otherwise-valid transition because that debt is not owned by this
-        # claim, route, or one of its inferences.  Keep the packet aligned with
-        # the exact ownership relation enforced by _resolve_integration_debts.
+        # and sibling debts are not route-local blockers.  A small semantic
+        # reconciliation checklist is nevertheless useful: a newly integrated
+        # theorem can genuinely discharge an older root debt even when that
+        # debt was conservatively owned by ``root``.  Keep route-local blockers
+        # authoritative, then append only high-overlap root debts as optional
+        # candidates.  The integration report must justify any candidate it
+        # closes, and the patch guard enforces that justification.
         route_inference_ids = _integration_route_inference_ids(
             selected_route,
             selected_inferences,
@@ -261,6 +314,17 @@ def build_context_manifest(
             selected_route,
             inference_ids=route_inference_ids,
         )
+        selected_debts.extend(
+            _integration_semantic_debt_candidates(
+                state,
+                target=target,
+                selected_route=selected_route,
+                selected_inferences=selected_inferences,
+                excluded_debt_ids={
+                    str(row.get("debt_id") or "") for row in selected_debts
+                },
+            )
+        )
     selected_artifacts = _select_artifacts(
         state,
         selected_claim_ids,
@@ -269,7 +333,13 @@ def build_context_manifest(
         selected_debts,
         target_id=target_id,
         action=action,
-        include_stop_writer_artifacts=bool(action and action.get("write_existing_proofs_on_stop")),
+        include_stop_writer_artifacts=bool(
+            action
+            and (
+                action.get("write_existing_proofs_on_stop")
+                or action.get("periodic_hmt")
+            )
+        ),
     )
     if paper_audit_strict_packet:
         selected_artifacts = _paper_audit_packet_artifacts(
@@ -278,6 +348,7 @@ def build_context_manifest(
             action=action,
         )
     role_policy = _role_context_policy(action)
+    memory_view = role_memory_view_policy(str(role_policy.get("context_role") or "general"))
     patch_contract = _patch_contract(action, role_policy)
     parallel_exchange = _parallel_exchange_card(store)
     cas_enabled = session_cas_enabled(str(role_policy.get("context_role") or ""), action)
@@ -327,6 +398,21 @@ def build_context_manifest(
     if ordinary_integration_packet:
         proof_spine = _scope_integration_proof_spine(proof_spine, selected_debts)
     research_strategy = strategy_context_card(state, action or {})
+    try:
+        certified_memory = certified_cross_run_candidates(store, state)
+    except Exception as exc:
+        certified_memory = {
+            "candidates": [],
+            "automatic_import": False,
+            "verification_authority": False,
+            "index_error": f"{type(exc).__name__}: {exc}",
+        }
+    if not certified_memory.get("candidates"):
+        certified_memory = {
+            "candidates": [],
+            "automatic_import": False,
+            "verification_authority": False,
+        }
     branch_summaries = build_branch_summaries(store, state=state, limit=4)
     memory_hygiene: Dict[str, Any] = {}
     if duplicate_debts:
@@ -366,6 +452,7 @@ def build_context_manifest(
         "active_context_compression": active_compression,
         "workflow_action": _workflow_action_card(action),
         "role_context_policy": role_policy,
+        "memory_view": memory_view,
         "patch_contract": patch_contract,
         "parallel_exchange": parallel_exchange,
         "local_search_policy": local_search_policy,
@@ -382,10 +469,16 @@ def build_context_manifest(
             "Use manifest.parallel_exchange as a live research blackboard for short evidence signals; signals are advisory and never verify proof state by themselves.",
             "Stay on the graph frontier: prefer root, target, local premises, active debts, and claims with small root_distance.",
             "Use manifest.role_context_policy to identify the authoritative packet for this role.",
+            "Use manifest.memory_view automatically: only verified items are settled premises; candidates are advisory and failures are regression/do-not-retry evidence.",
             "Use manifest.research_strategy for bridge sufficiency, global synthesis, method-card, experiment, conjecture, invention, deep-session, information-gain, and proof-compression policy. Method cards and speculative artifacts are advisory and never proof premises.",
+            "Use manifest.research_strategy.proof_programs and case_coverage_map as the compact proof-program layer: work an explicit root implication, decisive obligation, coverage gap, or validation criterion rather than creating isolated claims.",
+            "Use manifest.research_strategy.minimal_active_debt_frontier: schedule only canonical primary debts while retaining aliases as provenance; only a verifier may certify their mathematical resolution.",
+            "Use manifest.research_strategy.threat_propagation: threatened certifications remain recorded but require strict revalidation before downstream reuse; an unvalidated obstruction is not yet a refutation.",
         ],
         "excluded_full_transcripts": True,
     }
+    if certified_memory.get("candidates"):
+        manifest["certified_cross_run_memory"] = certified_memory
     completion_policy = str(problem.get("completion_policy") or DEFAULT_COMPLETION_POLICY)
     manifest["completion_policy"] = {
         "policy": completion_policy,
@@ -416,9 +509,13 @@ def build_context_manifest(
         )
     if ordinary_integration_packet:
         manifest["instructions"].append(
-            "Integration debt isolation is active: only debt ids listed in manifest.debts may appear in "
-            "resolved_debt_ids. Do not infer or close upstream/root/sibling debts from narrative artifacts or "
-            "global proof summaries; those remain for the downstream route that owns them."
+            "Integration debt reconciliation is active: only debt ids listed in manifest.debts may appear in "
+            "resolved_debt_ids. Route-local debts are binding blockers. Rows marked "
+            "integration_resolution_candidate=true are optional upstream/root candidates, not blockers to this "
+            "integration; close one only when the integrated theorem explicitly discharges its whole obligation. "
+            "For every such candidate placed in resolved_debt_ids, put a precise nonempty explanation in the "
+            "integration_report metadata.resolved_debt_justifications object under that debt id. Leave partial, "
+            "uncertain, sibling, and merely related debts active."
         )
     # State-driven: a stored audit_subject artifact marks the whole problem as
     # an audit run, whatever single action is being planned.
@@ -504,6 +601,123 @@ def build_context_manifest(
     if active_compression:
         manifest["instructions"].append(
             "manifest.active_context_compression removes unused branches from the primary packet while preserving every historical row in storage; work from the explicit dependency closure and feed its weakest sufficient new statement into bridge search."
+        )
+    if action and action.get("approach_brainstorming_required"):
+        portfolio_kind = str(action.get("approach_portfolio_kind") or "initial")
+        minimum = int(action.get("approach_candidate_minimum") or (6 if portfolio_kind == "initial" else 3))
+        supersedes = str(action.get("supersedes_artifact_id") or "")
+        approach_alignment = dict(action.get("approach_alignment") or {})
+        alignment_required = bool(approach_alignment.get("required"))
+        manifest["approach_portfolio_contract"] = {
+            "artifact_type": "approach_portfolio",
+            "purpose": "compare mathematically different routes before committing to local computation",
+            "metadata_shape": {
+                "strategy_schema_version": 1,
+                "portfolio_kind": portfolio_kind,
+                "brainstorming_summary": "global comparison of the proof landscape",
+                "supersedes_artifact_id": supersedes or "omit for an initial portfolio",
+                **(
+                    {
+                        "alignment_source_steering_ids": list(
+                            approach_alignment.get("source_steering_ids") or []
+                        ),
+                        "alignment_evidence_artifact_ids": list(
+                            approach_alignment.get("evidence_artifact_ids") or []
+                        ),
+                        "alignment_summary": (
+                            "explain how the processed steering and newer verified root evidence change the global strategy"
+                        ),
+                        "root_effect_recomputed": True,
+                    }
+                    if alignment_required
+                    else {}
+                ),
+                "approaches": [
+                    {
+                        "approach_id": "stable unique id",
+                        "title": "short mathematical name",
+                        "mechanism": "actual proof or counterexample mechanism",
+                        "mathematical_objects": ["specific objects the approach studies"],
+                        "representation_or_invariant": "language, invariant, functor, reduction, or model",
+                        "target_id": "root or an exact existing claim id",
+                        "target_route_id": "existing route id or none_yet",
+                        "root_consequence": "exact consequence for the original theorem if the approach works",
+                        **(
+                            {
+                                "steering_impact": (
+                                    "what the processed directive or newer verified root evidence changes for this approach"
+                                )
+                            }
+                            if alignment_required
+                            else {}
+                        ),
+                        "bridge_statement": "weakest exact statement connecting this mechanism to the root",
+                        "contribution_level": "integer 0..5 using the contribution legend",
+                        "contribution_kind": "root_closing|major_bridge|major_case|route_killing|informative_probe|exploratory|unplaced",
+                        "evidence": "existing theorem, analogy, example, obstruction, or explicit no_evidence_yet",
+                        "likely_failure_mode": "specific reason this route may fail",
+                        "decisive_test": "cheapest test that would select, revise, or kill it",
+                        "estimated_cost": "low|medium|high",
+                        "novelty_score": "number in [0,1], qualitative rather than calibrated",
+                        "confidence": "low|medium|high",
+                        "confidence_basis": "why that confidence is warranted",
+                        "status": "idea|pilot|selected|active|paused|killed|successful",
+                        "semantic_signature": {
+                            "mechanism": "normalized mechanism family",
+                            "representation": "normalized representation",
+                            "proof_direction": "forward|backward|adversarial|classification|experimental|other",
+                            "theorem_family": "neighboring theorem or method family",
+                            "root_obligation": "exact obligation attacked",
+                            "failure_mode": "normalized likely obstruction",
+                        },
+                    }
+                ],
+                "selected_approach_ids": ["two or three approach ids"],
+                "research_questions": ["nonblocking conceptual or experimental question"],
+            },
+            "candidate_count_rule": f"provide {minimum} to 12 semantically distinct approaches and select two or three",
+            "contribution_legend": dict((action.get("approach_portfolio") or {}).get("contribution_legend") or {}),
+            "layer_policy": {
+                "ideas": "live in this advisory portfolio and may be numerous",
+                "research_questions": "may become minor or major nonblocking debts only when an owner exists",
+                "proof_debts": "remain strict and may be blocking only after a selected route exposes an exact missing obligation",
+            },
+            "nonblocking_debt_policy": {
+                "maximum": int(action.get("research_question_debt_cap") or 6),
+                "allowed_debt_types": list(action.get("research_question_debt_types") or []),
+                "severity": "minor by default; major only for a selected pilot's decisive test; never blocking in brainstorming",
+                "owner_rule": "use an existing concrete graph owner; do not invent claims merely to own a question",
+                "anti_clutter_rule": "do not create one debt per idea; persist only questions likely to change approach selection",
+            },
+            "forbidden_during_this_pass": [
+                "adding proof claims, routes, or inferences",
+                "creating blocking proof debts",
+                "presenting novelty or confidence scores as calibrated probabilities",
+                "producing a list of paraphrases with the same semantic_signature",
+                *(
+                    [
+                        "copying a superseded root_consequence without reconciling it with the processed steering",
+                        "displaying an approach whose steering_impact is missing",
+                    ]
+                    if alignment_required
+                    else []
+                ),
+            ],
+            **(
+                {
+                    "steering_alignment": approach_alignment,
+                    "alignment_rule": (
+                        "Recompute root_consequence for every approach against every listed verified_root_development "
+                        "and human directive. Every approach must contain a nonempty steering_impact."
+                    ),
+                }
+                if alignment_required
+                else {}
+            ),
+        }
+        manifest["instructions"].insert(
+            1,
+            "Brainstorm before doing local proof work. Follow manifest.approach_portfolio_contract exactly and attach one approach_portfolio artifact. Generate genuinely different mechanisms and representations, state each exact root contribution and cheapest decisive test, then select two or three complementary pilots. When steering_alignment is present, reconcile every approach and every root_consequence with all listed directives and verified root developments; fill every steering_impact and do not leave stale root effects in the replacement portfolio. Ideas are advisory, research questions are nonblocking, and proof debts remain strict. You may persist up to six decision-changing research questions as minor debts (or major only for a selected pilot), using the allowed types and an existing concrete owner; do not create one debt per idea. Do not add claims, routes, inferences, or blocking debts in this pass.",
         )
     if action and action.get("bidirectional_bridge_search_required"):
         manifest["bridge_lemma_search_contract"] = {
@@ -622,6 +836,38 @@ def build_context_manifest(
         manifest["instructions"].insert(1,
             "Perform canonical full-proof reconstruction and follow manifest.proof_compression_contract exactly: draft the entire shortest plausible proof in the artifact content, mark every unsupported sentence, isolate exactly one decisive missing theorem, retain only the strongest counterexample architecture and three informative failed ideas as active context, and keep all other history stored as background."
         )
+    if action and action.get("reference_solution_reconstruction_required"):
+        manifest["reference_solution_reconstruction_contract"] = {
+            "source": dict(action.get("reference_solution") or {}),
+            "required_output_artifact_type": "proof_dossier",
+            "required_metadata": {
+                "reference_solution_artifact_id": "exact source artifact id",
+                "target_id": "root",
+                "proof_candidate": True,
+                "ready_for_verifier": True,
+                "proof_program_id": "stable program id",
+                "proof_philosophy": "mathematical architecture of the supplied solution",
+                "root_implication": "exact route from reconstructed steps to the root",
+                "covered_cases": ["every named case in the source"],
+                "open_cases": [],
+                "cases_exhaustive": True,
+                "validation_criteria": ["strict local checks required before acceptance"],
+                "abandonment_criteria": ["specific mathematical mismatch that invalidates this reconstruction"],
+            },
+            "requirements": [
+                "translate every definition and convention into local notation",
+                "map every source hypothesis to the exact root hypothesis",
+                "reconstruct all implications instead of citing the source as authority",
+                "record all cases and boundary cases explicitly",
+                "create or repair an ordinary sufficient route and terminal inference",
+                "submit the resulting packet to the ordinary strict verifier",
+            ],
+            "reference_is_not_verification_authority": True,
+        }
+        manifest["instructions"].insert(
+            1,
+            "Reconstruct the human-supplied reference solution now. Read the manifest-listed reference_solution artifact, translate it into local notation and a complete case map, attach one proof_dossier following manifest.reference_solution_reconstruction_contract, and create or repair the ordinary route/inference that the strict verifier will check. Do not treat the reference itself as verified evidence.",
+        )
     if action and action.get("conceptual_invariant_discovery_required"):
         manifest["conceptual_invariant_contract"] = {
             "artifact_type": "conceptual_invariant_report",
@@ -674,11 +920,32 @@ def build_context_manifest(
         )
     if action and action.get("deep_session_required"):
         manifest["instructions"].append(
-            "This root-critical branch receives one coherent long mathematical session, not fragmented lemma production. Try at least two materially different proof attacks unless the first closes the target; test examples, compare a neighboring theorem with an explicit dictionary, and attempt full-root assembly. Follow manifest.workflow_action.deep_session.required_deliverable exactly. Prefer a proof_dossier that changes the proof state; attach deep_session_report only as a fallback carrying a productive mathematical delta. A management-only report is not progress and must not be persisted. The session has no verification authority."
+            "This root-critical branch receives one coherent long mathematical session, not fragmented lemma production. It has no strategy wall-clock timeout: continue a coherent proof as long as it produces or sharpens mathematical deltas, and resume the canonical artifact in manifest.workflow_action.long_session_workspace instead of creating parallel paperwork. Try at least two materially different proof attacks unless the first closes the target; test examples, compare a neighboring theorem with an explicit dictionary, and attempt full-root assembly. Follow manifest.workflow_action.deep_session.required_deliverable exactly. Prefer a proof_dossier that changes the proof state; attach deep_session_report only as a fallback carrying a productive mathematical delta. A management-only report is not progress and must not be persisted. The session has no verification authority."
         )
     if action and action.get("decisive_obligation_frontier_required"):
         manifest["instructions"].append(
             "Treat manifest.workflow_action.decisive_obligation_frontier as the deterministic logical work frontier. Work the named decisive_obligation before an interesting side lemma. If it cannot be solved, replace it only with a strictly smaller obligation and explain the graph implication back to the selected sufficient route."
+        )
+    if certified_memory.get("candidates"):
+        manifest["instructions"].append(
+            "manifest.certified_cross_run_memory is a read-only nomination index, not proof evidence. Use it to avoid rediscovery only. Never cite or assume a candidate in the current proof until an operator performs explicit scope-import and the local interface, definitions, hypotheses, and dependency closure are rechecked."
+        )
+    if action and action.get("root_cut_consolidation_required"):
+        manifest["instructions"].append(
+            "The root-cut hard gate is active. Do not add a new route-less claim or parallel dossier. Work exactly one move that changes the minimal root cut: assemble existing verified claims, prove or refute the decisive cut obligation, validate a counterexample, or retire/replace the route with evidence. Record root_cut_signature_before and root_cut_signature_after in the canonical dossier metadata."
+        )
+    canonical_owner = action.get("canonical_route_ownership") if action else None
+    if canonical_owner and canonical_owner.get("ownership_required"):
+        manifest["instructions"].append(
+            "Follow manifest.workflow_action.canonical_route_ownership. The selected nonempty route has one canonical proof dossier. A replacement artifact must set canonical_route_owner_version=1, canonical_route_id to the selected route_id, supersedes_artifact_id when a canonical_artifact_id is present, root_implication_update, root_cut_signature_before, root_cut_signature_after, and creates_parallel_dossier=false."
+        )
+    elif canonical_owner and canonical_owner.get("continuity_required"):
+        manifest["instructions"].append(
+            "Continue the existing route-less canonical proof dossier named by manifest.workflow_action.canonical_route_ownership.canonical_artifact_id. The replacement must set supersedes_artifact_id, root_implication_update, root_cut_signature_before, root_cut_signature_after, and creates_parallel_dossier=false. Do not set canonical_route_owner_version or canonical_route_id until a nonempty route_id exists."
+        )
+    if action and action.get("initial_counterexample_preflight_required"):
+        manifest["instructions"].append(
+            "This is the mandatory early falsification pass. Test the full original hypotheses, minimal and boundary examples, and one bounded CAS family when available. Stamp counterexample_preflight_version=1 in the primary adversarial artifact. A null search result narrows the search space but is not a proof."
         )
     if action and action.get("representation_switch_required"):
         manifest["instructions"].append(
@@ -687,14 +954,20 @@ def build_context_manifest(
     if action and action.get("theorem_adaptation_required"):
         manifest["instructions"].append(
             "Follow manifest.workflow_action.theorem_adaptation_contract. Return an exact theorem-adaptation packet, not a bibliography: source location and statement, local notation and definition dictionary, complete hypothesis map, checked and missing hypotheses, the exact local deduction, reusable proof moves from the source proof, and the boundary where adaptation fails."
+            " Record each required field either in artifact metadata or as an explicit keyed line in the artifact content; do not duplicate the same packet in both places."
+            " Also run the source-technique compiler in that contract: record the source proof skeleton, key constructions, why each hypothesis is used, failure examples, the local translation steps, and the next local deduction; stamp source_technique_compiler_version=1."
         )
     if action and action.get("proof_interface_check_required"):
         manifest["instructions"].append(
-            "Run the selective deterministic proof-interface checklist in manifest.workflow_action.proof_interface_contract. The verification or integration report metadata must set proof_interface_check_version=1 and explicitly record all required Boolean fields. A zero-gap verdict is allowed only when every field is true. Lean 4 is not required."
+            "Run the selective deterministic proof-interface checklist in manifest.workflow_action.proof_interface_contract. Compare the typed target and premise interfaces (objects, ambient category, field/ring, action type, finiteness, quantifier order, subgroup/quotient/section scope, normalization, and parameter range). The verification or integration report metadata must set proof_interface_check_version=2, mathematical_interface_version=1, nonempty interface_checks, unresolved_interface_mismatches as a list, and all required Boolean fields. A zero-gap verdict is allowed only when every Boolean is true and the mismatch list is empty. Lean 4 is not required."
         )
     if action and action.get("counterexample_probe_required"):
         manifest["instructions"].append(
             "Counterexamples are mathematical probes: test the full original hypothesis, name at least two competing conjectures, and choose a construction or computation whose possible outcomes lead to different proof decisions. Tests of weakened shadows are diagnostic only and cannot refute the target."
+        )
+    if action and action.get("theorem_preflight_required"):
+        manifest["instructions"].append(
+            "Run the compact risk-triggered theorem preflight in manifest.workflow_action.theorem_preflight_contract inside the primary mathematical work: check omitted endpoint hypotheses, zero/minimal/degenerate cases, equality cases, normalization conventions, and the exact downstream object. When classification_scope_requires_iff_target=true, preserve the submitted root text but state the exhaustive iff target being pursued, define every invariant and boundary convention, and do not treat a displayed example family as exhaustive evidence. Record unresolved interpretation choices as precise root-scope debts. Do not create a separate checklist artifact. If a probe fails, repair or refute the statement before attempting the long proof."
         )
     context_role = str(role_policy.get("context_role") or "")
     work_mode = str((action or {}).get("researcher_work_mode") or "")
@@ -724,6 +997,16 @@ def build_context_manifest(
             "keep_exploiting keeps the branch active even when blocked, pause_or_merge rotates away from it, "
             "needs_source/needs_cas route the next branch pass to the librarian/CAS."
         )
+        manifest["instructions"].append(
+            "Episodic strategy review: compare genuinely different global proof spines, not variants of one local calculation. "
+            "For every route you keep, name its central theorem, whether it has a finite/exhaustive termination mechanism, "
+            "its unverified representation interfaces, the risk that it is stronger than the root, and the concrete event that "
+            "would force a route reset. Put this mathematics in the existing advisor_report; create no separate management artifact."
+        )
+        if action and action.get("proof_program_comparison_required"):
+            manifest["instructions"].append(
+                "Evidence-based strategic checkpoint: compare the proof programs already listed in manifest.research_strategy.proof_programs by their exact root implication, decisive theorem, exhaustive case coverage, validation evidence, and mathematical kill criterion. Continue a long route when its proof remains coherent; elapsed time is never a reason to pause or abandon it. Consolidate semantic debt aliases into one recommended work item and name the precise event that would change the decision. Record this in the existing advisor_synthesis/advisor_report only."
+            )
     steering_card = steering.context_card(store.state_dir)
     if steering_card:
         manifest["human_steering"] = steering_card
@@ -810,10 +1093,23 @@ def build_context_manifest(
             "COMPLETE standalone LaTeX source, per the paper contract below."
         )
         manifest["instructions"].append(PAPER_CONTRACT)
+    human_readable_text_packet = _human_readable_text_packet(
+        state,
+        selected_artifacts=selected_artifacts,
+        action=action,
+    )
+    if human_readable_text_packet:
+        manifest["human_readable_text_packet"] = human_readable_text_packet
+        manifest["instructions"].append(
+            "Periodic HMT authoring must use manifest.human_readable_text_packet as the accepted-state map. "
+            "Write one cumulative partial paper for a human mathematician, accurately separating proved, "
+            "verified, plausible, failed, and open material. The HMT is expository and non-certifying."
+        )
     if str((action or {}).get("mode") or "") == "write" and (
         (action or {}).get("paper_authoring")
         or (action or {}).get("paper_revision")
         or (action or {}).get("external_writing_revision")
+        or (action or {}).get("periodic_hmt")
     ):
         staging_dir = _permit_writer_paper_staging_dir(manifest, store)
         if writing_paper_packet:
@@ -826,6 +1122,13 @@ def build_context_manifest(
                 "Revise the external manuscript as a real file: preserve its source format, write the COMPLETE "
                 f"revised document to {staging_dir}/<artifact_id>.{document_format}, then attach it by path with "
                 "artifact_type=revision_document and NO content field."
+            )
+        elif (action or {}).get("periodic_hmt"):
+            human_readable_text_packet["staging_dir"] = staging_dir
+            manifest["instructions"].append(
+                "Author the HMT as a real file: write the COMPLETE standalone LaTeX source to "
+                f"{staging_dir}/<artifact_id>.tex, then attach it by path with "
+                "artifact_type=human_readable_mathematical_text and no inline content."
             )
         else:
             manifest["instructions"].append(
@@ -1228,7 +1531,7 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
     }
     contracts: dict[str, list[dict[str, Any]]] = {
         "researcher": [
-            {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type=proof_dossier|research_notebook|research_diagnostic|literature_search_request|decomposition_plan|cas_experiment_report|bridge_lemma_search|conjecture_portfolio|proof_compression|conceptual_invariant_report|deep_session_report|definition_candidate", "content", "metadata(optional)"]},
+            {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type=proof_dossier|research_notebook|research_diagnostic|literature_search_request|decomposition_plan|cas_experiment_report|approach_portfolio|bridge_lemma_search|conjecture_portfolio|proof_compression|conceptual_invariant_report|deep_session_report|definition_candidate", "content", "metadata(optional)"]},
             {"op": "add_claim", "fields": ["claim_id", "kind=lemma|theorem|definition|hypothesis|obstruction|counterexample|reference", "statement", "validation_status=untested|plausible|challenged", "parent_ids", "root_impact", "reduction_depth", "evidence_artifact_ids"]},
             {"op": "add_route", "fields": ["route_id", "conclusion_claim_id", "label", "strategy", "relation_to_parent=sufficient|necessary|diagnostic|variant", "evidence_artifact_ids"]},
             {"op": "add_inference", "fields": ["inference_id", "route_id", "conclusion_claim_id", "premise_claim_ids", "validation_status=untested|plausible|challenged", "explanation", "evidence_artifact_ids"]},
@@ -1273,7 +1576,7 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
         "counterexample_validator": [
             {
                 "op": "attach_artifact",
-                "fields": ["artifact_id", "artifact_type=confirmed_counterexample", "content", "metadata.confirmed=true", "metadata.target_claim_id", "metadata.validation_result=confirmed"],
+                "fields": ["artifact_id", "artifact_type=confirmed_counterexample", "content", "metadata.confirmed=true", "metadata.target_claim_id", "metadata.candidate_artifact_id=<workflow_action.candidate_counterexample_artifact_id>", "metadata.validation_result=confirmed"],
                 "rule": "Attach only after independently checking the concrete object, hypotheses, and failed conclusion.",
             },
             {
@@ -1416,8 +1719,30 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
     if mode == "integrate" and not action.get("paper_audit_document_integration_required"):
         context_role = "integration_verifier"
         contracts["integration_verifier"] = [
-            {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type=integration_report", "content", "metadata.integrates", "metadata.root_alignment"]},
-            {"op": "propose_status_transition", "fields": ["target_type=claim", "target_id", "status_type=lifecycle", "new_status=integrated", "route_id", "evidence_artifact_ids"]},
+            {
+                "op": "attach_artifact",
+                "fields": [
+                    "artifact_id",
+                    "artifact_type=integration_report",
+                    "content",
+                    "metadata.integrates",
+                    "metadata.root_alignment",
+                    "metadata.resolved_debt_ids(optional; ids must come from manifest.debts)",
+                    "metadata.resolved_debt_justifications(optional object; required for each integration_resolution_candidate)",
+                ],
+            },
+            {
+                "op": "propose_status_transition",
+                "fields": [
+                    "target_type=claim",
+                    "target_id",
+                    "status_type=lifecycle",
+                    "new_status=integrated",
+                    "route_id",
+                    "evidence_artifact_ids",
+                    "resolved_debt_ids(optional; repeat metadata.resolved_debt_ids)",
+                ],
+            },
             {"op": "add_debt", "fields": ["debt_id", "owner_type", "owner_id", "severity=blocking", "status=active", "obligation"]},
         ]
     return {
@@ -1683,11 +2008,11 @@ def _proof_architecture_templates(
                 ],
             }
         )
-    if any(term in text for term in ("matroid", "hvector", "h-vector", "ehrhart", "alcoved", "dhr", "msss", "postnikov")):
+    if any(term in text for term in ("matroid", "hstar", "h-vector", "ehrhart", "alcoved", "dhr", "msss", "postnikov")):
         templates.append(
             {
-                "template_id": "matroid-hvector-bridge-patterns",
-                "domain": "matroid_hvector",
+                "template_id": "matroid-hstar-bridge-patterns",
+                "domain": "matroid_hstar",
                 "when_to_use": "DHR/Ehrhart/alcoved or h*-vector bridge lemmas",
                 "moves": [
                     "separate convention checks such as P versus -P before using computations",
@@ -1745,7 +2070,8 @@ def _local_search_policy(
         "exclude_by_default": [
             "agents/generation/results/**",
             "agents/generation/downloads/** unless explicitly problem-relevant under download_scope_rule",
-            "experiment output and raw data directories",
+            "experiments/**",
+            "experiment data/**",
             "logs/**",
             "raw_run_logs/**",
             "older benchmark output packets",
@@ -2103,6 +2429,95 @@ def _select_debts(
     return [_debt_card(row) for row in rows[:12]]
 
 
+def _integration_match_terms(text: Any) -> set[str]:
+    return {
+        token
+        for token in normalize_text(str(text or "")).split()
+        if len(token) >= 4 and token not in _INTEGRATION_DEBT_MATCH_STOPWORDS
+    }
+
+
+def _integration_semantic_debt_candidates(
+    state: Mapping[str, Any],
+    *,
+    target: Mapping[str, Any],
+    selected_route: Optional[Mapping[str, Any]],
+    selected_inferences: Iterable[Mapping[str, Any]],
+    excluded_debt_ids: set[str],
+    limit: int = 6,
+) -> List[Dict[str, Any]]:
+    """Return root-owned debts plausibly discharged by a non-root theorem.
+
+    Debt ownership is deliberately conservative, so an early root debt often
+    remains owned by ``root`` after research has promoted its exact obligation
+    into a named claim.  Integration is the right verifier-owned moment to
+    reconcile that bookkeeping, but showing every root debt recreates a noisy
+    global packet.  This shortlist is advisory: lexical overlap only nominates
+    a debt, while the integration verifier must certify full mathematical
+    discharge and provide a written justification before the patch guard will
+    close it.
+    """
+
+    target_id = str(target.get("claim_id") or "")
+    if not target_id or target_id == "root":
+        return []
+    route_id = str(selected_route.get("route_id") or "") if selected_route else ""
+    proof_text = " ".join(
+        [
+            str(target.get("statement") or ""),
+            str(selected_route.get("label") or "") if selected_route else "",
+            str(selected_route.get("strategy") or "") if selected_route else "",
+            *[
+                str(row.get("explanation") or "")
+                for row in selected_inferences
+                if not route_id or str(row.get("route_id") or "") == route_id
+            ],
+        ]
+    )
+    proof_terms = _integration_match_terms(proof_text)
+    if not proof_terms:
+        return []
+
+    ranked: List[tuple[float, int, str, Mapping[str, Any], List[str]]] = []
+    for debt in state.get("debts", []):
+        debt_id = str(debt.get("debt_id") or "")
+        if not debt_id or debt_id in excluded_debt_ids:
+            continue
+        if str(debt.get("status") or "") != "active":
+            continue
+        if str(debt.get("severity") or "") not in {"blocking", "major"}:
+            continue
+        if str(debt.get("owner_id") or "") != "root" and str(
+            debt.get("suggested_next_target") or ""
+        ) != "root":
+            continue
+        debt_terms = _integration_match_terms(debt.get("obligation"))
+        overlap = sorted(proof_terms & debt_terms)
+        if len(overlap) < 3:
+            continue
+        score = len(overlap) / max(1, min(len(proof_terms), len(debt_terms)))
+        if score < 0.12:
+            continue
+        ranked.append((score, len(overlap), debt_id, debt, overlap))
+    ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+
+    candidates: List[Dict[str, Any]] = []
+    for score, _, _, debt, overlap in ranked[: max(0, limit)]:
+        card = _debt_card(debt)
+        card.update(
+            {
+                "integration_resolution_candidate": True,
+                "candidate_for_claim_id": target_id,
+                "semantic_overlap_score": round(score, 3),
+                "matched_terms": overlap[:10],
+                "full_discharge_justification_required": True,
+                "candidate_is_not_route_blocker": True,
+            }
+        )
+        candidates.append(card)
+    return candidates
+
+
 def _branch_packet_debt_ids(action: Optional[Mapping[str, Any]]) -> set[str]:
     branch_packet = (action or {}).get("branch_packet")
     if not isinstance(branch_packet, Mapping):
@@ -2410,6 +2825,10 @@ def _apply_paper_audit_strict_packet_isolation(manifest: Dict[str, Any]) -> None
 
     manifest["retrieval_cards"] = []
     manifest["theorem_library"] = []
+    manifest["research_strategy"] = {
+        "compact": True,
+        "policy": "strict paper-audit packet is isolated from sibling strategy, threat, debt, and reference state",
+    }
     manifest.pop("negative_result_ledger", None)
     policy = manifest.get("local_search_policy")
     if isinstance(policy, dict):
@@ -2456,6 +2875,10 @@ def _apply_paper_audit_verification_only_isolation(manifest: Dict[str, Any]) -> 
     manifest["debts"] = []
     manifest["retrieval_cards"] = []
     manifest["theorem_library"] = []
+    manifest["research_strategy"] = {
+        "compact": True,
+        "policy": "verifier-only paper-audit packet is isolated from sibling strategy, threat, debt, and reference state",
+    }
     manifest.pop("negative_result_ledger", None)
     manifest.pop("researcher_packet", None)
     manifest.pop("verification_packet", None)
@@ -2559,6 +2982,9 @@ def _select_artifacts(
             break
     if include_stop_writer_artifacts and len(cards) < 18:
         useful_types = {
+            "proof_dossier",
+            "proof_blueprint",
+            "research_notebook",
             "final_proof",
             "verified_blueprint",
             "proof_compression_report",
@@ -2917,6 +3343,8 @@ def _researcher_packet(
             "creative_attack_signal": action.get("creative_attack_signal", {}),
             "proof_route_conversion_required": bool(action.get("proof_route_conversion_required")),
             "proof_candidate_artifact_id": action.get("proof_candidate_artifact_id", ""),
+            "proved_lemma_claim_extraction_required": bool(action.get("proved_lemma_claim_extraction_required")),
+            "proved_lemma_candidate_statements": action.get("proved_lemma_candidate_statements", []),
             "no_result_search_synthesis_required": bool(action.get("no_result_search_synthesis_required")),
             "obstruction_route_conversion_required": bool(action.get("obstruction_route_conversion_required")),
             "global_obstruction_architecture_required": bool(action.get("global_obstruction_architecture_required")),
@@ -2957,7 +3385,10 @@ def _researcher_packet(
                 "When proof_route_conversion_required=true, do not start a new proof search. Read proof_candidate_artifact_id, decide "
                 "whether it contains a local verifier-ready argument, and create exactly one active sufficient route plus one untested "
                 "or plausible route inference citing that artifact as evidence. If the artifact is not route-ready, attach one short "
-                "research_diagnostic and add one precise proof debt instead. This pass exists to make strict verification schedulable."
+                "research_diagnostic and add one precise proof debt instead. When proved_lemma_claim_extraction_required=true, create an "
+                "exact child claim for the locally proved lemma (unless an equivalent claim already exists), make the route and inference "
+                "conclude that lemma rather than the root, and preserve its implication back to the current target. This pass exists to "
+                "make strict verification schedulable."
             ),
             "global_synthesis_rule": (
                 "When global_synthesis_required=true, treat the current artifacts as a near-proof portfolio. Do not request another broad "
@@ -3275,7 +3706,12 @@ def _permit_writer_paper_staging_dir(manifest: Dict[str, Any], store: ProofState
     evidence-boundary scorer would flag the staging path as an unlisted local
     evidence access. Mirrors _permit_writing_review_artifact_path above.
     """
-    staging_dir = str(store.state_dir / "artifacts" / "staging")
+    staging_path = store.state_dir / "artifacts" / "staging"
+    # The writer receives this directory as an explicit Codex --add-dir
+    # sandbox grant.  Create it before launch so the manifest and sandbox
+    # always refer to a real writable directory.
+    staging_path.mkdir(parents=True, exist_ok=True)
+    staging_dir = str(staging_path)
     policy = manifest.get("local_search_policy")
     if isinstance(policy, dict):
         allowed = policy.get("allowed_local_evidence_paths")
@@ -3447,6 +3883,55 @@ def _writing_paper_packet(
         "claim_route_summary": _claim_route_summary(state),
         "literature": literature,
         "paper_contract": PAPER_CONTRACT,
+    }
+
+
+def _human_readable_text_packet(
+    state: Mapping[str, Any],
+    *,
+    selected_artifacts: Iterable[Mapping[str, Any]],
+    action: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Accepted mathematical state for a one-shot cumulative partial paper."""
+    action = action or {}
+    if str(action.get("mode") or "") != "write" or not action.get("periodic_hmt"):
+        return {}
+    problem = state.get("problem_state", {})
+    source_integrated_claim_count = int(
+        action.get("hmt_source_integrated_claim_count")
+        or sum(
+            1
+            for claim in state.get("claims", [])
+            if str(claim.get("lifecycle_status") or "") == "integrated"
+        )
+    )
+    return {
+        "packet_type": "human_readable_mathematical_text",
+        "source_revision": int(action.get("hmt_source_revision") or problem.get("current_revision") or 0),
+        "source_integrated_claim_count": source_integrated_claim_count,
+        "integrated_claim_interval": int(action.get("hmt_integrated_claim_interval") or 10),
+        "sequence": int(action.get("hmt_sequence") or 1),
+        "root_statement": str(problem.get("root_statement") or ""),
+        "claims": [_claim_card(row) for row in state.get("claims", [])],
+        "routes": [_route_card(row) for row in state.get("routes", [])],
+        "inferences": [_inference_card(row) for row in state.get("inferences", [])],
+        "active_debts": [
+            _debt_card(row)
+            for row in state.get("debts", [])
+            if str(row.get("status") or "") == "active"
+        ],
+        "source_artifacts": [dict(row) for row in selected_artifacts],
+        "certification_legend": {
+            "informally_verified_or_formally_verified": "may be stated as proved, with its hypotheses and evidence preserved",
+            "integrated": "belongs to the accepted proof spine",
+            "plausible_or_untested": "must be labeled conjectural or provisional",
+            "challenged_or_refuted": "must be reported as an obstruction or failed statement, never as a theorem",
+            "active_debt": "an unresolved mathematical gap or source obligation",
+        },
+        "scope_rule": (
+            "This is a faithful cumulative exposition of accepted progress, not a new proof pass. "
+            "Do not strengthen statements, silently close gaps, or turn workflow confidence into a theorem."
+        ),
     }
 
 
@@ -3739,6 +4224,13 @@ def _workflow_action_card(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]
     allowed = {
         "mode",
         "display_mode",
+        "periodic_hmt",
+        "human_readable_text_required",
+        "hmt_source_revision",
+        "hmt_source_integrated_claim_count",
+        "hmt_sequence",
+        "hmt_integrated_claim_interval",
+        "hmt_revision_interval",
         "target_id",
         "route_id",
         "reason",
@@ -3780,6 +4272,10 @@ def _workflow_action_card(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]
         "definition_invention_required",
         "invention_authorization",
         "advisor_global_synthesis_required",
+        "proof_program_comparison_required",
+        "evidence_based_strategic_review_required",
+        "strategy_review_trigger",
+        "continue_long_proof_when_coherent",
         "synthesis_trigger",
         "advisor_synthesis_artifact_id",
         "advisor_synthesis_revision",
@@ -3791,6 +4287,8 @@ def _workflow_action_card(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]
         "deep_session_suppressed",
         "forced_research_philosophy",
         "long_mathematical_session_required",
+        "long_session_workspace",
+        "no_wall_clock_strategy_timeout",
         "research_philosophy",
         "research_cycle",
         "decisive_obligation_frontier_required",
@@ -3802,8 +4300,27 @@ def _workflow_action_card(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]
         "representation_switch_contract",
         "theorem_adaptation_required",
         "theorem_adaptation_contract",
+        "theorem_preflight_required",
+        "theorem_preflight_contract",
+        "case_coverage_map",
+        "case_coverage_map_required",
+        "proof_program_view",
+        "minimal_active_debt_frontier",
+        "role_starvation_recovery",
+        "researcher_only_streak",
+        "circling_stall",
+        "strategy_advisor_required",
+        "decompose_or_reroute",
+        "threat_propagation",
+        "root_leverage_metrics",
         "proof_interface_check_required",
         "proof_interface_contract",
+        "root_cut_progress_gate",
+        "root_cut_consolidation_required",
+        "claim_creation_frozen",
+        "canonical_route_ownership",
+        "initial_counterexample_preflight_required",
+        "counterexample_preflight_contract",
         "branch_diversity_contract",
         "method_card_ids",
         "method_retrieval_structural_features",
@@ -3879,6 +4396,13 @@ def _workflow_action_card(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]
         "research_attack_stage",
         "research_synthesis_required",
         "approach_portfolio_synthesis_required",
+        "approach_pilot_required",
+        "selected_approach",
+        "decisive_test_required",
+        "root_consequence_required",
+        "proof_claim_creation_forbidden_unless_test_succeeds",
+        "approach_alignment",
+        "exclusive_wave_required",
         "global_synthesis_required",
         "theorem_building_synthesis_required",
         "proof_architecture_required",
@@ -3915,13 +4439,23 @@ def _workflow_action_card(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]
         "proof_route_conversion_required",
         "proof_candidate_artifact_id",
         "proof_candidate_summary",
+        "proved_lemma_claim_extraction_required",
+        "proved_lemma_candidate_statements",
         "verify_ready_route_policy",
+        "automatic_researcher_verifier_handoff",
+        "revalidating_integrated_route",
+        "prior_route_status",
+        "dependency_threat_revalidation_required",
+        "certification_state",
+        "prior_certification_not_silently_revoked",
         "strict_verifier_scope",
         "verifier_evidence_artifact_ids",
         "verifier_evidence_state_revision",
         "verification_focus_inference_id",
         "strict_verifier_no_fresh_evidence",
         "strict_verifier_no_cas",
+        "reference_solution_reconstruction_required",
+        "reference_solution",
         "paper_audit_verification_only",
         "paper_audit_document_review_required",
         "paper_audit_document_integration_required",
@@ -4060,13 +4594,26 @@ def _compact_authoritative_debts(manifest: Dict[str, Any]) -> bool:
         return False
     compact = [
         {
-            "debt_id": str(row.get("debt_id") or ""),
-            "owner_type": str(row.get("owner_type") or ""),
-            "owner_id": str(row.get("owner_id") or ""),
-            "debt_type": str(row.get("debt_type") or ""),
-            "severity": str(row.get("severity") or ""),
-            "status": str(row.get("status") or ""),
-            "obligation": _compact_text(str(row.get("obligation") or ""), 260),
+            **{
+                "debt_id": str(row.get("debt_id") or ""),
+                "owner_type": str(row.get("owner_type") or ""),
+                "owner_id": str(row.get("owner_id") or ""),
+                "debt_type": str(row.get("debt_type") or ""),
+                "severity": str(row.get("severity") or ""),
+                "status": str(row.get("status") or ""),
+                "obligation": _compact_text(str(row.get("obligation") or ""), 260),
+            },
+            **(
+                {
+                    "integration_resolution_candidate": True,
+                    "candidate_for_claim_id": str(row.get("candidate_for_claim_id") or ""),
+                    "matched_terms": list(row.get("matched_terms") or [])[:6],
+                    "full_discharge_justification_required": True,
+                    "candidate_is_not_route_blocker": True,
+                }
+                if row.get("integration_resolution_candidate")
+                else {}
+            ),
         }
         for row in debts
         if isinstance(row, Mapping)
@@ -4082,9 +4629,49 @@ def _emergency_trim_manifest(manifest: Dict[str, Any]) -> bool:
     """Last-resort compaction for deliberately tiny context budgets."""
     instructions = manifest.get("instructions")
     if isinstance(instructions, list) and len(instructions) > 1:
-        manifest["instructions"] = ["Treat this manifest as authoritative Albilich v1 state."]
-        manifest["instructions_trimmed"] = True
-        return True
+        action = manifest.get("workflow_action")
+        action = action if isinstance(action, Mapping) else {}
+        required_fragments = [
+            "Additional run instruction for this execution:",
+            "manifest.human_steering carries directives",
+        ]
+        role_policy = manifest.get("role_context_policy")
+        context_role = str(role_policy.get("context_role") or "") if isinstance(role_policy, Mapping) else ""
+        if context_role == "phd_advisor":
+            required_fragments.extend(
+                [
+                    "directed_researcher_mode",
+                    "Branch adjudication:",
+                    "Episodic strategy review:",
+                ]
+            )
+        if action.get("bidirectional_bridge_search_required"):
+            required_fragments.append("manifest.bridge_lemma_search_contract exactly")
+        if action.get("approach_brainstorming_required") or "approach_portfolio_contract" in manifest:
+            required_fragments.append("manifest.approach_portfolio_contract exactly")
+        if action.get("proof_compression_operation_required"):
+            required_fragments.append("manifest.proof_compression_contract exactly")
+        if action.get("advisor_global_synthesis_required"):
+            required_fragments.append("manifest.advisor_synthesis_contract exactly")
+        if action.get("experiment_workflow_required") or str(action.get("researcher_work_mode") or "") == "cas":
+            required_fragments.append("manifest.cas_experiment_contract exactly")
+        if action.get("reference_solution_reconstruction_required"):
+            required_fragments.append("Reconstruct the human-supplied reference solution now")
+        if action.get("proof_interface_check_required"):
+            required_fragments.append("selective deterministic proof-interface checklist")
+        if action.get("theorem_preflight_required"):
+            required_fragments.append("compact risk-triggered theorem preflight")
+        compact_instructions = ["Treat this manifest as authoritative Albilich v1 state."]
+        compact_instructions.extend(
+            line
+            for line in instructions
+            if any(fragment in str(line) for fragment in required_fragments)
+            and line not in compact_instructions
+        )
+        if compact_instructions != instructions:
+            manifest["instructions"] = compact_instructions
+            manifest["instructions_trimmed"] = True
+            return True
     strategy = manifest.get("research_strategy")
     minimal_strategy = {
         "compact": True,
@@ -4399,11 +4986,12 @@ def _trim_advisory_context(manifest: Dict[str, Any]) -> bool:
     contract = manifest.get("patch_contract")
     if isinstance(contract, dict):
         templates = contract.get("operation_templates")
-        if isinstance(templates, list) and len(templates) > 2:
+        protected_templates = _protected_operation_templates(contract)
+        if isinstance(templates, list) and len(templates) > 2 and not protected_templates:
             contract["operation_templates"] = templates[:2]
             contract["operation_templates_trimmed"] = True
             return True
-        if "operation_templates" in contract:
+        if "operation_templates" in contract and not protected_templates:
             contract.pop("operation_templates", None)
             contract["operation_templates_trimmed"] = True
             return True
@@ -4484,7 +5072,7 @@ def _minimal_patch_contract(contract: Mapping[str, Any]) -> Dict[str, Any]:
     context_role = str(contract.get("context_role") or "")
     if not op_names:
         op_names = _default_operation_names(context_role)
-    return {
+    compact = {
         "compact": True,
         "context_role": context_role,
         "required_top_level": "schema_version, problem_id, base_revision, actor_role, target_id, operations, rationale",
@@ -4493,6 +5081,10 @@ def _minimal_patch_contract(contract: Mapping[str, Any]) -> Dict[str, Any]:
         "parallel_signal_rule": "Optional top-level parallel_signals are advisory blackboard signals.",
         "allowed_operation_names": op_names[:8],
     }
+    protected_templates = _protected_operation_templates(contract)
+    if protected_templates:
+        compact["operation_templates"] = protected_templates
+    return compact
 
 
 def _emergency_patch_contract(contract: Mapping[str, Any]) -> Dict[str, Any]:
@@ -4503,7 +5095,31 @@ def _emergency_patch_contract(contract: Mapping[str, Any]) -> Dict[str, Any]:
         compact["context_role"] = context_role
     if op_names:
         compact["allowed_operation_names"] = op_names[:8]
+    protected_templates = _protected_operation_templates(contract)
+    if protected_templates:
+        compact["operation_templates"] = protected_templates
     return compact
+
+
+def _protected_operation_templates(contract: Mapping[str, Any]) -> list[Dict[str, Any]]:
+    """Retain outcome-critical patch shapes for counterexample validation.
+
+    A validator must know that a confirmed counterexample and the matching
+    refutation transition belong in the same patch, while an incomplete check
+    records only a validation debt.  Operation names alone lose that contract,
+    so these three small templates survive even emergency context compaction.
+    """
+    if str(contract.get("context_role") or "") != "counterexample_validator":
+        return []
+    templates = contract.get("operation_templates")
+    if not isinstance(templates, list):
+        return []
+    required_ops = {"attach_artifact", "propose_status_transition", "add_debt"}
+    return [
+        dict(template)
+        for template in templates
+        if isinstance(template, Mapping) and str(template.get("op") or "") in required_ops
+    ]
 
 
 def _default_operation_names(context_role: str) -> list[str]:

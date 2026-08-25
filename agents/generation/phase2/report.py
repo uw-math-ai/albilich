@@ -202,10 +202,18 @@ def _research_strategy_lines(state: Dict[str, Any]) -> list[str]:
     frontier = strategy.get("decisive_obligation_frontier") or {}
     learning = strategy.get("verifier_filtered_outcome_learning") or {}
     roi = strategy.get("deep_session_roi") or {}
+    programs = strategy.get("proof_programs") or {}
+    threats = strategy.get("threat_propagation") or {}
+    debt_frontier = strategy.get("minimal_active_debt_frontier") or {}
+    leverage = strategy.get("root_leverage_metrics") or {}
+    reference = strategy.get("reference_solution") or {}
+    portfolio = strategy.get("approach_portfolio") or {}
+    lease = strategy.get("bottleneck_lease") or {}
     if not any(
         strategy.get(key)
         for key in (
             "latest_advisor_synthesis_artifact_id",
+            "latest_approach_portfolio_artifact_id",
             "latest_proof_compression_artifact_id",
             "latest_bridge_search_artifact_id",
             "latest_conjecture_portfolio_artifact_id",
@@ -220,6 +228,11 @@ def _research_strategy_lines(state: Dict[str, Any]) -> list[str]:
         "",
         "Strategic artifacts are persisted proof-state context, not verified mathematical evidence.",
         "",
+        f"- Approach portfolio: `{portfolio.get('artifact_id') or 'none'}`; candidates={portfolio.get('approach_count', 0)}, "
+        f"selected={portfolio.get('selected_approach_ids') or []}",
+        f"- Bottleneck lease: active={bool(lease.get('active'))}, escape_required={bool(lease.get('escape_required'))}, "
+        f"completed_no_delta={lease.get('completed_no_delta_passes', 0)}/{lease.get('completed_no_delta_limit', 2)}, "
+        f"execution_failures={lease.get('consecutive_execution_failures', 0)}/{lease.get('execution_failure_limit', 2)}; wall_clock_timeout=none",
         f"- Latest global advisor synthesis: `{strategy.get('latest_advisor_synthesis_artifact_id') or 'none'}`",
         f"- Latest active proof compression: `{strategy.get('latest_proof_compression_artifact_id') or 'none'}`",
         f"- Bridge search: `{strategy.get('latest_bridge_search_artifact_id') or 'none'}`; "
@@ -236,9 +249,22 @@ def _research_strategy_lines(state: Dict[str, Any]) -> list[str]:
             f"- Graph-derived decisive obligation: `{(frontier.get('decisive_obligation') or {}).get('obligation_id') or 'none'}`; "
             f"selected route=`{frontier.get('selected_route_id') or 'none'}`, ready_for_verification={bool(frontier.get('selected_route_ready_for_verification'))}",
             f"- Verifier-filtered outcome learning: family=`{learning.get('current_strategy_family') or 'none'}`; "
-            f"local families={len(learning.get('families') or {})}; reference_solution_used={bool(learning.get('reference_solution_used'))}",
+            f"local families={len(learning.get('families') or {})}; root-contributing successes="
+            f"{(learning.get('current_family') or {}).get('root_contributing_successes', 0)}; "
+            f"reference_solution_used={bool(learning.get('reference_solution_used'))}",
             f"- Deep-session ROI: allowed={bool(roi.get('allowed', True))}; reason={roi.get('reason') or 'not evaluated'}",
+            f"- Proof programs: total={programs.get('program_count', 0)}, root-closing={programs.get('root_closing_program_count', 0)}, "
+            f"exhaustive-case programs={(programs.get('case_coverage_status_counts') or {}).get('exhaustive', 0)}; no wall-clock abandonment={bool(programs.get('no_wall_clock_abandonment'))}",
+            f"- Threat propagation: threatened certified claims={len(threats.get('threatened_verified_claim_ids') or [])}, "
+            f"pending strict revalidations={len(threats.get('pending_revalidation_routes') or [])}; certification is not silently revoked",
+            f"- Canonical debt frontier: active blocking={debt_frontier.get('active_blocking_debt_count', 0)}, "
+            f"independent work items={debt_frontier.get('minimal_frontier_count', 0)}, aliases={len(debt_frontier.get('alias_to_primary') or {})}",
+            f"- Reference solution: available={bool(reference.get('available'))}, pending reconstruction={bool(reference.get('pending_reconstruction'))}, verification authority=false",
+            f"- Root leverage: terminal root inferences={leverage.get('root_terminal_inference_count', 0)}, "
+            f"verified terminal root inferences={leverage.get('verified_root_terminal_inference_count', 0)}, "
+            f"pending threat revalidations={leverage.get('pending_threat_revalidation_count', 0)}",
             "- Information-gain policy: scheduler exposes closing, refuting, root-progress, information, reuse, duplication, token, wall-time, verification-cost, and verifier-filtered outcome components; speculative work never consumes the protected verification reserve.",
+            "- Creativity policy: ideas and nonblocking research questions may be numerous; blocking proof debts remain exact route obligations. The active portfolio reserves 30% exploration, 50% exploitation, and 20% adversarial testing as a qualitative allocation rather than a hidden probability model.",
             "- Method library policy: 18 developer-curated structural/domain method cards are advisory only and are kept separate from verified facts, external theorem cards, and private speculation.",
             "",
         ]

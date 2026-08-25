@@ -41,7 +41,9 @@ from .research_policy import (
     search_policy_for_action,
 )
 from .research_intelligence import action_patch_contract_errors
+from .research_strategy import approach_portfolio_view
 from .branch_summary import sync_branch_workbenches
+from .hmt_sidecar import periodic_hmt_sidecar_action, publish_hmt_sidecar
 from .scheduler import (
     DEFAULT_MULTI_BRANCH_WORKERS,
     _artifact_is_proof_candidate,
@@ -196,6 +198,139 @@ def run_workflow(
     stale_retry_recoveries = 0
     max_stale_retry_recoveries = _stale_retry_recovery_attempts()
 
+    # Periodic HMT authoring is deliberately independent of the proof wave.
+    # The daemon writer may run while research continues, but its result is
+    # published only to the sidecar catalog and never patched into proof state.
+    hmt_lock = threading.Lock()
+    hmt_thread: threading.Thread | None = None
+    hmt_completed: Dict[str, Any] | None = None
+    hmt_stop_event = threading.Event()
+    hmt_last_attempted_integrated_claim_count = 0
+    hmt_sidecar_results: list[Dict[str, Any]] = []
+
+    def collect_hmt_sidecar() -> None:
+        nonlocal hmt_thread, hmt_completed
+        with hmt_lock:
+            completed = hmt_completed
+            hmt_completed = None
+        if completed is None:
+            return
+        action = completed["action"]
+        execution = completed["execution"]
+        session_plan = completed["session_plan"]
+        owner_entry = completed["owner_entry"]
+        errors = _evidence_boundary_errors(execution, session_plan)
+        patch = execution.get("patch")
+        if isinstance(patch, Mapping):
+            errors.extend(action_patch_contract_errors(action, patch))
+        if errors:
+            outcome: Dict[str, Any] = {"accepted": False, "errors": errors}
+        else:
+            outcome = publish_hmt_sidecar(store, action=action, execution=execution)
+        result = {
+            "action": dict(action),
+            "execution": _public_execution(execution),
+            "publish_outcome": outcome,
+            "status": "completed" if outcome.get("accepted") else "failed",
+            "non_blocking": True,
+            "proof_state_revision": store.get_revision(),
+        }
+        hmt_sidecar_results.append(result)
+        owner_entry["hmt_sidecar_result"] = result
+        owner_entry["hmt_sidecar_status"] = result["status"]
+        hmt_thread = None
+        with console_lock:
+            write_console_snapshot_locked(force=True)
+
+    def start_hmt_sidecar(action: Mapping[str, Any], owner_entry: Dict[str, Any]) -> None:
+        nonlocal hmt_thread, hmt_completed, hmt_last_attempted_integrated_claim_count
+        session_item = _prepare_scheduled_session(
+            store,
+            action,
+            research_mode=research_mode,
+            web_search=web_search,
+            max_context_chars=max_context_chars,
+            model_profile=model_profile,
+            is_companion=True,
+        )
+        session_plan = session_item["session_plan"]
+        item_progress = _progress_callback_for_item(progress_callback_for(owner_entry), session_item)
+        hmt_last_attempted_integrated_claim_count = int(
+            action.get("hmt_source_integrated_claim_count") or 0
+        )
+        owner_entry.setdefault("parallel_actions", []).append(dict(action))
+        owner_entry["hmt_sidecar_status"] = "running"
+
+        def invoke() -> None:
+            nonlocal hmt_completed
+            try:
+                if executor is None:
+                    execution = execute_session(
+                        store,
+                        action,
+                        session_plan,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                        model_profile=model_profile,
+                        codex_bin=codex_bin,
+                        sandbox=sandbox,
+                        web_search=session_item["session_web_search"],
+                        timeout_sec=timeout_sec,
+                        progress_callback=item_progress,
+                        stop_event=hmt_stop_event,
+                    )
+                else:
+                    _emit_synthetic_progress(item_progress, session_item, phase="started", status="running")
+                    call_kwargs: Dict[str, Any] = {
+                        "store": store,
+                        "action": action,
+                        "session_plan": session_plan,
+                    }
+                    try:
+                        params = inspect.signature(executor).parameters
+                        accepts_var_kw = any(p.kind == p.VAR_KEYWORD for p in params.values())
+                        if accepts_var_kw or "progress_callback" in params:
+                            call_kwargs["progress_callback"] = item_progress
+                        if accepts_var_kw or "stop_event" in params:
+                            call_kwargs["stop_event"] = hmt_stop_event
+                    except (TypeError, ValueError):
+                        pass
+                    execution = dict(executor(**call_kwargs))
+                    _emit_synthetic_progress(
+                        item_progress,
+                        session_item,
+                        phase="completed",
+                        status=str(execution.get("status") or "completed"),
+                        execution=execution,
+                    )
+            except BaseException as exc:  # keep presentation failures off the proof lane
+                execution = {
+                    "run_id": f"hmt-sidecar-{hmt_last_attempted_integrated_claim_count}",
+                    "actor_role": "writer",
+                    "status": "failed",
+                    "returncode": -1,
+                    "patch": None,
+                    "patch_error": f"{type(exc).__name__}: {exc}",
+                    "usage": {},
+                }
+            with hmt_lock:
+                hmt_completed = {
+                    "action": dict(action),
+                    "session_plan": dict(session_plan),
+                    "execution": execution,
+                    "owner_entry": owner_entry,
+                }
+
+        hmt_thread = threading.Thread(
+            target=invoke,
+            daemon=True,
+            name=(
+                "albilich-hmt-sidecar-integrated-"
+                f"{hmt_last_attempted_integrated_claim_count}"
+            ),
+        )
+        hmt_thread.start()
+
     def write_console_snapshot_locked(*, force: bool = False) -> None:
         nonlocal console_path
         if write_console and console_write_throttle.should_write(force=force):
@@ -279,11 +414,22 @@ def run_workflow(
             record_entry(entry)
             break
 
-        action = next_action(store, research_mode=research_mode, web_search=web_search)
+        collect_hmt_sidecar()
+        action = next_action(
+            store,
+            research_mode=research_mode,
+            web_search=web_search,
+            include_periodic_hmt=False,
+        )
         # Human steering present at step start is injected into this step's agent context
         # (via build_context_manifest); mark it consumed once the step has run so it is
         # delivered exactly once without halting the run.
         pending_steering_ids = [m.get("id") for m in steering.unconsumed_steering(store.state_dir)]
+        approach_alignment_steering_ids = [
+            str(item)
+            for item in dict(action.get("approach_alignment") or {}).get("source_steering_ids", [])
+            if str(item)
+        ]
         actions = [action]
         if parallel_librarian_verifier:
             actions.extend(
@@ -377,9 +523,36 @@ def run_workflow(
             record_entry(entry)
             break
 
+        if pending_steering_ids:
+            steering.mark_delivered(
+                store.state_dir,
+                pending_steering_ids,
+                revision=store.get_revision(),
+            )
+        if approach_alignment_steering_ids:
+            steering.mark_approach_alignment_processing(
+                store.state_dir,
+                approach_alignment_steering_ids,
+            )
+
         entry["execution_phase"] = "running"
         entry["started_at"] = utc_now()
         record_entry(entry)
+
+        if hmt_thread is None:
+            hmt_action = periodic_hmt_sidecar_action(store, research_mode=research_mode)
+            if hmt_action is not None:
+                source_integrated_claim_count = int(
+                    hmt_action.get("hmt_source_integrated_claim_count") or 0
+                )
+                interval = int(hmt_action.get("hmt_integrated_claim_interval") or 1)
+                if (
+                    not hmt_last_attempted_integrated_claim_count
+                    or source_integrated_claim_count
+                    - hmt_last_attempted_integrated_claim_count
+                    >= interval
+                ):
+                    start_hmt_sidecar(hmt_action, entry)
 
         step_timeout = timeout_sec
         if remaining_wall is not None:
@@ -478,6 +651,7 @@ def run_workflow(
         entry["execution_phase"] = str(primary_result.get("status") or "completed")
         entry["finished_at"] = utc_now()
         record_entry(entry)
+        collect_hmt_sidecar()
 
         # Persist the per-branch workbenches from the just-accepted proof
         # state (idempotent: no write when a branch's workbench is unchanged).
@@ -488,6 +662,34 @@ def run_workflow(
 
         if pending_steering_ids:
             steering.mark_consumed(store.state_dir, pending_steering_ids)
+
+        # A steering message is not fully reconciled merely because an agent
+        # read it.  Complete its alignment lifecycle only after an accepted
+        # replacement portfolio is durably visible in SQLite.  Failed or
+        # rejected refreshes remain pending and are retried automatically.
+        if action.get("approach_brainstorming_required") and (primary_result.get("patch_outcome") or {}).get("accepted"):
+            latest_portfolio = approach_portfolio_view(store.get_scheduler_state())
+            previous_portfolio_id = str(action.get("supersedes_artifact_id") or "")
+            latest_portfolio_id = str(latest_portfolio.get("artifact_id") or "")
+            if latest_portfolio_id and latest_portfolio_id != previous_portfolio_id:
+                completed_alignment_ids = list(
+                    dict.fromkeys(
+                        [
+                            *approach_alignment_steering_ids,
+                            *(
+                                [str(item) for item in pending_steering_ids if str(item)]
+                                if action.get("approach_alignment")
+                                else []
+                            ),
+                        ]
+                    )
+                )
+                steering.mark_approach_alignment_completed(
+                    store.state_dir,
+                    completed_alignment_ids,
+                    artifact_id=latest_portfolio_id,
+                    revision=int(latest_portfolio.get("state_revision") or store.get_revision()),
+                )
 
         # Update the per-role session registry for same-role resume. Keep a healthy
         # session to continue next step; drop it on a failed/timed-out step so the
@@ -616,6 +818,17 @@ def run_workflow(
             )
             record_entry(entry)
 
+    collect_hmt_sidecar()
+    hmt_stop_event.set()
+    if hmt_thread is not None:
+        # Never wait for exposition when the proof run reaches a stop.  The
+        # daemon writer observes this event and systemd also owns its process
+        # cgroup, so no HMT child can keep a research attempt alive.
+        for entry in reversed(history):
+            if entry.get("hmt_sidecar_status") == "running":
+                entry["hmt_sidecar_status"] = "cancelled_on_research_stop"
+                break
+
     if execute:
         _finalize_run_status(store, history)
     report_path = str(write_markdown_report(store)) if write_report else ""
@@ -634,6 +847,7 @@ def run_workflow(
         "wall_limit_seconds": max_wall_seconds,
         "parallel_librarian_verifier": parallel_librarian_verifier,
         "parallel_branches": parallel_branches,
+        "hmt_sidecar_results": hmt_sidecar_results,
         "write_on_stop": write_on_stop,
         "write_console": write_console,
     }
@@ -1611,7 +1825,13 @@ def _local_evidence_prefix_variants(path: str) -> list[str]:
     variants = [path]
     marker = "agents/generation/"
     if marker in path:
-        variants.append(path[path.find(marker):])
+        relative = path[path.find(marker):]
+        variants.append(relative)
+        # Codex's workspace sandbox reports an explicitly granted repository
+        # path through its synthetic /agents mount.  Treat that spelling as
+        # the same approved path; without it, a writer can create the exact
+        # manifest-listed staging file and still be rejected after the fact.
+        variants.append("/" + relative)
     return variants
 
 

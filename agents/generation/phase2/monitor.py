@@ -26,10 +26,11 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Mapping
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from .console import build_run_console_payload
 from .graph_policy import claim_is_retired, supersession_index
+from .hmt_sidecar import hmt_paper_by_id, read_hmt_catalog
 from .models import statement_is_interrogative_problem, utc_now
 from .scheduler import bottleneck_frontier_summary, proof_spine_summary, route_verifier_readiness
 from .research_strategy import strategy_observability
@@ -40,6 +41,8 @@ _LIVE_STATUSES = {"running", "started", "heartbeat", "planned"}
 _LIVE_TELEMETRY_STALE_SECONDS = 180.0
 MONITOR_REFRESH_INTERVAL_ENV = "ALBILICH_MONITOR_REFRESH_INTERVAL_SECONDS"
 DEFAULT_MONITOR_REFRESH_INTERVAL_SECONDS = 60.0
+HUMAN_READABLE_TEXT_ARTIFACT_TYPE = "human_readable_mathematical_text"
+PAPER_ARTIFACT_TYPES = {HUMAN_READABLE_TEXT_ARTIFACT_TYPE, "final_paper"}
 
 
 def _monitor_refresh_interval_seconds(poll_ms: int) -> float:
@@ -148,6 +151,217 @@ def _short_text(value: Any, limit: int = 220) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
+def _humanize_identifier(value: Any) -> str:
+    return " ".join(str(value or "").replace("-", "_").split("_")).strip()
+
+
+def _artifact_display_title(artifact: Mapping[str, Any]) -> str:
+    metadata = _json_object(artifact.get("metadata_json"))
+    for key in ("title", "proved_statement", "statement", "theorem", "result", "claim"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return _short_text(value, 180)
+    summary = str(artifact.get("content_summary") or "").strip()
+    if summary:
+        return _short_text(summary, 180)
+    artifact_type = _humanize_identifier(artifact.get("artifact_type"))
+    return artifact_type[:1].upper() + artifact_type[1:] if artifact_type else "Mathematical artifact"
+
+
+def _artifact_mathematical_statement(artifact: Mapping[str, Any]) -> str:
+    metadata = _json_object(artifact.get("metadata_json"))
+    for key in (
+        "proved_statement",
+        "exact_statement",
+        "statement",
+        "theorem",
+        "result",
+        "claim",
+        "conclusion",
+        "obstruction",
+        "missing",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return _short_text(value, 700)
+        if isinstance(value, list):
+            text = "; ".join(str(item).strip() for item in value if str(item).strip())
+            if text:
+                return _short_text(text, 700)
+    return _short_text(artifact.get("content_summary"), 700)
+
+
+def _resolved_artifact_path(store: ProofStateStore, artifact: Mapping[str, Any]) -> Path | None:
+    raw_path = str(artifact.get("path") or "").strip()
+    if not raw_path:
+        return None
+    try:
+        target = Path(raw_path).resolve()
+        artifact_root = (store.state_dir / "artifacts").resolve()
+        target.relative_to(artifact_root)
+    except (OSError, ValueError):
+        return None
+    return target if target.is_file() else None
+
+
+def _artifact_text_excerpt(store: ProofStateStore, artifact: Mapping[str, Any], limit: int = 1_600) -> str:
+    path = _resolved_artifact_path(store, artifact)
+    if path is None or path.suffix.lower() == ".pdf":
+        return ""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if "\\begin{document}" in content:
+        content = content.split("\\begin{document}", 1)[1]
+    content = content.replace("\\end{document}", "")
+    return content[:limit].strip()
+
+
+def _paper_pdf_path(store: ProofStateStore, artifact: Mapping[str, Any]) -> Path | None:
+    if str(artifact.get("artifact_type") or "") not in PAPER_ARTIFACT_TYPES:
+        return None
+    metadata = _json_object(artifact.get("metadata_json"))
+    candidates = [str(metadata.get("pdf_path") or "")]
+    source_path = _resolved_artifact_path(store, artifact)
+    if source_path is not None:
+        candidates.append(str(source_path.with_suffix(".pdf")))
+    artifact_root = (store.state_dir / "artifacts").resolve()
+    for raw_path in candidates:
+        if not raw_path:
+            continue
+        try:
+            candidate = Path(raw_path).resolve()
+            candidate.relative_to(artifact_root)
+        except (OSError, ValueError):
+            continue
+        if candidate.is_file() and candidate.suffix.lower() == ".pdf":
+            return candidate
+    return None
+
+
+def _paper_catalog(store: ProofStateStore, *, state: Mapping[str, Any] | None = None) -> list[Dict[str, Any]]:
+    state = state if state is not None else store.get_state()
+    papers: list[Dict[str, Any]] = []
+    for artifact in state.get("artifacts", []):
+        if str(artifact.get("artifact_type") or "") not in PAPER_ARTIFACT_TYPES:
+            continue
+        pdf_path = _paper_pdf_path(store, artifact)
+        if pdf_path is None:
+            continue
+        metadata = _json_object(artifact.get("metadata_json"))
+        artifact_id = str(artifact.get("artifact_id") or "")
+        papers.append(
+            {
+                "artifact_id": artifact_id,
+                "artifact_type": str(artifact.get("artifact_type") or ""),
+                "title": _artifact_display_title(artifact),
+                "source_revision": int(metadata.get("source_revision") or artifact.get("state_revision") or 0),
+                "sequence": int(metadata.get("sequence") or 0),
+                "state_revision": int(artifact.get("state_revision") or 0),
+                "created_at": str(artifact.get("created_at") or ""),
+                "pdf_url": f"/api/paper?id={quote(artifact_id, safe='')}",
+                "kind": "Final paper" if artifact.get("artifact_type") == "final_paper" else "HMT partial paper",
+            }
+        )
+    known_ids = {str(row.get("artifact_id") or "") for row in papers}
+    for paper in read_hmt_catalog(store):
+        artifact_id = str(paper.get("artifact_id") or "")
+        if not artifact_id or artifact_id in known_ids:
+            continue
+        source_revision = int(paper.get("source_revision") or 0)
+        papers.append(
+            {
+                "artifact_id": artifact_id,
+                "artifact_type": HUMAN_READABLE_TEXT_ARTIFACT_TYPE,
+                "title": str(paper.get("title") or "Cumulative Human-Readable Mathematical Text"),
+                "source_revision": source_revision,
+                "sequence": int(paper.get("sequence") or 0),
+                # Sidecar papers do not advance proof state; use their source
+                # revision solely for chronological display compatibility.
+                "state_revision": source_revision,
+                "created_at": str(paper.get("created_at") or ""),
+                "pdf_url": f"/api/paper?id={quote(artifact_id, safe='')}",
+                "kind": "HMT sidecar paper",
+                "non_blocking": True,
+            }
+        )
+    papers.sort(
+        key=lambda row: (row["source_revision"], row["state_revision"], row["created_at"], row["artifact_id"])
+    )
+    return papers
+
+
+def _artifact_catalog(store: ProofStateStore, *, state: Mapping[str, Any] | None = None) -> list[Dict[str, Any]]:
+    state = state if state is not None else store.get_state()
+    rows: list[Dict[str, Any]] = []
+    for artifact in state.get("artifacts", []):
+        artifact_id = str(artifact.get("artifact_id") or "")
+        if not artifact_id:
+            continue
+        rows.append(
+            {
+                "artifact_id": artifact_id,
+                "artifact_type": str(artifact.get("artifact_type") or ""),
+                "producer_role": str(artifact.get("producer_role") or ""),
+                "state_revision": int(artifact.get("state_revision") or 0),
+                "created_at": str(artifact.get("created_at") or ""),
+                "display_title": _artifact_display_title(artifact),
+                "mathematical_statement": _artifact_mathematical_statement(artifact),
+                "read_url": f"/api/artifact?id={quote(artifact_id, safe='')}",
+                "pdf_url": (
+                    f"/api/paper?id={quote(artifact_id, safe='')}"
+                    if _paper_pdf_path(store, artifact) is not None
+                    else ""
+                ),
+            }
+        )
+    rows.sort(
+        key=lambda row: (row["state_revision"], row["created_at"], row["artifact_id"]),
+        reverse=True,
+    )
+    return rows
+
+
+def _artifact_document(store: ProofStateStore, artifact_id: str) -> Dict[str, Any] | None:
+    state = store.get_state()
+    artifact = next(
+        (row for row in state.get("artifacts", []) if str(row.get("artifact_id") or "") == artifact_id),
+        None,
+    )
+    if artifact is None:
+        return None
+    path = _resolved_artifact_path(store, artifact)
+    content = ""
+    truncated = False
+    if path is not None and path.suffix.lower() != ".pdf":
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as handle:
+                raw = handle.read(800_001)
+            truncated = size > 800_000
+            content = raw[:800_000].decode("utf-8", errors="replace")
+        except OSError:
+            content = ""
+    return {
+        "artifact_id": artifact_id,
+        "artifact_type": str(artifact.get("artifact_type") or ""),
+        "producer_role": str(artifact.get("producer_role") or ""),
+        "state_revision": int(artifact.get("state_revision") or 0),
+        "created_at": str(artifact.get("created_at") or ""),
+        "title": _artifact_display_title(artifact),
+        "mathematical_statement": _artifact_mathematical_statement(artifact),
+        "content_summary": str(artifact.get("content_summary") or ""),
+        "content": content,
+        "truncated": truncated,
+        "pdf_url": (
+            f"/api/paper?id={quote(artifact_id, safe='')}"
+            if _paper_pdf_path(store, artifact) is not None
+            else ""
+        ),
+    }
+
+
 def _producer_role_code(role: str) -> str:
     normalized = str(role or "").strip().lower()
     return {
@@ -225,7 +439,9 @@ def _proof_graph_payload(store: ProofStateStore, *, state: Dict[str, Any] | None
             {
                 "id": f"claim:{claim_id}",
                 "kind": "claim",
-                "label": claim_id,
+                "label": _short_text(claim.get("statement"), 110) or _humanize_identifier(claim_id),
+                "full_label": _short_text(claim.get("statement"), 400),
+                "record_id": claim_id,
                 "status": str(claim.get("validation_status") or ""),
                 "lifecycle_status": str(claim.get("lifecycle_status") or ""),
                 "summary": _short_text(claim.get("statement"), 260),
@@ -245,13 +461,23 @@ def _proof_graph_payload(store: ProofStateStore, *, state: Dict[str, Any] | None
         verified_count = verified_inference_counts_by_route.get(route_id, 0)
         readiness = route_verifier_readiness(state, route_id)
         verifier_ready = bool(readiness.get("verifier_ready"))
+        conclusion_statement = str(
+            claims.get(str(route.get("conclusion_claim_id") or ""), {}).get("statement") or ""
+        )
+        route_title = str(route.get("label") or "").strip() or str(route.get("strategy") or "").strip()
         add_node(
             {
                 "id": f"route:{route_id}",
                 "kind": "route",
-                "label": route_id,
+                "label": _short_text(route_title or conclusion_statement, 110) or _humanize_identifier(route_id),
+                "full_label": _short_text(route_title or conclusion_statement, 400),
+                "record_id": route_id,
                 "status": str(route.get("status") or ""),
-                "summary": _short_text(route.get("strategy") or route.get("label"), 260),
+                "summary": _short_text(
+                    f"Goal: {conclusion_statement}\n\nStrategy: {route.get('strategy') or route.get('label') or ''}",
+                    700,
+                ),
+                "conclusion_statement": conclusion_statement,
                 "conclusion_claim_id": str(route.get("conclusion_claim_id") or ""),
                 "relation_to_parent": str(route.get("relation_to_parent") or ""),
                 "inference_count": inf_count,
@@ -271,7 +497,9 @@ def _proof_graph_payload(store: ProofStateStore, *, state: Dict[str, Any] | None
             {
                 "id": f"inference:{inference_id}",
                 "kind": "inference",
-                "label": inference_id,
+                "label": _short_text(inf.get("explanation"), 110) or _humanize_identifier(inference_id),
+                "full_label": _short_text(inf.get("explanation"), 400),
+                "record_id": inference_id,
                 "status": str(inf.get("validation_status") or ""),
                 "summary": _short_text(inf.get("explanation"), 260),
                 "route_id": str(inf.get("route_id") or ""),
@@ -298,7 +526,9 @@ def _proof_graph_payload(store: ProofStateStore, *, state: Dict[str, Any] | None
             {
                 "id": f"debt:{debt_id}",
                 "kind": "debt",
-                "label": debt_id,
+                "label": _short_text(debt.get("obligation"), 110) or _humanize_identifier(debt_id),
+                "full_label": _short_text(debt.get("obligation"), 400),
+                "record_id": debt_id,
                 "status": str(debt.get("severity") or ""),
                 "summary": _short_text(debt.get("obligation"), 260),
                 "owner_type": owner_type,
@@ -327,17 +557,21 @@ def _proof_graph_payload(store: ProofStateStore, *, state: Dict[str, Any] | None
         producer_role = str(artifact.get("producer_role") or "")
         role_code = _producer_role_code(producer_role)
         state_revision = int(artifact.get("state_revision") or 0)
+        display_title = _artifact_display_title(artifact)
         add_node(
             {
                 "id": f"artifact:{artifact_id}",
                 "kind": "artifact",
                 "label": f"A{ref_index} {role_code}",
                 "full_label": artifact_id,
+                "display_title": display_title,
+                "record_id": artifact_id,
+                "artifact_id": artifact_id,
                 "artifact_ref": f"A{ref_index}",
                 "artifact_ref_index": ref_index,
                 "producer_role_code": role_code,
                 "status": str(artifact.get("artifact_type") or ""),
-                "summary": _short_text(artifact.get("content_summary") or artifact.get("metadata_json"), 220),
+                "summary": _artifact_mathematical_statement(artifact) or display_title,
                 "producer_role": producer_role,
                 "state_revision": state_revision,
                 "compact": True,
@@ -383,6 +617,61 @@ def _proof_graph_payload(store: ProofStateStore, *, state: Dict[str, Any] | None
             "blocking_debt_count": sum(1 for row in debts if str(row.get("severity") or "") == "blocking"),
         },
     }
+
+
+def _enrich_human_readable_dashboard_rows(
+    store: ProofStateStore,
+    payload: Dict[str, Any],
+    state: Mapping[str, Any],
+) -> None:
+    claims = {
+        str(row.get("claim_id") or ""): row
+        for row in state.get("claims", [])
+    }
+    routes = {
+        str(row.get("route_id") or ""): row
+        for row in state.get("routes", [])
+    }
+    route_inferences: dict[str, list[str]] = {}
+    for inference in state.get("inferences", []):
+        explanation = str(inference.get("explanation") or "").strip()
+        if explanation:
+            route_inferences.setdefault(str(inference.get("route_id") or ""), []).append(explanation)
+    for row in payload.get("route_scoreboard", []) or []:
+        if not isinstance(row, dict):
+            continue
+        route_id = str(row.get("route_id") or "")
+        route = routes.get(route_id, {})
+        conclusion_id = str(route.get("conclusion_claim_id") or row.get("conclusion_claim_id") or "")
+        conclusion = str(claims.get(conclusion_id, {}).get("statement") or "")
+        strategy = str(route.get("strategy") or "").strip()
+        label = str(route.get("label") or "").strip()
+        row.update(
+            {
+                "display_title": _short_text(label or strategy or conclusion, 180) or _humanize_identifier(route_id),
+                "conclusion_statement": conclusion,
+                "strategy_statement": strategy or label,
+                "inference_statements": route_inferences.get(route_id, [])[:12],
+            }
+        )
+
+    artifacts = {
+        str(row.get("artifact_id") or ""): row
+        for row in state.get("artifacts", [])
+    }
+    for row in payload.get("recent_research_artifacts", []) or []:
+        if not isinstance(row, dict):
+            continue
+        artifact_id = str(row.get("artifact_id") or "")
+        artifact = artifacts.get(artifact_id, row)
+        row.update(
+            {
+                "display_title": _artifact_display_title(artifact),
+                "mathematical_statement": _artifact_mathematical_statement(artifact),
+                "readable_excerpt": _artifact_text_excerpt(store, artifact),
+                "read_url": f"/api/artifact?id={quote(artifact_id, safe='')}",
+            }
+        )
 
 
 _LIVE_OVERLAY_KEYS = ("live_logs", "current_invocation")
@@ -451,6 +740,13 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
         live_children = (file_payload.get("usage_summary") or {}).get("active_live_children")
         if isinstance(live_children, dict):
             payload.setdefault("usage_summary", {})["active_live_children"] = live_children
+    try:
+        _enrich_human_readable_dashboard_rows(store, payload, state)
+        payload["papers"] = _paper_catalog(store, state=state)
+        payload["artifact_catalog"] = _artifact_catalog(store, state=state)
+    except Exception:
+        payload["papers"] = []
+        payload["artifact_catalog"] = []
     # All claims (statement only), verified ones marked — the headline output ledger.
     try:
         claims = state.get("claims", [])
@@ -589,6 +885,11 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
         payload["proof_spine_status"] = {}
     try:
         payload["research_strategy"] = strategy_observability(scheduler_state)
+        alignment_card = steering.approach_alignment_card(store.state_dir)
+        portfolio = payload["research_strategy"].setdefault("approach_portfolio", {})
+        portfolio["human_alignment"] = alignment_card
+        if alignment_card.get("required"):
+            portfolio["alignment_status"] = "stale"
     except Exception:
         payload["research_strategy"] = {}
     live = _has_live_child(payload)
@@ -864,12 +1165,22 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
         def log_message(self, *args: Any) -> None:  # noqa: D401, N802
             return
 
-        def _send(self, code: int, body: bytes, content_type: str) -> None:
+        def _send(
+            self,
+            code: int,
+            body: bytes,
+            content_type: str,
+            *,
+            headers: Mapping[str, str] | None = None,
+        ) -> None:
             try:
                 self.send_response(code)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                for name, value in (headers or {}).items():
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
@@ -889,6 +1200,55 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
                 return
             if path == "/api/files":
                 body = json.dumps({"files": _inspectable_files(store)}, ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+                return
+            if path == "/api/papers":
+                body = json.dumps({"papers": _paper_catalog(store)}, ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+                return
+            if path == "/api/artifacts":
+                body = json.dumps({"artifacts": _artifact_catalog(store)}, ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+                return
+            if path == "/api/paper":
+                artifact_id = (parse_qs(parsed.query).get("id") or [""])[0]
+                state = store.get_state()
+                artifact = next(
+                    (
+                        row
+                        for row in state.get("artifacts", [])
+                        if str(row.get("artifact_id") or "") == artifact_id
+                    ),
+                    None,
+                )
+                pdf_path = _paper_pdf_path(store, artifact or {})
+                if artifact_id and pdf_path is None:
+                    sidecar_paper = hmt_paper_by_id(store, artifact_id)
+                    if sidecar_paper is not None:
+                        pdf_path = Path(str(sidecar_paper.get("pdf_path") or ""))
+                if not artifact_id or pdf_path is None or not pdf_path.is_file():
+                    self._send(404, b'{"error":"paper PDF not found"}', "application/json")
+                    return
+                try:
+                    body = pdf_path.read_bytes()
+                except OSError:
+                    self._send(404, b'{"error":"paper PDF not found"}', "application/json")
+                    return
+                safe_name = "".join(ch for ch in artifact_id if ch.isalnum() or ch in "-_") or "paper"
+                self._send(
+                    200,
+                    body,
+                    "application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="{safe_name}.pdf"'},
+                )
+                return
+            if path == "/api/artifact":
+                artifact_id = (parse_qs(parsed.query).get("id") or [""])[0]
+                document = _artifact_document(store, artifact_id) if artifact_id else None
+                if document is None:
+                    self._send(404, b'{"error":"artifact not found"}', "application/json")
+                    return
+                body = json.dumps(document, ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
                 return
             if path == "/api/tail":
@@ -938,10 +1298,18 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
                 data = json.loads(raw.decode("utf-8") or "{}")
                 text = str(data.get("text") or "").strip()
                 blocker_id = data.get("blocker_id") or None
+                requires_alignment = data.get("requires_approach_alignment")
                 if not text:
                     self._send(400, b'{"error":"empty steering text"}', "application/json")
                     return
-                msg = steering.submit_steering(store.state_dir, text, blocker_id=blocker_id)
+                msg = steering.submit_steering(
+                    store.state_dir,
+                    text,
+                    blocker_id=blocker_id,
+                    requires_approach_alignment=(
+                        bool(requires_alignment) if requires_alignment is not None else None
+                    ),
+                )
                 self._send(200, json.dumps({"ok": True, "message": msg}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             except Exception as exc:  # pragma: no cover - defensive
                 self._send(500, json.dumps({"error": str(exc)}).encode("utf-8"), "application/json")
@@ -1032,8 +1400,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Albilich Monitor · __PROBLEM_ID__</title>
-<!-- No external font fetch: the dashboard must render fully offline; the CSS
-     font stacks fall back to high-quality system fonts. -->
+<script>
+window.MathJax = {
+  tex: {inlineMath: {'[+]': [['$', '$']]}, processEscapes: true},
+  svg: {fontCache: 'global'},
+  options: {enableMenu: false},
+  startup: {typeset: false}
+};
+</script>
+<script defer src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-svg.js"></script>
+<!-- Text fonts remain system-local. MathJax is loaded separately to typeset
+     delimiter-marked mathematical prose; raw LaTeX remains readable if its
+     CDN is temporarily unavailable. -->
 <style>
   /* ===== UW Math AI Lab palette: purple #4b2e83 + gold #b7a57a ===== */
   :root {
@@ -1357,6 +1735,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .bmetric .bv { font-family: var(--mono); font-size: 16px; margin-top: 4px; color: var(--text); overflow-wrap: anywhere; }
   .bottleneck-list { margin-top: 10px; display: grid; gap: 7px; }
   .bmini { font-family: var(--mono); font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+  .portfolio-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 12px; }
+  .portfolio-policy { display: flex; gap: 7px; flex-wrap: wrap; }
+  .approach-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 11px; }
+  .approach-card { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); padding: 12px 13px; min-width: 0; }
+  .approach-card.selected { border-color: color-mix(in srgb, var(--uw-purple) 55%, var(--border)); box-shadow: inset 3px 0 0 var(--uw-purple); }
+  .approach-title { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; margin-bottom: 7px; }
+  .approach-title b { font-size: 13px; overflow-wrap: anywhere; }
+  .approach-mechanism { color: var(--text); font-size: 12.5px; line-height: 1.45; margin-bottom: 8px; }
+  .approach-row { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 6px 9px; padding: 4px 0; font-size: 11.5px; }
+  .approach-row .ak { color: var(--faint); text-transform: uppercase; letter-spacing: .4px; font-size: 9.5px; }
+  .approach-row .av { color: var(--muted); overflow-wrap: anywhere; }
+  .contribution { display: inline-flex; gap: 3px; align-items: center; }
+  .contribution i { width: 7px; height: 7px; border-radius: 50%; background: var(--track); }
+  .contribution i.on { background: var(--uw-gold-deep); }
+  .approach-actions { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 9px; }
   .spine-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, .72fr); gap: 14px; align-items: stretch; }
   .spine-main, .spine-side { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); padding: 13px 15px; min-width: 0; }
   .spine-list { display: grid; gap: 7px; margin-top: 10px; }
@@ -1379,6 +1772,42 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .routes-table .route-score { width: 17%; }
   .routes-table .route-root, .routes-table .route-verified { width: 11%; }
   .routes-table .scorebar { width: min(56px, 42%); }
+  /* Human-readable papers and mathematical artifact reader */
+  .paperbar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 12px; }
+  .paperbar select { min-width: min(520px, 100%); flex: 1 1 360px; }
+  .paper-meta { color: var(--muted); font-size: 12px; line-height: 1.45; margin: -2px 0 12px; }
+  .paper-frame {
+    display: block; width: 100%; height: clamp(560px, 76vh, 940px);
+    border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+    background: #ececec;
+  }
+  .paper-empty { min-height: 180px; display: grid; place-items: center; border: 1px dashed var(--border-strong); border-radius: var(--radius-sm); background: var(--surface-2); }
+  .artifact-shell { display: grid; grid-template-columns: minmax(280px, .8fr) minmax(0, 1.7fr); gap: 14px; align-items: stretch; }
+  .artifact-list { max-height: 580px; overflow: auto; display: grid; gap: 8px; align-content: start; padding-right: 3px; }
+  .artifact-item { appearance: none; width: 100%; text-align: left; cursor: pointer; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; }
+  .artifact-item:hover, .artifact-item.selected { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--uw-purple) 14%, transparent); }
+  .artifact-item .atitle { font: 700 12.5px/1.4 var(--sans); overflow-wrap: anywhere; }
+  .artifact-item .ameta { margin-top: 6px; color: var(--faint); font: 10.5px/1.35 var(--mono); }
+  .artifact-item .astatement { margin-top: 6px; color: var(--muted); font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere; }
+  .artifact-reader { min-height: 420px; max-height: 580px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); padding: 18px 20px; }
+  .artifact-reader h3 { margin: 0 0 7px; font-size: 18px; line-height: 1.35; }
+  .artifact-reader .reader-meta { color: var(--faint); font: 10.5px/1.4 var(--mono); margin-bottom: 14px; overflow-wrap: anywhere; }
+  .artifact-reader .reader-statement { border-left: 3px solid var(--uw-gold); padding: 9px 12px; margin-bottom: 16px; background: color-mix(in srgb, var(--uw-gold) 9%, transparent); color: var(--text); font: 15px/1.6 Georgia, "Times New Roman", serif; white-space: pre-wrap; }
+  .math-tex mjx-container { color: inherit; max-width: 100%; overflow-x: auto; overflow-y: hidden; }
+  .math-tex mjx-container[display="true"] { margin: .65em 0; }
+  /* Never expose delimiter source while MathJax is replacing it.  Stable DOM
+     updates below mean this hidden state occurs only for genuinely new math,
+     not on every dashboard poll. */
+  .math-tex[data-math-pending="1"] { visibility: hidden; }
+  .math-tex.math-typeset-failed { visibility: visible; }
+  .math-document { color: var(--text); font: 14.5px/1.65 Georgia, "Times New Roman", serif; overflow-wrap: anywhere; }
+  .math-document h3, .math-document h4 { font-family: var(--sans); margin: 22px 0 8px; }
+  .math-document pre { font: 12px/1.55 var(--mono); white-space: pre-wrap; background: var(--log-bg); color: var(--log-fg); padding: 12px; border-radius: 8px; }
+  .route-card { border: 1px solid var(--border); border-left: 3px solid var(--uw-purple); border-radius: var(--radius-sm); background: var(--surface-2); padding: 11px 13px; margin: 8px; }
+  .route-card .rtitle { font-weight: 750; font-size: 13px; line-height: 1.4; }
+  .route-card .rgoal { margin-top: 7px; color: var(--text); font: 13.5px/1.55 Georgia, "Times New Roman", serif; }
+  .route-card .rstrategy { margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .route-card .rmeta { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-top: 9px; }
   /* Proof graph */
   .graphwrap { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 14px; align-items: stretch; }
   .graphstage { position: relative; min-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
@@ -1424,6 +1853,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .graphdetail { min-height: 180px; }
     .bottleneck-panel { grid-template-columns: 1fr; }
     .spine-panel { grid-template-columns: 1fr; }
+    .artifact-shell { grid-template-columns: 1fr; }
+    .artifact-list { max-height: 330px; }
   }
   @media (max-width: 720px) {
     .wrap { padding-left: 14px; padding-right: 14px; }
@@ -1474,6 +1905,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h2>Approach Portfolio · possible routes &amp; contribution <span class="count" id="approachCount"></span></h2>
+    <div class="body" id="approachPortfolio"><div class="empty">No approach portfolio yet.</div></div>
+  </div>
+
+  <div class="card">
     <h2>Active Proof Spine <span class="count" id="spineCount"></span></h2>
     <div class="body" id="proofSpine"><div class="empty">No proof spine yet.</div></div>
   </div>
@@ -1520,6 +1956,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="body" id="verified"></div>
   </div>
 
+  <div class="card" id="papersCard">
+    <h2>Human-Readable Mathematical Text · cumulative papers <span class="count" id="paperCount"></span></h2>
+    <div class="body">
+      <div class="paperbar">
+        <button class="btn" id="paperPrev" type="button" title="Previous cumulative snapshot">← Previous</button>
+        <select class="tailsel" id="paperSelect" aria-label="Choose a cumulative paper snapshot"></select>
+        <button class="btn" id="paperNext" type="button" title="Next cumulative snapshot">Next →</button>
+        <a class="btn" id="paperOpen" target="_blank" rel="noopener">Open PDF ↗</a>
+      </div>
+      <div class="paper-meta" id="paperMeta">The writer will add a cumulative partial paper at the next HMT milestone.</div>
+      <div class="paper-empty" id="paperEmpty"><div class="empty">No compiled HMT PDF yet.</div></div>
+      <iframe class="paper-frame" id="paperFrame" title="Cumulative Human-Readable Mathematical Text PDF" loading="lazy" style="display:none"></iframe>
+    </div>
+  </div>
+
   <div class="card">
     <h2>Proof Graph <span class="count" id="graphCount"></span></h2>
     <div class="body">
@@ -1529,6 +1980,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <div class="graphcanvas" id="proofGraph"><div class="empty">No proof graph yet.</div></div>
         </div>
         <div class="graphdetail" id="graphDetail"><div class="empty">Select a graph node to inspect its evidence, blockers, and proof role.</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Mathematical Artifact Library <span class="count" id="artCount"></span></h2>
+    <div class="body">
+      <div class="artifact-shell">
+        <div class="artifact-list" id="artifacts"><div class="empty">No mathematical artifacts yet.</div></div>
+        <article class="artifact-reader" id="artifactReader"><div class="empty">Select an artifact to read its mathematical statement and full text.</div></article>
       </div>
     </div>
   </div>
@@ -1551,10 +2012,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div class="card">
         <h2>Route Scoreboard <span class="count" id="routeCount"></span></h2>
         <div class="body tight cap" id="routes"><div class="empty">No routes yet.</div></div>
-      </div>
-      <div class="card">
-        <h2>Recent Research Artifacts <span class="count" id="artCount"></span></h2>
-        <div class="body tight cap" id="artifacts"><div class="empty">No artifacts yet.</div></div>
       </div>
     </div>
     <div class="col-right">
@@ -1579,8 +2036,99 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 const POLL_MS = __POLL_MS__;
 let paused = false, lastOk = 0;
+let tickInFlight = false;
+const CONSOLE_REQUEST_TIMEOUT_MS = Math.max(10000, POLL_MS * 4);
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const STABLE_HTML_KEYS = new WeakMap();
+function setStableHTML(node, html){
+  if (!node) return false;
+  if (STABLE_HTML_KEYS.get(node) === html) return false;
+  STABLE_HTML_KEYS.set(node, html);
+  node.innerHTML = html;
+  return true;
+}
+const UNICODE_MATH_GLYPHS = new Map([
+  ['≤', String.raw`\leq`], ['≥', String.raw`\geq`], ['≠', String.raw`\neq`],
+  ['∈', String.raw`\in`], ['∉', String.raw`\notin`], ['⊂', String.raw`\subset`],
+  ['⊆', String.raw`\subseteq`], ['⊊', String.raw`\subsetneq`], ['∪', String.raw`\cup`],
+  ['∩', String.raw`\cap`], ['→', String.raw`\to`], ['⇒', String.raw`\Rightarrow`],
+  ['↔', String.raw`\leftrightarrow`], ['⇔', String.raw`\Longleftrightarrow`],
+  ['≅', String.raw`\cong`], ['≃', String.raw`\simeq`], ['≈', String.raw`\approx`],
+  ['×', String.raw`\times`], ['⊕', String.raw`\oplus`], ['⊗', String.raw`\otimes`],
+  ['±', String.raw`\pm`], ['∞', String.raw`\infty`], ['∅', String.raw`\varnothing`],
+  ['∣', String.raw`\mid`], ['∤', String.raw`\nmid`], ['∑', String.raw`\sum`],
+  ['∏', String.raw`\prod`], ['√', String.raw`\sqrt{} `],
+  ['α', String.raw`\alpha`], ['β', String.raw`\beta`], ['γ', String.raw`\gamma`],
+  ['δ', String.raw`\delta`], ['ε', String.raw`\varepsilon`], ['ζ', String.raw`\zeta`],
+  ['η', String.raw`\eta`], ['θ', String.raw`\theta`], ['κ', String.raw`\kappa`],
+  ['λ', String.raw`\lambda`], ['μ', String.raw`\mu`], ['ν', String.raw`\nu`],
+  ['ξ', String.raw`\xi`], ['π', String.raw`\pi`], ['ρ', String.raw`\rho`],
+  ['σ', String.raw`\sigma`], ['τ', String.raw`\tau`], ['φ', String.raw`\varphi`],
+  ['χ', String.raw`\chi`], ['ψ', String.raw`\psi`], ['ω', String.raw`\omega`],
+  ['Γ', String.raw`\Gamma`], ['Δ', String.raw`\Delta`], ['Θ', String.raw`\Theta`],
+  ['Λ', String.raw`\Lambda`], ['Ξ', String.raw`\Xi`], ['Π', String.raw`\Pi`],
+  ['Σ', String.raw`\Sigma`], ['Φ', String.raw`\Phi`], ['Ψ', String.raw`\Psi`],
+  ['Ω', String.raw`\Omega`]
+]);
+const SUBSCRIPT_DIGITS = {'₀':'0','₁':'1','₂':'2','₃':'3','₄':'4','₅':'5','₆':'6','₇':'7','₈':'8','₉':'9','₊':'+','₋':'-'};
+const SUPERSCRIPT_DIGITS = {'⁰':'0','¹':'1','²':'2','³':'3','⁴':'4','⁵':'5','⁶':'6','⁷':'7','⁸':'8','⁹':'9','⁺':'+','⁻':'-'};
+function latexScriptSuffix(chars){
+  let sub = '', sup = '';
+  for (const ch of chars){
+    if (Object.prototype.hasOwnProperty.call(SUBSCRIPT_DIGITS, ch)) sub += SUBSCRIPT_DIGITS[ch];
+    if (Object.prototype.hasOwnProperty.call(SUPERSCRIPT_DIGITS, ch)) sup += SUPERSCRIPT_DIGITS[ch];
+  }
+  return (sub ? `_{${sub}}` : '') + (sup ? `^{${sup}}` : '');
+}
+function replaceUnicodeMath(text, wrap){
+  let value = String(text == null ? '' : text);
+  value = value.replace(/([A-Za-z]+)([₀₁₂₃₄₅₆₇₈₉₊₋⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻]+)/gu, (_, base, scripts) => {
+    const latex = base + latexScriptSuffix(scripts);
+    return wrap ? String.raw`\(${latex}\)` : latex;
+  });
+  if (wrap){
+    value = value.replace(/\b(PSL|PGL|PSU|PGU|PSp|SL|GL|SU|Sp|SO|A|S|C)(\d+)(\([^()\n]+\))?/g, (_, name, degree, args) => {
+      const latexName = ['A','S','C'].includes(name) ? name : String.raw`\operatorname{${name}}`;
+      return String.raw`\(${latexName}_{${degree}}${args||''}\)`;
+    });
+  }
+  for (const [glyph, latex] of UNICODE_MATH_GLYPHS){
+    value = value.split(glyph).join(wrap ? String.raw`\(${latex}\)` : latex);
+  }
+  return value;
+}
+function latexCompat(text){
+  const parts = String(text == null ? '' : text).split(/(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$[^$\n]+?\$)/g);
+  return parts.map(part => {
+    const delimited = part.startsWith('$') || part.startsWith('\\(') || part.startsWith('\\[');
+    return replaceUnicodeMath(part, !delimited);
+  }).join('');
+}
+function mathHTML(text){
+  return `<span class="math-tex" data-math-pending="1">${esc(latexCompat(text))}</span>`;
+}
+let mathJaxQueue = Promise.resolve();
+function typesetPending(root=document){
+  if (!window.MathJax || typeof window.MathJax.typesetPromise !== 'function') return mathJaxQueue;
+  const nodes = Array.from((root || document).querySelectorAll('[data-math-pending="1"]'));
+  if (!nodes.length) return mathJaxQueue;
+  nodes.forEach(node => node.removeAttribute('data-math-pending'));
+  // MathJax rejects overlapping typeset calls and large proof states can take
+  // longer than one dashboard poll.  Queue each batch so display refreshes
+  // cannot accumulate concurrent MathJax work and lock the renderer.
+  mathJaxQueue = mathJaxQueue
+    .catch(() => {})
+    .then(() => window.MathJax.typesetPromise(nodes))
+    .catch(() => nodes.forEach(node => node.classList.add('math-typeset-failed')));
+  return mathJaxQueue;
+}
+window.addEventListener('load', () => {
+  if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') typesetPending(document);
+  else document.querySelectorAll('[data-math-pending="1"]').forEach(node => {
+    node.removeAttribute('data-math-pending'); node.classList.add('math-typeset-failed');
+  });
+});
 const num = (n) => (Number(n)||0).toLocaleString();
 function compact(n){ n=Number(n)||0; if(n>=1e9) return (n/1e9).toFixed(2)+"B"; if(n>=1e6) return (n/1e6).toFixed(2)+"M"; if(n>=1e3) return (n/1e3).toFixed(1)+"K"; return String(n); }
 function fmtSec(s){ s=Number(s)||0; if(s<60) return s.toFixed(0)+"s"; const m=Math.floor(s/60),x=Math.round(s%60); if(m<60) return m+"m "+x+"s"; const h=Math.floor(m/60); return h+"h "+(m%60)+"m"; }
@@ -1784,7 +2332,7 @@ function renderBottleneck(frontier){
   const top = frontier.top_bottleneck_debts || [];
   if (!current.debt_id){
     $("bottleneckCount").textContent = "";
-    $("bottleneckFrontier").innerHTML = `<div class="empty">No active root-local bottleneck.</div>`;
+    setStableHTML($("bottleneckFrontier"), `<div class="empty">No active root-local bottleneck.</div>`);
     return;
   }
   $("bottleneckCount").innerHTML = frontier.locked
@@ -1792,7 +2340,7 @@ function renderBottleneck(frontier){
     : `<span class="pill warn">watching</span>`;
   const diagIds = cooldown.artifact_ids || [];
   const sourceIds = current.source_artifact_ids || [];
-  $("bottleneckFrontier").innerHTML = `
+  setStableHTML($("bottleneckFrontier"), `
     <div class="bottleneck-panel">
       <div class="bottleneck-main">
         <div class="bottleneck-title">
@@ -1802,9 +2350,9 @@ function renderBottleneck(frontier){
           ${Number(current.repeated_count)>0?`<span class="pill bad">repeat ${num(current.repeated_count)}</span>`:""}
           ${Number(current.fresh_narrowing_score)>0?`<span class="pill info">fresh ${num(current.fresh_narrowing_score)}</span>`:""}
         </div>
-        <div class="bottleneck-obligation">${esc(current.obligation || "No obligation summary.")}</div>
+        <div class="bottleneck-obligation">${mathHTML(current.obligation || "No obligation summary.")}</div>
         ${sourceIds.length?`<div class="bottleneck-list">${sourceIds.map(id => `<span class="pill mut">${esc(id)}</span>`).join(" ")}</div>`:""}
-        ${top.length>1?`<div class="bottleneck-list">${top.slice(1,4).map(d => `<div class="bmini">${esc(d.debt_id)} · repeat ${num(d.repeated_count)} · fresh ${num(d.fresh_narrowing_score||0)} · ${esc(String(d.obligation||"").slice(0,120))}</div>`).join("")}</div>`:""}
+        ${top.length>1?`<div class="bottleneck-list">${top.slice(1,4).map(d => `<div class="bmini">${esc(d.debt_id)} · repeat ${num(d.repeated_count)} · fresh ${num(d.fresh_narrowing_score||0)} · ${mathHTML(String(d.obligation||"").slice(0,120))}</div>`).join("")}</div>`:""}
       </div>
       <div class="bottleneck-side">
         <div class="bottleneck-metrics">
@@ -1815,7 +2363,60 @@ function renderBottleneck(frontier){
         </div>
         ${diagIds.length?`<div class="bottleneck-list">${diagIds.map(id => `<span class="pill mut">${esc(id)}</span>`).join(" ")}</div>`:""}
       </div>
-    </div>`;
+    </div>`);
+}
+
+function renderApproachPortfolio(strategy){
+  strategy = strategy || {};
+  const portfolio = strategy.approach_portfolio || {};
+  const approaches = portfolio.approaches || [];
+  const selected = new Set(portfolio.selected_approach_ids || []);
+  const alignmentStatus = String(portfolio.alignment_status || "current");
+  const alignmentEvidence = portfolio.alignment_evidence || [];
+  const humanAlignment = portfolio.human_alignment || {};
+  const alignmentPending = alignmentStatus === "stale" || Boolean(humanAlignment.required);
+  const lease = strategy.bottleneck_lease || {};
+  let portfolioChanged = false;
+  if (!approaches.length){
+    $("approachCount").innerHTML = `<span class="pill info">brainstorming pending</span>`;
+    portfolioChanged = setStableHTML($("approachPortfolio"), `<div class="portfolio-head"><div class="empty">The next hard-problem research cycle will generate a semantically diverse portfolio before local proof work.</div><button class="btn approach-refresh">Generate approaches</button></div>`);
+  } else {
+    $("approachCount").innerHTML = `${num(approaches.length)} routes · ${num(selected.size)} selected${alignmentPending?' · <span class="pill warn">refresh required</span>':''}`;
+    const leaseClass = lease.escape_required ? "bad" : "good";
+    const leaseText = lease.escape_required ? "local lease expired" : `lease ${num(lease.completed_no_delta_passes||0)}/${num(lease.completed_no_delta_limit||2)} no-delta`;
+    const cards = approaches.map(a => {
+      const id = String(a.approach_id||"");
+      const level = Math.max(0, Math.min(5, Number(a.contribution_level)||0));
+      const dots = Array.from({length:5}, (_,i)=>`<i class="${i<level?"on":""}"></i>`).join("");
+      const prompt = `Prioritize approach ${id}: ${String(a.title||a.mechanism||"")}. Run its decisive test first and report the exact root consequence.`;
+      return `<div class="approach-card ${selected.has(id)?"selected":""}">
+        <div class="approach-title"><span class="pill ${selected.has(id)?"info":""}">${selected.has(id)?"selected":esc(a.status||"idea")}</span><b>${mathHTML(a.title||id||"Unnamed approach")}</b></div>
+        <div class="approach-mechanism">${mathHTML(a.mechanism||"No mechanism recorded.")}</div>
+        <div class="approach-row"><div class="ak">Contribution</div><div class="av"><span class="contribution" title="qualitative contribution ${level}/5">${dots}</span> ${level}/5 · ${esc(a.contribution_kind||"unplaced")}</div></div>
+        <div class="approach-row"><div class="ak">Root effect${alignmentPending?' (stale)':''}</div><div class="av">${mathHTML(a.root_consequence||"Unplaced")}</div></div>
+        ${a.steering_impact?`<div class="approach-row"><div class="ak">Steering impact</div><div class="av">${mathHTML(a.steering_impact)}</div></div>`:""}
+        <div class="approach-row"><div class="ak">Bridge</div><div class="av">${mathHTML(a.bridge_statement||"None yet")}</div></div>
+        <div class="approach-row"><div class="ak">Decisive test</div><div class="av">${mathHTML(a.decisive_test||"Not specified")}</div></div>
+        <div class="approach-row"><div class="ak">May fail by</div><div class="av">${mathHTML(a.likely_failure_mode||"Unknown")}</div></div>
+        <div class="approach-row"><div class="ak">Profile</div><div class="av">cost ${esc(a.estimated_cost||"?")} · novelty ${esc(a.novelty_score??"?")} · confidence ${esc(a.confidence||"?")}</div></div>
+        <div class="approach-actions"><button class="btn approach-steer" data-prompt="${esc(prompt)}">Steer to pilot</button></div>
+      </div>`;
+    }).join("");
+    portfolioChanged = setStableHTML($("approachPortfolio"), `${alignmentPending?`<div class="blocker"><div class="bhead">Portfolio refresh queued</div><div class="bdetail">Processed steering or ${num(alignmentEvidence.length)} newer verified root development(s) changed the strategy baseline. Root effects below are visibly stale until one dedicated replacement portfolio is accepted.</div></div>`:""}<div class="portfolio-head">
+      <div><div class="portfolio-policy"><span class="pill info">50% exploit</span><span class="pill">30% explore</span><span class="pill warn">20% adversarial</span><span class="pill ${leaseClass}">${esc(leaseText)}</span></div><div class="bmini" style="margin-top:7px">Ideas are advisory; research questions are nonblocking; proof debts remain strict.</div></div>
+      <button class="btn approach-refresh">Generate new approaches</button></div><div class="approach-grid">${cards}</div>`);
+  }
+  if (!portfolioChanged) return;
+  document.querySelectorAll(".approach-steer").forEach(btn => btn.addEventListener("click", () => {
+    $("steerText").value = btn.dataset.prompt || "";
+    $("steerText").focus();
+    $("steerText").scrollIntoView({behavior:"smooth", block:"center"});
+  }));
+  document.querySelectorAll(".approach-refresh").forEach(btn => btn.addEventListener("click", () => {
+    $("steerText").value = "Refresh the global approach portfolio before more local computation. Generate semantically different mechanisms, state each exact root contribution and cheapest decisive test, and select two or three complementary pilots.";
+    $("steerText").focus();
+    $("steerText").scrollIntoView({behavior:"smooth", block:"center"});
+  }));
 }
 
 function renderWorkModeColumn(title, hints, block, emptyNote){
@@ -1905,13 +2506,13 @@ function renderProofSpine(spine){
   const rootVerified = rootIntegrated || rootStatus === "informally_verified" || rootStatus === "formally_verified";
   if (!claims.length && !routes.length && !arts.length && !bottleneck.debt_id){
     $("spineCount").textContent = "";
-    $("proofSpine").innerHTML = `<div class="empty">No compact proof spine yet.</div>`;
+    setStableHTML($("proofSpine"), `<div class="empty">No compact proof spine yet.</div>`);
     return;
   }
   $("spineCount").innerHTML = rootIntegrated
     ? `${claims.length} trunk · root integrated`
     : (rootVerified ? `${claims.length} trunk · integration pending` : `${claims.length} trunk · ${ready.length} verifier-ready`);
-  $("proofSpine").innerHTML = `
+  setStableHTML($("proofSpine"), `
     <div class="spine-panel">
       <div class="spine-main">
         <div class="bottleneck-title">
@@ -1925,19 +2526,19 @@ function renderProofSpine(spine){
                 ? `<span class="pill good">${ready.length} verifier-ready</span>`
                 : `<span class="pill warn">route conversion needed</span>`))}
         </div>
-        <div class="spine-rule">${esc(spine.next_workflow_rule || "")}</div>
+        <div class="spine-rule">${mathHTML(spine.next_workflow_rule || "")}</div>
         <div class="spine-list">
-          ${claims.slice(0,5).map(c => `<div class="spine-item"><b>${esc(c.claim_id)}</b> · impact ${Number(c.root_impact||0).toFixed(2)} · d${num(c.root_distance||0)}<br>${esc(c.statement||"")}</div>`).join("")}
-          ${bottleneck.debt_id?`<div class="spine-item"><b>Current bottleneck</b> · ${esc(bottleneck.debt_id)}<br>${esc(bottleneck.obligation||"")}</div>`:""}
+          ${claims.slice(0,5).map(c => `<div class="spine-item"><b>${esc(c.claim_id)}</b> · impact ${Number(c.root_impact||0).toFixed(2)} · d${num(c.root_distance||0)}<br>${mathHTML(c.statement||"")}</div>`).join("")}
+          ${bottleneck.debt_id?`<div class="spine-item"><b>Current bottleneck</b> · ${esc(bottleneck.debt_id)}<br>${mathHTML(bottleneck.obligation||"")}</div>`:""}
         </div>
       </div>
       <div class="spine-side">
         <div class="group-h">Routes</div>
-        <div class="spine-list">${routes.slice(0,4).map(r => `<div class="spine-item"><b>${esc(r.route_id||"")}</b> · ${esc(r.status||"")} · score ${num(r.score||0)}<br>${esc(r.summary||"")}</div>`).join("") || `<div class="empty">No active route spine.</div>`}</div>
+        <div class="spine-list">${routes.slice(0,4).map(r => `<div class="spine-item"><b>${esc(r.route_id||"")}</b> · ${esc(r.status||"")} · score ${num(r.score||0)}<br>${mathHTML(r.summary||"")}</div>`).join("") || `<div class="empty">No active route spine.</div>`}</div>
         <div class="group-h">Recent Proof Artifacts</div>
-        <div class="spine-list">${arts.slice(0,4).map(a => `<div class="spine-item"><b>${esc(a.artifact_id||"")}</b> · ${esc(a.artifact_type||"")} · ${esc(a.producer_role||"")}<br>${esc(a.next_decisive_action || a.summary || "")}</div>`).join("") || `<div class="empty">No recent spine artifacts.</div>`}</div>
+        <div class="spine-list">${arts.slice(0,4).map(a => `<div class="spine-item"><b>${esc(a.artifact_id||"")}</b> · ${esc(a.artifact_type||"")} · ${esc(a.producer_role||"")}<br>${mathHTML(a.next_decisive_action || a.summary || "")}</div>`).join("") || `<div class="empty">No recent spine artifacts.</div>`}</div>
       </div>
-    </div>`;
+    </div>`);
 }
 
 /* Live agent stream: keep the window stable and always populated. The backend
@@ -2041,6 +2642,44 @@ function renderSession(payload){
 }
 
 function scoreColor(s){ s=Number(s); if(s>0) return "var(--good)"; if(s<0) return "var(--bad)"; return "var(--muted)"; }
+let paperRows = [], selectedPaperId = "", displayedPaperUrl = "";
+function showSelectedPaper(){
+  const paper = paperRows.find(row => row.artifact_id === selectedPaperId);
+  const frame = $("paperFrame"), empty = $("paperEmpty"), open = $("paperOpen");
+  if (!paper){
+    frame.style.display = "none"; empty.style.display = "grid"; open.style.display = "none";
+    $("paperMeta").textContent = "The writer will add a cumulative partial paper at the next HMT milestone.";
+    return;
+  }
+  const index = paperRows.findIndex(row => row.artifact_id === selectedPaperId);
+  empty.style.display = "none"; frame.style.display = "block"; open.style.display = "inline-flex";
+  if (displayedPaperUrl !== paper.pdf_url){ frame.src = paper.pdf_url; displayedPaperUrl = paper.pdf_url; }
+  open.href = paper.pdf_url;
+  $("paperMeta").textContent = `${paper.kind} ${index+1} of ${paperRows.length} · accepted-state revision ${paper.source_revision} · created ${paper.created_at||"—"} · ${paper.artifact_id}`;
+  $("paperPrev").disabled = index <= 0; $("paperNext").disabled = index < 0 || index >= paperRows.length-1;
+  $("paperSelect").value = selectedPaperId;
+}
+function renderPapers(rows){
+  if (!Array.isArray(rows)) return;
+  const previousIds = paperRows.map(row => row.artifact_id).join("|");
+  paperRows = rows;
+  $("paperCount").textContent = rows.length ? `${rows.length} PDF${rows.length===1?"":"s"}` : "";
+  if (!rows.some(row => row.artifact_id === selectedPaperId)) selectedPaperId = rows.length ? rows[rows.length-1].artifact_id : "";
+  const nextIds = rows.map(row => row.artifact_id).join("|");
+  if (previousIds !== nextIds){
+    $("paperSelect").innerHTML = rows.map((paper, index) => `<option value="${esc(paper.artifact_id)}">${index+1}. rev ${esc(paper.source_revision)} · ${esc(paper.title||paper.kind)}</option>`).join("");
+  }
+  showSelectedPaper();
+}
+async function refreshPapers(){
+  try {
+    const response = await fetch("/api/papers", {cache:"no-store"});
+    if (response.ok) renderPapers((await response.json()).papers||[]);
+  } catch (_) {}
+}
+$("paperSelect").addEventListener("change", event => { selectedPaperId = event.target.value; showSelectedPaper(); });
+$("paperPrev").addEventListener("click", () => { const i=paperRows.findIndex(row=>row.artifact_id===selectedPaperId); if(i>0){selectedPaperId=paperRows[i-1].artifact_id;showSelectedPaper();} });
+$("paperNext").addEventListener("click", () => { const i=paperRows.findIndex(row=>row.artifact_id===selectedPaperId); if(i>=0&&i<paperRows.length-1){selectedPaperId=paperRows[i+1].artifact_id;showSelectedPaper();} });
 function routeStatusHint(r){
   const status = String(r.scoreboard_status||"");
   const reasons = Array.isArray(r.kill_reasons) && r.kill_reasons.length ? ` Reasons: ${r.kill_reasons.join("; ")}` : "";
@@ -2051,17 +2690,23 @@ function routeStatusHint(r){
 function renderRoutes(rows){
   rows = rows || [];
   $("routeCount").textContent = rows.length ? `${rows.length}` : "";
-  if (!rows.length){ $("routes").innerHTML = `<div class="empty">No routes recorded.</div>`; return; }
-  let h = `<table class="routes-table"><thead><tr><th class="route-id">Route</th><th class="route-status">Status</th><th class="num route-score">Score</th><th class="num route-root">Root d</th><th class="num route-verified">Verified</th></tr></thead><tbody>`;
+  if (!rows.length){ setStableHTML($("routes"), `<div class="empty">No routes recorded.</div>`); return; }
+  let h = "";
   for (const r of rows){
     const sc = Number(r.score)||0, mag = Math.min(100, Math.abs(sc)*16);
-    h += `<tr><td class="mid route-id" title="${esc(r.route_id)}">${esc(r.route_id)}</td>
-      <td class="route-status" title="${esc(routeStatusHint(r))}"><span class="pill ${PILL(r.scoreboard_status)}">${esc(r.scoreboard_status||"")}</span></td>
-      <td class="num route-score"><span class="scorebar"><i style="width:${mag}%;background:${scoreColor(sc)}"></i></span> ${sc.toFixed(2)}</td>
-      <td class="num route-root">${esc(r.root_distance)}</td>
-      <td class="num route-verified">${r.verified_inference_count||0}/${r.inference_count||0}</td></tr>`;
+    h += `<article class="route-card" title="record ${esc(r.route_id||"")}">
+      <div class="rtitle">${mathHTML(r.display_title||r.strategy_statement||r.route_id||"Mathematical route")}</div>
+      ${r.conclusion_statement?`<div class="rgoal"><b>Conclusion.</b> ${mathHTML(r.conclusion_statement)}</div>`:""}
+      ${r.strategy_statement?`<div class="rstrategy"><b>Route.</b> ${mathHTML(r.strategy_statement)}</div>`:""}
+      <div class="rmeta">
+        <span class="pill ${PILL(r.scoreboard_status)}" title="${esc(routeStatusHint(r))}">${esc(r.scoreboard_status||"")}</span>
+        <span class="pill" title="route score"><span class="scorebar"><i style="width:${mag}%;background:${scoreColor(sc)}"></i></span> ${sc.toFixed(2)}</span>
+        <span class="pill">${r.verified_inference_count||0}/${r.inference_count||0} verified steps</span>
+        <span class="pill">root distance ${esc(r.root_distance)}</span>
+        <span class="mid" title="internal route id">${esc(r.route_id||"")}</span>
+      </div></article>`;
   }
-  $("routes").innerHTML = h + `</tbody></table>`;
+  setStableHTML($("routes"), h);
 }
 
 function renderDebts(groups){
@@ -2069,7 +2714,7 @@ function renderDebts(groups){
   const order = ["Blocking","Citation / Hypothesis","Verifier Repair","Decomposition / Regulator","Other"];
   let total = 0; order.forEach(g => total += (groups[g]||[]).length);
   $("debtCount").textContent = total ? `${total}` : "";
-  if (!total){ $("debts").innerHTML = `<div class="empty">No active proof debts.</div>`; return; }
+  if (!total){ setStableHTML($("debts"), `<div class="empty">No active proof debts.</div>`); return; }
   let h = "";
   for (const g of order){
     const list = groups[g] || [];
@@ -2082,24 +2727,24 @@ function renderDebts(groups){
           <span class="pill ${blocking?"bad":"warn"}">${esc(d.severity||"")}</span>
           ${Number(d.repeated_count)>1?`<span class="pill bad">×${esc(d.repeated_count)}</span>`:""}
           <span class="pair" style="color:var(--faint);font-size:11px">→ ${esc(d.suggested_next_target||"?")}</span></div>
-        <div class="oblig">${esc(String(d.obligation||"").slice(0,260))}${String(d.obligation||"").length>260?"…":""}</div></div>`;
+        <div class="oblig">${mathHTML(String(d.obligation||"").slice(0,260))}${String(d.obligation||"").length>260?"…":""}</div></div>`;
     }
   }
-  $("debts").innerHTML = h;
+  setStableHTML($("debts"), h);
 }
 
 function renderSignals(rows){
   rows = (rows||[]).slice(-12).reverse();
   $("sigCount").textContent = rows.length ? `${rows.length}` : "";
-  if (!rows.length){ $("signals").innerHTML = `<div class="empty">No parallel branch signals yet.</div>`; return; }
+  if (!rows.length){ setStableHTML($("signals"), `<div class="empty">No parallel branch signals yet.</div>`); return; }
   let h = "";
   for (const s of rows){
     h += `<div class="sig"><span class="pill ${PILL(s.relation)}">${esc(s.signal_type||"signal")}</span>
       <div><div><b class="mono">${esc(s.actor_role||"")}</b> <span class="pair" style="color:var(--faint)">${esc(s.created_at||"")}</span> ${s.confidence?`· conf ${esc(s.confidence)}`:""}</div>
-        <div class="sig-summary" style="color:var(--muted)">${esc(String(s.summary||"").slice(0,200))}</div>
-        ${s.evidence?`<div class="pair sig-evidence" style="color:var(--faint);font-size:11px">evidence: ${esc(s.evidence)}</div>`:""}</div></div>`;
+        <div class="sig-summary" style="color:var(--muted)">${mathHTML(String(s.summary||"").slice(0,200))}</div>
+        ${s.evidence?`<div class="pair sig-evidence" style="color:var(--faint);font-size:11px">evidence: ${mathHTML(s.evidence)}</div>`:""}</div></div>`;
   }
-  $("signals").innerHTML = h;
+  setStableHTML($("signals"), h);
 }
 
 function renderTimeline(rows){
@@ -2140,19 +2785,72 @@ function renderTimeline(rows){
   $("timeline").innerHTML = h + `</tbody></table>`;
 }
 
-function renderArtifacts(rows){
-  rows = (rows||[]).slice(0,16);
-  $("artCount").textContent = rows.length ? `${rows.length}` : "";
-  if (!rows.length){ $("artifacts").innerHTML = `<div class="empty">No research artifacts yet.</div>`; return; }
-  let h = `<table><thead><tr><th>Artifact</th><th>Type</th><th>By</th><th class="num">rev</th></tr></thead><tbody>`;
-  for (const a of rows){
-    const summary = a.metadata_summary || a.content_summary || "";
-    h += `<tr><td class="mid" title="${esc(a.path||a.artifact_id)}">${esc(a.artifact_id)}${summary?`<div class="pair" style="color:var(--faint);font-size:11px;white-space:normal">${esc(String(summary).slice(0,90))}</div>`:""}</td>
-      <td><span class="pill info">${esc(a.artifact_type||"")}</span></td>
-      <td class="mono" style="font-size:11px">${esc(a.producer_role||"")}</td>
-      <td class="num">${esc(a.state_revision)}</td></tr>`;
+let artifactRows = [], selectedArtifactId = "", loadedArtifactId = "";
+function readableDocumentHTML(content){
+  const text = String(content||"").trim();
+  if (!text) return `<div class="empty">No full text was stored for this artifact; the mathematical statement above is the readable record.</div>`;
+  if (text.startsWith("{") || text.includes("\\documentclass")) return `<pre>${esc(text)}</pre>`;
+  const lines = text.split(/\r?\n/), out = []; let para = [];
+  const flush = () => { if (para.length){ out.push(`<p>${mathHTML(para.join(" "))}</p>`); para=[]; } };
+  for (const raw of lines){
+    const line = raw.trim();
+    if (!line){ flush(); continue; }
+    const heading = line.match(/^(#{1,4})\s+(.+)$/);
+    if (heading){ flush(); const level = heading[1].length <= 2 ? "h3" : "h4"; out.push(`<${level}>${mathHTML(heading[2])}</${level}>`); continue; }
+    if (/^(?:[-*]|\d+\.)\s+/.test(line)){ flush(); out.push(`<p>• ${mathHTML(line.replace(/^(?:[-*]|\d+\.)\s+/, ""))}</p>`); continue; }
+    para.push(line);
   }
-  $("artifacts").innerHTML = h + `</tbody></table>`;
+  flush(); return out.join("");
+}
+async function openArtifact(artifactId){
+  if (!artifactId) return;
+  selectedArtifactId = artifactId;
+  document.querySelectorAll(".artifact-item").forEach(el => el.classList.toggle("selected", el.dataset.artifactId === artifactId));
+  if (loadedArtifactId === artifactId) return;
+  const reader = $("artifactReader");
+  setStableHTML(reader, `<div class="empty">Loading mathematical artifact…</div>`);
+  try {
+    const response = await fetch(`/api/artifact?id=${encodeURIComponent(artifactId)}`, {cache:"no-store"});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const a = await response.json(); loadedArtifactId = artifactId;
+    setStableHTML(reader, `<h3>${mathHTML(a.title||"Mathematical artifact")}</h3>
+      <div class="reader-meta">${esc(a.artifact_type||"")} · ${esc(a.producer_role||"")} · revision ${esc(a.state_revision)} · record ${esc(a.artifact_id||"")}</div>
+      ${a.mathematical_statement?`<div class="reader-statement">${mathHTML(a.mathematical_statement)}</div>`:""}
+      ${a.pdf_url?`<p><a class="btn" href="${esc(a.pdf_url)}" target="_blank" rel="noopener">Open compiled PDF ↗</a></p>`:""}
+      <div class="math-document">${readableDocumentHTML(a.content)}</div>
+      ${a.truncated?`<div class="empty">Display truncated at 800 KB.</div>`:""}`);
+    typesetPending(reader);
+  } catch (error){ setStableHTML(reader, `<div class="empty">Could not load artifact: ${esc(error.message)}</div>`); }
+}
+function renderArtifacts(rows){
+  artifactRows = rows||[];
+  $("artCount").textContent = artifactRows.length ? `${artifactRows.length} readable records` : "";
+  if (!artifactRows.length){
+    selectedArtifactId = ""; loadedArtifactId = "";
+    setStableHTML($("artifacts"), `<div class="empty">No mathematical artifacts yet.</div>`);
+    setStableHTML($("artifactReader"), `<div class="empty">Artifacts will appear here with their mathematical statements.</div>`);
+    return;
+  }
+  if (!artifactRows.some(a => a.artifact_id === selectedArtifactId)) selectedArtifactId = artifactRows[0].artifact_id;
+  const artifactListChanged = setStableHTML($("artifacts"), artifactRows.map(a => {
+    const statement = a.mathematical_statement || a.metadata_summary || a.content_summary || a.readable_excerpt || "";
+    return `<button type="button" class="artifact-item${a.artifact_id===selectedArtifactId?" selected":""}" data-artifact-id="${esc(a.artifact_id)}">
+      <div class="atitle">${mathHTML(a.display_title||statement||a.artifact_type||"Mathematical artifact")}</div>
+      ${statement?`<div class="astatement">${mathHTML(String(statement).slice(0,280))}${String(statement).length>280?"…":""}</div>`:""}
+      <div class="ameta">${esc(a.artifact_type||"")} · ${esc(a.producer_role||"")} · rev ${esc(a.state_revision)} · ${esc(a.artifact_id||"")}</div>
+    </button>`;
+  }).join(""));
+  if (artifactListChanged){
+    typesetPending($("artifacts"));
+    $("artifacts").querySelectorAll(".artifact-item").forEach(button => button.addEventListener("click", () => openArtifact(button.dataset.artifactId||"")));
+  }
+  openArtifact(selectedArtifactId);
+}
+async function refreshArtifactCatalog(){
+  try {
+    const response = await fetch("/api/artifacts", {cache:"no-store"});
+    if (response.ok) renderArtifacts((await response.json()).artifacts||[]);
+  } catch (_) {}
 }
 
 function renderClaims(rows){
@@ -2213,7 +2911,7 @@ function renderClaims(rows){
     const status = visualStatus(c);
     return `<div class="vclaim status-${esc(status)}${c.verified?"":" unverified"}" data-claim-id="${esc(c.claim_id)}" data-claim-status="${esc(status)}">
       <div class="vhead">${badge}<span class="mid" title="${esc(c.claim_id)}">${esc(c.claim_id)}</span></div>
-      <div class="vstmt">${esc(c.statement||"(no statement)")}</div>
+      <div class="vstmt">${mathHTML(c.statement||"(no statement)")}</div>
       ${relations?`<div class="vrel">${relations}</div>`:""}
     </div>`;
   };
@@ -2262,7 +2960,7 @@ function renderClaims(rows){
     const retiredHtml = sortClaims(retiredRows).map(renderClaimCard).join("");
     h += `<section class="claim-section retired"><div class="claim-section-title">Retired / superseded / falsified claims <span class="count">${retiredRows.length} claims</span></div><div class="retired-claims">${retiredHtml}</div></section>`;
   }
-  $("verified").innerHTML = h;
+  setStableHTML($("verified"), h);
 }
 
 let selectedGraphNode = "";
@@ -2291,21 +2989,24 @@ function graphDetailHTML(n, graph){
   if (!n) return `<div class="empty">Select a graph node to inspect its evidence, blockers, and proof role.</div>`;
   const incoming = (graph.edges||[]).filter(e => e.target === n.id).slice(0, 8);
   const outgoing = (graph.edges||[]).filter(e => e.source === n.id).slice(0, 8);
+  const nodeNames = Object.fromEntries((graph.nodes||[]).map(node => [node.id, node.full_label||node.display_title||node.label||node.record_id||node.id]));
   const rows = [
     ["kind", n.kind],
     ["status", n.status || n.lifecycle_status || "—"],
+    ["record", n.record_id || ""],
     ["ref", n.kind === "artifact" ? `${n.artifact_ref || ""} ${n.producer_role_code || ""}`.trim() : ""],
     ["producer", n.kind === "artifact" ? n.producer_role || "" : ""],
     ["revision", n.kind === "artifact" ? n.state_revision ?? "" : ""],
     ["blockers", n.blocking_debt_count != null ? `${n.blocking_debt_count} blocking / ${n.active_debt_count||0} active` : ""],
     ["verifier", n.kind === "route" ? `${n.verifier_ready ? "ready for strict check" : (n.verifier_readiness_level || "not ready")} · score ${n.verifier_readiness_score ?? 0}` : ""],
     ["missing", Array.isArray(n.verifier_missing_checks) ? n.verifier_missing_checks.join(", ") : ""],
-    ["incoming", incoming.map(e => `${e.relation}: ${e.source}`).join("\n")],
-    ["outgoing", outgoing.map(e => `${e.relation}: ${e.target}`).join("\n")],
+    ["incoming", incoming.map(e => `${e.relation}: ${nodeNames[e.source]||e.source}`).join("\n")],
+    ["outgoing", outgoing.map(e => `${e.relation}: ${nodeNames[e.target]||e.target}`).join("\n")],
   ].filter(r => r[1] !== "" && r[1] != null);
-  return `<div class="dtitle">${esc(n.full_label||n.label||n.id)}</div>
-    <div class="dgrid">${rows.map(r => `<span>${esc(r[0])}</span><span>${esc(r[1])}</span>`).join("")}</div>
-    <div class="dsummary">${esc(n.summary||"")}</div>`;
+  return `<div class="dtitle">${mathHTML(n.display_title||n.full_label||n.label||n.id)}</div>
+    <div class="dgrid">${rows.map(r => `<span>${esc(r[0])}</span><span>${mathHTML(r[1])}</span>`).join("")}</div>
+    <div class="dsummary">${mathHTML(n.summary||"")}</div>
+    ${n.kind==="artifact"&&n.artifact_id?`<button type="button" class="btn" data-read-graph-artifact="${esc(n.artifact_id)}" style="margin-top:12px">Read full mathematical artifact ↓</button>`:""}`;
 }
 function renderProofGraph(graph){
   graph = graph || {nodes:[], edges:[], summary:{}};
@@ -2320,10 +3021,12 @@ function renderProofGraph(graph){
   ].join("");
   const canvas = $("proofGraph");
   if (!nodes.length){
-    canvas.innerHTML = `<div class="empty">No proof graph yet.</div>`;
-    $("graphDetail").innerHTML = graphDetailHTML(null, graph);
+    setStableHTML(canvas, `<div class="empty">No proof graph yet.</div>`);
+    setStableHTML($("graphDetail"), graphDetailHTML(null, graph));
     return;
   }
+  const selected = nodes.find(n => n.id === selectedGraphNode) || nodes.find(n => n.verifier_ready) || nodes.find(n => Number(n.blocking_debt_count||0)>0) || nodes[0];
+  selectedGraphNode = selected ? selected.id : "";
   const cols = {claim: 30, route: 300, inference: 570, debt: 840, artifact: 1110};
   const labels = {claim:"Claims", route:"Routes", inference:"Inferences", debt:"Open Cases", artifact:"Evidence"};
   const buckets = {claim:[], route:[], inference:[], debt:[], artifact:[]};
@@ -2358,19 +3061,28 @@ function renderProofGraph(graph){
     const p = positions[n.id] || {x:30, y:42};
     html += `<button type="button" class="${esc(graphNodeClass(n))}" data-node="${esc(n.id)}" style="left:${p.x}px;top:${p.y}px" title="${esc(n.full_label||n.summary||n.label||n.id)}">
       <div class="gkind">${esc(n.kind||"")}${n.verifier_ready ? " · verifier-ready" : ""}</div>
-      <div class="glabel">${esc(n.label||n.id)}</div>
+      <div class="glabel">${mathHTML(n.label||n.id)}</div>
       <div class="gmeta">${esc(graphMeta(n))}</div>
     </button>`;
   }
   canvas.style.minHeight = `${height}px`;
-  canvas.innerHTML = html;
-  const selected = nodes.find(n => n.id === selectedGraphNode) || nodes.find(n => n.verifier_ready) || nodes.find(n => Number(n.blocking_debt_count||0)>0) || nodes[0];
-  selectedGraphNode = selected ? selected.id : "";
-  $("graphDetail").innerHTML = graphDetailHTML(selected, graph);
-  canvas.querySelectorAll(".gnode").forEach(btn => btn.addEventListener("click", () => {
-    selectedGraphNode = btn.getAttribute("data-node") || "";
-    renderProofGraph(graph);
-  }));
+  const canvasChanged = setStableHTML(canvas, html);
+  const detailChanged = setStableHTML($("graphDetail"), graphDetailHTML(selected, graph));
+  if (canvasChanged){
+    typesetPending(canvas);
+    canvas.querySelectorAll(".gnode").forEach(btn => btn.addEventListener("click", () => {
+      selectedGraphNode = btn.getAttribute("data-node") || "";
+      renderProofGraph(graph);
+    }));
+  }
+  if (detailChanged){
+    typesetPending($("graphDetail"));
+    const graphArtifactButton = $("graphDetail").querySelector("[data-read-graph-artifact]");
+    if (graphArtifactButton) graphArtifactButton.addEventListener("click", () => {
+      openArtifact(graphArtifactButton.dataset.readGraphArtifact||"");
+      $("artifactReader").scrollIntoView({behavior:"smooth", block:"center"});
+    });
+  }
 }
 
 /* ===== Live tail viewer (stream any log/report/artifact) ===== */
@@ -2400,8 +3112,10 @@ async function refreshTailFiles(){
   } catch (e) {}
 }
 const tailCache = {};
+let tailFetchInFlight = false;
 async function fetchTail(){
-  if (!tailSel){ return; }
+  if (!tailSel || tailFetchInFlight){ return; }
+  tailFetchInFlight = true;
   try {
     const r = await fetch(`/api/tail?path=${encodeURIComponent(tailSel)}&bytes=60000`, {cache:"no-store"});
     const j = await r.json();
@@ -2415,7 +3129,10 @@ async function fetchTail(){
     if (v.textContent !== text){ v.textContent = text; }
     $("tailInfo").textContent = `${fmtBytes(j.size)}${j.truncated ? " · showing tail" : ""}`;
     if ($("tailFollow").checked && atBottom) v.scrollTop = v.scrollHeight;
-  } catch (e) {}
+  } catch (e) {
+  } finally {
+    tailFetchInFlight = false;
+  }
 }
 $("tailFile").addEventListener("change", e => { tailUserPicked = true; tailSel = e.target.value; const v=$("tailView"); v.textContent=""; fetchTail(); });
 $("tailRefresh").addEventListener("click", () => { refreshTailFiles().then(fetchTail); });
@@ -2428,7 +3145,12 @@ async function refreshSteering(){
     const r = await fetch("/api/steering", {cache:"no-store"});
     const j = await r.json();
     const blk = j.open_blockers || [];
-    $("steerCount").textContent = blk.length ? `${blk.length} open blocker(s)` : (j.unconsumed_count ? `${j.unconsumed_count} queued` : "");
+    const processing = Number(j.processing_count || 0);
+    const queued = Number(j.queued_count || 0);
+    const alignmentPending = Number(j.approach_alignment_pending_count || 0);
+    $("steerCount").textContent = blk.length
+      ? `${blk.length} open blocker(s)`
+      : (processing ? `${processing} processing` : (queued ? `${queued} queued` : (alignmentPending ? `${alignmentPending} portfolio refresh pending` : "")));
     $("steerBlockers").innerHTML = blk.length
       ? blk.map(b => `<div class="blocker"><div class="bhead">⚑ ${esc(b.summary||"")}</div>${b.detail?`<div class="bdetail">${esc(b.detail)}</div>`:""}${(b.options||[]).length?`<div class="bopts">${b.options.map(o=>`<button class="btn chiplike" data-blk="${esc(b.id)}" data-opt="${esc(o)}">${esc(o)}</button>`).join("")}</div>`:""}</div>`).join("")
       : `<div class="empty">No open blockers — the run is proceeding autonomously. Type guidance any time; it is delivered on the next step.</div>`;
@@ -2437,7 +3159,15 @@ async function refreshSteering(){
     if (blk.some(b => b.id === cur)) sel.value = cur;
     const inbox = (j.recent_inbox || []).slice(-6).reverse();
     $("steerLog").innerHTML = inbox.length
-      ? `<div class="group-h">recent steering</div>` + inbox.map(m => `<div class="sig"><span class="pill ${m.consumed?'good':'warn'}">${m.consumed?'delivered':'queued'}</span><div style="color:var(--muted)">${esc(m.text)}</div></div>`).join("")
+      ? `<div class="group-h">recent steering</div>` + inbox.map(m => {
+          const status = m.consumed ? "processed" : (m.delivery_status === "processing" ? "processing" : "queued");
+          const tone = status === "processed" ? "good" : (status === "processing" ? "info" : "warn");
+          const alignment = String(m.approach_alignment_status || "");
+          const alignmentPill = alignment === "pending" || alignment === "processing"
+            ? `<span class="pill warn">portfolio ${alignment}</span>`
+            : (alignment === "completed" ? `<span class="pill good">portfolio aligned</span>` : "");
+          return `<div class="sig"><span class="pill ${tone}">${status}</span>${alignmentPill}<div style="color:var(--muted)">${esc(m.text)}</div></div>`;
+        }).join("")
       : "";
     document.querySelectorAll('#steerBlockers .chiplike').forEach(btn => btn.addEventListener('click', () => {
       $("steerText").value = btn.dataset.opt === '(type your own guidance)' ? '' : btn.dataset.opt;
@@ -2478,9 +3208,16 @@ function renderRunbar(mon){
 }
 
 async function tick(){
-  if (paused) return;
+  // setInterval does not await async callbacks.  Without this single-flight
+  // guard, a slow render starts another full 400KB+ refresh every POLL_MS and
+  // eventually freezes the browser while the proof process remains healthy.
+  if (paused || tickInFlight) return;
+  tickInFlight = true;
+  const controller = new AbortController();
+  const requestTimeout = setTimeout(() => controller.abort(), CONSOLE_REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch("/api/console", {cache:"no-store"});
+    const res = await fetch("/api/console", {cache:"no-store", signal:controller.signal});
+    clearTimeout(requestTimeout);
     if (!res.ok) throw new Error("HTTP "+res.status);
     const p = await res.json();
     lastOk = Date.now();
@@ -2496,26 +3233,35 @@ async function tick(){
     renderRunbar(mon);
     renderKpis(snap);
     renderPipeline(p, activeStep(p));
+    renderApproachPortfolio(p.research_strategy);
     renderProofSpine(p.proof_spine_status);
     renderBottleneck(p.bottleneck_frontier);
     renderResearcherMode(p.researcher_mode_state);
     renderTokens(snap, p.usage_summary || {});
     renderClaims(p.claims);
+    renderPapers(p.papers);
     renderProofGraph(p.proof_graph);
     renderSession(p);
     renderRoutes(p.route_scoreboard);
     renderDebts(p.open_cases);
     renderSignals(p.parallel_exchange);
     renderTimeline(p.run_timeline);
-    renderArtifacts(p.recent_research_artifacts);
+    if (Array.isArray(p.artifact_catalog)) renderArtifacts(p.artifact_catalog);
+    else if (!artifactRows.length) renderArtifacts(p.recent_research_artifacts);
     if (!paused) fetchTail();
     $("foot").textContent = `source: ${mon.source||"?"} · ${snap.summary||""} · ${snap.verifier_health||""}`;
+    await typesetPending(document);
   } catch (e){
-    const bar = $("errbar"); bar.style.display = "block"; bar.textContent = "connection lost: "+e.message+" — retrying… "+ago();
+    const detail = e && e.name === "AbortError" ? "request timed out" : e.message;
+    const bar = $("errbar"); bar.style.display = "block"; bar.textContent = "connection lost: "+detail+" — retrying… "+ago();
     $("liveDot").className = "dot"; $("liveText").textContent = "disconnected";
     const rb = $("runbar"); rb.className = "runbar disconnected";
     rb.innerHTML = `<span class="rdot"></span><span>■ MONITOR UNREACHABLE</span><span class="rsub">cannot reach the monitor server — retrying…</span>`;
-  } finally { $("updated").textContent = ago(); }
+  } finally {
+    clearTimeout(requestTimeout);
+    tickInFlight = false;
+    $("updated").textContent = ago();
+  }
 }
 
 // Dashboard pause is DISPLAY-ONLY: it freezes browser refreshes and never
@@ -2534,6 +3280,10 @@ $("pauseBtn").addEventListener("click", () => {
 });
 $("refreshBtn").addEventListener("click", tick);
 setInterval(() => $("updated").textContent = ago(), 1000);
+refreshPapers();
+setInterval(refreshPapers, 30000);
+refreshArtifactCatalog();
+setInterval(refreshArtifactCatalog, 30000);
 tick();
 setInterval(tick, POLL_MS);
 </script>

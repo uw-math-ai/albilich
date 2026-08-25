@@ -1882,10 +1882,10 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
             self.assertFalse(outcome.accepted)
             self.assertIn("L5-PAPER-01", " ".join(outcome.errors))
 
-    def test_non_writer_path_attach_stays_guard_exempt_and_unmoved(self) -> None:
-        # Non-writer path-based attaches keep the old semantics: no content is
-        # loaded, no writer guard runs, and the artifact points at the given
-        # path (no copy is made).
+    def test_non_writer_path_attach_stays_guard_exempt_but_is_copied(self) -> None:
+        # Non-writer path-based attaches do not run writer content guards, but
+        # their accepted bytes are copied to an artifact-id-owned path so later
+        # staging-file mutation cannot change certified evidence.
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(Path(tmpdir), "path-attach-non-writer-test")
             staged = store.state_dir / "artifacts" / "experiment-log.txt"
@@ -1909,7 +1909,9 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
             with sqlite3.connect(store.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute("SELECT path FROM artifacts WHERE artifact_id='exp-log-1'").fetchone()
-            self.assertEqual(staged.resolve(), Path(row["path"]).resolve())
+            managed = Path(row["path"]).resolve()
+            self.assertNotEqual(staged.resolve(), managed)
+            self.assertEqual(managed.read_text(encoding="utf-8"), staged.read_text(encoding="utf-8"))
 
     def test_double_escaped_final_paper_is_normalized_and_accepted(self) -> None:
         # A fully double-escaped paper (over-escaped JSON patch: every LaTeX

@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.patches import apply_patch
 from agents.generation.phase2.store import ProofStateStore
+from agents.generation.phase2.steering import mark_consumed, snapshot as steering_snapshot, submit_steering
 from agents.generation.phase2.workflow import (
     _ConsoleWriteThrottle,
     _blocked_by_pending_priority_barrier,
@@ -31,6 +32,112 @@ from agents.generation.phase2.workflow import (
 
 
 class WorkflowOutageBreakerTests(unittest.TestCase):
+    def test_accepted_alignment_portfolio_completes_steering_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("workflow-steering-alignment", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("Target theorem.")
+            message = submit_steering(store.state_dir, "The new example changes the root lower bound.")
+            mark_consumed(store.state_dir, [message["id"]])
+
+            def candidate(index: int) -> dict:
+                return {
+                    "approach_id": f"aligned-{index}",
+                    "title": f"Aligned approach {index}",
+                    "mechanism": f"Use distinct mechanism {index} against the updated root.",
+                    "mathematical_objects": [f"object-{index}"],
+                    "representation_or_invariant": f"representation-{index}",
+                    "root_consequence": f"Mechanism {index} gives an exact updated root consequence.",
+                    "steering_impact": "The new lower bound changes the sharp target for this mechanism.",
+                    "bridge_statement": f"Exact aligned bridge {index}.",
+                    "contribution_level": 5 if index < 2 else 3,
+                    "contribution_kind": "root_closing" if index < 2 else "major_case",
+                    "evidence": "The processed human steer changes the baseline.",
+                    "likely_failure_mode": f"Failure mode {index}.",
+                    "decisive_test": f"Run decisive test {index}.",
+                    "estimated_cost": "medium",
+                    "novelty_score": 0.8 - index * 0.05,
+                    "confidence": "medium",
+                    "confidence_basis": "The bridge remains unproved.",
+                    "status": "selected" if index < 2 else "idea",
+                    "semantic_signature": {
+                        "mechanism": f"mechanism-{index}",
+                        "representation": f"representation-{index}",
+                        "proof_direction": "forward" if index % 2 == 0 else "adversarial",
+                        "theorem_family": f"family-{index}",
+                        "root_obligation": f"obligation-{index}",
+                        "failure_mode": f"failure-{index}",
+                    },
+                }
+
+            def executor(*, store: ProofStateStore, action: dict, session_plan: dict, **_: object) -> dict:
+                self.assertTrue(action["exclusive_wave_required"])
+                portfolio_id = "portfolio-aligned-after-steer"
+                return {
+                    "run_id": "alignment-refresh-run",
+                    "actor_role": "researcher",
+                    "status": "completed",
+                    "returncode": 0,
+                    "wall_time_seconds": 1.0,
+                    "peak_memory_mb": 1.0,
+                    "usage": {"input_tokens": 20, "output_tokens": 10, "reasoning_output_tokens": 0, "total_tokens": 30},
+                    "session_id": "alignment-session",
+                    "patch": {
+                        "schema_version": SCHEMA_VERSION,
+                        "problem_id": store.problem_id,
+                        "base_revision": session_plan["state_revision"],
+                        "actor_role": "researcher",
+                        "target_id": "root",
+                        "operations": [
+                            {
+                                "op": "attach_artifact",
+                                "artifact_id": portfolio_id,
+                                "artifact_type": "approach_portfolio",
+                                "content": "A steer-aligned global approach portfolio.",
+                                "metadata": {
+                                    "strategy_schema_version": 1,
+                                    "portfolio_kind": "initial",
+                                    "brainstorming_summary": "Six distinct mechanisms were recomputed after the steer.",
+                                    "alignment_source_steering_ids": [message["id"]],
+                                    "alignment_evidence_artifact_ids": [],
+                                    "alignment_summary": "The sharp target changed.",
+                                    "root_effect_recomputed": True,
+                                    "approaches": [candidate(index) for index in range(6)],
+                                    "selected_approach_ids": ["aligned-0", "aligned-1"],
+                                    "research_questions": [],
+                                },
+                            }
+                        ],
+                    },
+                    "patch_error": "",
+                    "output_artifact_ids": [portfolio_id],
+                    "final_message_path": "",
+                    "log_path": "",
+                    "model": "fake",
+                    "reasoning_effort": "xhigh",
+                    "sandbox": "workspace-write",
+                    "web_search": "disabled",
+                }
+
+            result = run_workflow(
+                store,
+                steps=1,
+                execute=True,
+                parallel_librarian_verifier=True,
+                parallel_branches=5,
+                write_on_stop=False,
+                write_console=False,
+                executor=executor,
+                research_mode="hard_problem",
+                web_search="disabled",
+            )
+
+            row = steering_snapshot(store.state_dir)["recent_inbox"][0]
+
+        self.assertTrue(result["steps"][0]["patch_outcome"]["accepted"])
+        self.assertNotIn("parallel_actions", result["steps"][0])
+        self.assertEqual(row["approach_alignment_status"], "completed")
+        self.assertEqual(row["approach_alignment_artifact_id"], "portfolio-aligned-after-steer")
+
     def test_console_write_throttle_coalesces_heartbeats_but_allows_forced_snapshots(self) -> None:
         throttle = _ConsoleWriteThrottle(15.0)
 
@@ -417,7 +524,7 @@ class WorkflowParallelRebaseTests(unittest.TestCase):
                                 "metadata": {
                                     "target_id": action.get("target_id", "root"),
                                     "verdict": "gap_found",
-                                    "proof_interface_check_version": 1,
+                                    "proof_interface_check_version": 2,
                                     "quantifiers_preserved": True,
                                     "hypotheses_matched": True,
                                     "cases_exhaustive": True,

@@ -188,19 +188,38 @@ def submit_steering(
     *,
     blocker_id: Optional[str] = None,
     author: str = "human",
+    requires_approach_alignment: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Record a human steering message; if it answers a blocker, resolve it too."""
     text = (text or "").strip()
     if not text:
         raise ValueError("steering text is empty")
+    # A general research steer may change the mathematical landscape seen by
+    # every speculative approach.  Once the directive has been processed, the
+    # scheduler therefore owes the user one dedicated portfolio-alignment pass.
+    # Answers to narrow blockers default to no global refresh; callers can opt
+    # them in explicitly when the answer really changes the root strategy.
+    alignment_required = bool(blocker_id is None) if requires_approach_alignment is None else bool(
+        requires_approach_alignment
+    )
     msg = {
         "id": _short_id("steer", author, text),
         "author": author,
         "text": text,
         "blocker_id": blocker_id,
         "created_at": _now(),
+        "delivery_status": "queued",
+        "delivered_at": None,
+        "delivery_attempts": 0,
+        "delivered_revision": None,
         "consumed": False,
         "consumed_at": None,
+        "approach_alignment_required": alignment_required,
+        "approach_alignment_status": "awaiting_processing" if alignment_required else "not_required",
+        "approach_alignment_started_at": None,
+        "approach_alignment_completed_at": None,
+        "approach_alignment_artifact_id": None,
+        "approach_alignment_revision": None,
     }
     path = _path(state_dir, INBOX_FILE)
     # Take the inbox lock so an append cannot race mark_consumed's locked
@@ -216,6 +235,38 @@ def unconsumed_steering(state_dir: os.PathLike | str) -> List[Dict[str, Any]]:
     return [m for m in _read(_path(state_dir, INBOX_FILE)) if not m.get("consumed")]
 
 
+def mark_delivered(
+    state_dir: os.PathLike | str,
+    ids: Iterable[str],
+    *,
+    revision: Optional[int] = None,
+) -> int:
+    """Mark pending steering as inserted into an executing agent context.
+
+    Delivery is intentionally distinct from consumption: a failed child leaves
+    the message unconsumed so a later step can retry it, while the dashboard can
+    still report that the current child is processing the directive.
+    """
+    ids = set(ids)
+    if not ids:
+        return 0
+    path = _path(state_dir, INBOX_FILE)
+    with _locked(path):
+        rows = _read(path)
+        n = 0
+        delivered_at = _now()
+        for row in rows:
+            if row.get("id") in ids and not row.get("consumed"):
+                row["delivery_status"] = "processing"
+                row["delivered_at"] = delivered_at
+                row["delivery_attempts"] = int(row.get("delivery_attempts") or 0) + 1
+                row["delivered_revision"] = revision
+                n += 1
+        if n:
+            _rewrite(path, rows)
+        return n
+
+
 def mark_consumed(state_dir: os.PathLike | str, ids: Iterable[str]) -> int:
     ids = set(ids)
     if not ids:
@@ -228,6 +279,117 @@ def mark_consumed(state_dir: os.PathLike | str, ids: Iterable[str]) -> int:
             if row.get("id") in ids and not row.get("consumed"):
                 row["consumed"] = True
                 row["consumed_at"] = _now()
+                row["delivery_status"] = "consumed"
+                if row.get("approach_alignment_required"):
+                    row["approach_alignment_status"] = "pending"
+                n += 1
+        if n:
+            _rewrite(path, rows)
+        return n
+
+
+def request_approach_alignment(state_dir: os.PathLike | str, ids: Iterable[str]) -> int:
+    """Queue a portfolio-alignment pass for existing steering messages.
+
+    This is primarily a recovery hook for messages created before the automatic
+    alignment fields existed.  It preserves the original message and delivery
+    history rather than injecting a duplicate steer.
+    """
+    ids = set(ids)
+    if not ids:
+        return 0
+    path = _path(state_dir, INBOX_FILE)
+    with _locked(path):
+        rows = _read(path)
+        n = 0
+        for row in rows:
+            if row.get("id") not in ids:
+                continue
+            row["approach_alignment_required"] = True
+            row["approach_alignment_status"] = "pending" if row.get("consumed") else "awaiting_processing"
+            row.setdefault("approach_alignment_started_at", None)
+            row.setdefault("approach_alignment_completed_at", None)
+            row.setdefault("approach_alignment_artifact_id", None)
+            row.setdefault("approach_alignment_revision", None)
+            n += 1
+        if n:
+            _rewrite(path, rows)
+        return n
+
+
+def pending_approach_alignment(state_dir: os.PathLike | str) -> List[Dict[str, Any]]:
+    """Return processed steers whose global approach effects are not reconciled."""
+    return [
+        row
+        for row in _read(_path(state_dir, INBOX_FILE))
+        if row.get("consumed")
+        and row.get("approach_alignment_required")
+        and str(row.get("approach_alignment_status") or "pending") in {"pending", "processing"}
+    ]
+
+
+def approach_alignment_card(state_dir: os.PathLike | str) -> Dict[str, Any]:
+    pending = pending_approach_alignment(state_dir)
+    return {
+        "required": bool(pending),
+        "pending_count": len(pending),
+        "source_steering_ids": [str(row.get("id") or "") for row in pending if str(row.get("id") or "")],
+        "directives": [
+            {
+                "id": str(row.get("id") or ""),
+                "text": str(row.get("text") or ""),
+                "created_at": str(row.get("created_at") or ""),
+            }
+            for row in pending
+        ],
+    }
+
+
+def mark_approach_alignment_processing(state_dir: os.PathLike | str, ids: Iterable[str]) -> int:
+    ids = set(ids)
+    if not ids:
+        return 0
+    path = _path(state_dir, INBOX_FILE)
+    with _locked(path):
+        rows = _read(path)
+        n = 0
+        started_at = _now()
+        for row in rows:
+            if (
+                row.get("id") in ids
+                and row.get("consumed")
+                and row.get("approach_alignment_required")
+                and str(row.get("approach_alignment_status") or "pending") in {"pending", "processing"}
+            ):
+                row["approach_alignment_status"] = "processing"
+                row["approach_alignment_started_at"] = started_at
+                n += 1
+        if n:
+            _rewrite(path, rows)
+        return n
+
+
+def mark_approach_alignment_completed(
+    state_dir: os.PathLike | str,
+    ids: Iterable[str],
+    *,
+    artifact_id: str,
+    revision: Optional[int] = None,
+) -> int:
+    ids = set(ids)
+    if not ids or not str(artifact_id or "").strip():
+        return 0
+    path = _path(state_dir, INBOX_FILE)
+    with _locked(path):
+        rows = _read(path)
+        n = 0
+        completed_at = _now()
+        for row in rows:
+            if row.get("id") in ids and row.get("approach_alignment_required"):
+                row["approach_alignment_status"] = "completed"
+                row["approach_alignment_completed_at"] = completed_at
+                row["approach_alignment_artifact_id"] = str(artifact_id)
+                row["approach_alignment_revision"] = revision
                 n += 1
         if n:
             _rewrite(path, rows)
@@ -239,12 +401,36 @@ def mark_consumed(state_dir: os.PathLike | str, ids: Iterable[str]) -> int:
 # --------------------------------------------------------------------------- #
 def snapshot(state_dir: os.PathLike | str, *, inbox_limit: int = 25) -> Dict[str, Any]:
     blockers = _read(_path(state_dir, BLOCKERS_FILE))
-    inbox = _read(_path(state_dir, INBOX_FILE))
+    inbox = []
+    for raw in _read(_path(state_dir, INBOX_FILE)):
+        row = dict(raw)
+        if row.get("consumed"):
+            row["delivery_status"] = "consumed"
+        elif row.get("delivery_status") == "processing" or row.get("delivered_at"):
+            row["delivery_status"] = "processing"
+        else:
+            row["delivery_status"] = "queued"
+        inbox.append(row)
+    queued_count = sum(1 for m in inbox if m.get("delivery_status") == "queued")
+    processing_count = sum(1 for m in inbox if m.get("delivery_status") == "processing")
+    alignment_pending_count = sum(
+        1
+        for m in inbox
+        if m.get("approach_alignment_required")
+        and str(m.get("approach_alignment_status") or "") in {"pending", "processing"}
+    )
+    alignment_processing_count = sum(
+        1 for m in inbox if str(m.get("approach_alignment_status") or "") == "processing"
+    )
     return {
         "open_blockers": [b for b in blockers if b.get("status") == "open"],
         "resolved_blockers": [b for b in blockers if b.get("status") != "open"][-inbox_limit:],
         "recent_inbox": inbox[-inbox_limit:],
         "unconsumed_count": sum(1 for m in inbox if not m.get("consumed")),
+        "queued_count": queued_count,
+        "processing_count": processing_count,
+        "approach_alignment_pending_count": alignment_pending_count,
+        "approach_alignment_processing_count": alignment_processing_count,
         "open_blocker_count": sum(1 for b in blockers if b.get("status") == "open"),
     }
 

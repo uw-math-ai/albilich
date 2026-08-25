@@ -393,6 +393,10 @@ class ProofStateStore:
         workflow step.
         """
         with self.connect() as conn:
+            # Keep every scheduler query on one WAL snapshot.  Without an
+            # explicit read transaction a concurrent patch can advance between
+            # SELECTs, yielding an old current_revision mixed with new claims.
+            conn.execute("BEGIN")
             state = self.get_problem_row(conn)
             claims = self.fetch_all(conn, "claims")
             routes = self.fetch_all(conn, "routes")
@@ -456,13 +460,16 @@ class ProofStateStore:
                         'definition_audit_report',
                         'route_triage_report',
                         'advisor_report',
+                        'approach_portfolio',
                         'advisor_synthesis',
                         'bridge_lemma_search',
                         'conjecture_portfolio',
                         'deep_session_report',
                         'definition_candidate',
                         'invention_authorization',
-                        'proof_compression'
+                        'proof_compression',
+                        'conceptual_invariant_report',
+                        'reference_solution'
                     )
                     ORDER BY state_revision DESC, created_at DESC
                     LIMIT 48
@@ -488,6 +495,42 @@ class ProofStateStore:
                 for row in research_artifacts
             ):
                 research_artifacts.append(compact_dict(latest_advisor_synthesis))
+            # The active approach portfolio is a durable research-policy
+            # input, not merely a recent artifact. Keep it visible after a
+            # long local branch has filled the ordinary artifact window.
+            latest_approach_portfolio = conn.execute(
+                """
+                SELECT artifact_id, artifact_type, producer_role, state_revision,
+                       content_summary, metadata_json, path, created_at
+                FROM artifacts
+                WHERE artifact_type = 'approach_portfolio'
+                ORDER BY state_revision DESC, created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if latest_approach_portfolio and not any(
+                row["artifact_id"] == latest_approach_portfolio["artifact_id"]
+                for row in research_artifacts
+            ):
+                research_artifacts.append(compact_dict(latest_approach_portfolio))
+            # A human reference must remain visible until its reconstruction
+            # is complete even when a busy run has produced more than the
+            # ordinary recent-artifact window.
+            latest_reference_solution = conn.execute(
+                """
+                SELECT artifact_id, artifact_type, producer_role, state_revision,
+                       content_summary, metadata_json, path, created_at
+                FROM artifacts
+                WHERE artifact_type = 'reference_solution'
+                ORDER BY state_revision DESC, created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if latest_reference_solution and not any(
+                row["artifact_id"] == latest_reference_solution["artifact_id"]
+                for row in research_artifacts
+            ):
+                research_artifacts.append(compact_dict(latest_reference_solution))
             confirmed_counterexamples = [
                 compact_dict(row)
                 for row in conn.execute(
@@ -584,9 +627,12 @@ class ProofStateStore:
 
     def get_state(self) -> Dict[str, Any]:
         with self.connect() as conn:
+            conn.execute("BEGIN")
             return self.snapshot_from_conn(conn)
 
     def snapshot_from_conn(self, conn: sqlite3.Connection) -> Dict[str, Any]:
+        if not conn.in_transaction:
+            raise ValueError("snapshot_from_conn requires an active read transaction")
         state = self.get_problem_row(conn)
         claims = self.fetch_all(conn, "claims")
         routes = self.fetch_all(conn, "routes")

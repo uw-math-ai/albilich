@@ -10,6 +10,7 @@ ordinary claims, routes, and inferences pass their existing verifier gates.
 
 | Artifact | Producer | Purpose | Hard limit or gate |
 | --- | --- | --- | --- |
+| `approach_portfolio` | researcher | Initial and periodic breadth-first map of genuinely different proof, reformulation, experimental, and counterexample mechanisms | 6-12 initial or 3-12 refresh candidates; 2-3 selected; duplicate semantic signatures rejected; no proof authority |
 | `bridge_lemma_search` | researcher | Forward/backward frontier and sufficiency-prechecked bridge portfolio | 1-3 candidates; 1-2 selected; duplicates and gap-moving candidates rejected |
 | `advisor_synthesis` | PhD advisor | Periodic global proof architecture and budget allocation | One decisive missing statement; newest artifact must supersede the prior synthesis |
 | `invention_authorization` | PhD advisor | Exceptional permission to invent an auxiliary definition or object | All authorization conditions true; at most 2 candidates and 2 research passes |
@@ -25,15 +26,27 @@ versioned contract.
 
 ## Deterministic planning
 
-The scheduler first preserves high-priority verification, integration, writing,
-counterexample validation, explicit debt repair, and existing circuit breakers.
-For unprotected mature-run actions it may schedule:
+The scheduler first preserves high-priority retrieval, verification, integration,
+writing, counterexample validation, exact non-research debt repair, and existing
+circuit breakers. On a new hard problem, exact source scouting can run in
+parallel while the first researcher pass builds an approach portfolio instead
+of committing immediately to a local calculation. For unprotected mature-run
+actions it may schedule:
 
-1. a selected bridge or conjecture, including a decisive CAS refutation test;
-2. proof compression before a due global synthesis;
-3. global-synthesis mode on the existing `phd_advisor`;
-4. an invention pass only while a persisted authorization remains within both
+1. initial or periodic portfolio brainstorming and a selected low-cost pilot;
+2. a selected bridge or conjecture, including a decisive CAS refutation test;
+3. proof compression before a due global synthesis;
+4. global-synthesis mode on the existing `phd_advisor`;
+5. an invention pass only while a persisted authorization remains within both
    candidate and pass budgets.
+
+A local bottleneck receives an evidence-based lease. It may continue without a
+wall-clock limit while it produces mathematical deltas. After two completed
+passes with no root-relevant mathematical delta, or two consecutive execution
+failures, the lock no longer outranks creative/global work: the scheduler
+refreshes the portfolio and changes mechanism, representation, or proof
+direction. This fixes the former priority inversion in which `debt_id` and
+`proof_repair_required` made bottleneck research permanently non-preemptible.
 
 Global synthesis becomes due from persisted signals such as three substantive
 passes without root-relevant progress, multiple routes sharing an obstruction,
@@ -57,10 +70,39 @@ labeled as heuristics. As the run proceeds, the scheduler builds a Bayesian
 local posterior for each strategy family from its own later verifier/integration
 evidence. Producing prose is not success: credit requires an output artifact to
 enter verified evidence, a concrete target claim to be verified, or the worked
-route to integrate. Rejections and timeouts are negative evidence. No reference
+route to integrate. The score weights verified contributions placed in a
+sufficient root route more heavily than isolated local verifications.
+Rejections and timeouts are negative evidence. No reference
 solution and no private cross-problem run cache is consulted. When scores are
 close, work-mode rotation remains the diversity tie-breaker. Speculative actions
 never consume the protected verification reserve.
+
+## Brainstorming, creativity, and debt layers
+
+Brainstorming has a short dedicated researcher prompt rather than the full
+local-proof instruction block. Each approach card records its mechanism,
+mathematical objects, representation or invariant, exact root consequence,
+weakest bridge statement, likely failure, cheapest decisive test, qualitative
+contribution level 0-5, cost, novelty, confidence basis, status, and a semantic
+signature. The signature spans mechanism, representation, proof direction,
+theorem family, root obligation, and failure mode; paraphrases therefore do not
+count as creative diversity.
+
+The search state separates three layers:
+
+1. **Ideas** are advisory portfolio entries. They may be numerous, speculative,
+   and mutually incompatible.
+2. **Research questions** are conceptual, source, counterexample, or experiment
+   questions. Up to six decision-changing questions may be recorded as minor
+   nonblocking debts once a concrete graph owner exists (major only for a
+   selected pilot); the system does not create one debt per idea.
+3. **Proof debts** remain exact obligations on selected claims, routes, or
+   inferences. A blocking debt is created only after a selected route exposes a
+   statement whose proof is actually necessary.
+
+The qualitative allocation is 50% exploitation, 30% exploration, and 20%
+adversarial testing. It is a diversity policy, not a calibrated probability or
+a relaxation of verification.
 
 ## Graph-derived decisive obligation frontier
 
@@ -180,8 +222,48 @@ different mathematical philosophies and share concrete cross-branch signals.
 ## Observability
 
 The Markdown report includes a Research Strategy section with the latest
-synthesis, compression, bridge and conjecture portfolios, selected candidates,
-selection reason, invention authorization, and current synthesis trigger. The
-monitor JSON includes the same `research_strategy` payload. Each workflow action
-also exposes its information-gain score components and the synthesis directive
-it follows.
+approach portfolio and bottleneck lease, synthesis, compression, bridge and
+conjecture portfolios, selected candidates, selection reason, invention
+authorization, and current synthesis trigger. The monitor JSON includes the
+same `research_strategy` payload. The dashboard renders every approach with its
+possible root contribution, bridge, decisive test, failure mode, cost, novelty,
+confidence, and selection status. “Steer to pilot” and “Generate new
+approaches” populate the existing human-steering control; they never mutate
+proof state silently. Each workflow action also exposes its information-gain
+score components and the synthesis directive it follows.
+
+## Proof programs, coverage, and long research sessions
+
+The strategy layer derives a compact proof-program view from ordinary routes
+and artifact metadata. A program records its mathematical philosophy, exact
+root implication, decisive obligation, validation evidence, reset criterion,
+covered cases, and open cases. This is a view over the existing graph, not a new
+role, approval gate, or database authority. Advisors compare genuinely
+different programs only at evidence-triggered checkpoints: new counterevidence,
+repeated research without verifier handoff, semantic debt duplication,
+uncovered root cases, or multiple mature proof philosophies.
+
+Elapsed time is never a strategy-reset signal. `attempt` defaults to `--steps 0`
+with no wall-clock cap, and the long-session workspace points later workers back
+to the canonical proof artifact. A coherent proof may continue indefinitely
+while it produces or sharpens mathematical deltas. An operator may still impose
+an explicit resource cap with `--max-wall-sec`.
+
+Fresh proof-grade evidence marked `proof_candidate` or `ready_for_verifier` is
+handed directly to the strict verifier, including repairs to an already
+integrated route. Fresh counterevidence propagates to downstream certified
+dependencies as `threatened_pending_revalidation`; certification remains
+recorded until the strict verifier confirms a repair or a refutation.
+
+Semantically overlapping blocking debts are collapsed into one scheduling
+frontier without rewriting their database status. Aliases remain provenance and
+only verifier-certified mathematical work resolves them. Reports and metrics
+therefore emphasize root-closing programs, terminal root inferences, exhaustive
+case coverage, minimal blocking-frontier size, and pending revalidations rather
+than artifact counts.
+
+Use `ingest-reference-solution` to attach a human-supplied Markdown, LaTeX,
+plain-text, or text-extractable PDF solution to an existing run. The scheduler
+reconstructs it in local notation, maps every hypothesis and case, and creates
+or repairs the ordinary route/inference. The reference is advisory and never
+bypasses strict verification or integration.

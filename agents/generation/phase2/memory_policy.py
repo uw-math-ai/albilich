@@ -29,6 +29,56 @@ MEMORY_STATUSES = {
     "background",
 }
 
+
+def role_memory_view_policy(context_role: str) -> Dict[str, Any]:
+    """Describe the zero-paperwork memory lens for one epistemic role.
+
+    The rows remain in the single proof-state store; this policy only controls
+    how they may be used.  It prevents conjectural work from becoming an
+    implicit premise without asking workers to maintain separate notebooks.
+    """
+
+    role = str(context_role or "general")
+    if role in {"strict_verifier", "integration_verifier", "counterexample_validator"}:
+        return {
+            "role": role,
+            "settled_premise_statuses": ["verified"],
+            "candidate_use": "audit target only; never supplement the bounded evidence packet",
+            "failed_use": "test whether the submitted proof repeats a known failure",
+            "authoritative_boundary": "role packet",
+        }
+    if role == "villain":
+        return {
+            "role": role,
+            "settled_premise_statuses": ["verified"],
+            "candidate_use": "targets for refutation, not settled premises",
+            "failed_use": "reusable counterexample and obstruction regression library",
+            "authoritative_boundary": "target plus adversarial workbench",
+        }
+    if role in {"phd_advisor", "advisor"}:
+        return {
+            "role": role,
+            "settled_premise_statuses": ["verified"],
+            "candidate_use": "route evidence with explicit uncertainty",
+            "failed_use": "route-selection evidence and do-not-retry conditions",
+            "authoritative_boundary": "global proof graph",
+        }
+    if role == "literature_researcher":
+        return {
+            "role": role,
+            "settled_premise_statuses": ["verified"],
+            "candidate_use": "theorem-matching leads requiring source certification",
+            "failed_use": "known applicability failures",
+            "authoritative_boundary": "research task and source ledger",
+        }
+    return {
+        "role": role,
+        "settled_premise_statuses": ["verified"],
+        "candidate_use": "advisory conjectural context only",
+        "failed_use": "regression tests and forbidden unchanged routes",
+        "authoritative_boundary": "research workbench",
+    }
+
 VERIFIED_VALIDATION_STATUSES = {"informally_verified", "formally_verified"}
 
 # Raw run/session logs and transcripts: evidence for humans debugging a run,
