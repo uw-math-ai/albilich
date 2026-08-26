@@ -548,6 +548,9 @@ def branch_useful_delta(
             continue
         debt_id = str(debt.get("debt_id") or "")
         status = str(debt.get("status") or "")
+        if status == "refuted":
+            add(debt.get("last_seen"), "clean_obstruction", f"debt {debt_id} refuted")
+            continue
         if status in {"resolved", "discarded"}:
             add(debt.get("last_seen"), "debt_resolved", f"debt {debt_id} {status}")
             continue

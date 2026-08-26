@@ -12,12 +12,13 @@ How the math-writing harness is wired into the Albilich phase2 engine
    is explicitly **not** proof evidence and receives no mathematical
    verification claim from this harness.
 
-Both paths run deterministic checks followed by three independent audits, in
-order: terminology, introduction, and whole-paper exposition. The
-introduction has the highest quality-control standard. Uncertain terminology
-never triggers an agent guess: it raises a blocking human-consultation item in
-the steering dashboard. No document ships with an unresolved blocker or major
-writing debt; exhausted automation pauses for human resolution.
+Every solved internal run authors the standalone LaTeX paper and applies the
+deterministic register, lint, and compile checks before `stop_solved`.
+`completion_policy=publication_ready` and external revision additionally run
+three independent audits, in order: terminology, introduction, and whole-paper
+exposition. The introduction has the highest quality-control standard.
+Uncertain terminology never triggers an agent guess: it raises a blocking
+human-consultation item in the steering dashboard.
 
 ## Source of truth
 
@@ -95,20 +96,20 @@ certificate and bypasses proof research, integration, and proof-status gates.
    block revision. Open blocker/major debts dispatch a diff-minimal writer
    revision whose packet enumerates every debt as a located required-fix
    checklist. Deterministic-only revisions use a separate cap of two.
-3. **Terminology audit.** The `terminology_editor` inventories technical
+3. **Terminology audit (`publication_ready`).** The `terminology_editor` inventories technical
    names and checks them against the manuscript's citations, supplied
    literature, and bounded live search when enabled. Standard terminology is
    preferred. A coinage must be precisely defined and explain why the nearest
    standard term is inadequate. Ambiguous evidence produces a blocking
    `L3-TERM-03` debt containing the exact marker
    `HUMAN CONSULTATION REQUIRED:`.
-4. **Introduction audit.** The `introduction_editor` treats the abstract and
+4. **Introduction audit (`publication_ready`).** The `introduction_editor` treats the abstract and
    introduction as the highest-control prose in the manuscript. It requires
    one natural big-picture story, accurate scope, and a causal proof
    architecture that explains why the ingredients enter and how they combine.
    A theorem inventory, section list, or chronological work log is a major
    failure.
-5. **Whole-paper audit.** The `editor` checks publishable exposition, repeats
+5. **Whole-paper audit (`publication_ready`).** The `editor` checks publishable exposition, repeats
    the introduction and terminology checks independently, and may file at
    most 12 located, actionable findings. Mathematical correctness review is
    out of scope: internal papers already have a verified certificate, while
@@ -129,8 +130,12 @@ certificate and bypasses proof research, integration, and proof-status gates.
    internal paper, LaTeX compile failures continue forcing revisions past the
    normal caps.
 
-Convergence (`stop_solved`) requires all three audits and no gating debt.
-Internal-paper outcome identity remains defined by the `final_proof`.
+Default internal convergence (`stop_solved`) requires a `final_paper` with no
+deterministic register/lint/compile blocker. Publication-ready convergence
+additionally requires all three audits and no gating writing debt.
+Internal-paper outcome identity remains defined by the `final_proof`; the
+terminal action also names the shipped `final_paper` as
+`final_paper_artifact_id`.
 External revision reports `writing_revision_complete`, relation to theorem
 target `not_applicable`, and no proved statement.
 

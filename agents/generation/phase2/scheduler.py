@@ -867,48 +867,27 @@ def _plan_next_action(
             )
         completion_policy = str(problem.get("completion_policy") or "full_proof_first")
         post_solve_work_requested = completion_policy == "publication_ready" or research_mode == "citation_pass"
-        if not post_solve_work_requested:
-            return _action(
-                "stop_solved",
-                "root",
-                _integrated_route_for_claim(state, "root"),
-                "root is integrated and certified final proof artifact exists",
-                plan_step_budget(problem, "stop_solved", 0),
+        if post_solve_work_requested:
+            citation_decision = should_run_librarian(
+                state,
                 research_mode=research_mode,
-                terminal_classification="solved_final",
-                final_artifact_id=final_artifact.get("artifact_id", ""),
+                web_search=web_search,
+                target_id="root",
+                phase="post_integration",
             )
-        citation_decision = should_run_librarian(
-            state,
-            research_mode=research_mode,
-            web_search=web_search,
-            target_id="root",
-            phase="post_integration",
-        )
-        if citation_decision.get("run"):
-            mode = "retrieve"
-            return _action(
-                mode,
-                str(citation_decision.get("target_id") or "root"),
-                "",
-                str(citation_decision.get("reason") or "citation-pass literature scan"),
-                plan_step_budget(problem, mode, requested_tokens),
-                research_mode=research_mode,
-                retrieval_required=True,
-                search_permission=citation_decision.get("search_permission", "live"),
-                search_intent=citation_decision.get("search_intent", "citation_pass"),
-            )
-        if completion_policy != "publication_ready":
-            return _action(
-                "stop_solved",
-                "root",
-                _integrated_route_for_claim(state, "root"),
-                "root is integrated, certified final proof exists, and the explicit citation pass is complete",
-                plan_step_budget(problem, "stop_solved", 0),
-                research_mode=research_mode,
-                terminal_classification="solved_final",
-                final_artifact_id=final_artifact.get("artifact_id", ""),
-            )
+            if citation_decision.get("run"):
+                mode = "retrieve"
+                return _action(
+                    mode,
+                    str(citation_decision.get("target_id") or "root"),
+                    "",
+                    str(citation_decision.get("reason") or "citation-pass literature scan"),
+                    plan_step_budget(problem, mode, requested_tokens),
+                    research_mode=research_mode,
+                    retrieval_required=True,
+                    search_permission=citation_decision.get("search_permission", "live"),
+                    search_intent=citation_decision.get("search_intent", "citation_pass"),
+                )
         writing_gate = _writing_gate_action(
             store,
             state,
@@ -916,18 +895,26 @@ def _plan_next_action(
             problem=problem,
             requested_tokens=requested_tokens,
             research_mode=research_mode,
+            editorial_review_required=completion_policy == "publication_ready",
         )
         if writing_gate:
             return writing_gate
+        paper_artifact = _final_paper_artifact(state)
         return _action(
             "stop_solved",
             "root",
             _integrated_route_for_claim(state, "root"),
-            "root is integrated and final proof artifact exists",
+            (
+                "root is integrated and the standalone LaTeX final paper passed deterministic delivery checks"
+                if paper_artifact
+                else "root is integrated and the audit-mode final proof artifact exists"
+            ),
             plan_step_budget(problem, "stop_solved", 0),
             research_mode=research_mode,
             terminal_classification="solved_final",
             final_artifact_id=final_artifact.get("artifact_id", ""),
+            final_paper_artifact_id=(paper_artifact or {}).get("artifact_id", ""),
+            certificate_artifact_id=final_artifact.get("artifact_id", ""),
         )
 
     # Highest priority after a solved/integrated root: if the root has been refuted by a
@@ -10309,8 +10296,9 @@ def _writing_gate_action(
     problem: Mapping[str, Any],
     requested_tokens: Optional[int],
     research_mode: str,
+    editorial_review_required: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    """Publication writing gate between an internal certificate and stop_solved.
+    """LaTeX delivery gate between an internal certificate and stop_solved.
 
     Mathematical correctness review is out of scope because the main harness
     already verified ``final_proof``, which remains internal and is never
@@ -10324,14 +10312,12 @@ def _writing_gate_action(
     a diff-minimal revision with every open debt enumerated. Deterministic-only
     repairs have their own budget and never consume the review-driven budget.
 
-    A clean paper then receives, in order, the terminology editor, introduction
-    editor, and whole-paper editor. Completed lenses are not reset by unrelated
-    revisions, but any document revised after its whole-paper audit must pass a
-    final editor confirmation. An uncertain terminology finding pauses for an
-    explicit human decision. Any unresolved blocker or major after automated budgets are
-    exhausted also pauses for human resolution; the gate never silently ships
-    major writing debt. Generation residue and compile failures remain
-    non-bypassable past the normal caps.
+    With ``editorial_review_required``, a clean paper then receives, in order,
+    the terminology editor, introduction editor, and whole-paper editor.
+    Default theorem runs omit those publication-only reviews but still require
+    the standalone final_paper and every deterministic register/lint/compile
+    check. Generation residue and compile failures remain non-bypassable past
+    the normal caps.
     """
     certificate_id = str(final_artifact.get("artifact_id") or "")
     if not certificate_id:
@@ -10364,6 +10350,7 @@ def _writing_gate_action(
         requested_tokens=requested_tokens,
         research_mode=research_mode,
         external_revision=False,
+        editorial_review_required=editorial_review_required,
     )
 
 
@@ -10422,6 +10409,7 @@ def _writing_existing_document_gate_action(
     requested_tokens: Optional[int],
     research_mode: str,
     external_revision: bool,
+    editorial_review_required: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Run deterministic checks and the three independent writing reviews."""
 
@@ -10445,26 +10433,41 @@ def _writing_existing_document_gate_action(
         _sync_writing_compile_debt(store, artifact_id)
     gate = _writing_gate_state(store, artifact_id)
     open_debts = gate["open_writing_debts"]
-    blocking = [
+    all_blocking = [
         debt
         for debt in open_debts
         if str(debt.get("severity") or "") in WRITING_GATE_BLOCKING_SEVERITIES
     ]
-    consultation = _writing_human_consultation_action(
-        store,
-        blocking,
-        artifact_id=artifact_id,
-        problem=problem,
-        research_mode=research_mode,
+    blocking = all_blocking if editorial_review_required else [
+        debt
+        for debt in all_blocking
+        if str(debt.get("debt_id") or "").startswith(
+            (WRITING_LINT_DEBT_PREFIX, WRITING_COMPILE_DEBT_PREFIX)
+        )
+    ]
+    consultation = (
+        _writing_human_consultation_action(
+            store,
+            blocking,
+            artifact_id=artifact_id,
+            problem=problem,
+            research_mode=research_mode,
+        )
+        if editorial_review_required
+        else None
     )
     if consultation is not None:
         return consultation
 
-    remaining_lenses = [
-        lens
-        for lens in WRITING_GATE_REVIEW_LENSES
-        if int(gate["lens_sessions"].get(lens, 0)) < PAPER_EDITOR_MAX_PASSES
-    ]
+    remaining_lenses = (
+        [
+            lens
+            for lens in WRITING_GATE_REVIEW_LENSES
+            if int(gate["lens_sessions"].get(lens, 0)) < PAPER_EDITOR_MAX_PASSES
+        ]
+        if editorial_review_required
+        else []
+    )
     if blocking:
         deterministic_only = all(
             str(debt.get("debt_id") or "").startswith(
@@ -10558,7 +10561,8 @@ def _writing_existing_document_gate_action(
         # unresolved major debt.
 
     final_editor_confirmation = (
-        not blocking
+        editorial_review_required
+        and not blocking
         and not remaining_lenses
         and int(gate["current_lens_sessions"].get(WRITING_GATE_EDITOR_LENS, 0))
         < PAPER_EDITOR_MAX_PASSES

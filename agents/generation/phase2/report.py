@@ -194,6 +194,13 @@ def build_markdown_report(store: ProofStateStore) -> str:
     else:
         for debt in active_debts:
             lines.append(f"- `{debt['debt_id']}` `{debt['severity']}` on `{debt['owner_id']}`: {debt['obligation']}")
+    lines.extend(["", "## Refuted Proof Debts", ""])
+    refuted_debts = [row for row in state["debts"] if row["status"] == "refuted"]
+    if not refuted_debts:
+        lines.append("No refuted proof debts.")
+    else:
+        for debt in refuted_debts:
+            lines.append(f"- `{debt['debt_id']}` on `{debt['owner_id']}`: {debt['obligation']}")
     return "\n".join(lines) + "\n"
 
 

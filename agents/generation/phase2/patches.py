@@ -908,6 +908,8 @@ def _nested_payload_op(op: Dict[str, Any], nested_key: str, kind: str) -> Dict[s
 
 def _normalize_debt_fields(op: Dict[str, Any], *, patch_target_id: str = "") -> None:
     """Map agent debt shapes (owner/description/blocking_claim_id) to the schema."""
+    if not op.get("resolution_note") and op.get("resolution"):
+        op["resolution_note"] = op["resolution"]
     if not op.get("obligation"):
         for alt in ("description", "obligation_text", "detail", "statement", "summary"):
             if op.get(alt):
@@ -1220,13 +1222,20 @@ def _bind_evidence_targets(operations: Sequence[Any], patch: Mapping[str, Any]) 
 
     The stamp is derived only from transitions that cite the artifact.  This
     preserves convenient same-patch verifier output while preventing a report
-    from being replayed later against an unrelated claim or inference.
+    from being replayed later against an unrelated claim, inference, or debt.
     """
 
     transitions = [
         op
         for op in operations
         if isinstance(op, dict) and str(op.get("op") or "") == "propose_status_transition"
+    ]
+    debt_refutations = [
+        op
+        for op in operations
+        if isinstance(op, dict)
+        and str(op.get("op") or "") == "update_debt"
+        and str(op.get("status") or "") == "refuted"
     ]
     patch_evidence = {str(item) for item in (patch.get("evidence_artifact_ids") or []) if str(item)}
     for op in operations:
@@ -1257,6 +1266,21 @@ def _bind_evidence_targets(operations: Sequence[Any], patch: Mapping[str, Any]) 
                     "route_id": str(transition.get("route_id") or ""),
                 }
             )
+        for debt_op in debt_refutations:
+            cited = {
+                str(item)
+                for item in (
+                    debt_op.get("resolution_evidence_artifact_ids")
+                    or debt_op.get("evidence_artifact_ids")
+                    or patch_evidence
+                )
+                if str(item)
+            }
+            if artifact_id not in cited:
+                continue
+            debt_id = str(debt_op.get("debt_id") or "").strip()
+            if debt_id:
+                targets.append({"target_type": "debt", "target_id": debt_id, "route_id": ""})
         if not targets:
             patch_target = str(op.get("target_id") or patch.get("target_id") or "").strip()
             if patch_target:
@@ -2859,6 +2883,16 @@ def _debt_operation(
             raise PatchRejected([f"unknown debt: {debt_id}"])
         evidence = dict(op.get("resolution_evidence", {}))
         actor = str(patch.get("actor_role") or "")
+        if row["status"] == "refuted":
+            existing_evidence = json_loads(row["resolution_evidence_json"], {})
+            if not isinstance(existing_evidence, dict):
+                existing_evidence = {}
+            existing_evidence.update(evidence)
+            conn.execute(
+                "UPDATE debts SET last_seen = ?, resolution_evidence_json = ? WHERE debt_id = ?",
+                (utc_now(), json_dumps(existing_evidence), debt_id),
+            )
+            return
         if actor not in VERIFYING_ROLES:
             evidence.setdefault("repair_submitted_by", actor)
             evidence.setdefault("resolution_status", "repair_submitted_pending_verifier")
@@ -2894,10 +2928,65 @@ def _debt_operation(
         severity = _normalize_debt_severity(op.get("severity", row["severity"]))
         if status not in DEBT_STATUSES or severity not in DEBT_SEVERITIES:
             raise PatchRejected(["invalid debt status or severity"])
+        actor = str(patch.get("actor_role") or "")
+        if row["status"] == "refuted" and status != "refuted":
+            raise PatchRejected(
+                [
+                    f"refuted debt {debt_id} cannot be reclassified as {status}; create a corrected obligation as a new debt"
+                ]
+            )
         resolution_json = row["resolution_evidence_json"]
         resolution_note = str(op.get("resolution_note") or "").strip()
         resolution_ids = [str(item) for item in (op.get("resolution_evidence_artifact_ids") or []) if str(item or "")]
         resolution_extra = op.get("resolution_evidence") if isinstance(op.get("resolution_evidence"), Mapping) else {}
+        if status == "refuted":
+            if actor not in {"strict_informal_verifier", "counterexample_validator"}:
+                raise PatchRejected(
+                    [
+                        f"{actor} cannot mark debt {debt_id} as refuted; expected counterexample_validator or strict_informal_verifier"
+                    ]
+                )
+            evidence_ids = list(
+                dict.fromkeys(
+                    resolution_ids
+                    + [str(item) for item in (op.get("evidence_artifact_ids") or []) if str(item or "")]
+                    + [str(item) for item in (patch.get("evidence_artifact_ids") or []) if str(item or "")]
+                )
+            )
+            has_confirmed_counterexample = _has_artifact_type(
+                conn,
+                evidence_ids,
+                "confirmed_counterexample",
+                target_type="debt",
+                target_id=debt_id,
+                producer_role="counterexample_validator",
+            )
+            has_strict_refutation_report = (
+                actor == "strict_informal_verifier"
+                and _has_clean_verification(
+                    conn,
+                    evidence_ids,
+                    outcome="refutation",
+                    target_type="debt",
+                    target_id=debt_id,
+                    producer_role="strict_informal_verifier",
+                )
+            )
+            if not has_confirmed_counterexample and not has_strict_refutation_report:
+                raise PatchRejected(
+                    [
+                        "refuted debt status requires debt-bound confirmed_counterexample evidence or a "
+                        "zero-gap strict_informal_verifier verification_report"
+                    ]
+                )
+            resolution_extra = dict(resolution_extra)
+            resolution_extra.update(
+                {
+                    "classification": "refuted",
+                    "resolution_status": "closed_by_refutation",
+                    "refuted_by": actor,
+                }
+            )
         if resolution_note or resolution_ids or resolution_extra:
             evidence = json_loads(resolution_json, {})
             if not isinstance(evidence, dict):
@@ -2925,6 +3014,8 @@ def _debt_operation(
     status = _normalize_debt_status(op.get("status", "active"))
     if severity not in DEBT_SEVERITIES or status not in DEBT_STATUSES:
         raise PatchRejected(["invalid debt status or severity"])
+    if status == "refuted":
+        raise PatchRejected(["new debts must be created as active; use an evidence-gated update_debt to refute an existing debt"])
     existing = conn.execute(
         "SELECT * FROM debts WHERE owner_type = ? AND owner_id = ? AND fingerprint = ?",
         (owner_type, owner_id, fingerprint),
@@ -2975,6 +3066,11 @@ def _refresh_existing_debt(
     status: str,
 ) -> None:
     source_ids = sorted(set(json_loads(existing["source_artifact_ids_json"]) + list(op.get("source_artifact_ids", []))))
+    # A duplicate add_debt operation must not silently resurrect a verifier-
+    # refuted obligation.  A materially corrected obligation needs a new
+    # fingerprint and therefore a new debt row.
+    if existing["status"] == "refuted":
+        status = "refuted"
     conn.execute(
         """
         UPDATE debts

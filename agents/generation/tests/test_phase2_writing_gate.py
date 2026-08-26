@@ -154,7 +154,7 @@ def make_solved_store(tmpdir: Path, problem_id: str) -> ProofStateStore:
 
 
 class SolvedRunTerminationTest(unittest.TestCase):
-    def test_default_full_proof_first_stops_before_optional_paper_work(self) -> None:
+    def test_default_full_proof_first_authors_latex_before_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_solved_store(Path(tmpdir), "solved-run-termination-test")
             store.set_completion_policy("full_proof_first", reason="default theorem workflow", source="test")
@@ -162,10 +162,46 @@ class SolvedRunTerminationTest(unittest.TestCase):
 
             action = next_action(store, web_search="disabled")
 
+            self.assertEqual("write", action["mode"], action)
+            self.assertTrue(action.get("paper_authoring"), action)
+            self.assertEqual("final-proof-1", action["certificate_artifact_id"])
+            self.assertEqual(WRITING_GATE_PAPER_INTENT, action["search_intent"])
+
+    def test_default_full_proof_first_stops_after_clean_latex_without_editor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = make_solved_store(Path(tmpdir), "solved-run-latex-delivered-test")
+            store.set_completion_policy("full_proof_first", reason="default theorem workflow", source="test")
+            attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
+            insert_final_paper(store, "final-paper-1", CLEAN_FINAL_PAPER)
+
+            action = next_action(store, web_search="disabled")
+
             self.assertEqual("stop_solved", action["mode"], action)
             self.assertEqual("solved_final", action["terminal_classification"])
             self.assertEqual("final-proof-1", action["final_artifact_id"])
+            self.assertEqual("final-paper-1", action["final_paper_artifact_id"])
+            self.assertEqual("final-proof-1", action["certificate_artifact_id"])
             self.assertFalse(action.get("paper_authoring"), action)
+            self.assertFalse(action.get("critic_lens"), action)
+
+    def test_default_full_proof_first_repairs_noncompiling_latex_before_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = make_solved_store(Path(tmpdir), "solved-run-broken-latex-test")
+            store.set_completion_policy("full_proof_first", reason="default theorem workflow", source="test")
+            attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
+            insert_final_paper(
+                store,
+                "final-paper-broken",
+                CLEAN_FINAL_PAPER,
+                pdf_status="compile_failed",
+                latex_log="! Undefined control sequence.\nl.7 \\badmacro\n",
+            )
+
+            action = next_action(store, web_search="disabled")
+
+            self.assertEqual("write", action["mode"], action)
+            self.assertTrue(action.get("paper_revision"), action)
+            self.assertEqual(WRITING_GATE_DETERMINISTIC_REVISION_INTENT, action["search_intent"])
 
 
 def attach_final_proof(store: ProofStateStore, artifact_id: str, content: str) -> None:

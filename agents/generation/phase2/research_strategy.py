@@ -964,6 +964,21 @@ def approach_portfolio_view(state: Mapping[str, Any]) -> Dict[str, Any]:
         for item in _json_list((artifact or {}).get("metadata", {}).get("selected_approach_ids"))
         if str(item)
     }
+    if candidates and not selected_ids:
+        selected_ids = {
+            str(item.get("approach_id") or "")
+            for item in candidates
+            if str(item.get("status") or "") in {"selected", "pilot", "active"}
+            and str(item.get("approach_id") or "")
+        }
+    if candidates and not selected_ids:
+        # Missing advisory ranking metadata must not make useful ideas vanish.
+        # This fallback has no proof or verification authority.
+        selected_ids = {
+            str(item.get("approach_id") or "")
+            for item in candidates[:2]
+            if str(item.get("approach_id") or "")
+        }
     ranked = sorted(
         candidates,
         key=lambda item: (
@@ -977,6 +992,32 @@ def approach_portfolio_view(state: Mapping[str, Any]) -> Dict[str, Any]:
     alignment_evidence = (
         approach_alignment_evidence(state, portfolio_revision=portfolio_revision) if artifact else []
     )
+    approach_runs = [
+        run
+        for run in state.get("recent_runs", [])
+        if str(run.get("search_intent") or "")
+        in {APPROACH_PORTFOLIO_INTENT, APPROACH_REFRESH_INTENT}
+    ]
+    approach_runs.sort(
+        key=lambda run: (
+            int(run.get("state_revision") or 0),
+            str(run.get("created_at") or ""),
+            str(run.get("run_id") or ""),
+        ),
+        reverse=True,
+    )
+    latest_run = approach_runs[0] if approach_runs else {}
+    latest_status = str(latest_run.get("status") or "").lower()
+    if artifact:
+        generation_status = "current"
+    elif latest_status in {"running", "started", "in_progress", "pending"}:
+        generation_status = "generating"
+    elif latest_status in {"failed", "error", "cancelled", "timeout", "patch_rejected"}:
+        generation_status = "retry_pending"
+    elif latest_status in {"completed", "succeeded", "success"}:
+        generation_status = "missing_output_retry_pending"
+    else:
+        generation_status = "pending"
     return {
         "artifact_id": str(artifact.get("artifact_id") or "") if artifact else "",
         "state_revision": int(artifact.get("state_revision") or 0) if artifact else 0,
@@ -986,6 +1027,12 @@ def approach_portfolio_view(state: Mapping[str, Any]) -> Dict[str, Any]:
         "approach_count": len(ranked),
         "selected_approach_ids": sorted(selected_ids),
         "research_questions": _json_list((artifact or {}).get("metadata", {}).get("research_questions")),
+        "generation_state": {
+            "status": generation_status,
+            "latest_run_id": str(latest_run.get("run_id") or ""),
+            "latest_run_status": latest_status,
+            "attempt_count": len(approach_runs),
+        },
         "alignment_status": "stale" if alignment_evidence else ("current" if artifact else "uninitialized"),
         "alignment_evidence": alignment_evidence,
         "contribution_legend": {
@@ -3289,7 +3336,7 @@ def _validate_experiment(metadata: Mapping[str, Any]) -> list[str]:
 def _validate_approach_portfolio(metadata: Mapping[str, Any], conn: sqlite3.Connection) -> list[str]:
     errors = _require_fields(
         metadata,
-        ("portfolio_kind", "brainstorming_summary", "approaches", "selected_approach_ids"),
+        ("portfolio_kind", "approaches"),
         prefix="approach_portfolio",
     )
     kind = str(metadata.get("portfolio_kind") or "")
@@ -3327,7 +3374,11 @@ def _validate_approach_portfolio(metadata: Mapping[str, Any], conn: sqlite3.Conn
                     f"approach_portfolio alignment_evidence_artifact_ids contains unknown artifact {artifact_id}"
                 )
     candidates = _approach_candidates(metadata)
-    minimum = 6 if kind == "initial" else 3
+    # Six initial ideas (three on refresh) remain the prompt-level quality
+    # target. Since this artifact is advisory and carries no proof authority,
+    # persist a smaller usable portfolio instead of discarding every idea when
+    # the model omits nonessential profiling metadata.
+    minimum = 3 if kind == "initial" else 2
     if not minimum <= len(candidates) <= 12:
         errors.append(f"approach_portfolio requires {minimum} to 12 approaches for portfolio_kind={kind or 'unknown'}")
         return errors
@@ -3342,21 +3393,9 @@ def _validate_approach_portfolio(metadata: Mapping[str, Any], conn: sqlite3.Conn
                     "approach_id",
                     "title",
                     "mechanism",
-                    "mathematical_objects",
-                    "representation_or_invariant",
                     "root_consequence",
-                    "bridge_statement",
-                    "contribution_level",
-                    "contribution_kind",
-                    "evidence",
-                    "likely_failure_mode",
                     "decisive_test",
-                    "estimated_cost",
-                    "novelty_score",
-                    "confidence",
-                    "confidence_basis",
                     "status",
-                    "semantic_signature",
                     *(("steering_impact",) if alignment_required else ()),
                 ),
                 prefix=prefix,
@@ -3366,43 +3405,50 @@ def _validate_approach_portfolio(metadata: Mapping[str, Any], conn: sqlite3.Conn
         if approach_id in approach_ids:
             errors.append(f"duplicate approach id: {approach_id}")
         approach_ids.add(approach_id)
-        if not _nonempty_list(candidate.get("mathematical_objects")):
+        if "mathematical_objects" in candidate and not _nonempty_list(candidate.get("mathematical_objects")):
             errors.append(f"{prefix} mathematical_objects must be a nonempty list")
-        try:
-            contribution = int(candidate.get("contribution_level"))
-        except (TypeError, ValueError):
-            contribution = -1
-        if not 0 <= contribution <= 5:
-            errors.append(f"{prefix} contribution_level must be an integer from 0 to 5")
-        if str(candidate.get("contribution_kind") or "") not in APPROACH_CONTRIBUTION_KINDS:
+        if "contribution_level" in candidate:
+            try:
+                contribution = int(candidate.get("contribution_level"))
+            except (TypeError, ValueError):
+                contribution = -1
+            if not 0 <= contribution <= 5:
+                errors.append(f"{prefix} contribution_level must be an integer from 0 to 5")
+        if (
+            "contribution_kind" in candidate
+            and str(candidate.get("contribution_kind") or "") not in APPROACH_CONTRIBUTION_KINDS
+        ):
             errors.append(f"{prefix} has invalid contribution_kind")
-        if str(candidate.get("estimated_cost") or "") not in APPROACH_COSTS:
+        if "estimated_cost" in candidate and str(candidate.get("estimated_cost") or "") not in APPROACH_COSTS:
             errors.append(f"{prefix} estimated_cost must be low, medium, or high")
-        try:
-            novelty = float(candidate.get("novelty_score"))
-        except (TypeError, ValueError):
-            novelty = -1.0
-        if not 0.0 <= novelty <= 1.0:
-            errors.append(f"{prefix} novelty_score must lie in [0, 1]")
-        if str(candidate.get("confidence") or "") not in APPROACH_CONFIDENCE_LEVELS:
+        if "novelty_score" in candidate:
+            try:
+                novelty = float(candidate.get("novelty_score"))
+            except (TypeError, ValueError):
+                novelty = -1.0
+            if not 0.0 <= novelty <= 1.0:
+                errors.append(f"{prefix} novelty_score must lie in [0, 1]")
+        if "confidence" in candidate and str(candidate.get("confidence") or "") not in APPROACH_CONFIDENCE_LEVELS:
             errors.append(f"{prefix} confidence must be low, medium, or high")
         if str(candidate.get("status") or "") not in APPROACH_STATUSES:
             errors.append(f"{prefix} has invalid status")
         signature = _json_object(candidate.get("semantic_signature"))
-        errors.extend(
-            _require_fields(
-                signature,
-                ("mechanism", "representation", "proof_direction", "theorem_family", "root_obligation", "failure_mode"),
-                prefix=f"{prefix}.semantic_signature",
-            )
-        )
+        if not signature:
+            signature = {
+                "mechanism": str(candidate.get("mechanism") or ""),
+                "representation": str(candidate.get("representation_or_invariant") or ""),
+                "proof_direction": "",
+                "theorem_family": "",
+                "root_obligation": str(candidate.get("bridge_statement") or candidate.get("root_consequence") or ""),
+                "failure_mode": str(candidate.get("likely_failure_mode") or ""),
+            }
         fingerprint = normalize_text(json.dumps(signature, sort_keys=True, ensure_ascii=True))
         if fingerprint and fingerprint in semantic_signatures:
             errors.append(f"{prefix} duplicates another semantic_signature")
         semantic_signatures.add(fingerprint)
     selected = _unique_strings(metadata.get("selected_approach_ids"))
-    if not 2 <= len(selected) <= 3:
-        errors.append("approach_portfolio requires two or three selected_approach_ids")
+    if selected and not 1 <= len(selected) <= 3:
+        errors.append("approach_portfolio accepts at most three selected_approach_ids")
     unknown = [item for item in selected if item not in approach_ids]
     if unknown:
         errors.append("approach_portfolio selected_approach_ids must name portfolio approaches")

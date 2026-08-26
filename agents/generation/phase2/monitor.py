@@ -2370,6 +2370,7 @@ function renderApproachPortfolio(strategy){
   strategy = strategy || {};
   const portfolio = strategy.approach_portfolio || {};
   const approaches = portfolio.approaches || [];
+  const generation = portfolio.generation_state || {};
   const selected = new Set(portfolio.selected_approach_ids || []);
   const alignmentStatus = String(portfolio.alignment_status || "current");
   const alignmentEvidence = portfolio.alignment_evidence || [];
@@ -2378,8 +2379,15 @@ function renderApproachPortfolio(strategy){
   const lease = strategy.bottleneck_lease || {};
   let portfolioChanged = false;
   if (!approaches.length){
-    $("approachCount").innerHTML = `<span class="pill info">brainstorming pending</span>`;
-    portfolioChanged = setStableHTML($("approachPortfolio"), `<div class="portfolio-head"><div class="empty">The next hard-problem research cycle will generate a semantically diverse portfolio before local proof work.</div><button class="btn approach-refresh">Generate approaches</button></div>`);
+    const generationStatus = String(generation.status || "pending");
+    const generationLabel = generationStatus === "generating" ? "brainstorming now" : generationStatus.includes("retry") ? "retry queued" : "brainstorming pending";
+    const generationDetail = generationStatus === "generating"
+      ? "A dedicated brainstorming pass is generating mathematically distinct routes now."
+      : generationStatus.includes("retry")
+      ? `The last brainstorming pass produced no usable portfolio${generation.latest_run_status?` (${esc(generation.latest_run_status)})`:""}; Albilich will retry before treating the Ideas section as initialized.`
+      : "The next hard-problem research cycle will generate a semantically diverse portfolio before local proof work.";
+    $("approachCount").innerHTML = `<span class="pill info">${generationLabel}</span>`;
+    portfolioChanged = setStableHTML($("approachPortfolio"), `<div class="portfolio-head"><div class="empty">${generationDetail}</div><button class="btn approach-refresh">Generate approaches</button></div>`);
   } else {
     $("approachCount").innerHTML = `${num(approaches.length)} routes · ${num(selected.size)} selected${alignmentPending?' · <span class="pill warn">refresh required</span>':''}`;
     const leaseClass = lease.escape_required ? "bad" : "good";

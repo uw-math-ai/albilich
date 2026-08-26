@@ -92,6 +92,70 @@ def _state() -> dict:
 
 
 class ResearchIntelligenceTests(unittest.TestCase):
+    def test_decisive_frontier_honors_latest_advisor_root_cut_replacement(self) -> None:
+        state = {
+            "claims": [
+                {
+                    "claim_id": "root",
+                    "validation_status": "untested",
+                    "lifecycle_status": "active",
+                    "parent_ids": [],
+                }
+            ],
+            "routes": [
+                {
+                    "route_id": "route_root",
+                    "conclusion_claim_id": "root",
+                    "relation_to_parent": "sufficient",
+                    "status": "active",
+                }
+            ],
+            "inferences": [],
+            "debts": [
+                {
+                    "debt_id": "debt_stale",
+                    "owner_type": "route",
+                    "owner_id": "route_root",
+                    "status": "active",
+                    "severity": "blocking",
+                    "obligation": "A falsified interface retained only for provenance.",
+                },
+                {
+                    "debt_id": "debt_current",
+                    "owner_type": "route",
+                    "owner_id": "route_root",
+                    "status": "active",
+                    "severity": "blocking",
+                    "obligation": "The advisor-selected replacement theorem.",
+                },
+            ],
+            "artifacts": [
+                {
+                    "artifact_id": "advisor_latest",
+                    "artifact_type": "advisor_report",
+                    "producer_role": "phd_advisor",
+                    "state_revision": 12,
+                    "metadata": {
+                        "root_cut_signature_before": [
+                            "debt:debt_stale",
+                            "debt:debt_current",
+                        ],
+                        "root_cut_signature_after": ["debt:debt_current"],
+                    },
+                }
+            ],
+        }
+
+        frontier = decisive_obligation_frontier(state)
+
+        self.assertEqual(frontier["decisive_obligation"]["obligation_id"], "debt_current")
+        self.assertEqual(frontier["advisor_root_cut_order"], ["debt_current"])
+        self.assertEqual(frontier["advisor_retired_debt_ids"], ["debt_stale"])
+        self.assertNotIn(
+            "debt_stale",
+            {row["obligation_id"] for row in frontier["minimal_cut_obligations"]},
+        )
+
     def test_graph_frontier_selects_smallest_sufficient_route_cut(self) -> None:
         frontier = decisive_obligation_frontier(_state())
         self.assertTrue(frontier["graph_derived"])
@@ -336,6 +400,54 @@ class ResearchIntelligenceTests(unittest.TestCase):
         self.assertTrue(validate_proof_interface_metadata(metadata))
         metadata["dependencies_assemble"] = True
         self.assertEqual(validate_proof_interface_metadata(metadata), [])
+
+    def test_elementary_side_claim_skips_large_interface_checklist(self) -> None:
+        state = _state()
+        state["claims"].append(
+            {
+                "claim_id": "easy-side-lemma",
+                "statement": "The identity element belongs to the group.",
+                "root_impact": 0.2,
+                "validation_status": "plausible",
+                "lifecycle_status": "active",
+            }
+        )
+
+        elementary = proof_interface_contract(
+            {"mode": "prove", "target_id": "easy-side-lemma", "route_id": "route-easy"},
+            state=state,
+        )
+        root = proof_interface_contract(
+            {"mode": "prove", "target_id": "root", "route_id": "route-root"},
+            state=state,
+        )
+        enriched_elementary = enrich_action(
+            state,
+            {"mode": "prove", "target_id": "easy-side-lemma", "route_id": "route-easy"},
+        )
+
+        self.assertEqual(elementary, {})
+        self.assertEqual(root["proof_interface_check_version"], 2)
+        self.assertFalse(enriched_elementary.get("proof_interface_check_required", False))
+
+    def test_high_risk_side_claim_keeps_large_interface_checklist(self) -> None:
+        state = _state()
+        state["claims"].append(
+            {
+                "claim_id": "high-impact-side-lemma",
+                "statement": "The reduction covers every remaining case.",
+                "root_impact": 0.8,
+                "validation_status": "plausible",
+                "lifecycle_status": "active",
+            }
+        )
+
+        contract = proof_interface_contract(
+            {"mode": "prove", "target_id": "high-impact-side-lemma", "route_id": "route-high"},
+            state=state,
+        )
+
+        self.assertEqual(contract["proof_interface_check_version"], 2)
 
     def test_scheduled_verifier_patch_must_include_interface_version(self) -> None:
         action = {"mode": "prove", "route_id": "route-short", "proof_interface_check_required": True}

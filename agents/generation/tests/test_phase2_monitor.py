@@ -179,6 +179,9 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("Portfolio refresh queued", INDEX_HTML)
         self.assertIn("Root effect${alignmentPending?' (stale)':''}", INDEX_HTML)
         self.assertIn("Steering impact", INDEX_HTML)
+        self.assertIn("brainstorming now", INDEX_HTML)
+        self.assertIn("retry queued", INDEX_HTML)
+        self.assertIn("produced no usable portfolio", INDEX_HTML)
 
     def test_steering_ui_distinguishes_queued_processing_and_processed(self) -> None:
         self.assertIn('`${processing} processing`', INDEX_HTML)

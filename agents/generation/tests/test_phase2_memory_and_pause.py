@@ -122,6 +122,7 @@ class MemoryStatusClassifierTests(unittest.TestCase):
 
         self.assertEqual(debt_memory_status({"status": "active", "severity": "blocking"}), "blocked")
         self.assertEqual(debt_memory_status({"status": "resolved", "severity": "blocking"}), "superseded")
+        self.assertEqual(debt_memory_status({"status": "refuted", "severity": "blocking"}), "failed")
         self.assertEqual(debt_memory_status({"status": "discarded", "severity": "minor"}), "stale")
 
         self.assertEqual(artifact_memory_status({"artifact_type": "final_proof"}), "verified")

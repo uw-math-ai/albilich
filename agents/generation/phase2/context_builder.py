@@ -1523,7 +1523,7 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
         ],
         "base_revision_rule": "Use manifest.state_revision exactly.",
         "artifact_rule": "Prefer inline content in attach_artifact; do not set producer_role; artifact paths must stay under the current proof-state artifacts directory.",
-        "status_rule": "Only verifier/integration roles may propose verified, refuted, or integrated status transitions.",
+        "status_rule": "Only verifier/integration roles may propose verified, refuted, or integrated status transitions. A proof debt whose obligation is disproved must be marked status=refuted with debt-bound verifier evidence; do not leave it active/blocked and do not collapse it to resolved.",
         "closed_claim_rule": "Do not add a new active sufficient route whose conclusion_claim_id is already integrated. Add evidence to an existing route/inference only when repairing an explicit integration/root-synthesis debt, otherwise work the next root-level gap.",
         "debt_owner_rule": "For add_debt/update_debt, owner_id must be a concrete graph id copied from an existing or same-patch claim_id, route_id, or inference_id. Never use agent role names such as researcher, phd_advisor, advisor, verifier, or literature_researcher as owner_id; put the responsible role in prose or metadata instead.",
         "schema_discovery_rule": "Do not read agents/generation/phase2/*.py, schemas, tests, or README just to discover patch syntax; use these templates.",
@@ -1566,6 +1566,7 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
         "strict_verifier": [
             {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type=verification_report", "content", "metadata.verdict", "metadata.verification_report.checked_items", "metadata.verification_report.critical_errors", "metadata.verification_report.gaps"]},
             {"op": "propose_status_transition", "fields": ["target_type=claim|inference", "target_id", "status_type=validation", "new_status=informally_verified|formally_verified|refuted", "evidence_artifact_ids"]},
+            {"op": "update_debt", "fields": ["debt_id", "status=refuted", "resolution_note", "resolution_evidence_artifact_ids=<same-patch verification_report id>"], "rule": "Use when the debt obligation itself has been disproved by a zero-gap strict refutation. This retires the debt as a failed proposition, not as a merely resolved proof task."},
             {"op": "add_debt", "fields": ["debt_id", "owner_type=claim|route|inference", "owner_id", "debt_type=gap|missing_reference|missing_hypothesis", "severity=blocking|major|minor", "status=active", "obligation", "source_artifact_ids", "suggested_next_target"]},
         ],
         "citation_verifier": [
@@ -1584,6 +1585,7 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
                 "fields": ["target_type=claim", "target_id", "status_type=validation", "new_status=refuted", "evidence_artifact_ids=<same-patch confirmed_counterexample id>"],
                 "rule": "A fully confirmed declarative counterexample must record refuted in the same patch; do not leave the claim merely challenged.",
             },
+            {"op": "update_debt", "fields": ["debt_id", "status=refuted", "resolution_note", "resolution_evidence_artifact_ids=<same-patch confirmed_counterexample id>"], "rule": "Use when the confirmed counterexample disproves the debt obligation itself."},
             {"op": "add_debt", "fields": ["debt_id", "owner_type=claim", "owner_id", "debt_type=counterexample_validation", "severity=blocking", "status=active", "obligation"], "rule": "Use only when validation remains incomplete; do not attach confirmed_counterexample."},
         ],
         "writer": [
@@ -1600,7 +1602,7 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
             {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type=advisor_report|advisor_synthesis|route_triage_report|key_failure_analysis|invention_authorization|proof_compression", "content", "metadata.current_best_plan|metadata.recommended_next_action|metadata.next_task_acceptance_criteria|metadata.directed_researcher_mode(online|offline|cas)|metadata.directed_researcher_mode_reason|metadata.directed_researcher_mode_steps(1-3)|metadata.directed_villain_mode(online|offline|cas)|metadata.directed_villain_mode_reason|metadata.directed_villain_mode_steps(1-3)"]},
             {"op": "abandon_route", "fields": ["route_id", "reason", "failure_fingerprint", "evidence_artifact_ids"], "rule": "Use for a globally synthesized route-to-abandon decision; preserve verified facts and explain the replacement bottleneck."},
             {"op": "add_debt", "fields": ["debt_id", "owner_type=claim|route|inference", "owner_id", "debt_type=gap|missing_hypothesis|counterexample_risk", "severity=blocking|major|minor", "status=active", "obligation", "source_artifact_ids", "suggested_next_target"]},
-            {"op": "update_debt", "fields": ["debt_id", "status=active|blocked|paused", "resolution_note(optional)", "resolution_evidence_artifact_ids(optional)"], "rule": "Use only to sharpen or pause an existing proof obligation; do not close debts unless evidence already proves the obligation."},
+            {"op": "update_debt", "fields": ["debt_id", "status=active", "severity=blocking|major|minor", "suggested_next_target", "resolution_note(optional)", "resolution_evidence_artifact_ids(optional)"], "rule": "Use only to sharpen an existing proof obligation; do not close or refute debts. Debt refutation is reserved for evidence-gated verifier roles."},
         ],
         "general": [
             {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type", "content", "metadata(optional)"]},

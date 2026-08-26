@@ -4202,7 +4202,13 @@ class Phase2VerifierPatchAliasTest(unittest.TestCase):
                     "operations": [
                         {"op": "attach_artifact", "artifact_id": "vr-refute-x", "artifact_type": "verification_report", "metadata": {}, "content": content},
                         {"op": "set_claim_validation_status", "claim_id": "lemma-x", "validation_status": "refuted", "evidence_artifact_ids": ["vr-refute-x"]},
-                        {"op": "set_debt_status", "debt_id": "debt-lemma-x", "status": "resolved", "resolution": "Strict verifier proved the negation."},
+                        {
+                            "op": "set_debt_status",
+                            "debt_id": "debt-lemma-x",
+                            "status": "refuted",
+                            "resolution": "Strict verifier proved the negation.",
+                            "resolution_evidence_artifact_ids": ["vr-refute-x"],
+                        },
                     ],
                     "rationale": "verify refutation with explicit aliases",
                 },
@@ -4212,10 +4218,115 @@ class Phase2VerifierPatchAliasTest(unittest.TestCase):
                 conn.row_factory = sqlite3.Row
                 claim = conn.execute("SELECT validation_status FROM claims WHERE claim_id=?", ("lemma-x",)).fetchone()
                 inf = conn.execute("SELECT validation_status FROM inferences WHERE inference_id=?", ("inf-x",)).fetchone()
-                debt = conn.execute("SELECT status FROM debts WHERE debt_id=?", ("debt-lemma-x",)).fetchone()
+                debt = conn.execute(
+                    "SELECT status, resolution_evidence_json FROM debts WHERE debt_id=?",
+                    ("debt-lemma-x",),
+                ).fetchone()
             self.assertEqual(claim["validation_status"], "refuted")
             self.assertEqual(inf["validation_status"], "plausible")
-            self.assertEqual(debt["status"], "resolved")
+            self.assertEqual(debt["status"], "refuted")
+            resolution = json.loads(debt["resolution_evidence_json"])
+            self.assertEqual(resolution["classification"], "refuted")
+            self.assertEqual(resolution["resolution_status"], "closed_by_refutation")
+            self.assertEqual(resolution["resolution_note"], "Strict verifier proved the negation.")
+            self.assertEqual(resolution["resolution_evidence_artifact_ids"], ["vr-refute-x"])
+            report = build_markdown_report(store)
+            self.assertIn("## Refuted Proof Debts", report)
+            self.assertIn("`debt-lemma-x`", report)
+
+    def test_non_verifier_cannot_refute_a_debt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("debt-refutation-role-gate-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("root")
+            seeded = apply_patch(
+                store,
+                add_debt_patch(
+                    problem_id=store.problem_id,
+                    base_revision=store.get_revision(),
+                    debt_id="debt-false-bridge",
+                    obligation="Prove the proposed false bridge.",
+                ),
+            )
+            self.assertTrue(seeded.accepted, seeded.errors)
+            outcome = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {"op": "update_debt", "debt_id": "debt-false-bridge", "status": "refuted"}
+                    ],
+                    "rationale": "attempt an unevidenced refutation",
+                },
+            )
+            self.assertFalse(outcome.accepted)
+            self.assertTrue(any("cannot mark debt" in error for error in outcome.errors), outcome.errors)
+
+    def test_duplicate_add_does_not_reopen_refuted_debt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("debt-refutation-reopen-test", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("root")
+            seeded = apply_patch(
+                store,
+                add_debt_patch(
+                    problem_id=store.problem_id,
+                    base_revision=store.get_revision(),
+                    debt_id="debt-false-bridge",
+                    obligation="Prove the proposed false bridge.",
+                ),
+            )
+            self.assertTrue(seeded.accepted, seeded.errors)
+            content = {
+                "verdict": "correct_refutation",
+                "critical_errors": [],
+                "gaps": [],
+                "blocking_gap": False,
+                "summary": "The bridge has a concrete contradiction.",
+            }
+            refuted = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "strict_informal_verifier",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "vr-false-bridge",
+                            "artifact_type": "verification_report",
+                            "content": content,
+                        },
+                        {
+                            "op": "update_debt",
+                            "debt_id": "debt-false-bridge",
+                            "status": "refuted",
+                            "resolution_evidence_artifact_ids": ["vr-false-bridge"],
+                        },
+                    ],
+                    "rationale": "certify the false bridge",
+                },
+            )
+            self.assertTrue(refuted.accepted, refuted.errors)
+            duplicate = apply_patch(
+                store,
+                add_debt_patch(
+                    problem_id=store.problem_id,
+                    base_revision=store.get_revision(),
+                    debt_id="debt-false-bridge",
+                    obligation="Prove the proposed false bridge.",
+                ),
+            )
+            self.assertTrue(duplicate.accepted, duplicate.errors)
+            with sqlite3.connect(store.db_path) as conn:
+                status = conn.execute(
+                    "SELECT status FROM debts WHERE debt_id = ?", ("debt-false-bridge",)
+                ).fetchone()[0]
+            self.assertEqual(status, "refuted")
 
     def test_report_with_real_gap_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -17,8 +17,8 @@ Node vocabulary (update-advice TODO 3):
   list.
 - ``CandidateFact`` — a useful but unverified claim/inference; NEVER usable
   as settled proof input.
-- ``Obstruction`` — an active debt, failed route, or blocked/refuted claim
-  (missing hypotheses and blockers live here); resolved debts stay as
+- ``Obstruction`` — an active/refuted debt, failed route, or blocked/refuted
+  claim (missing hypotheses and blockers live here); closed debts stay as
   inactive obstructions so ``repairs`` edges have a target.
 - ``SourceFact`` — a retrieval card or theorem-library entry with its checked
   metadata.
@@ -135,7 +135,7 @@ class CandidateFact:
 class Obstruction:
     """An active debt, failed route, or blocked/refuted claim.
 
-    Resolved debts stay in the view as inactive obstructions (``active`` is
+    Resolved and refuted debts stay in the view as inactive obstructions (``active`` is
     False) so ``repairs`` edges have a target; only ACTIVE debts emit
     ``blocks`` edges.
     """
@@ -144,7 +144,7 @@ class Obstruction:
     source_table: str  # "debts" | "routes" | "claims"
     source_id: str
     description: str
-    obstruction_kind: str  # active_debt | resolved_debt | failed_route | blocked_claim | refuted_claim
+    obstruction_kind: str  # active_debt | resolved_debt | refuted_debt | failed_route | blocked_claim | refuted_claim
     severity: str
     owner_id: str
     active: bool
@@ -502,6 +502,8 @@ def build_fact_graph(
             kind, active = "active_debt", True
         elif status == "resolved":
             kind, active = "resolved_debt", False
+        elif status == "refuted":
+            kind, active = "refuted_debt", False
         else:
             continue  # discarded debts leave the view
         graph.nodes[f"debt:{debt_id}"] = Obstruction(

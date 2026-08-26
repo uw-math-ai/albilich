@@ -23,7 +23,7 @@ ROUTE_RELATIONS = {"sufficient", "necessary", "diagnostic", "variant"}
 ROUTE_STATUSES = {"active", "blocked", "abandoned", "integrated", "superseded"}
 INFERENCE_STATUSES = VALIDATION_STATUSES
 DEBT_SEVERITIES = {"blocking", "major", "minor", "discarded"}
-DEBT_STATUSES = {"active", "resolved", "discarded"}
+DEBT_STATUSES = {"active", "resolved", "refuted", "discarded"}
 # Persisted whole-run control states (problem_state.run_status).
 # dashboard_paused is reserved for a display-only dashboard freeze and never
 # blocks the workflow; pause_requested/stopping are transient request states.

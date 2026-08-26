@@ -335,6 +335,63 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         self.assertEqual(action["operation"], "approach_pilot")
         self.assertTrue(action["search_intent"].startswith("approach_pilot:"))
 
+    def test_compact_advisory_portfolio_is_retained_and_auto_selects_pilots(self) -> None:
+        compact = {
+            "strategy_schema_version": 1,
+            "portfolio_kind": "initial",
+            "approaches": [
+                {
+                    "approach_id": f"compact-{index}",
+                    "title": f"Compact route {index}",
+                    "mechanism": f"Use mechanism {index}.",
+                    "root_consequence": f"The mechanism would settle root branch {index}.",
+                    "decisive_test": f"Test boundary case {index}.",
+                    "status": "idea",
+                }
+                for index in range(3)
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-compact-approach-portfolio")
+            accepted = self._attach(
+                store,
+                "researcher",
+                "portfolio-compact",
+                "approach_portfolio",
+                compact,
+            )
+            self.assertTrue(accepted.accepted, accepted.errors)
+            view = approach_portfolio_view(store.get_scheduler_state())
+
+        self.assertEqual(view["approach_count"], 3)
+        self.assertEqual(view["selected_approach_ids"], ["compact-0", "compact-1"])
+        self.assertEqual(view["generation_state"]["status"], "current")
+
+    def test_failed_brainstorm_without_portfolio_is_visible_as_retry_pending(self) -> None:
+        state = _pure_strategy_state()
+        state["recent_runs"] = [
+            {
+                "run_id": "brainstorm-failed",
+                "actor_role": "researcher",
+                "mode": "reduce",
+                "target_id": "root",
+                "state_revision": 10,
+                "status": "failed",
+                "search_intent": "approach_portfolio_brainstorming",
+                "output_artifact_ids_json": "[]",
+            }
+        ]
+
+        view = approach_portfolio_view(state)
+        action = next_strategy_operation(
+            state,
+            {"mode": "reduce", "target_id": "root", "route_id": "", "research_mode": "hard_problem"},
+        )
+
+        self.assertEqual(view["generation_state"]["status"], "retry_pending")
+        self.assertEqual(view["generation_state"]["latest_run_id"], "brainstorm-failed")
+        self.assertEqual(action["operation"], "approach_portfolio_brainstorming")
+
     def test_approach_portfolio_rejects_semantic_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(tmpdir, "strategy-approach-duplicate")

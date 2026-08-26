@@ -16,7 +16,7 @@ from .models import json_loads, normalize_text
 
 
 OUTCOME_LEARNING_VERSION = 2
-OBLIGATION_FRONTIER_VERSION = 1
+OBLIGATION_FRONTIER_VERSION = 2
 DEEP_SESSION_ROI_VERSION = 1
 REPRESENTATION_SWITCH_VERSION = 1
 THEOREM_ADAPTATION_VERSION = 1
@@ -317,6 +317,51 @@ def _artifact_metadata(row: Mapping[str, Any]) -> Dict[str, Any]:
     return _json_object(row.get("metadata_json", row.get("metadata", {})))
 
 
+def _advisor_root_cut_policy(state: Mapping[str, Any]) -> tuple[list[str], set[str]]:
+    """Return the newest explicit advisor cut order and its retired debts.
+
+    Advisor reports may retain obsolete obstruction debts for provenance.  A
+    report that supplies both root-cut signatures is an explicit scheduling
+    decision, so debts removed from the successor cut must not reappear merely
+    because their durable graph rows remain active.
+    """
+
+    reports = [
+        row
+        for row in _artifact_rows(state)
+        if str(row.get("artifact_type") or "") in {"advisor_report", "advisor_synthesis"}
+        and str(row.get("producer_role") or "") == "phd_advisor"
+    ]
+    reports.sort(
+        key=lambda row: (
+            int(row.get("state_revision") or 0),
+            str(row.get("created_at") or ""),
+            str(row.get("artifact_id") or ""),
+        ),
+        reverse=True,
+    )
+    for report in reports:
+        metadata = _artifact_metadata(report)
+        if "root_cut_signature_before" not in metadata or "root_cut_signature_after" not in metadata:
+            continue
+
+        def debt_ids(values: Any) -> list[str]:
+            ids: list[str] = []
+            for item in _json_list(values):
+                value = str(item or "").strip()
+                if value.startswith("debt:"):
+                    value = value.removeprefix("debt:")
+                if value and value not in ids:
+                    ids.append(value)
+            return ids
+
+        before = debt_ids(metadata.get("root_cut_signature_before"))
+        after = debt_ids(metadata.get("root_cut_signature_after"))
+        if before:
+            return after, set(before) - set(after)
+    return [], set()
+
+
 def _verified_evidence_ids(state: Mapping[str, Any]) -> set[str]:
     evidence: set[str] = set()
     for claim in state.get("claims", []) or []:
@@ -514,6 +559,10 @@ def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the smallest active sufficient-route obligation cut near root."""
 
     debt_coverage_index = DebtCoverageIndex(state)
+    advisor_root_cut_order, advisor_retired_debt_ids = _advisor_root_cut_policy(state)
+    advisor_root_cut_rank = {
+        debt_id: index for index, debt_id in enumerate(advisor_root_cut_order)
+    }
     claims = {str(row.get("claim_id") or ""): row for row in state.get("claims", []) or []}
     inferences_by_route: Dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for inference in state.get("inferences", []) or []:
@@ -522,6 +571,7 @@ def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
         row
         for row in state.get("debts", []) or []
         if str(row.get("status") or "") == "active"
+        and str(row.get("debt_id") or "") not in advisor_retired_debt_ids
         and not debt_covered_by_integrated_claim(
             state,
             row,
@@ -625,6 +675,10 @@ def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
         ordered = sorted(
             obligations.values(),
             key=lambda item: (
+                0 if str(item.get("obligation_id") or "") in advisor_root_cut_rank else 1,
+                advisor_root_cut_rank.get(
+                    str(item.get("obligation_id") or ""), len(advisor_root_cut_rank)
+                ),
                 -int(item.get("weight") or 0),
                 root_distance_for_claim_id(state, str(item.get("target_id") or "")),
                 str(item.get("obligation_id") or ""),
@@ -676,6 +730,8 @@ def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
         "obligation_frontier_version": OBLIGATION_FRONTIER_VERSION,
         "policy": "smallest graph-derived sufficient-route obligation cut",
         "graph_derived": True,
+        "advisor_root_cut_order": advisor_root_cut_order,
+        "advisor_retired_debt_ids": sorted(advisor_retired_debt_ids),
         "self_reported_root_leverage_used": False,
         "selected_route_id": str(selected.get("route_id") or ""),
         "selected_route_ready_for_verification": bool(route_cuts and not selected.get("obligations")),
@@ -1120,8 +1176,48 @@ def proof_interface_contract(
     mode = str(action.get("mode") or "")
     route_id = str(action.get("route_id") or "")
     selective = mode in {"integrate", "formalize", "validate_counterexample"}
-    selective = selective or (mode == "prove" and bool(route_id))
     selective = selective or bool(action.get("parent_implication_required"))
+    mathematical_interface: Dict[str, Any] = {}
+    if state is not None:
+        mathematical_interface = mathematical_interface_contract(state, action)
+    if mode == "prove" and route_id:
+        # Routed verification always remains a strict, evidence-bound proof
+        # check. The large typed-interface checklist is an additional
+        # safeguard for root-critical or transfer-sensitive arguments, not a
+        # paperwork prerequisite for an elementary side lemma.
+        if state is None:
+            selective = True  # conservative for callers without proof state
+        else:
+            target_id = str(action.get("target_id") or "root")
+            claim = next(
+                (
+                    row
+                    for row in state.get("claims", [])
+                    if str(row.get("claim_id") or "") == target_id
+                ),
+                {},
+            )
+            try:
+                root_impact = float(claim.get("root_impact") or 0.0)
+            except (TypeError, ValueError):
+                root_impact = 0.0
+            high_risk_recheck = any(
+                bool(action.get(flag))
+                for flag in (
+                    "dependency_threat_revalidation_required",
+                    "revalidating_integrated_route",
+                    "proof_repair_verification_required",
+                    "advisor_requested_verification",
+                )
+            )
+            selective = selective or bool(
+                not claim
+                or target_id == "root"
+                or root_impact >= 0.7
+                or action.get("theorem_preflight_required")
+                or mathematical_interface.get("risk_flags")
+                or high_risk_recheck
+            )
     if not selective:
         return {}
     result = {
@@ -1136,7 +1232,7 @@ def proof_interface_contract(
         "theorem_preflight": dict(action.get("theorem_preflight_contract") or {}),
     }
     if state is not None:
-        result["mathematical_interface"] = mathematical_interface_contract(state, action)
+        result["mathematical_interface"] = mathematical_interface
         result["required_metadata"] = {
             "mathematical_interface_version": MATHEMATICAL_INTERFACE_VERSION,
             "interface_checks": "one explicit comparison per risk flag and proof boundary",

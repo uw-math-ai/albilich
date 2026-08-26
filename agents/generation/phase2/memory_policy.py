@@ -184,6 +184,8 @@ def inference_memory_status(row: Mapping[str, Any]) -> str:
 def debt_memory_status(row: Mapping[str, Any]) -> str:
     status = str(row.get("status") or "")
     severity = str(row.get("severity") or "")
+    if status == "refuted":
+        return "failed"
     if status == "resolved":
         return "superseded"
     if status == "discarded" or severity == "discarded":
