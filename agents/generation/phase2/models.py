@@ -72,6 +72,7 @@ NON_VERIFYING_ROLES = {
     "phd_advisor",
     "advisor",
     "writer",
+    "referee",
     "writing_critic",
 }
 

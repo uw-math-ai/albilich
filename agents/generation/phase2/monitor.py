@@ -372,6 +372,134 @@ def _artifact_catalog(store: ProofStateStore, *, state: Mapping[str, Any] | None
     return rows
 
 
+def _publication_workflow_payload(
+    store: ProofStateStore,
+    *,
+    state: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Build the human-facing writer--referee timeline.
+
+    Review decisions are read from their normalized SQL rows.  Paper lineage
+    comes from artifact metadata.  Keeping this derived view out of the core
+    proof schema lets the monitor evolve without making publication UI details
+    part of mathematical state.
+    """
+
+    state = state if state is not None else store.get_state()
+    artifacts = {
+        str(row.get("artifact_id") or ""): row
+        for row in state.get("artifacts", [])
+        if str(row.get("artifact_id") or "")
+    }
+    papers: list[Dict[str, Any]] = []
+    for artifact in artifacts.values():
+        if str(artifact.get("artifact_type") or "") != "final_paper":
+            continue
+        metadata = _json_object(artifact.get("metadata_json"))
+        if str(metadata.get("publication_workflow") or "") != "writer_referee":
+            continue
+        artifact_id = str(artifact.get("artifact_id") or "")
+        papers.append(
+            {
+                "artifact_id": artifact_id,
+                "version": int(metadata.get("paper_version") or 0),
+                "title": _artifact_display_title(artifact),
+                "state_revision": int(artifact.get("state_revision") or 0),
+                "created_at": str(artifact.get("created_at") or ""),
+                "certificate_artifact_id": str(metadata.get("certificate_artifact_id") or ""),
+                "revision_of_artifact_id": str(metadata.get("revision_of_artifact_id") or ""),
+                "addresses_referee_report_id": str(metadata.get("addresses_referee_report_id") or ""),
+                "pdf_url": (
+                    f"/api/paper?id={quote(artifact_id, safe='')}"
+                    if _paper_pdf_path(store, artifact) is not None
+                    else ""
+                ),
+                "read_url": f"/api/artifact?id={quote(artifact_id, safe='')}",
+            }
+        )
+    papers.sort(
+        key=lambda row: (
+            int(row.get("version") or 0),
+            int(row.get("state_revision") or 0),
+            str(row.get("created_at") or ""),
+            str(row.get("artifact_id") or ""),
+        )
+    )
+    for index, paper in enumerate(papers, start=1):
+        if int(paper.get("version") or 0) <= 0:
+            paper["version"] = index
+
+    reviews: list[Dict[str, Any]] = []
+    for row in state.get("publication_reviews", []):
+        review_id = str(row.get("review_id") or "")
+        report = artifacts.get(review_id, {})
+        metadata = _json_object(row.get("metadata_json"))
+        reviews.append(
+            {
+                "review_id": review_id,
+                "round_number": int(row.get("round_number") or 0),
+                "paper_artifact_id": str(row.get("paper_artifact_id") or ""),
+                "certificate_artifact_id": str(row.get("certificate_artifact_id") or ""),
+                "verdict": str(row.get("verdict") or ""),
+                "decision_token": str(row.get("decision_token") or ""),
+                "finding_count": int(row.get("finding_count") or 0),
+                "affected_route_id": str(row.get("affected_route_id") or ""),
+                "falsified_step": _short_text(row.get("falsified_step"), 520),
+                "mathematical_evidence": _short_text(row.get("mathematical_evidence"), 900),
+                "created_at": str(row.get("created_at") or ""),
+                "escalated_at": str(row.get("escalated_at") or ""),
+                "title": _artifact_display_title(report) if report else f"Referee report, round {row.get('round_number') or 0}",
+                "report_url": f"/api/artifact?id={quote(review_id, safe='')}",
+                "findings": metadata.get("findings") if isinstance(metadata.get("findings"), list) else [],
+            }
+        )
+    reviews.sort(key=lambda row: (row["round_number"], row["created_at"], row["review_id"]))
+    reviews_by_paper: dict[str, list[Dict[str, Any]]] = {}
+    for review in reviews:
+        reviews_by_paper.setdefault(review["paper_artifact_id"], []).append(review)
+    for paper in papers:
+        linked = reviews_by_paper.get(str(paper.get("artifact_id") or ""), [])
+        paper["reviews"] = linked
+        paper["latest_verdict"] = str((linked[-1] if linked else {}).get("verdict") or "")
+
+    proof_ready = any(
+        str(row.get("artifact_type") or "") in {"final_proof", "verified_blueprint"}
+        for row in artifacts.values()
+    )
+    latest_paper = papers[-1] if papers else {}
+    latest_reviews = reviews_by_paper.get(str(latest_paper.get("artifact_id") or ""), [])
+    latest_review = latest_reviews[-1] if latest_reviews else {}
+    verdict = str(latest_review.get("verdict") or "")
+    if verdict == "accept":
+        status, current_role = "accepted", "complete"
+    elif verdict == "major_proof_route_error":
+        status = "returned_to_research" if latest_review.get("escalated_at") else "returning_to_research"
+        current_role = "research"
+    elif verdict == "revise":
+        status, current_role = "revision_requested", "writer"
+    elif latest_paper:
+        status, current_role = "awaiting_referee", "referee"
+    elif proof_ready:
+        status, current_role = "awaiting_writer", "writer"
+    else:
+        status, current_role = "research_in_progress", "research"
+
+    return {
+        "workflow": "writer_referee",
+        "status": status,
+        "current_role": current_role,
+        "enabled": bool(papers or reviews or proof_ready),
+        "paper_count": len(papers),
+        "review_count": len(reviews),
+        "current_round": int(latest_review.get("round_number") or (len(reviews) + 1 if latest_paper else 0)),
+        "current_paper_artifact_id": str(latest_paper.get("artifact_id") or ""),
+        "latest_verdict": verdict,
+        "papers": papers,
+        "reviews": reviews,
+        "loop_policy": "Writer and domain referee alternate until [accept]. A demonstrated false proof route returns the run to research.",
+    }
+
+
 def _artifact_document(store: ProofStateStore, artifact_id: str) -> Dict[str, Any] | None:
     state = store.get_state()
     artifact = next(
@@ -421,6 +549,7 @@ def _producer_role_code(role: str) -> str:
         "strict_informal_verifier": "SV",
         "integration_verifier": "IV",
         "writer": "W",
+        "referee": "RF",
     }.get(normalized, "".join(part[:1].upper() for part in normalized.split("_") if part)[:2] or "A")
 
 
@@ -794,9 +923,11 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
         _enrich_human_readable_dashboard_rows(store, payload, state)
         payload["papers"] = _paper_catalog(store, state=state)
         payload["artifact_catalog"] = _artifact_catalog(store, state=state)
+        payload["publication_workflow"] = _publication_workflow_payload(store, state=state)
     except Exception:
         payload["papers"] = []
         payload["artifact_catalog"] = []
+        payload["publication_workflow"] = {}
     # All claims (statement only), verified ones marked — the headline output ledger.
     try:
         claims = state.get("claims", [])
@@ -1658,7 +1789,7 @@ window.MathJax = {
   .grid { display: grid; grid-template-columns: 1.55fr 1fr; gap: 20px; align-items: start; }
   @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
   .grid > *, .card, .card .body { min-width: 0; }
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-sm); margin-bottom: 20px; overflow: hidden; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-sm); margin-bottom: 20px; overflow: hidden; scroll-margin-top: 92px; }
   .card > h2 { margin: 0; padding: 15px 18px; font-size: 12px; letter-spacing: .6px; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 9px; font-weight: 700; }
   .card > h2::before { content: ""; width: 7px; height: 7px; border-radius: 2px; background: var(--uw-gold); }
   .card > h2 .count { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--faint); text-transform: none; font-weight: 500; }
@@ -1836,6 +1967,45 @@ window.MathJax = {
     background: #ececec;
   }
   .paper-empty { min-height: 180px; display: grid; place-items: center; border: 1px dashed var(--border-strong); border-radius: var(--radius-sm); background: var(--surface-2); }
+  /* Terminal publication workflow */
+  .pub-summary { display: grid; grid-template-columns: minmax(220px, .7fr) minmax(0, 1.5fr); gap: 18px; align-items: stretch; }
+  .pub-status { border: 1px solid var(--border); border-radius: 13px; padding: 15px 16px; background: var(--surface-2); }
+  .pub-status.status-accepted { border-color: color-mix(in srgb, var(--good) 42%, var(--border)); background: color-mix(in srgb, var(--good) 5%, var(--surface-2)); }
+  .pub-status.status-revision_requested { border-color: color-mix(in srgb, var(--warn) 46%, var(--border)); }
+  .pub-status.status-returning_to_research, .pub-status.status-returned_to_research { border-color: color-mix(in srgb, var(--bad) 46%, var(--border)); background: color-mix(in srgb, var(--bad) 5%, var(--surface-2)); }
+  .pub-status .eyebrow { color: var(--faint); font: 700 10px/1.3 var(--mono); text-transform: uppercase; letter-spacing: .7px; }
+  .pub-status .decision { margin-top: 7px; font-size: 20px; font-weight: 800; letter-spacing: -.35px; }
+  .pub-status .policy { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .pub-roles { display: grid; grid-template-columns: 1fr 34px 1fr; align-items: center; gap: 9px; margin-top: 14px; }
+  .pub-role { border: 1px solid var(--border); border-radius: 10px; padding: 10px 11px; background: var(--surface); }
+  .pub-role.active { border-color: var(--uw-purple); box-shadow: 0 0 0 2px color-mix(in srgb, var(--uw-purple) 15%, transparent); background: var(--accent-soft); }
+  .pub-role .name { font-weight: 750; font-size: 12px; }
+  .pub-role .job { margin-top: 3px; color: var(--muted); font-size: 10.5px; line-height: 1.35; }
+  .pub-exchange { text-align: center; color: var(--uw-gold-deep); font-size: 19px; font-weight: 700; }
+  .pub-timeline { min-width: 0; display: grid; gap: 9px; align-content: start; max-height: 360px; overflow: auto; padding-right: 3px; }
+  .pub-round { border: 1px solid var(--border); border-radius: 12px; background: var(--surface-2); padding: 11px 13px; }
+  .pub-round.current { border-color: color-mix(in srgb, var(--uw-purple) 42%, var(--border)); }
+  .pub-round-head { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+  .pub-version { font-weight: 800; font-size: 12.5px; }
+  .pub-title { flex: 1 1 260px; min-width: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .pub-actions { display: flex; gap: 7px; flex-wrap: wrap; }
+  .pub-report { margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--border); display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 10px; align-items: start; }
+  .pub-report .report-copy { min-width: 0; }
+  .pub-report .report-line { font: 650 12px/1.5 var(--sans); }
+  .pub-report .report-line.good { color: var(--good); }
+  .pub-report .report-line.warn { color: var(--warn); }
+  .pub-report .report-line.bad { color: var(--bad); }
+  .pub-report .report-line.info { color: var(--uw-purple); }
+  .pub-report .report-detail { margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+  .pub-report.route-error { border-left: 3px solid var(--bad); padding-left: 10px; }
+  @media (max-width: 900px) {
+    .pub-summary { grid-template-columns: 1fr; }
+    .pub-timeline { max-height: none; }
+  }
+  @media (max-width: 600px) {
+    .pub-report { grid-template-columns: 1fr; }
+    .pub-report .btn { justify-self: start; }
+  }
   .artifact-shell { display: grid; grid-template-columns: minmax(280px, .8fr) minmax(0, 1.7fr); gap: 14px; align-items: stretch; }
   .artifact-list { max-height: 580px; overflow: auto; display: grid; gap: 8px; align-content: start; padding-right: 3px; }
   .artifact-item { appearance: none; width: 100%; text-align: left; cursor: pointer; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; }
@@ -1912,7 +2082,7 @@ window.MathJax = {
   }
   @media (max-width: 720px) {
     .wrap { padding-left: 14px; padding-right: 14px; }
-    header.topbar { padding-left: 14px; padding-right: 14px; margin-left: -14px; margin-right: -14px; }
+    header.topbar { position: static; padding-left: 14px; padding-right: 14px; margin-left: -14px; margin-right: -14px; }
     th, td { padding: 8px 7px; }
     .routes-table { font-size: 11.5px; }
     .routes-table .route-id { width: 36%; }
@@ -2010,6 +2180,11 @@ window.MathJax = {
     <div class="body" id="verified"></div>
   </div>
 
+  <div class="card" id="publicationCard" style="display:none">
+    <h2>Publication Workshop · writer &amp; referee <span class="count" id="publicationCount"></span></h2>
+    <div class="body" id="publicationWorkflow"><div class="empty">The publication loop begins after the proof certificate is complete.</div></div>
+  </div>
+
   <div class="card" id="papersCard">
     <h2>Human-Readable Mathematical Text · cumulative papers <span class="count" id="paperCount"></span></h2>
     <div class="body">
@@ -2038,7 +2213,7 @@ window.MathJax = {
     </div>
   </div>
 
-  <div class="card">
+  <div class="card" id="artifactsCard">
     <h2>Mathematical Artifact Library <span class="count" id="artCount"></span></h2>
     <div class="body">
       <div class="artifact-shell">
@@ -2224,10 +2399,10 @@ const STATUS_CLASS = (s) => {
 };
 const PILL = (s) => {
   s = String(s||"").toLowerCase();
-  if (s.includes("verified")||s.includes("complete")||s.includes("ready")||s==="good") return "good";
+  if (s.includes("verified")||s.includes("complete")||s.includes("ready")||s.includes("accept")||s==="good") return "good";
   if (s.includes("fail")||s.includes("refut")||s.includes("error")||s.includes("blocking")||s.includes("blocked")||s.includes("timeout")||s.includes("stalled")) return "bad";
   if (s.includes("active")||s.includes("running")||s.includes("started")||s.includes("heartbeat")) return "info";
-  if (s.includes("partial")||s.includes("pending")||s.includes("plausible")||s.includes("challenged")) return "warn";
+  if (s.includes("partial")||s.includes("pending")||s.includes("plausible")||s.includes("challenged")||s.includes("revise")||s.includes("revision")) return "warn";
   return "";
 };
 
@@ -2740,6 +2915,80 @@ function renderPapers(rows){
     $("paperSelect").innerHTML = rows.map((paper, index) => `<option value="${esc(paper.artifact_id)}">${index+1}. rev ${esc(paper.source_revision)} · ${esc(paper.title||paper.kind)}</option>`).join("");
   }
   showSelectedPaper();
+}
+function publicationStatusLabel(status){
+  return ({
+    research_in_progress: "Research in progress",
+    awaiting_writer: "Writer is drafting",
+    awaiting_referee: "Awaiting referee decision",
+    revision_requested: "Revision requested",
+    returning_to_research: "Proof route under challenge",
+    returned_to_research: "Returned to mathematical research",
+    accepted: "Accepted for publication"
+  })[String(status||"")] || String(status||"Publication workflow").replaceAll("_", " ");
+}
+function openPublicationPaper(artifactId){
+  if (!artifactId) return;
+  selectedPaperId = artifactId;
+  showSelectedPaper();
+  $("papersCard").scrollIntoView({behavior:"smooth", block:"start"});
+}
+function openPublicationReport(artifactId){
+  if (!artifactId) return;
+  openArtifact(artifactId);
+  $("artifactsCard").scrollIntoView({behavior:"smooth", block:"start"});
+}
+function renderPublicationWorkflow(workflow){
+  workflow = workflow || {};
+  const card = $("publicationCard"), body = $("publicationWorkflow");
+  if (!workflow.enabled){ card.style.display = "none"; return; }
+  card.style.display = "";
+  const papers = workflow.papers || [];
+  $("publicationCount").textContent = `${papers.length} version${papers.length===1?"":"s"} · ${workflow.review_count||0} report${Number(workflow.review_count)===1?"":"s"}`;
+  const currentPaperId = String(workflow.current_paper_artifact_id||"");
+  const rounds = papers.length ? papers.map((paper) => {
+    const reviews = paper.reviews || [];
+    const reports = reviews.length ? reviews.map(review => {
+      const verdict = String(review.verdict||"");
+      const routeError = verdict === "major_proof_route_error";
+      const firstFinding = Array.isArray(review.findings) && review.findings.length ? review.findings[0] : null;
+      const detail = routeError
+        ? (review.falsified_step || review.mathematical_evidence || "The report gives mathematical evidence against the proof route.")
+        : firstFinding
+          ? `${firstFinding.location||"Located finding"}: ${firstFinding.problem||"revision required"}. Required: ${firstFinding.required_fix||"repair the located defect"}`
+          : (verdict === "accept" ? "The referee found no remaining defect that warrants revision." : `${review.finding_count||0} located finding${Number(review.finding_count)===1?"":"s"}.`);
+      return `<div class="pub-report${routeError?" route-error":""}">
+        <div class="report-copy"><div class="report-line ${PILL(verdict)}">${esc(review.decision_token||verdict)} · Referee round ${esc(review.round_number)} · ${esc(review.finding_count||0)} finding${Number(review.finding_count)===1?"":"s"}</div>
+          <div class="report-detail">${mathHTML(detail)}</div></div>
+        <button type="button" class="btn pub-open-report" data-report-id="${esc(review.review_id||"")}">Read report</button>
+      </div>`;
+    }).join("") : `<div class="pub-report"><div class="report-copy"><div class="report-line info">In review · The domain referee is next.</div><div class="report-detail">The review covers the complete proof certificate and the journal manuscript.</div></div></div>`;
+    return `<article class="pub-round${paper.artifact_id===currentPaperId?" current":""}">
+      <div class="pub-round-head">
+        <span class="pub-version">Paper v${esc(paper.version||"?")}</span>
+        <span class="pub-title">${mathHTML(paper.title||paper.artifact_id||"Journal manuscript")}</span>
+        <div class="pub-actions">${paper.pdf_url?`<button type="button" class="btn pub-open-paper" data-paper-id="${esc(paper.artifact_id||"")}">View PDF</button>`:""}</div>
+      </div>${reports}</article>`;
+  }).join("") : `<div class="empty">The proof certificate is ready. The writer has not attached the first paper version yet.</div>`;
+  const currentRole = String(workflow.current_role||"");
+  const changed = setStableHTML(body, `<div class="pub-summary">
+    <section class="pub-status status-${esc(workflow.status||"")}">
+      <div class="eyebrow">Current publication state</div>
+      <div class="decision">${esc(publicationStatusLabel(workflow.status))}</div>
+      <div class="policy">${esc(workflow.loop_policy||"")}</div>
+      <div class="pub-roles">
+        <div class="pub-role${currentRole==="writer"?" active":""}"><div class="name">Writer</div><div class="job">Produces and revises the complete paper.</div></div>
+        <div class="pub-exchange">⇄</div>
+        <div class="pub-role${currentRole==="referee"?" active":""}"><div class="name">Referee</div><div class="job">Audits the mathematics and exposition.</div></div>
+      </div>
+    </section>
+    <section class="pub-timeline">${rounds}</section>
+  </div>`);
+  if (changed){
+    body.querySelectorAll(".pub-open-paper").forEach(button => button.addEventListener("click", () => openPublicationPaper(button.dataset.paperId||"")));
+    body.querySelectorAll(".pub-open-report").forEach(button => button.addEventListener("click", () => openPublicationReport(button.dataset.reportId||"")));
+    typesetPending(body);
+  }
 }
 async function refreshPapers(){
   if (document.hidden) return;
@@ -3341,6 +3590,7 @@ async function tick(forceHeavy=false){
     renderResearcherMode(p.researcher_mode_state);
     renderTokens(snap, p.usage_summary || {});
     renderPapers(p.papers);
+    renderPublicationWorkflow(p.publication_workflow);
     renderSession(p);
     renderSignals(p.parallel_exchange);
     renderTimeline(p.run_timeline);

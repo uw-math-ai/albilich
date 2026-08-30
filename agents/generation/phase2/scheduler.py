@@ -43,6 +43,12 @@ from .writing.paper_contract import (
     HUMAN_TERMINOLOGY_CONSULTATION_MARKER,
     REQUIRED_WRITING_REVIEW_LENSES,
 )
+from .writing.publication import (
+    PUBLICATION_REFEREE_LENS,
+    latest_review_for_paper,
+    mark_route_error_escalated,
+    pending_route_error_review,
+)
 from .debt_canonicalizer import central_debt_clusters, central_obstruction_for_debt
 from .graph_policy import (
     DebtCoverageIndex,
@@ -418,6 +424,9 @@ WRITING_GATE_DETERMINISTIC_REVISION_INTENT = "writing_gate_revision_deterministi
 WRITING_GATE_HUMAN_REVISION_INTENT_PREFIX = "writing_gate_revision_human:"
 WRITING_GATE_PAPER_INTENT = "writing_gate_paper"
 WRITING_GATE_REVIEW_INTENT_PREFIX = "writing_gate_review:"
+PUBLICATION_REFEREE_INTENT = "publication_referee_review"
+PUBLICATION_WRITER_REVISION_INTENT = "publication_writer_revision"
+PUBLICATION_ROUTE_ERROR_RESEARCH_INTENT = "publication_route_error_research"
 WRITING_DEBT_TYPE = "writing"
 # Deterministic lint findings become debts under this debt_id prefix; only
 # those are auto-closed when they stop reproducing (critic debts are the
@@ -854,6 +863,16 @@ def _plan_next_action(
     if paper_audit_terminal:
         return paper_audit_terminal
 
+    referee_route_error = _publication_route_error_research_action(
+        store,
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    if referee_route_error:
+        return referee_route_error
+
     root = _claim(state, "root")
     if root and root["lifecycle_status"] == "integrated":
         final_artifact = _final_proof_artifact(state, "root")
@@ -900,7 +919,10 @@ def _plan_next_action(
             problem=problem,
             requested_tokens=requested_tokens,
             research_mode=research_mode,
-            editorial_review_required=completion_policy == "publication_ready",
+            editorial_review_required=(
+                post_solve_work_requested
+                or _is_publication_workflow_document(_final_paper_artifact(state) or {})
+            ),
         )
         if writing_gate:
             return writing_gate
@@ -10311,8 +10333,15 @@ def _integrated_route_for_claim(state: Mapping[str, Any], claim_id: str) -> str:
 
 
 def _final_proof_artifact(state: Mapping[str, Any], claim_id: str) -> Optional[Mapping[str, Any]]:
+    invalid_certificate_ids = {
+        str(review.get("certificate_artifact_id") or "")
+        for review in state.get("publication_reviews", [])
+        if str(review.get("verdict") or "") == "major_proof_route_error"
+    }
     for artifact in state.get("final_artifacts", []):
         if str(artifact.get("artifact_type") or "") not in {"final_proof", "verified_blueprint"}:
+            continue
+        if str(artifact.get("artifact_id") or "") in invalid_certificate_ids:
             continue
         metadata = artifact.get("metadata_json", {})
         if isinstance(metadata, str):
@@ -10346,26 +10375,15 @@ def _writing_gate_action(
     research_mode: str,
     editorial_review_required: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    """LaTeX delivery gate between an internal certificate and stop_solved.
+    """LaTeX delivery gate between a proof certificate and publication.
 
-    Mathematical correctness review is out of scope because the main harness
-    already verified ``final_proof``, which remains internal and is never
-    reviewed here. The bounded path costs at most twelve LLM sessions: one
-    paper-authoring pass, up to two deterministic repairs, up to three
-    review-driven revisions, the three required audits, and whole-paper
-    confirmations of documents revised after the initial editor pass.
-
-    Once the writer attaches ``final_paper``, deterministic lint, paper
-    register, and compile checks run on every pass. Blocking findings dispatch
-    a diff-minimal revision with every open debt enumerated. Deterministic-only
-    repairs have their own budget and never consume the review-driven budget.
-
-    With ``editorial_review_required``, a clean paper then receives, in order,
-    the terminology editor, introduction editor, and whole-paper editor.
-    Default theorem runs omit those publication-only reviews but still require
-    the standalone final_paper and every deterministic register/lint/compile
-    check. Generation residue and compile failures remain non-bypassable past
-    the normal caps.
+    The writer first produces a standalone paper.  Deterministic lint,
+    statement-register, and compilation gates run before every referee pass.
+    A domain referee then reviews both the certified proof and the complete
+    manuscript.  The writer and referee alternate without an arbitrary round
+    cap until the referee accepts the current version or supplies substantive
+    evidence that the integrated proof route is false.  The latter decision is
+    persisted and returned to the research scheduler.
     """
     certificate_id = str(final_artifact.get("artifact_id") or "")
     if not certificate_id:
@@ -10376,6 +10394,13 @@ def _writing_gate_action(
         # authoring must not fire in this mode.
         return None
     paper_artifact = _final_paper_artifact(state)
+    if paper_artifact is not None and _is_publication_workflow_document(paper_artifact):
+        paper_metadata = _json_object(paper_artifact.get("metadata_json"))
+        if str(paper_metadata.get("certificate_artifact_id") or "") != certificate_id:
+            # A referee route-error decision invalidates the old proof
+            # certificate and therefore every paper version based on it.  A
+            # newly integrated replacement route must receive a new paper.
+            paper_artifact = None
     if paper_artifact is None:
         # The certificate is internal and unreviewed: author the paper now.
         mode = "write"
@@ -10460,6 +10485,16 @@ def _writing_existing_document_gate_action(
     editorial_review_required: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Run deterministic checks and the three independent writing reviews."""
+
+    if not external_revision and _is_publication_workflow_document(document_artifact):
+        return _publication_document_gate_action(
+            store,
+            state,
+            document_artifact=document_artifact,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+        )
 
     paper_artifact = document_artifact
     artifact_id = str(paper_artifact.get("artifact_id") or "")
@@ -10657,6 +10692,255 @@ def _writing_existing_document_gate_action(
         search_intent=f"{WRITING_GATE_REVIEW_INTENT_PREFIX}{lens}",
         open_writing_debts=_writing_debt_cards(open_debts),
         final_editor_confirmation=final_editor_confirmation,
+    )
+
+
+def _is_publication_workflow_document(document_artifact: Mapping[str, Any]) -> bool:
+    """Distinguish new writer output from resumable pre-loop manuscripts."""
+
+    metadata = _json_object(document_artifact.get("metadata_json"))
+    return str(metadata.get("publication_workflow") or "") == "writer_referee"
+
+
+def _publication_document_gate_action(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    document_artifact: Mapping[str, Any],
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Unbounded writer--referee loop for an internally certified paper."""
+
+    artifact_id = str(document_artifact.get("artifact_id") or "")
+    content = _writing_artifact_content(document_artifact)
+    _sync_writing_lint_debts(store, artifact_id, content, include_paper_register=True)
+    _sync_writing_compile_debt(store, artifact_id)
+    gate = _writing_gate_state(store, artifact_id)
+    open_debts = gate["open_writing_debts"]
+    blocking = [
+        debt
+        for debt in open_debts
+        if str(debt.get("severity") or "") in WRITING_GATE_BLOCKING_SEVERITIES
+    ]
+    consultation = _writing_human_consultation_action(
+        store,
+        blocking,
+        artifact_id=artifact_id,
+        problem=problem,
+        research_mode=research_mode,
+    )
+    if consultation is not None:
+        return consultation
+
+    review = latest_review_for_paper(state, artifact_id)
+    verdict = str((review or {}).get("verdict") or "")
+    review_id = str((review or {}).get("review_id") or "")
+    revision_debts = blocking
+    if verdict == "revise":
+        revision_debts = [
+            debt
+            for debt in open_debts
+            if str(debt.get("owner_id") or "") == artifact_id
+        ] or open_debts
+    if blocking or verdict == "revise":
+        round_number = int((review or {}).get("round_number") or 0)
+        return _action(
+            "write",
+            "root",
+            _integrated_route_for_claim(state, "root"),
+            (
+                f"publication loop: writer revises final paper {artifact_id} after referee round {round_number}"
+                if verdict == "revise"
+                else f"publication loop: writer repairs {len(blocking)} deterministic paper defect(s) before refereeing"
+            ),
+            plan_step_budget(problem, "write", requested_tokens),
+            research_mode=research_mode,
+            writing_revision=True,
+            paper_revision=True,
+            publication_writer=True,
+            revision_of_artifact_id=artifact_id,
+            referee_report_artifact_id=review_id,
+            writing_debts=_writing_debt_cards(revision_debts),
+            search_intent=PUBLICATION_WRITER_REVISION_INTENT,
+            writing_gate_round=round_number + 1,
+        )
+    if verdict == "accept":
+        return None
+    if verdict == "major_proof_route_error":
+        # The top-level scheduler branch processes this before another paper
+        # action.  Returning no action here is a defensive fallback.
+        return None
+
+    certificate = _final_proof_artifact(state, "root")
+    route_id = _integrated_route_for_claim(state, "root")
+    round_number = len(state.get("publication_reviews", [])) + 1
+    return _action(
+        "review_writing",
+        "root",
+        "",
+        f"publication loop: domain referee reviews final paper {artifact_id} in round {round_number}",
+        plan_step_budget(problem, "review_writing", requested_tokens),
+        research_mode=research_mode,
+        publication_referee=True,
+        critic_lens=PUBLICATION_REFEREE_LENS,
+        artifact_reviewed=artifact_id,
+        paper_review=True,
+        certificate_artifact_id=str((certificate or {}).get("artifact_id") or ""),
+        integrated_route_id=route_id,
+        referee_round=round_number,
+        state_revision_reviewed=gate["artifact_state_revision"],
+        search_intent=PUBLICATION_REFEREE_INTENT,
+        open_writing_debts=_writing_debt_cards(open_debts),
+    )
+
+
+def _publication_route_error_research_action(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Challenge the integrated root and return a falsified route to research."""
+
+    review = pending_route_error_review(state)
+    if review is None:
+        return None
+    review_id = str(review.get("review_id") or "")
+    route_id = str(review.get("affected_route_id") or "")
+    debt_id = f"referee-route-error-{fingerprint_text(review_id + route_id)[:12]}"
+    root = _claim(state, "root") or {}
+    existing_debt = next(
+        (debt for debt in state.get("debts", []) if str(debt.get("debt_id") or "") == debt_id),
+        None,
+    )
+    operations: list[Dict[str, Any]] = []
+    if str(root.get("lifecycle_status") or "") == "integrated":
+        operations.append(
+            {
+                "op": "propose_status_transition",
+                "target_type": "claim",
+                "target_id": "root",
+                "status_type": "lifecycle",
+                "new_status": "active",
+                "evidence_artifact_ids": [review_id],
+            }
+        )
+    if str(root.get("validation_status") or "") != "challenged":
+        operations.append(
+            {
+                "op": "propose_status_transition",
+                "target_type": "claim",
+                "target_id": "root",
+                "status_type": "validation",
+                "new_status": "challenged",
+                "evidence_artifact_ids": [review_id],
+            }
+        )
+    route = next(
+        (row for row in state.get("routes", []) if str(row.get("route_id") or "") == route_id),
+        None,
+    )
+    if route is not None and str(route.get("status") or "") != "blocked":
+        operations.append(
+            {
+                "op": "propose_status_transition",
+                "target_type": "route",
+                "target_id": route_id,
+                "status_type": "route",
+                "new_status": "blocked",
+                "evidence_artifact_ids": [review_id],
+            }
+        )
+    for inference in state.get("inferences", []):
+        if str(inference.get("route_id") or "") != route_id:
+            continue
+        if str(inference.get("validation_status") or "") == "challenged":
+            continue
+        operations.append(
+            {
+                "op": "propose_status_transition",
+                "target_type": "inference",
+                "target_id": str(inference.get("inference_id") or ""),
+                "status_type": "validation",
+                "new_status": "challenged",
+                "evidence_artifact_ids": [review_id],
+            }
+        )
+    if existing_debt is None:
+        operations.append(
+            {
+                "op": "add_debt",
+                "debt_id": debt_id,
+                "owner_type": "claim",
+                "owner_id": "root",
+                "debt_type": "referee_route_error",
+                "severity": "blocking",
+                "status": "active",
+                "obligation": (
+                    "The publication referee supplied evidence that the integrated proof route is false. "
+                    f"Falsified step: {str(review.get('falsified_step') or '')} "
+                    f"Evidence: {str(review.get('mathematical_evidence') or '')}"
+                ),
+                "source_artifact_ids": [review_id],
+                "suggested_next_target": "root",
+            }
+        )
+    if operations:
+        outcome = apply_patch(
+            store,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "problem_id": store.problem_id,
+                "base_revision": int(problem.get("current_revision") or 0),
+                "actor_role": "scheduler",
+                "target_id": "root",
+                "evidence_artifact_ids": [review_id],
+                "operations": operations,
+                "rationale": "publication referee falsified the integrated proof route; reopen mathematical research",
+            },
+        )
+        if not outcome.accepted:
+            return _action(
+                "stop_with_partial_results",
+                "root",
+                route_id,
+                "could not apply the referee route-error escalation",
+                plan_step_budget(problem, "stop_with_partial_results", 0),
+                research_mode=research_mode,
+                errors=outcome.errors,
+                stop_reason_code="referee_route_error_escalation_failed",
+            )
+    with store.connect() as conn:
+        escalated_at = mark_route_error_escalated(conn, review_id)
+        store.write_event(
+            conn,
+            store.get_revision(conn),
+            "publication_route_error_escalated",
+            {
+                "review_id": review_id,
+                "route_id": route_id,
+                "debt_id": debt_id,
+                "escalated_at": escalated_at,
+            },
+        )
+        conn.commit()
+    return _action(
+        "reduce",
+        "root",
+        "",
+        f"publication referee falsified route {route_id}; research must replace the route and discharge {debt_id}",
+        plan_step_budget(problem, "reduce", requested_tokens),
+        research_mode=research_mode,
+        debt_id=debt_id,
+        proof_repair_required=True,
+        referee_route_error_research=True,
+        referee_report_artifact_id=review_id,
+        falsified_route_id=route_id,
+        search_intent=PUBLICATION_ROUTE_ERROR_RESEARCH_INTENT,
     )
 
 

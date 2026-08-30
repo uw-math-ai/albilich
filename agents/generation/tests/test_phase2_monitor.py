@@ -19,6 +19,7 @@ from agents.generation.phase2.monitor import (
     _claim_verification_history,
     _make_handler,
     _monitor_refresh_interval_seconds,
+    _publication_workflow_payload,
     build_monitor_payload,
     start_background_monitor,
 )
@@ -94,6 +95,90 @@ class MonitorTest(unittest.TestCase):
             self.assertIn(payload["_monitor"]["source"], {"store", "store+console"})
             self.assertIn("live", payload["_monitor"])
 
+    def test_publication_workflow_exposes_paper_and_referee_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            artifact_dir = store.state_dir / "artifacts"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            proof_path = artifact_dir / "proof.md"
+            paper_path = artifact_dir / "paper.tex"
+            paper_pdf_path = artifact_dir / "paper.pdf"
+            report_path = artifact_dir / "report.md"
+            proof_path.write_text("A complete proof.", encoding="utf-8")
+            paper_path.write_text("\\documentclass{article}\\begin{document}A paper.\\end{document}", encoding="utf-8")
+            paper_pdf_path.write_bytes(b"%PDF-1.4\n")
+            report_path.write_text("[accept]\n\nThe proof and paper are correct.", encoding="utf-8")
+            now = utc_now()
+            report_metadata = {
+                "title": "Journal referee report",
+                "findings": [],
+                "reviewed_paper_artifact_id": "paper-1",
+            }
+            with store.connect() as conn:
+                conn.execute(
+                    """INSERT INTO artifacts(
+                           artifact_id, artifact_type, path, sha256, producer_role, run_id,
+                           state_revision, content_summary, metadata_json, created_at
+                       ) VALUES ('proof-1', 'final_proof', ?, 'proof-sha', 'writer', '', 1,
+                                 'The root theorem is proved.', '{}', ?)""",
+                    (str(proof_path), now),
+                )
+                conn.execute(
+                    """INSERT INTO artifacts(
+                           artifact_id, artifact_type, path, sha256, producer_role, run_id,
+                           state_revision, content_summary, metadata_json, created_at
+                       ) VALUES ('paper-1', 'final_paper', ?, 'paper-sha', 'writer', '', 2,
+                                 'A journal-ready proof of the root theorem.', ?, ?)""",
+                    (
+                        str(paper_path),
+                        json.dumps(
+                            {
+                                "title": "A proof of the root theorem",
+                                "publication_workflow": "writer_referee",
+                                "paper_version": 1,
+                                "certificate_artifact_id": "proof-1",
+                                "pdf_path": str(paper_pdf_path),
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO artifacts(
+                           artifact_id, artifact_type, path, sha256, producer_role, run_id,
+                           state_revision, content_summary, metadata_json, created_at
+                       ) VALUES ('report-1', 'referee_report', ?, 'report-sha', 'referee', '', 3,
+                                 'The referee accepts the paper.', ?, ?)""",
+                    (str(report_path), json.dumps(report_metadata), now),
+                )
+                conn.execute(
+                    """INSERT INTO publication_reviews(
+                           review_id, round_number, paper_artifact_id, certificate_artifact_id,
+                           verdict, decision_token, affected_route_id, falsified_step,
+                           mathematical_evidence, finding_count, metadata_json, state_revision,
+                           created_at, escalated_at
+                       ) VALUES ('report-1', 1, 'paper-1', 'proof-1', 'accept', '[accept]',
+                                 '', '', '', 0, ?, 3, ?, '')""",
+                    (json.dumps(report_metadata), now),
+                )
+                conn.commit()
+
+            workflow = _publication_workflow_payload(store)
+
+            self.assertEqual("accepted", workflow["status"])
+            self.assertEqual("complete", workflow["current_role"])
+            self.assertEqual(1, workflow["paper_count"])
+            self.assertEqual("[accept]", workflow["papers"][0]["reviews"][0]["decision_token"])
+            self.assertEqual("/api/paper?id=paper-1", workflow["papers"][0]["pdf_url"])
+            payload = build_monitor_payload(store)
+            self.assertEqual("accepted", payload["publication_workflow"]["status"])
+
+        self.assertIn('id="publicationCard"', INDEX_HTML)
+        self.assertIn("function renderPublicationWorkflow", INDEX_HTML)
+        self.assertIn("renderPublicationWorkflow(p.publication_workflow)", INDEX_HTML)
+        self.assertIn("Writer</div>", INDEX_HTML)
+        self.assertIn("Referee</div>", INDEX_HTML)
+
     def test_open_case_counts_exclude_debts_covered_by_integrated_claims(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(tmpdir)
@@ -147,8 +232,8 @@ class MonitorTest(unittest.TestCase):
                            hypotheses, conditions_json, validation_status, lifecycle_status,
                            root_impact, reduction_depth, parent_ids_json, source_ids_json,
                            tags_json, evidence_artifact_ids_json, created_at, updated_at
-                       ) VALUES ('claim-completed-bridge', 'lemma', 'The completed outer bridge.',
-                                 'the completed outer bridge', 'fp-completed-bridge', '', '[]',
+                       ) VALUES ('claim-psl-bridge', 'lemma', 'The completed PSL bridge.',
+                                 'the completed psl bridge', 'fp-psl-bridge', '', '[]',
                                  'informally_verified', 'integrated', 0.8, 1, '["root"]',
                                  '[]', '[]', '[]', ?, ?)""",
                     (now, now),
@@ -158,8 +243,8 @@ class MonitorTest(unittest.TestCase):
                            debt_id, owner_type, owner_id, obligation, fingerprint, debt_type,
                            severity, status, first_seen, last_seen, repeated_count,
                            source_artifact_ids_json, suggested_next_target, resolution_evidence_json
-                       ) VALUES ('debt-completed-bridge', 'claim', 'root',
-                                 'Prove the completed bridge in every remaining case.', 'fp-completed-debt', 'gap',
+                       ) VALUES ('debt-psl-bridge', 'claim', 'root',
+                                 'Prove the PSL bridge in all outer cosets.', 'fp-psl-debt', 'gap',
                                  'blocking', 'active', ?, ?, 1, '[]', 'root', '{}')""",
                     (now, now),
                 )

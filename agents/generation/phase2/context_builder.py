@@ -1062,7 +1062,10 @@ def build_context_manifest(
     writing_review_packet = _writing_review_packet(state, action=action)
     if writing_review_packet:
         manifest["writing_review_packet"] = writing_review_packet
-        _apply_writing_lens_isolation(manifest, str((action or {}).get("critic_lens") or ""))
+        _apply_writing_lens_isolation(
+            manifest,
+            "editor" if (action or {}).get("publication_referee") else str((action or {}).get("critic_lens") or ""),
+        )
         _permit_writing_review_artifact_path(manifest, writing_review_packet)
         manifest["instructions"].append(
             "Writing review must use manifest.writing_review_packet as the authoritative packet: "
@@ -1487,6 +1490,14 @@ def _role_context_policy(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
             "summary": "write from verified route material and references",
         }
     if mode == "review_writing":
+        if (action or {}).get("publication_referee"):
+            return {
+                "context_role": "referee",
+                "retrieval_card_limit": 12,
+                "theorem_library_limit": 16,
+                "authoritative_packet": "writing_review_packet",
+                "summary": "audit the final article as a top-journal domain referee",
+            }
         lens = str(action.get("critic_lens") or "")
         # The editor checks bibliography reality against the literature ledger;
         # the legacy provenance_auditor kept the same access.
@@ -1597,6 +1608,11 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
             {"op": "add_debt", "fields": ["debt_id", "owner_type=artifact", "owner_id=<reviewed final_proof artifact_id>", "debt_type=writing", "severity=blocking|major|minor", "status=active", "obligation='<rule_id>: <finding> (line N)'"]},
             {"op": "update_debt", "fields": ["debt_id", "status", "severity", "suggested_next_target"], "rule": "Only sharpen debts you opened in this same session; never close another critic's or the linter's debts."},
             {"op": "record_run_metrics", "fields": ["run_id", "mode", "target_id", "status"]},
+        ],
+        "referee": [
+            {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type=referee_report", "content", "metadata.verdict=accept|revise|major_proof_route_error", "metadata.reviewed_paper_artifact_id", "metadata.certificate_artifact_id", "metadata.findings", "metadata.finding_count", "metadata.affected_route_id", "metadata.falsified_step", "metadata.mathematical_evidence"], "rule": "Attach exactly one report and begin its content with the matching bracketed decision token."},
+            {"op": "add_debt", "fields": ["debt_id", "owner_type=artifact", "owner_id=<reviewed final_paper id>", "debt_type=writing", "severity=blocking|major|minor", "status=active", "obligation", "source_artifact_ids", "suggested_next_target"], "rule": "Use one located debt per [revise] finding. [accept] and [major-proof-route-error] open no debts."},
+            {"op": "record_run_metrics", "fields": ["run_id", "mode=review_writing", "target_id=root", "status"]},
         ],
         "phd_advisor": [
             {"op": "attach_artifact", "fields": ["artifact_id", "artifact_type=advisor_report|advisor_synthesis|route_triage_report|key_failure_analysis|invention_authorization|proof_compression", "content", "metadata.current_best_plan|metadata.recommended_next_action|metadata.next_task_acceptance_criteria|metadata.directed_researcher_mode(online|offline|cas)|metadata.directed_researcher_mode_reason|metadata.directed_researcher_mode_steps(1-3)|metadata.directed_villain_mode(online|offline|cas)|metadata.directed_villain_mode_reason|metadata.directed_villain_mode_steps(1-3)"]},
@@ -2160,7 +2176,7 @@ def _parallel_exchange_card(store: ProofStateStore) -> Dict[str, Any]:
         "signal_schema": {
             "created_at": "ISO timestamp",
             "run_id": "current run id when known",
-            "actor_role": "researcher|villain|literature_researcher|strict_informal_verifier",
+            "actor_role": "researcher|villain|literature_researcher|strict_informal_verifier|writer|referee",
             "mode": "current mode",
             "signal_type": "source_found|obstruction_found|contradiction_alert|useful_lemma|failed_path|request_for_check|route_update",
             "target_id": "claim id",
@@ -3633,7 +3649,7 @@ def _writing_review_packet(
     reviewed_type = str(row.get("artifact_type") or "final_proof")
     content = _read_artifact_content(str(row.get("path") or ""), WRITING_PACKET_MAX_ARTIFACT_CHARS)
     packet: Dict[str, Any] = {
-        "packet_type": "writing_review",
+        "packet_type": "publication_referee" if action.get("publication_referee") else "writing_review",
         "lens": lens,
         "artifact_reviewed": str(row.get("artifact_id") or ""),
         "reviewed_artifact_type": reviewed_type,
@@ -3649,6 +3665,77 @@ def _writing_review_packet(
         },
         "open_writing_debts": _open_writing_debt_cards(state),
     }
+    if action.get("publication_referee"):
+        # Use an explicit name in the new workflow while retaining the legacy
+        # final_proof key for old writing-critic prompt consumers.
+        packet["paper"] = dict(packet["final_proof"])
+        certificate = _latest_final_proof_row(state)
+        if certificate is not None:
+            packet["certificate"] = {
+                "artifact_id": str(certificate.get("artifact_id") or ""),
+                "path": str(certificate.get("path") or ""),
+                "content": _read_artifact_content(
+                    str(certificate.get("path") or ""), WRITING_PACKET_MAX_ARTIFACT_CHARS
+                ),
+            }
+        integrated_route_id = str(action.get("integrated_route_id") or "")
+        route = next(
+            (
+                dict(candidate)
+                for candidate in state.get("routes", [])
+                if str(candidate.get("route_id") or "") == integrated_route_id
+            ),
+            {},
+        )
+        route_inferences = [
+            dict(inference)
+            for inference in state.get("inferences", [])
+            if str(inference.get("route_id") or "") == integrated_route_id
+        ]
+        evidence_ids: list[str] = []
+        for source in [route, *route_inferences]:
+            for evidence_id in json_loads(source.get("evidence_artifact_ids_json"), []):
+                text = str(evidence_id or "")
+                if text and text not in evidence_ids:
+                    evidence_ids.append(text)
+        artifact_index = {
+            str(artifact.get("artifact_id") or ""): artifact
+            for artifact in state.get("artifacts", [])
+        }
+        packet["integrated_route"] = route
+        packet["route_inferences"] = route_inferences
+        packet["proof_evidence"] = [
+            {
+                "artifact_id": evidence_id,
+                "artifact_type": str((artifact_index.get(evidence_id) or {}).get("artifact_type") or ""),
+                "producer_role": str((artifact_index.get(evidence_id) or {}).get("producer_role") or ""),
+                "content_summary": str((artifact_index.get(evidence_id) or {}).get("content_summary") or ""),
+                "content": _read_artifact_content(
+                    str((artifact_index.get(evidence_id) or {}).get("path") or ""),
+                    WRITING_PACKET_MAX_ARTIFACT_CHARS,
+                ),
+            }
+            for evidence_id in evidence_ids[:24]
+            if evidence_id in artifact_index
+        ]
+        packet["claim_route_summary"] = _claim_route_summary(state)
+        packet["prior_referee_rounds"] = []
+        for review in list(state.get("publication_reviews", []))[-8:]:
+            review_id = str(review.get("review_id") or "")
+            report_artifact = artifact_index.get(review_id, {})
+            packet["prior_referee_rounds"].append(
+                {
+                    "review_id": review_id,
+                    "round_number": int(review.get("round_number") or 0),
+                    "paper_artifact_id": str(review.get("paper_artifact_id") or ""),
+                    "decision_token": str(review.get("decision_token") or ""),
+                    "finding_count": int(review.get("finding_count") or 0),
+                    "content": _read_artifact_content(
+                        str(report_artifact.get("path") or ""), 20_000
+                    ),
+                }
+            )
+        return packet
     if lens in {"skeptical_editor", "introduction_editor", "editor"} and not action.get(
         "external_writing_review"
     ):
@@ -3798,7 +3885,9 @@ def _writing_revision_packet(
         )
     elif revised_type == "final_paper":
         revision_contract = (
-            "Revise diff-minimally and voice-preservingly; address exactly the listed writing debts; resolve each via "
+            "Revise on top of the latest paper and preserve every correct, rule-compliant passage. Make all changes "
+            "the referee report requires, including structural changes when a local edit cannot repair the defect. "
+            "Address every listed writing debt; resolve each via "
             "update_debt with a resolution_note and resolution_evidence_artifact_ids naming the revised final_paper; "
             "attach exactly one revised final_paper with a new artifact_id whose content is the COMPLETE revised LaTeX "
             "source (it must still compile standalone with pdflatex); keep the bibliography intact."
@@ -3809,7 +3898,7 @@ def _writing_revision_packet(
             "update_debt with a resolution_note and resolution_evidence_artifact_ids naming the revised final_proof; "
             "attach exactly one revised final_proof with a new artifact_id; keep the References section intact."
         )
-    return {
+    packet = {
         "packet_type": "writing_revision",
         "revision_of_artifact_id": str(row.get("artifact_id") or ""),
         "revised_artifact_type": revised_type,
@@ -3830,6 +3919,25 @@ def _writing_revision_packet(
         "open_writing_debts": debt_cards,
         "revision_contract": revision_contract,
     }
+    referee_report_id = str(action.get("referee_report_artifact_id") or "")
+    if referee_report_id:
+        report = next(
+            (
+                artifact
+                for artifact in state.get("artifacts", [])
+                if str(artifact.get("artifact_id") or "") == referee_report_id
+            ),
+            None,
+        )
+        if report is not None:
+            packet["referee_report"] = {
+                "artifact_id": referee_report_id,
+                "content": _read_artifact_content(
+                    str(report.get("path") or ""), WRITING_PACKET_MAX_ARTIFACT_CHARS
+                ),
+                "metadata": _json_object(report.get("metadata_json")),
+            }
+    return packet
 
 
 def _writing_paper_packet(
@@ -5134,6 +5242,7 @@ def _default_operation_names(context_role: str) -> list[str]:
         "literature_researcher": ["cache_retrieval_card", "attach_artifact", "add_debt"],
         "phd_advisor": ["attach_artifact", "add_debt", "update_debt"],
         "writer": ["attach_artifact"],
+        "referee": ["attach_artifact", "add_debt"],
         "villain": ["attach_artifact", "add_claim", "propose_status_transition", "add_debt"],
         "researcher": ["attach_artifact", "add_claim", "add_route", "add_inference", "update_inference", "add_debt"],
     }

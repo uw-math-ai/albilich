@@ -48,6 +48,12 @@ from .verification import (
 from .writing.latex_template import normalize_paper_template
 from .writing.linter import run_paper_lint, run_residue_scan
 from .writing.paper_contract import SUPPORTED_WRITING_REVIEW_LENSES
+from .writing.publication import (
+    REFEREE_VERDICTS,
+    prepare_final_paper_metadata,
+    prepare_referee_report_metadata,
+    record_referee_report,
+)
 from .writing.revision import (
     REVISION_DOCUMENT_ARTIFACT_TYPE,
     revision_document_metadata,
@@ -99,7 +105,7 @@ ARTIFACT_PRODUCER_ROLES = {
     "formal_backend_result": {"formal_backend"},
     "confirmed_counterexample": {"counterexample_validator"},
     "integration_report": {"integration_verifier"},
-    "referee_report": {"writer"},
+    "referee_report": {"writer", "referee"},
     "writing_review": {"writing_critic"},
     "final_paper": {"writer"},
     "human_readable_mathematical_text": {"writer"},
@@ -116,6 +122,8 @@ ARTIFACT_PRODUCER_ROLES = {
 STRICT_VERIFIER_ARTIFACT_TYPES = {"verification_report"}
 WRITING_CRITIC_ROLE = "writing_critic"
 WRITING_CRITIC_ARTIFACT_TYPES = {"writing_review"}
+REFEREE_ROLE = "referee"
+REFEREE_ARTIFACT_TYPES = {"referee_report"}
 WRITING_REVIEW_VERDICTS = {"pass", "fail"}
 # "editor" is the single lens the scheduler dispatches; the legacy three-lens
 # names stay accepted so old review data still parses.
@@ -202,6 +210,58 @@ def preflight_patch_errors(patch: Mapping[str, Any], actor_role: str) -> List[st
         if str(op.get("op") or "") in {"attach_artifact", "add_artifact"}
     }
     errors: List[str] = []
+    if actor_role == REFEREE_ROLE:
+        reports = [
+            op
+            for op in attached_ops.values()
+            if str(op.get("artifact_type") or "") == "referee_report"
+        ]
+        if len(reports) != 1:
+            errors.append("referee patches must attach exactly one referee_report")
+        allowed_ops = {"attach_artifact", "add_artifact", "add_debt", "record_run_metrics"}
+        invalid = sorted(
+            {
+                str(op.get("op") or "")
+                for op in operations
+                if str(op.get("op") or "") not in allowed_ops
+            }
+        )
+        if invalid:
+            errors.append(
+                "referee patches may only attach a referee report, add located writing debts, and record metrics; "
+                f"invalid operations: {invalid}"
+            )
+        if reports:
+            metadata = reports[0].get("metadata") if isinstance(reports[0].get("metadata"), Mapping) else {}
+            verdict = str(metadata.get("verdict") or "").strip().lower().replace("-", "_")
+            if verdict not in REFEREE_VERDICTS:
+                errors.append(
+                    "referee_report metadata.verdict must be accept, revise, or major_proof_route_error"
+                )
+            debt_ops = [op for op in operations if str(op.get("op") or "") == "add_debt"]
+            if verdict == "accept" and debt_ops:
+                errors.append("an [accept] referee decision may not open writing debts")
+            if verdict == "revise" and not debt_ops:
+                errors.append("a [revise] referee decision must open at least one located writing debt")
+            if verdict == "major_proof_route_error" and debt_ops:
+                errors.append(
+                    "a [major-proof-route-error] decision records route evidence in the report; "
+                    "the scheduler creates the research debt"
+                )
+            reviewed_paper_id = str(
+                metadata.get("reviewed_paper_artifact_id")
+                or metadata.get("artifact_reviewed")
+                or ""
+            )
+            for debt_op in debt_ops:
+                if (
+                    str(debt_op.get("owner_type") or "") != "artifact"
+                    or str(debt_op.get("owner_id") or "") != reviewed_paper_id
+                    or str(debt_op.get("debt_type") or "") != "writing"
+                ):
+                    errors.append(
+                        "referee findings must be writing debts owned by the reviewed final_paper artifact"
+                    )
     for op in attached_ops.values():
         metadata = op.get("metadata") if isinstance(op.get("metadata"), Mapping) else {}
         errors.extend(
@@ -2019,6 +2079,21 @@ def _attach_artifact(
         raise PatchRejected(["artifact metadata must be an object"])
     metadata = _compact_artifact_metadata(artifact_type, metadata)
     metadata = _prepare_revision_document_metadata(conn, actor, artifact_type, metadata)
+    try:
+        metadata = prepare_final_paper_metadata(
+            conn,
+            actor_role=actor,
+            artifact_type=artifact_type,
+            metadata=metadata,
+        )
+        metadata = prepare_referee_report_metadata(
+            conn,
+            actor_role=actor,
+            artifact_type=artifact_type,
+            metadata=metadata,
+        )
+    except ValueError as exc:
+        raise PatchRejected([str(exc)]) from exc
     content = _artifact_inline_content(op)
     strategy_errors = strategic_artifact_errors(
         conn,
@@ -2058,6 +2133,12 @@ def _attach_artifact(
         staged_from_path = True
     if content is not None and not content.endswith("\n"):
         content += "\n"
+    if actor == REFEREE_ROLE and artifact_type == "referee_report":
+        expected_token = str(metadata.get("decision_token") or "")
+        if not content or not content.lstrip().startswith(expected_token):
+            raise PatchRejected(
+                [f"publication referee_report content must begin with its decision token {expected_token}"]
+            )
     content, content_augmented = _augment_writer_partial_receipt_content(conn, actor, artifact_type, metadata, content)
     content = _normalize_writer_latex_escaping(artifact_type, content)
     content = _normalize_writer_paper_template(artifact_type, content)
@@ -2142,6 +2223,8 @@ def _attach_artifact(
             log_path = str(sidecars.get("latex_log_path") or "")
             if log_path:
                 metadata["latex_log_path"] = log_path
+    created_at = utc_now()
+    artifact_state_revision = int(op.get("state_revision", patch["base_revision"]))
     conn.execute(
         """
         INSERT INTO artifacts(
@@ -2156,12 +2239,20 @@ def _attach_artifact(
             digest,
             actor,
             op.get("run_id", ""),
-            int(op.get("state_revision", patch["base_revision"])),
+            artifact_state_revision,
             op.get("content_summary") or artifact_summary(metadata, fallback=content or ""),
             json_dumps(metadata),
-            utc_now(),
+            created_at,
         ),
     )
+    if artifact_type == "referee_report" and actor == REFEREE_ROLE:
+        record_referee_report(
+            conn,
+            artifact_id=artifact_id,
+            metadata=metadata,
+            state_revision=artifact_state_revision,
+            created_at=created_at,
+        )
 
 
 def _prepare_revision_document_metadata(
@@ -3144,10 +3235,10 @@ def _status_transition(conn: sqlite3.Connection, patch: Dict[str, Any], op: Dict
     actor = patch["actor_role"]
     evidence_ids = list(op.get("evidence_artifact_ids") or patch.get("evidence_artifact_ids", []))
 
-    if actor == WRITING_CRITIC_ROLE:
+    if actor in {WRITING_CRITIC_ROLE, REFEREE_ROLE}:
         raise PatchRejected([
-            "writing_critic may not transition claim, inference, or route statuses; "
-            "report findings as writing debts and writing_review artifacts only"
+            f"{actor} may not transition claim, inference, or route statuses; "
+            "the scheduler alone escalates a referee's route-error decision back to research"
         ])
     if target_type not in {"claim", "inference", "route"}:
         raise PatchRejected([f"unsupported transition target_type: {target_type}"])
@@ -4699,6 +4790,11 @@ def _guard_artifact_actor(actor: str, artifact_type: str, artifact_id: str) -> N
         raise PatchRejected([
             f"writing_critic cannot attach {artifact_type} artifact {artifact_id}; "
             "writing review may only attach writing_review artifacts"
+        ])
+    if actor == REFEREE_ROLE and artifact_type not in REFEREE_ARTIFACT_TYPES:
+        raise PatchRejected([
+            f"referee cannot attach {artifact_type} artifact {artifact_id}; "
+            "publication review may only attach referee_report artifacts"
         ])
     allowed = ARTIFACT_PRODUCER_ROLES.get(artifact_type)
     if allowed and actor not in allowed:

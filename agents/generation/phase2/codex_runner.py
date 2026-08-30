@@ -157,7 +157,7 @@ def actor_role_for_action(action: Mapping[str, Any]) -> str:
     if mode == "write":
         return "writer"
     if mode == "review_writing":
-        return "writing_critic"
+        return "referee" if action.get("publication_referee") else "writing_critic"
     if mode == "prove" and (
         route_id
         or action.get("citation_certification_required")
@@ -483,18 +483,27 @@ def _writer_writing_revision_guidance(action: Mapping[str, Any]) -> str:
         )
     if action.get("paper_revision"):
         revised_id = str(action.get("revision_of_artifact_id") or "the current final_paper")
+        referee_report_id = str(action.get("referee_report_artifact_id") or "")
         return (
-            f"PAPER REVISION PASS: a final_paper already exists ({revised_id}) and the writing gate found open writing "
-            "debts against it. Revise the existing article DIFF-MINIMALLY and voice-preservingly: keep the structure, "
-            "notation, and prose voice of the current LaTeX, and change only what the listed writing debts require. Do "
-            "not restructure sections, do not rewrite passages the debts do not touch, and keep the bibliography intact. "
+            f"PAPER REVISION PASS: revise final_paper {revised_id} on top of its latest text. "
+            + (
+                f"Read and answer the complete referee_report {referee_report_id} in "
+                "manifest.writing_revision_packet.referee_report. "
+                if referee_report_id
+                else ""
+            )
+            + "Preserve every correct, rule-compliant passage and the author's established voice. Make all changes "
+            "needed to answer the referee, including structural changes when the identified defect cannot be fixed "
+            "locally. Keep mathematical claims within the certificate and keep verified bibliography entries intact. "
             + _writing_debt_lines(action)
-            + "Address exactly these open writing debts: fix each one in the text, then resolve each via an update_debt "
+            + "Address every open writing debt: fix each one in the text, then resolve each via an update_debt "
             "operation with debt_id, status='resolved', a one-line resolution_note saying what changed, and "
             "resolution_evidence_artifact_ids naming the revised final_paper artifact you attach in this patch. "
             "Attach exactly one revised final_paper artifact (a NEW artifact_id): the artifact you attach must be the "
-            "COMPLETE revised LaTeX source (artifact_type final_paper), not a diff or an excerpt, and it must still "
-            "compile standalone with pdflatex. "
+            "COMPLETE revised LaTeX source (artifact_type final_paper), not a diff or an excerpt. Include metadata "
+            f"revision_of_artifact_id='{revised_id}'"
+            + (f" and addresses_referee_report_id='{referee_report_id}'" if referee_report_id else "")
+            + ". It must compile standalone with pdflatex. "
             + _WRITER_PAPER_PATH_ATTACH_CONTRACT
             + "Do not weaken or change mathematical content, certification labels, or "
             "claim statuses while revising prose. "
@@ -528,8 +537,8 @@ def _writer_paper_authoring_guidance(action: Mapping[str, Any]) -> str:
         "cite; claim_route_summary maps what was established at which certification level. "
         + PAPER_CONTRACT
         + " OP CONTRACT: return one Albilich v1 patch whose operations are exactly: one attach_artifact with "
-        "artifact_type='final_paper' attached BY PATH (metadata may carry certificate_artifact_id and "
-        "source_artifact_ids); update_debt only when a paper-revision packet names open writing debts; "
+        "artifact_type='final_paper' attached BY PATH with metadata.certificate_artifact_id and source_artifact_ids; "
+        "update_debt only when a paper-revision packet names open writing debts; "
         "record_run_metrics as usual. "
         + _WRITER_PAPER_PATH_ATTACH_CONTRACT
         + "Do not attach any other artifact type, do not verify, refute, or integrate, "
@@ -671,6 +680,40 @@ def _writing_critic_guidance(action: Mapping[str, Any]) -> str:
         "to look thorough. If you report blocker/major findings, you may additionally attach a writing_review artifact "
         "with verdict='fail' (same metadata shape) summarizing them. writing_review is the only artifact type you may "
         "attach."
+    )
+
+
+def _publication_referee_guidance(action: Mapping[str, Any]) -> str:
+    paper_id = str(action.get("artifact_reviewed") or "the current final_paper")
+    certificate_id = str(action.get("certificate_artifact_id") or "the internal final proof")
+    route_id = str(action.get("integrated_route_id") or "the integrated root route")
+    round_number = int(action.get("referee_round") or 1)
+    return (
+        "PUBLICATION REFEREE PASS: act as a critical top-journal referee and a domain expert, not as a copy editor. "
+        f"This is round {round_number}. Review final_paper {paper_id} against certificate {certificate_id}, the "
+        f"integrated proof route {route_id}, the supplied proof evidence, and the verified literature records. "
+        "Check theorem scope and hypotheses, every load-bearing implication, cited theorem applicability, computation "
+        "coverage, no-gaps reproducibility, statement hygiene, notation, exposition, and all rules in the writing "
+        "AGENTS.md. Be skeptical and precise. Do not invent objections merely to prolong review. Never edit the paper "
+        "or mutate claims, routes, inferences, or statuses. Attach exactly one referee_report whose prose begins with "
+        "one of the three decision tokens below and whose metadata carries reviewed_paper_artifact_id, "
+        "certificate_artifact_id, verdict, findings, finding_count, a human-readable title, and a sentence-level "
+        "content_summary. After the decision token, write an actual referee report with a recommendation, a concise "
+        "summary of the contribution and proof route, a correctness assessment, numbered major and minor findings "
+        "with exact locations, a writing and notation assessment, and a citation/reproducibility assessment. Omit an "
+        "empty findings section, but never replace the report with workflow metadata.\n"
+        "[accept]: use metadata.verdict='accept' only when the article is mathematically sound, journal-ready, "
+        "self-contained at the promised level, and has no issue that warrants another author revision. Open no debts.\n"
+        "[revise]: use metadata.verdict='revise' for every correctable mathematical-exposition, local proof, "
+        "citation, architecture, notation, or prose defect. metadata.findings must be a nonempty array of located "
+        "objects with severity, location, problem, and required_fix. For each finding, also add one writing debt owned "
+        "by the reviewed paper. The writer receives the full report and every debt on the next round.\n"
+        "[major-proof-route-error]: use metadata.verdict='major_proof_route_error' only when you have concrete "
+        "mathematical evidence that the entire integrated proof route is false, not for an omitted explanation, a "
+        "repairable gap, a doubtful stylistic choice, or a citation that could be replaced. Supply affected_route_id, "
+        "a precise falsified_step, and substantive mathematical_evidence that states the counterargument or "
+        "contradiction. Open no writing debts. The scheduler will log this decision in SQL, challenge the root, block "
+        "the false route, create a research debt, and return control to the research harness."
     )
 
 
@@ -855,6 +898,8 @@ def _mode_guidance(mode: str, actor_role: str, route_id: str, action: Optional[M
 
 
 def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mapping[str, Any]) -> str:
+    if actor_role == "referee":
+        return _publication_referee_guidance(action)
     if actor_role == "writing_critic":
         return _writing_critic_guidance(action)
     if actor_role == "strict_informal_verifier":
@@ -1704,6 +1749,11 @@ def prepare_session(
         manifest,
         path,
         project_agents_dir=store.generation_root / ".agents",
+        agent_instructions_path=(
+            Path(__file__).resolve().parent / "writing" / "AGENTS.md"
+            if actor_role in {"writer", "referee"}
+            else None
+        ),
     )
     manifest_for_child = capsule["manifest"]
     path = capsule["context_path"]
@@ -1747,6 +1797,7 @@ def _materialize_evidence_capsule(
     context_path: Path,
     *,
     project_agents_dir: Path | None = None,
+    agent_instructions_path: Path | None = None,
 ) -> Dict[str, Any]:
     """Copy manifest-listed local evidence into a per-context child workspace."""
     capsule_dir = context_path.with_suffix("")
@@ -1757,6 +1808,8 @@ def _materialize_evidence_capsule(
         # this capsule. Keep its relative .agents/skills references valid
         # without widening the manifest's mathematical evidence boundary.
         shutil.copytree(project_agents_dir, capsule_dir / ".agents", dirs_exist_ok=True)
+    if agent_instructions_path is not None and agent_instructions_path.is_file():
+        shutil.copy2(agent_instructions_path, capsule_dir / "AGENTS.md")
     child_manifest = json.loads(json.dumps(manifest))
     path_map: dict[str, str] = {}
 
@@ -1840,9 +1893,19 @@ def _model_routing_hint(action: Mapping[str, Any], actor_role: str) -> Dict[str,
             "reason": "route triage and decomposition regulation should be faster than proof construction but still mathematically careful",
         }
     if actor_role == "writer":
+        if action.get("paper_authoring") or action.get("paper_revision") or action.get("publication_writer"):
+            return {
+                "tier": "strong_math",
+                "reason": "publication writing must reconstruct every certified argument and answer domain-referee findings",
+            }
         return {
             "tier": "writing",
             "reason": "proof exposition uses verified artifacts and should prioritize clarity over exploration",
+        }
+    if actor_role == "referee":
+        return {
+            "tier": "strong_math",
+            "reason": "journal refereeing must audit both mathematical correctness and publication quality",
         }
     if actor_role == "writing_critic":
         return {
@@ -1871,13 +1934,18 @@ def _context_char_budget_for_action(max_context_chars: int, action: Mapping[str,
         return max(max_context_chars, 30_000)
     if actor_role == "phd_advisor":
         return max(max_context_chars, 30_000)
+    if actor_role == "referee":
+        return max(max_context_chars, 120_000)
     if actor_role == "writing_critic":
         return max(max_context_chars, 60_000)
     if actor_role == "writer" and (
         action.get("writing_revision")
         or action.get("paper_authoring")
     ):
-        return max(max_context_chars, 60_000)
+        return max(
+            max_context_chars,
+            120_000 if action.get("paper_authoring") or action.get("paper_revision") else 60_000,
+        )
     if actor_role == "writer" and action.get("periodic_hmt"):
         # A cumulative HMT needs the accepted statements and routes across the
         # whole run, not just one selected branch packet.

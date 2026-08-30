@@ -336,23 +336,45 @@ def _run_control_event_lines(timing: Dict[str, Any]) -> list[str]:
 
 
 def _writing_review_lines(state: Dict[str, Any]) -> list[str]:
-    """"Writing review" section: lens verdicts per reviewed document revision
-    (naming the reviewed artifact's type: final_proof certificate or shipped
-    final_paper/revision_document), shipped-document status, writing-debt counts
-    by severity, and the unresolved list used for human quality steering."""
+    """Publication decisions, legacy lenses, and open writing obligations."""
     reviews = [row for row in state.get("artifacts", []) if row.get("artifact_type") == "writing_review"]
+    publication_reviews = list(state.get("publication_reviews", []))
     writing_debts = [row for row in state.get("debts", []) if str(row.get("debt_type") or "") == "writing"]
     has_revision_document = any(
         row.get("artifact_type") == "revision_document" for row in state.get("artifacts", [])
     )
-    if not reviews and not writing_debts and not has_revision_document:
+    if not reviews and not publication_reviews and not writing_debts and not has_revision_document:
         return []
     artifact_types = {
         str(row.get("artifact_id") or ""): str(row.get("artifact_type") or "")
         for row in state.get("artifacts", [])
     }
     lines = ["## Writing Review", ""]
+    if publication_reviews:
+        lines.extend(["### Writer--Referee Publication Loop", ""])
+        for review in sorted(
+            publication_reviews,
+            key=lambda row: (int(row.get("round_number") or 0), str(row.get("created_at") or "")),
+        ):
+            verdict = str(review.get("verdict") or "unknown")
+            line = (
+                f"- Round {int(review.get('round_number') or 0)}: "
+                f"`{review.get('decision_token') or verdict}` on "
+                f"`{review.get('paper_artifact_id') or 'unknown'}`; "
+                f"{int(review.get('finding_count') or 0)} located finding(s)"
+            )
+            if verdict == "major_proof_route_error":
+                line += (
+                    f"; affected route `{review.get('affected_route_id') or 'unknown'}`; "
+                    f"returned to research={'yes' if review.get('escalated_at') else 'pending'}"
+                )
+            lines.append(line)
+            if verdict == "major_proof_route_error":
+                lines.append(f"  - Falsified step: {review.get('falsified_step') or 'not recorded'}")
+                lines.append(f"  - Mathematical evidence: {review.get('mathematical_evidence') or 'not recorded'}")
+        lines.append("")
     if reviews:
+        lines.extend(["### Legacy Editorial Reviews", ""])
         for review in sorted(reviews, key=lambda row: str(row.get("created_at") or "")):
             metadata = json.loads(review.get("metadata_json") or "{}")
             if not isinstance(metadata, dict):
@@ -372,7 +394,12 @@ def _writing_review_lines(state: Dict[str, Any]) -> list[str]:
         if not isinstance(paper_metadata, dict):
             paper_metadata = {}
         paper_status = str(paper_metadata.get("pdf_status") or "no compile status recorded")
-        lines.append(f"- Final paper: `{final_paper.get('artifact_id', '')}` ({paper_status})")
+        version = int(paper_metadata.get("paper_version") or 0)
+        version_text = f", version {version}" if version else ""
+        lines.append(
+            f"- Final paper: `{final_paper.get('artifact_id', '')}` "
+            f"({paper_status}{version_text})"
+        )
         lines.append("")
     revision_document = _latest_revision_document(state)
     if revision_document is not None:

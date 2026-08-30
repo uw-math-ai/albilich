@@ -602,8 +602,8 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertTrue(action.get("paper_authoring"), action)
             self.assertEqual([], active_writing_debts(store))
 
-    def test_clean_paper_dispatches_terminology_review_first(self) -> None:
-        # Deterministically-clean paper starts the independent review sequence.
+    def test_new_clean_paper_dispatches_publication_referee(self) -> None:
+        # Every newly authored clean paper starts the publication referee loop.
         with tempfile.TemporaryDirectory() as tmpdir:
             store = make_solved_store(Path(tmpdir), "writing-gate-editor-dispatch-test")
             attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
@@ -612,11 +612,12 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             action = next_action(store, web_search="disabled")
 
             self.assertEqual("review_writing", action["mode"], action)
-            self.assertEqual("terminology_editor", action["critic_lens"], action)
+            self.assertEqual("publication_referee", action["critic_lens"], action)
             self.assertEqual("final-paper-1", action["artifact_reviewed"])
             self.assertTrue(action.get("paper_review"))
-            self.assertEqual(TERMINOLOGY_REVIEW_INTENT, action["search_intent"])
-            self.assertEqual("writing_critic", actor_role_for_action(action))
+            self.assertEqual("publication_referee_review", action["search_intent"])
+            self.assertTrue(action.get("publication_referee"))
+            self.assertEqual("referee", actor_role_for_action(action))
 
     def test_editor_pass_opens_the_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2242,7 +2243,7 @@ class Phase2WritingModeGuidanceTest(unittest.TestCase):
             },
             actor_role="writer",
         )
-        self.assertIn("DIFF-MINIMALLY", prompt)
+        self.assertIn("Preserve every correct, rule-compliant passage", prompt)
         self.assertIn("debt-p1", prompt)
         self.assertIn("COMPLETE revised LaTeX source", prompt)
         self.assertIn("final_paper", prompt)

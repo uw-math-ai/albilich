@@ -254,6 +254,22 @@ class ProofStateStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS publication_reviews (
+                review_id TEXT PRIMARY KEY REFERENCES artifacts(artifact_id),
+                round_number INTEGER NOT NULL,
+                paper_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+                certificate_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+                verdict TEXT NOT NULL,
+                decision_token TEXT NOT NULL,
+                affected_route_id TEXT NOT NULL,
+                falsified_step TEXT NOT NULL,
+                mathematical_evidence TEXT NOT NULL,
+                finding_count INTEGER NOT NULL,
+                metadata_json TEXT NOT NULL,
+                state_revision INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                escalated_at TEXT NOT NULL DEFAULT ''
+            );
             """
         )
         self._ensure_column(conn, "runs", "search_intent", "TEXT NOT NULL DEFAULT ''")
@@ -295,6 +311,8 @@ class ProofStateStore:
                 ON retrieval_cards(content_hash);
             CREATE INDEX IF NOT EXISTS idx_theorem_library_statement
                 ON theorem_library_entries(normalized_statement);
+            CREATE INDEX IF NOT EXISTS idx_publication_reviews_paper_round
+                ON publication_reviews(paper_artifact_id, round_number);
             """
         )
         conn.execute(
@@ -578,6 +596,7 @@ class ProofStateStore:
                 ).fetchall()
             ]
             run_count = int(conn.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"])
+            publication_reviews = self.fetch_all(conn, "publication_reviews")
 
         premise_map: Dict[str, List[str]] = {}
         for item in sorted(premises, key=lambda x: (x["inference_id"], x["position"])):
@@ -600,6 +619,7 @@ class ProofStateStore:
             "research_artifacts": research_artifacts,
             "confirmed_counterexamples": confirmed_counterexamples,
             "audit_artifacts": audit_artifacts,
+            "publication_reviews": publication_reviews,
         }
 
     def get_revision(self, conn: Optional[sqlite3.Connection] = None) -> int:
@@ -643,6 +663,7 @@ class ProofStateStore:
         cards = self.fetch_all(conn, "retrieval_cards")
         library_entries = self.fetch_all(conn, "theorem_library_entries")
         premises = self.fetch_all(conn, "inference_premises")
+        publication_reviews = self.fetch_all(conn, "publication_reviews")
 
         premise_map: Dict[str, List[str]] = {}
         for item in sorted(premises, key=lambda x: (x["inference_id"], x["position"])):
@@ -660,6 +681,7 @@ class ProofStateStore:
             "runs": runs,
             "retrieval_cards": cards,
             "theorem_library_entries": library_entries,
+            "publication_reviews": publication_reviews,
         }
 
     def write_snapshot(self) -> Dict[str, Any]:
