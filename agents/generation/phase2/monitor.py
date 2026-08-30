@@ -2083,6 +2083,9 @@ window.MathJax = {
   @media (max-width: 720px) {
     .wrap { padding-left: 14px; padding-right: 14px; }
     header.topbar { position: static; padding-left: 14px; padding-right: 14px; margin-left: -14px; margin-right: -14px; }
+    .brand { min-width: 0; max-width: 100%; }
+    .brand .titles { min-width: 0; }
+    .brand .pid { max-width: calc(100vw - 86px); }
     th, td { padding: 8px 7px; }
     .routes-table { font-size: 11.5px; }
     .routes-table .route-id { width: 36%; }
