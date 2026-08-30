@@ -1605,7 +1605,7 @@ window.MathJax = {
     --bad: #c0392b;
     --info: var(--uw-purple);
     --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --mono: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, "Liberation Mono", monospace;
     --radius: 16px;
     --radius-sm: 10px;
   }
