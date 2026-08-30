@@ -263,7 +263,8 @@ def publish_hmt_sidecar(
         or metadata.get("integrated_claim_interval")
         or DEFAULT_HMT_INTEGRATED_CLAIM_INTERVAL
     )
-    sequence = int(action.get("hmt_sequence") or metadata.get("sequence") or 1)
+    requested_sequence = int(action.get("hmt_sequence") or metadata.get("sequence") or 1)
+    existing_papers = read_hmt_catalog(store)
     row = {
         "artifact_id": artifact_id,
         "artifact_type": HMT_ARTIFACT_TYPE,
@@ -271,7 +272,7 @@ def publish_hmt_sidecar(
         "source_revision": source_revision,
         "source_integrated_claim_count": source_integrated_claim_count,
         "integrated_claim_interval": integrated_claim_interval,
-        "sequence": sequence,
+        "sequence": requested_sequence,
         "created_at": utc_now(),
         "tex_path": str(tex_path.resolve()),
         "pdf_path": str(pdf_path.resolve()),
@@ -282,10 +283,25 @@ def publish_hmt_sidecar(
         "non_certifying": True,
     }
     papers = [
-        existing for existing in read_hmt_catalog(store)
+        existing for existing in existing_papers
         if str(existing.get("artifact_id") or "") != artifact_id
     ]
     papers.append(row)
+    # HMT authoring is asynchronous.  A recovery may publish an older
+    # completed paper after a newer sidecar has already entered the catalog,
+    # and both actions may carry the sequence that was correct when each
+    # started.  Canonicalize the full catalog at publication time so ordering
+    # follows accepted-state chronology and sequence labels stay unique.
+    papers.sort(
+        key=lambda paper: (
+            int(paper.get("source_revision") or 0),
+            int(paper.get("source_integrated_claim_count") or 0),
+            str(paper.get("created_at") or ""),
+            str(paper.get("artifact_id") or ""),
+        )
+    )
+    for sequence, paper in enumerate(papers, start=1):
+        paper["sequence"] = sequence
     payload = {"catalog_version": CATALOG_VERSION, "papers": papers}
     catalog = hmt_catalog_path(store)
     catalog_tmp = catalog.with_suffix(".json.tmp")

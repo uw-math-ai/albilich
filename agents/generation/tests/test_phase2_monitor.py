@@ -62,11 +62,22 @@ class MonitorTest(unittest.TestCase):
 
     def test_dashboard_serializes_slow_browser_refresh_work(self) -> None:
         self.assertIn("let tickInFlight = false;", INDEX_HTML)
-        self.assertIn("if (paused || tickInFlight) return;", INDEX_HTML)
+        self.assertIn("if (paused || tickInFlight || document.hidden) return;", INDEX_HTML)
         self.assertIn("signal:controller.signal", INDEX_HTML)
         self.assertIn("await typesetPending(document);", INDEX_HTML)
         self.assertIn("let mathJaxQueue = Promise.resolve();", INDEX_HTML)
         self.assertIn("let tailFetchInFlight = false;", INDEX_HTML)
+
+    def test_dashboard_releases_replaced_math_and_skips_unchanged_heavy_renders(self) -> None:
+        clear_call = "window.MathJax.typesetClear([node])"
+        replace_call = "node.innerHTML = html;"
+        self.assertIn(clear_call, INDEX_HTML)
+        self.assertLess(INDEX_HTML.index(clear_call), INDEX_HTML.index(replace_call))
+        self.assertIn("let lastProofRevision = null;", INDEX_HTML)
+        self.assertIn("const proofStateChanged = forceHeavy || lastProofRevision !== revisionKey;", INDEX_HTML)
+        self.assertIn('document.addEventListener("visibilitychange"', INDEX_HTML)
+        self.assertGreaterEqual(INDEX_HTML.count("if (document.hidden) return;"), 4)
+        self.assertNotIn("renderArtifacts(p.artifact_catalog)", INDEX_HTML)
 
     def _store(self, tmpdir: str) -> ProofStateStore:
         store = ProofStateStore("monitor-test", generation_root=Path(tmpdir) / "generation")
@@ -160,6 +171,56 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(payload["snapshot"]["open_blocking_case_count"], 0)
         self.assertEqual(payload["snapshot"]["ledger_active_debt_count"], 1)
         self.assertFalse(any(payload["open_cases"].values()))
+
+    def test_dashboard_keeps_refuted_discarded_and_resolved_debts_visible_but_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            now = utc_now()
+            with store.connect() as conn:
+                for status in ("active", "refuted", "discarded", "resolved"):
+                    conn.execute(
+                        """INSERT INTO debts(
+                               debt_id, owner_type, owner_id, obligation, fingerprint, debt_type,
+                               severity, status, first_seen, last_seen, repeated_count,
+                               source_artifact_ids_json, suggested_next_target, resolution_evidence_json
+                           ) VALUES (?, 'claim', 'root', ?, ?, 'gap', 'blocking', ?, ?, ?, 1,
+                                     '[]', 'root', ?)""",
+                        (
+                            f"debt-{status}",
+                            f"The {status} obligation.",
+                            f"fp-{status}",
+                            status,
+                            now,
+                            now,
+                            json.dumps(
+                                {
+                                    "resolution_note": f"Classified as {status}.",
+                                    "resolution_evidence_artifact_ids": [f"evidence-{status}"],
+                                }
+                            ),
+                        ),
+                    )
+                conn.commit()
+
+            payload = build_monitor_payload(store)
+
+        self.assertEqual(sum(map(len, payload["open_cases"].values())), 1)
+        self.assertEqual(
+            {group: [row["debt_id"] for row in rows] for group, rows in payload["closed_cases"].items()},
+            {
+                "Refuted": ["debt-refuted"],
+                "Discarded": ["debt-discarded"],
+                "Resolved": ["debt-resolved"],
+            },
+        )
+        self.assertEqual(payload["closed_cases"]["Refuted"][0]["resolution_note"], "Classified as refuted.")
+        self.assertEqual(
+            payload["closed_cases"]["Refuted"][0]["resolution_evidence_artifact_ids"],
+            ["evidence-refuted"],
+        )
+        self.assertIn("Proof Obligations", INDEX_HTML)
+        self.assertIn("Closed obligation ledger", INDEX_HTML)
+        self.assertIn("renderDebts(p.open_cases, p.closed_cases);", INDEX_HTML)
 
     def test_token_ui_distinguishes_processed_from_budget_spend(self) -> None:
         self.assertIn('cached/input*100', INDEX_HTML)

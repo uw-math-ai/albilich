@@ -2441,6 +2441,29 @@ def _deep_session_context(state: Mapping[str, Any], action: Mapping[str, Any]) -
 
 def enrich_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[str, Any]:
     enriched = dict(action)
+    # A direct ``prove`` action without a route is researcher-owned.  The
+    # root-cut gate may later attach the decisive route to that action.  If it
+    # leaves the mode as ``prove``, actor_role_for_action reclassifies the
+    # session as a strict verifier even though the payload is still a
+    # researcher proof-construction/route-conversion task.  Besides giving the
+    # verifier the wrong packet, each gap report advances the proof-state
+    # revision and can create an unbounded verifier loop.  Remember the
+    # original ownership before any retargeting and preserve it below.
+    direct_researcher_prove = (
+        str(enriched.get("mode") or "") == "prove"
+        and not str(enriched.get("route_id") or "")
+        and not any(
+            enriched.get(flag)
+            for flag in (
+                "citation_certification_required",
+                "citation_triage_required",
+                "paper_audit_document_review_required",
+                "proof_repair_verification_required",
+                "verify_ready_route_policy",
+                "strict_verifier_scope",
+            )
+        )
+    )
     program_view = proof_program_view(state)
     threat_view = threat_propagation_view(state)
     debt_frontier = minimal_active_debt_frontier(state)
@@ -2503,6 +2526,11 @@ def enrich_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[s
             decisive_target_id = str(decisive.get("target_id") or enriched.get("target_id") or "root")
             enriched["target_id"] = _claim_target_for_context(state, decisive_target_id)
             enriched["route_id"] = str(decisive.get("route_id") or enriched.get("route_id") or "")
+            if direct_researcher_prove and enriched["route_id"]:
+                enriched["mode"] = "reduce"
+                enriched["display_mode"] = "researcher_prove"
+                enriched["root_cut_preserved_researcher_ownership"] = True
+                enriched.setdefault("proof_construction_required", True)
             enriched["reason"] = (
                 "root-cut consolidation gate: close, refute, or strictly shrink the decisive obligation "
                 f"{decisive.get('obligation_id') or ''} before creating another claim"

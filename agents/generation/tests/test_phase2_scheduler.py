@@ -1765,6 +1765,139 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             ],
         )
 
+    def test_proof_compression_with_explicit_proved_lemmas_schedules_claim_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore(
+                "scheduler-proof-compression-claim-extraction-test",
+                generation_root=Path(tmpdir) / "generation",
+            )
+            store.init_problem("Target theorem.")
+            outcome = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 0,
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "compression-with-proved-local-lemmas",
+                            "artifact_type": "proof_compression",
+                            "content": "The compression closes two local obstruction lemmas but not the root.",
+                            "metadata": {
+                                "target_id": "root",
+                                "artifact_roi": "route_blocked_or_abandoned",
+                                "mathematical_delta_kind": "route_killing_obstruction",
+                                "changed_proof_state": True,
+                                "strategy_schema_version": 1,
+                                "history_preserved": True,
+                                "minimal_proof_skeleton": {
+                                    "root": "Target theorem.",
+                                    "essential_verified_facts": [],
+                                    "essential_routes": ["none_yet"],
+                                    "unresolved_bridges": ["Prove the remaining global bridge."],
+                                    "conditional_steps": ["The root follows if the bridge holds."],
+                                    "unused_or_low_value_branches": ["Retire the compressed obstruction route."],
+                                    "shortest_known_route": ["Prove the remaining global bridge."],
+                                    "weakest_sufficient_new_statement": "The remaining global bridge holds.",
+                                    "single_decisive_missing_theorem": "The remaining global bridge holds.",
+                                    "strongest_candidate_counterexample_architecture": "Test the smallest admissible model.",
+                                    "most_informative_failed_ideas": ["The compressed obstruction does not close the root."],
+                                },
+                                "proved_lemma_statements": [
+                                    "Every admissible diagonal embedding preserves the first component order.",
+                                    "Increasing ambient conjugation preserves ordered component characteristics.",
+                                ],
+                            },
+                        }
+                    ],
+                    "rationale": "seed proved local lemmas produced by proof compression",
+                },
+            )
+            self.assertTrue(outcome.accepted, outcome.errors)
+
+            action = next_action(store, research_mode="balanced", web_search="disabled")
+            manifest = build_context_manifest(store, action=action)
+
+            record_run(
+                store,
+                base_revision=1,
+                run_id="run-earlier-proof-candidate-conversion",
+                mode="prove",
+                target_id="root",
+                search_intent="proof_candidate_route_conversion",
+                actor_role="researcher",
+            )
+            retry_action = next_action(store, research_mode="balanced", web_search="disabled")
+
+            first_extraction = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 2,
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "add_claim",
+                            "claim_id": "first-compressed-lemma",
+                            "kind": "lemma",
+                            "statement": "Every admissible diagonal embedding preserves the first component order.",
+                            "parent_ids": ["root"],
+                        },
+                        {
+                            "op": "add_route",
+                            "route_id": "route-first-compressed-lemma",
+                            "conclusion_claim_id": "first-compressed-lemma",
+                            "strategy": "Use the proof-compression argument.",
+                            "evidence_artifact_ids": ["compression-with-proved-local-lemmas"],
+                        },
+                        {
+                            "op": "add_inference",
+                            "inference_id": "inference-first-compressed-lemma",
+                            "route_id": "route-first-compressed-lemma",
+                            "conclusion_claim_id": "first-compressed-lemma",
+                            "explanation": "The compression proves the first local lemma.",
+                            "validation_status": "plausible",
+                            "evidence_artifact_ids": ["compression-with-proved-local-lemmas"],
+                        },
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "newer-generic-advisor-proof-candidate",
+                            "artifact_type": "advisor_report",
+                            "content": "A newer generic proof candidate that should not mask missing proved lemmas.",
+                            "metadata": {"target_id": "root", "proof_candidate": True},
+                        },
+                    ],
+                    "rationale": "extract the first of several proved lemmas",
+                },
+            )
+            self.assertTrue(first_extraction.accepted, first_extraction.errors)
+            remaining_candidate = _unrouted_proof_candidate(store.get_scheduler_state())
+
+        self.assertEqual(action["search_intent"], "proof_candidate_route_conversion")
+        self.assertEqual(action["proof_candidate_artifact_id"], "compression-with-proved-local-lemmas")
+        self.assertTrue(action["proved_lemma_claim_extraction_required"])
+        self.assertEqual(
+            action["proved_lemma_candidate_statements"],
+            [
+                "Every admissible diagonal embedding preserves the first component order.",
+                "Increasing ambient conjugation preserves ordered component characteristics.",
+            ],
+        )
+        self.assertTrue(manifest["workflow_action"]["proved_lemma_claim_extraction_required"])
+        self.assertEqual(retry_action["search_intent"], "proof_candidate_route_conversion")
+        self.assertEqual(retry_action["proof_candidate_artifact_id"], "compression-with-proved-local-lemmas")
+        self.assertTrue(retry_action["proved_lemma_claim_extraction_required"])
+        self.assertIsNotNone(remaining_candidate)
+        self.assertEqual(
+            remaining_candidate["candidate_lemmas"],
+            ["Increasing ambient conjugation preserves ordered component characteristics."],
+        )
+
     def test_incomplete_local_reduction_is_not_promoted_to_proved_lemma(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore(

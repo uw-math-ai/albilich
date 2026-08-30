@@ -206,10 +206,12 @@ def run_workflow(
     hmt_completed: Dict[str, Any] | None = None
     hmt_stop_event = threading.Event()
     hmt_last_attempted_integrated_claim_count = 0
+    hmt_retry_not_before_revision = 0
     hmt_sidecar_results: list[Dict[str, Any]] = []
 
     def collect_hmt_sidecar() -> None:
         nonlocal hmt_thread, hmt_completed
+        nonlocal hmt_last_attempted_integrated_claim_count, hmt_retry_not_before_revision
         with hmt_lock:
             completed = hmt_completed
             hmt_completed = None
@@ -238,6 +240,18 @@ def run_workflow(
         hmt_sidecar_results.append(result)
         owner_entry["hmt_sidecar_result"] = result
         owner_entry["hmt_sidecar_status"] = result["status"]
+        if outcome.get("accepted"):
+            hmt_retry_not_before_revision = 0
+        else:
+            # A failed non-certifying writer must not consume an entire
+            # integrated-claim cadence.  The old guard remembered the failed
+            # checkpoint and suppressed every retry until ten more claims were
+            # integrated, which could leave the dashboard with no HMT at the
+            # 10-claim milestone and a mislabeled sequence 1 at 20 claims.
+            # Retry after one accepted proof-state revision, keeping the HMT
+            # off the proof lane while avoiding a same-step failure loop.
+            hmt_last_attempted_integrated_claim_count = 0
+            hmt_retry_not_before_revision = store.get_revision() + 1
         hmt_thread = None
         with console_lock:
             write_console_snapshot_locked(force=True)
@@ -349,7 +363,12 @@ def run_workflow(
             with console_lock:
                 if not any(item is entry for item in history):
                     history.append(entry)
-                entry["execution_phase"] = "running"
+                # A periodic HMT is attached to the proof step that happened to
+                # launch it, but may finish several proof steps later.  Its late
+                # progress callback must not resurrect that already-finished
+                # owner step as ``running`` in the console/dashboard.
+                if not entry.get("finished_at"):
+                    entry["execution_phase"] = "running"
                 live_updates = entry.setdefault("live_session_updates", {})
                 if not isinstance(live_updates, dict):
                     live_updates = {}
@@ -539,7 +558,7 @@ def run_workflow(
         entry["started_at"] = utc_now()
         record_entry(entry)
 
-        if hmt_thread is None:
+        if hmt_thread is None and store.get_revision() >= hmt_retry_not_before_revision:
             hmt_action = periodic_hmt_sidecar_action(store, research_mode=research_mode)
             if hmt_action is not None:
                 source_integrated_claim_count = int(

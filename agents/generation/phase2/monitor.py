@@ -90,6 +90,55 @@ def _json_object(value: Any) -> dict[str, Any]:
     return dict(decoded) if isinstance(decoded, Mapping) else {}
 
 
+def _closed_case_groups(state: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Expose retired proof obligations without mixing them into open blockers."""
+    labels = {
+        "refuted": "Refuted",
+        "discarded": "Discarded",
+        "resolved": "Resolved",
+    }
+    groups: dict[str, list[dict[str, Any]]] = {label: [] for label in labels.values()}
+    closed_debts = [
+        row
+        for row in state.get("debts", [])
+        if str(row.get("status") or "") in labels
+    ]
+    closed_debts.sort(
+        key=lambda row: (
+            str(row.get("last_seen") or ""),
+            str(row.get("debt_id") or ""),
+        ),
+        reverse=True,
+    )
+    for debt in closed_debts:
+        status = str(debt.get("status") or "")
+        evidence = _json_object(debt.get("resolution_evidence_json"))
+        evidence_ids = [
+            str(item)
+            for item in _json_list(evidence.get("resolution_evidence_artifact_ids"))
+            if str(item or "")
+        ]
+        artifact_id = str(evidence.get("artifact_id") or "")
+        if artifact_id and artifact_id not in evidence_ids:
+            evidence_ids.append(artifact_id)
+        groups[labels[status]].append(
+            {
+                "debt_id": str(debt.get("debt_id") or ""),
+                "status": status,
+                "severity": str(debt.get("severity") or ""),
+                "owner": f"{debt.get('owner_type', '')}:{debt.get('owner_id', '')}",
+                "debt_type": str(debt.get("debt_type") or ""),
+                "obligation": str(debt.get("obligation") or ""),
+                "suggested_next_target": str(debt.get("suggested_next_target") or ""),
+                "repeated_count": int(debt.get("repeated_count") or 1),
+                "resolution_note": str(evidence.get("resolution_note") or ""),
+                "resolution_evidence_artifact_ids": evidence_ids,
+                "last_seen": str(debt.get("last_seen") or ""),
+            }
+        )
+    return groups
+
+
 def _report_has_items(value: Any) -> bool:
     if isinstance(value, (list, tuple, set)):
         return any(str(item or "").strip() for item in value)
@@ -721,6 +770,7 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
     """
     state = store.get_state()
     payload = build_run_console_payload(store, state=state)
+    payload["closed_cases"] = _closed_case_groups(state)
     source = "store"
     console_json = store.state_dir / "albilich_run_console.json"
     file_payload: Dict[str, Any] | None = None
@@ -1722,6 +1772,10 @@ window.MathJax = {
   .debt .head { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
   .debt .oblig { font-size: 12px; color: var(--muted); line-height: 1.5; overflow-wrap: anywhere; word-break: break-word; }
   .debt.blocking { border-left: 3px solid var(--bad); }
+  .debt.refuted { border-left: 3px solid var(--bad); background: color-mix(in srgb, var(--bad) 7%, var(--surface-2)); }
+  .debt.discarded { border-left: 3px solid var(--muted); background: color-mix(in srgb, var(--muted) 7%, var(--surface-2)); }
+  .debt.resolved { border-left: 3px solid var(--good); background: color-mix(in srgb, var(--good) 5%, var(--surface-2)); }
+  .closed-debt-ledger { margin-top: 17px; padding-top: 10px; border-top: 1px solid var(--border); }
   .group-h { font-size: 10.5px; text-transform: uppercase; letter-spacing: .6px; color: var(--faint); margin: 8px 0 8px; font-weight: 600; }
 
   .bottleneck-panel { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, .9fr); gap: 14px; align-items: stretch; }
@@ -2016,8 +2070,8 @@ window.MathJax = {
     </div>
     <div class="col-right">
       <div class="card">
-        <h2>Open Cases <span class="count" id="debtCount"></span></h2>
-        <div class="body cap" id="debts"><div class="empty">No active debts.</div></div>
+        <h2>Proof Obligations <span class="count" id="debtCount"></span></h2>
+        <div class="body cap" id="debts"><div class="empty">No proof obligations.</div></div>
       </div>
       <div class="card">
         <h2>Parallel Exchange <span class="count" id="sigCount"></span></h2>
@@ -2037,6 +2091,7 @@ window.MathJax = {
 const POLL_MS = __POLL_MS__;
 let paused = false, lastOk = 0;
 let tickInFlight = false;
+let lastProofRevision = null;
 const CONSOLE_REQUEST_TIMEOUT_MS = Math.max(10000, POLL_MS * 4);
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -2044,6 +2099,13 @@ const STABLE_HTML_KEYS = new WeakMap();
 function setStableHTML(node, html){
   if (!node) return false;
   if (STABLE_HTML_KEYS.get(node) === html) return false;
+  // MathJax keeps MathItem objects for every typeset node.  Clear those
+  // references before replacing a dynamic subtree; otherwise long-running
+  // dashboards retain every retired proof-state render until the renderer
+  // eventually exhausts memory.
+  if (window.MathJax && typeof window.MathJax.typesetClear === 'function'){
+    try { window.MathJax.typesetClear([node]); } catch (_) {}
+  }
   STABLE_HTML_KEYS.set(node, html);
   node.innerHTML = html;
   return true;
@@ -2680,6 +2742,7 @@ function renderPapers(rows){
   showSelectedPaper();
 }
 async function refreshPapers(){
+  if (document.hidden) return;
   try {
     const response = await fetch("/api/papers", {cache:"no-store"});
     if (response.ok) renderPapers((await response.json()).papers||[]);
@@ -2717,13 +2780,17 @@ function renderRoutes(rows){
   setStableHTML($("routes"), h);
 }
 
-function renderDebts(groups){
+function renderDebts(groups, closedGroups){
   groups = groups || {};
+  closedGroups = closedGroups || {};
   const order = ["Blocking","Citation / Hypothesis","Verifier Repair","Decomposition / Regulator","Other"];
+  const closedOrder = ["Refuted","Discarded","Resolved"];
   let total = 0; order.forEach(g => total += (groups[g]||[]).length);
-  $("debtCount").textContent = total ? `${total}` : "";
-  if (!total){ setStableHTML($("debts"), `<div class="empty">No active proof debts.</div>`); return; }
+  let closedTotal = 0; closedOrder.forEach(g => closedTotal += (closedGroups[g]||[]).length);
+  $("debtCount").textContent = total || closedTotal ? `${total} open · ${closedTotal} closed` : "";
+  if (!total && !closedTotal){ setStableHTML($("debts"), `<div class="empty">No proof obligations.</div>`); return; }
   let h = "";
+  if (!total) h += `<div class="empty">No active proof debts.</div>`;
   for (const g of order){
     const list = groups[g] || [];
     if (!list.length) continue;
@@ -2737,6 +2804,30 @@ function renderDebts(groups){
           <span class="pair" style="color:var(--faint);font-size:11px">→ ${esc(d.suggested_next_target||"?")}</span></div>
         <div class="oblig">${mathHTML(String(d.obligation||"").slice(0,260))}${String(d.obligation||"").length>260?"…":""}</div></div>`;
     }
+  }
+  if (closedTotal){
+    h += `<div class="closed-debt-ledger"><div class="group-h">Closed obligation ledger · ${closedTotal}</div>`;
+    for (const g of closedOrder){
+      const list = closedGroups[g] || [];
+      if (!list.length) continue;
+      const status = g.toLowerCase();
+      const tone = status === "refuted" ? "bad" : (status === "resolved" ? "good" : "");
+      h += `<div class="group-h">${esc(g)} · ${list.length}</div>`;
+      for (const d of list){
+        const note = String(d.resolution_note||"");
+        const evidence = d.resolution_evidence_artifact_ids || [];
+        h += `<div class="debt ${esc(status)}">
+          <div class="head"><span class="mid">${esc(d.debt_id)}</span>
+            <span class="pill ${tone}">${esc(d.status||status)}</span>
+            <span class="pill">${esc(d.severity||"")}</span>
+            <span class="pair" style="color:var(--faint);font-size:11px">${esc(d.owner||"")}</span></div>
+          <div class="oblig">${mathHTML(String(d.obligation||"").slice(0,260))}${String(d.obligation||"").length>260?"…":""}</div>
+          ${note?`<div class="oblig" style="margin-top:6px"><b>Disposition.</b> ${mathHTML(note)}</div>`:""}
+          ${evidence.length?`<div class="pair" style="color:var(--faint);font-size:10.5px;margin-top:6px">evidence: ${evidence.map(esc).join(", ")}</div>`:""}
+        </div>`;
+      }
+    }
+    h += `</div>`;
   }
   setStableHTML($("debts"), h);
 }
@@ -2855,6 +2946,7 @@ function renderArtifacts(rows){
   openArtifact(selectedArtifactId);
 }
 async function refreshArtifactCatalog(){
+  if (document.hidden) return;
   try {
     const response = await fetch("/api/artifacts", {cache:"no-store"});
     if (response.ok) renderArtifacts((await response.json()).artifacts||[]);
@@ -3096,6 +3188,7 @@ function renderProofGraph(graph){
 /* ===== Live tail viewer (stream any log/report/artifact) ===== */
 let tailFiles = [], tailSel = "", tailUserPicked = false;
 async function refreshTailFiles(){
+  if (document.hidden) return;
   try {
     const r = await fetch("/api/files", {cache:"no-store"});
     const j = await r.json();
@@ -3149,6 +3242,7 @@ setInterval(refreshTailFiles, 12000);
 
 /* ===== Human steering (see blockers + type guidance, without halting the run) ===== */
 async function refreshSteering(){
+  if (document.hidden) return;
   try {
     const r = await fetch("/api/steering", {cache:"no-store"});
     const j = await r.json();
@@ -3215,11 +3309,12 @@ function renderRunbar(mon){
   bar.innerHTML = `<span class="rdot"></span><span>${label}</span><span class="rsub">${esc(sub)}</span>`;
 }
 
-async function tick(){
+async function tick(forceHeavy=false){
   // setInterval does not await async callbacks.  Without this single-flight
   // guard, a slow render starts another full 400KB+ refresh every POLL_MS and
   // eventually freezes the browser while the proof process remains healthy.
-  if (paused || tickInFlight) return;
+  if (paused || tickInFlight || document.hidden) return;
+  if (typeof forceHeavy !== "boolean") forceHeavy = false;
   tickInFlight = true;
   const controller = new AbortController();
   const requestTimeout = setTimeout(() => controller.abort(), CONSOLE_REQUEST_TIMEOUT_MS);
@@ -3231,6 +3326,8 @@ async function tick(){
     lastOk = Date.now();
     $("errbar").style.display = "none";
     const snap = p.snapshot || {}, mon = p._monitor || {};
+    const revisionKey = snap.revision == null ? "missing" : String(snap.revision);
+    const proofStateChanged = forceHeavy || lastProofRevision !== revisionKey;
     $("pid").textContent = mon.problem_id || p.problem_id || "";
     document.title = `${(snap.public_status||"run")} · Albilich Monitor`;
     const sb = $("statusBadge"); sb.className = "badge "+STATUS_CLASS(snap.public_status); sb.textContent = snap.public_status || "—";
@@ -3241,21 +3338,22 @@ async function tick(){
     renderRunbar(mon);
     renderKpis(snap);
     renderPipeline(p, activeStep(p));
-    renderApproachPortfolio(p.research_strategy);
-    renderProofSpine(p.proof_spine_status);
-    renderBottleneck(p.bottleneck_frontier);
     renderResearcherMode(p.researcher_mode_state);
     renderTokens(snap, p.usage_summary || {});
-    renderClaims(p.claims);
     renderPapers(p.papers);
-    renderProofGraph(p.proof_graph);
     renderSession(p);
-    renderRoutes(p.route_scoreboard);
-    renderDebts(p.open_cases);
     renderSignals(p.parallel_exchange);
     renderTimeline(p.run_timeline);
-    if (Array.isArray(p.artifact_catalog)) renderArtifacts(p.artifact_catalog);
-    else if (!artifactRows.length) renderArtifacts(p.recent_research_artifacts);
+    if (proofStateChanged){
+      renderApproachPortfolio(p.research_strategy);
+      renderProofSpine(p.proof_spine_status);
+      renderBottleneck(p.bottleneck_frontier);
+      renderClaims(p.claims);
+      renderProofGraph(p.proof_graph);
+      renderRoutes(p.route_scoreboard);
+      renderDebts(p.open_cases, p.closed_cases);
+      lastProofRevision = revisionKey;
+    }
     if (!paused) fetchTail();
     $("foot").textContent = `source: ${mon.source||"?"} · ${snap.summary||""} · ${snap.verifier_health||""}`;
     await typesetPending(document);
@@ -3283,10 +3381,19 @@ $("pauseBtn").addEventListener("click", () => {
     const rb = $("runbar"); rb.className = "runbar stalled";
     rb.innerHTML = `<span class="rdot"></span><span>⏸ DASHBOARD PAUSED</span><span class="rsub">Dashboard paused; Albilich run is still active. Display refresh only — to pause the run itself use: python -m agents.generation.phase2.cli pause &lt;problem&gt;</span>`;
   } else {
-    tick();
+    tick(true);
   }
 });
-$("refreshBtn").addEventListener("click", tick);
+$("refreshBtn").addEventListener("click", () => tick(true));
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !paused){
+    tick(true);
+    refreshPapers();
+    refreshArtifactCatalog();
+    refreshTailFiles();
+    refreshSteering();
+  }
+});
 setInterval(() => $("updated").textContent = ago(), 1000);
 refreshPapers();
 setInterval(refreshPapers, 30000);

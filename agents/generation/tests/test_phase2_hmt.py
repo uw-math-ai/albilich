@@ -282,6 +282,54 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
             )
             self.assertTrue(Path(read_hmt_catalog(store)[0]["pdf_path"]).is_file())
 
+    def test_sidecar_publication_allocates_sequence_against_live_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            staging = store.state_dir / "artifacts" / "staging"
+            staging.mkdir(parents=True, exist_ok=True)
+
+            def publish(artifact_id: str, source_count: int) -> dict:
+                source = staging / f"{artifact_id}.tex"
+                source.write_text(HMT_LATEX, encoding="utf-8")
+                return publish_hmt_sidecar(
+                    store,
+                    action={
+                        "hmt_source_revision": source_count,
+                        "hmt_source_integrated_claim_count": source_count,
+                        "hmt_integrated_claim_interval": 10,
+                        # Both actions were planned before either publication.
+                        "hmt_sequence": 1,
+                    },
+                    execution={
+                        "run_id": f"run-{artifact_id}",
+                        "status": "completed",
+                        "patch": {
+                            "operations": [
+                                {
+                                    "op": "attach_artifact",
+                                    "artifact_id": artifact_id,
+                                    "artifact_type": "human_readable_mathematical_text",
+                                    "path": str(source),
+                                    "content_summary": "A cumulative partial result.",
+                                    "metadata": {"title": f"Snapshot at {source_count}"},
+                                }
+                            ]
+                        },
+                    },
+                )
+
+            self.assertTrue(publish("hmt-at-20", 20)["accepted"])
+            # Recover the older completed paper after the newer one has
+            # already entered the catalog.
+            self.assertTrue(publish("hmt-at-10", 10)["accepted"])
+
+            papers = read_hmt_catalog(store)
+            self.assertEqual([paper["sequence"] for paper in papers], [1, 2])
+            self.assertEqual(
+                [paper["source_integrated_claim_count"] for paper in papers],
+                [10, 20],
+            )
+
     def test_hmt_usage_is_never_charged_to_research_budget(self) -> None:
         self.assertEqual(
             run_spend_from_operation(
@@ -386,6 +434,207 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
                 run.get("search_intent") == "periodic_human_readable_mathematical_text"
                 for run in store.get_state()["runs"]
             ))
+
+    def test_late_hmt_progress_does_not_resurrect_finished_owner_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
+        ):
+            store = self._store(tmpdir)
+            self._set_revision(store, 10)
+            second_research_started = threading.Event()
+            hmt_returning = threading.Event()
+            research_calls = 0
+
+            def executor(
+                *,
+                store: ProofStateStore,
+                action: dict,
+                session_plan: dict,
+                **_: object,
+            ) -> dict:
+                nonlocal research_calls
+                if action.get("periodic_hmt"):
+                    self.assertTrue(
+                        second_research_started.wait(2.0),
+                        "the HMT did not remain pending past its owner step",
+                    )
+                    hmt_returning.set()
+                    return {
+                        "run_id": "late-hmt-sidecar",
+                        "actor_role": "writer",
+                        "status": "failed",
+                        "returncode": -1,
+                        "patch": None,
+                        "patch_error": "synthetic late completion",
+                        "usage": {},
+                    }
+
+                research_calls += 1
+                if research_calls == 2:
+                    second_research_started.set()
+                    self.assertTrue(hmt_returning.wait(1.0))
+                    time.sleep(0.05)
+                actor_role = str(session_plan.get("actor_role") or actor_role_for_action(action))
+                artifact_id = f"research-step-{research_calls}"
+                return {
+                    "run_id": artifact_id,
+                    "actor_role": actor_role,
+                    "status": "completed",
+                    "returncode": 0,
+                    "wall_time_seconds": 0.01,
+                    "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                    "patch": {
+                        "schema_version": SCHEMA_VERSION,
+                        "problem_id": store.problem_id,
+                        "base_revision": session_plan["state_revision"],
+                        "actor_role": actor_role,
+                        "target_id": action.get("target_id", "root"),
+                        "operations": [
+                            {
+                                "op": "attach_artifact",
+                                "artifact_id": artifact_id,
+                                "artifact_type": "source_synthesis_report",
+                                "content": "Research continued while the HMT completed asynchronously.",
+                                "content_summary": "Synthetic regression evidence.",
+                            }
+                        ],
+                    },
+                    "patch_error": "",
+                    "output_artifact_ids": [artifact_id],
+                }
+
+            with patch(
+                "agents.generation.phase2.hmt_sidecar.integrated_claim_count",
+                return_value=10,
+            ):
+                result = run_workflow(
+                    store,
+                    steps=2,
+                    execute=True,
+                    parallel_librarian_verifier=False,
+                    parallel_branches=0,
+                    write_on_stop=False,
+                    write_console=False,
+                    executor=executor,
+                )
+
+            self.assertEqual(research_calls, 2)
+            self.assertEqual(result["steps"][0]["execution_phase"], "completed")
+            self.assertEqual(result["steps"][0]["hmt_sidecar_status"], "failed")
+
+    def test_failed_hmt_retries_before_the_next_claim_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
+        ):
+            store = self._store(tmpdir)
+            self._set_revision(store, 10)
+            hmt_calls = 0
+            hmt_finished = threading.Event()
+            research_calls = 0
+
+            def executor(
+                *,
+                store: ProofStateStore,
+                action: dict,
+                session_plan: dict,
+                **_: object,
+            ) -> dict:
+                nonlocal hmt_calls, research_calls
+                if action.get("periodic_hmt"):
+                    hmt_calls += 1
+                    if hmt_calls == 1:
+                        hmt_finished.set()
+                        return {
+                            "run_id": "failed-hmt",
+                            "actor_role": "writer",
+                            "status": "failed",
+                            "returncode": 1,
+                            "patch": None,
+                            "patch_error": "synthetic transient failure",
+                            "usage": {},
+                        }
+                    source = store.state_dir / "artifacts" / "staging" / "retried-hmt.tex"
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_text(HMT_LATEX, encoding="utf-8")
+                    hmt_finished.set()
+                    return {
+                        "run_id": "retried-hmt",
+                        "actor_role": "writer",
+                        "status": "completed",
+                        "returncode": 0,
+                        "patch_error": "",
+                        "usage": {},
+                        "patch": {
+                            "schema_version": SCHEMA_VERSION,
+                            "problem_id": store.problem_id,
+                            "base_revision": session_plan["state_revision"],
+                            "actor_role": "writer",
+                            "target_id": "root",
+                            "operations": [
+                                {
+                                    "op": "attach_artifact",
+                                    "artifact_id": "retried-hmt",
+                                    "artifact_type": "human_readable_mathematical_text",
+                                    "path": str(source),
+                                    "content_summary": "The retry records the cumulative partial result.",
+                                    "metadata": {"title": "Retried HMT"},
+                                }
+                            ],
+                        },
+                    }
+
+                research_calls += 1
+                if research_calls in {1, 3}:
+                    self.assertTrue(hmt_finished.wait(1.0))
+                    hmt_finished.clear()
+                actor_role = str(session_plan.get("actor_role") or actor_role_for_action(action))
+                artifact_id = f"research-during-hmt-retry-{research_calls}"
+                return {
+                    "run_id": artifact_id,
+                    "actor_role": actor_role,
+                    "status": "completed",
+                    "returncode": 0,
+                    "usage": {},
+                    "patch_error": "",
+                    "patch": {
+                        "schema_version": SCHEMA_VERSION,
+                        "problem_id": store.problem_id,
+                        "base_revision": session_plan["state_revision"],
+                        "actor_role": actor_role,
+                        "target_id": action.get("target_id", "root"),
+                        "operations": [
+                            {
+                                "op": "attach_artifact",
+                                "artifact_id": artifact_id,
+                                "artifact_type": "source_synthesis_report",
+                                "content": "Research continued while HMT authoring retried.",
+                                "content_summary": "Synthetic retry regression evidence.",
+                            }
+                        ],
+                    },
+                }
+
+            with patch(
+                "agents.generation.phase2.hmt_sidecar.integrated_claim_count",
+                return_value=10,
+            ):
+                result = run_workflow(
+                    store,
+                    steps=3,
+                    execute=True,
+                    parallel_librarian_verifier=False,
+                    parallel_branches=0,
+                    write_on_stop=False,
+                    write_console=False,
+                    executor=executor,
+                )
+
+            self.assertEqual(hmt_calls, 2)
+            self.assertEqual(
+                [item["status"] for item in result["hmt_sidecar_results"]],
+                ["failed", "completed"],
+            )
+            self.assertEqual(read_hmt_catalog(store)[0]["artifact_id"], "retried-hmt")
 
     def test_hmt_manifest_and_prompt_are_one_shot_and_non_certifying(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(

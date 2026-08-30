@@ -212,7 +212,12 @@ OBSTRUCTION_SIGNAL_ARTIFACT_TYPES = {
     "proof_dossier",
     *ROUTE_OBSTRUCTION_ARTIFACT_TYPES,
 }
-PROOF_CANDIDATE_ARTIFACT_TYPES = {"proof_dossier", "proof_blueprint", "advisor_report"}
+PROOF_CANDIDATE_ARTIFACT_TYPES = {
+    "proof_dossier",
+    "proof_blueprint",
+    "proof_compression",
+    "advisor_report",
+}
 VERIFIER_PRIMARY_EVIDENCE_ARTIFACT_TYPES = {
     "final_proof",
     "partial_proof_report",
@@ -982,6 +987,19 @@ def _plan_next_action(
     if proof_evidence_handoff and not parent_implication_ready:
         return proof_evidence_handoff
 
+    # Break a repeated gap-verification loop before another generic verifier
+    # dispatch or proof-candidate conversion can return.  This guard used to
+    # sit below both early-return paths, making it unreachable precisely while
+    # a route was being rechecked over and over.
+    verifier_loop_classification = _verifier_loop_classification_action(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    if verifier_loop_classification and not parent_implication_ready:
+        return verifier_loop_classification
+
     support_precheck = _support_lemma_precheck_action(
         state,
         problem=problem,
@@ -1240,15 +1258,6 @@ def _plan_next_action(
         and _advisor_followup_can_preempt_bottleneck(advisor_followup, bottleneck_lock)
     ):
         return advisor_followup
-
-    verifier_loop_classification = _verifier_loop_classification_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if verifier_loop_classification and not parent_implication_ready:
-        return verifier_loop_classification
 
     # Branch persistence (TODO 1.2): a productive-but-blocked branch gets a
     # nearby-lemma pass BEFORE the duplicate-work/circling machinery can
@@ -2736,6 +2745,14 @@ def _route_evidence_state_revision(state: Mapping[str, Any], evidence_ids: list[
     artifact_revisions = {
         str(artifact.get("artifact_id") or ""): _revision_number(artifact.get("state_revision"))
         for artifact in state.get("research_artifacts", [])
+        # A verifier's own report is a verdict on the proof packet, not fresh
+        # mathematical route evidence.  Counting it here makes every failed
+        # check invalidate the "recently checked" watermark and immediately
+        # schedules the same route again.
+        if not (
+            str(artifact.get("artifact_type") or "") == "verification_report"
+            and str(artifact.get("producer_role") or "") == "strict_informal_verifier"
+        )
     }
     revisions = [artifact_revisions[artifact_id] for artifact_id in evidence_ids if artifact_id in artifact_revisions]
     if revisions:
@@ -3868,22 +3885,30 @@ def _unrouted_proof_candidate(state: Mapping[str, Any]) -> Optional[Dict[str, An
     last_revision = _revision_number(last_conversion.get("state_revision")) if last_conversion else -1
     routed_artifact_ids = _routed_evidence_artifact_ids(state)
     suppression_revision, suppressed_route_ids, suppressed_target_ids = _fresh_advisor_suppression(state)
-    candidates: list[tuple[int, str, Dict[str, Any]]] = []
+    candidates: list[tuple[int, int, str, Dict[str, Any]]] = []
     for artifact in state.get("research_artifacts", []):
         artifact_type = str(artifact.get("artifact_type") or "")
         if artifact_type not in PROOF_CANDIDATE_ARTIFACT_TYPES:
             continue
         artifact_id = str(artifact.get("artifact_id") or "")
-        if not artifact_id or artifact_id in routed_artifact_ids:
+        if not artifact_id:
+            continue
+        metadata = _json_object(artifact.get("metadata_json"))
+        all_proved_lemma_statements = _locally_proved_lemma_statements(metadata)
+        extracted_lemma_count = _artifact_evidenced_claim_count(state, artifact_id)
+        proved_lemma_statements = all_proved_lemma_statements[extracted_lemma_count:]
+        proved_lemma_delta = bool(proved_lemma_statements)
+        if artifact_id in routed_artifact_ids and not proved_lemma_delta:
             continue
         artifact_revision = _revision_number(artifact.get("state_revision"))
-        if artifact_revision <= last_revision:
+        # A conversion run is only a coarse revision watermark: it does not
+        # identify which candidate artifact that run handled.  Keep explicit
+        # proved lemmas eligible until their evidence is actually routed, or a
+        # later conversion can accidentally hide an older unextracted lemma.
+        if artifact_revision <= last_revision and not proved_lemma_delta:
             continue
         if not _artifact_is_proof_candidate(artifact):
             continue
-        metadata = _json_object(artifact.get("metadata_json"))
-        proved_lemma_statements = _locally_proved_lemma_statements(metadata)
-        proved_lemma_delta = bool(proved_lemma_statements)
         target_id = _target_id_from_metadata(state, metadata, fallback="root")
         route_id = _active_route_for_claim(state, target_id)
         if (
@@ -3898,6 +3923,7 @@ def _unrouted_proof_candidate(state: Mapping[str, Any]) -> Optional[Dict[str, An
             continue
         candidates.append(
             (
+                int(proved_lemma_delta),
                 artifact_revision,
                 artifact_id,
                 {
@@ -3913,8 +3939,30 @@ def _unrouted_proof_candidate(state: Mapping[str, Any]) -> Optional[Dict[str, An
         )
     if not candidates:
         return None
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    return candidates[0][2]
+    candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return candidates[0][3]
+
+
+def _artifact_evidenced_claim_count(state: Mapping[str, Any], artifact_id: str) -> int:
+    conclusion_claim_ids: set[str] = set()
+    for claim in state.get("claims", []):
+        claim_id = str(claim.get("claim_id") or "")
+        evidence_ids = {
+            str(item) for item in _json_list(claim.get("evidence_artifact_ids_json")) if str(item)
+        }
+        if claim_id and claim_id != "root" and artifact_id in evidence_ids:
+            conclusion_claim_ids.add(claim_id)
+    for entity_kind in ("routes", "inferences"):
+        for entity in state.get(entity_kind, []):
+            evidence_ids = {
+                str(item)
+                for item in _json_list(entity.get("evidence_artifact_ids_json"))
+                if str(item)
+            }
+            conclusion_claim_id = str(entity.get("conclusion_claim_id") or "")
+            if conclusion_claim_id and conclusion_claim_id != "root" and artifact_id in evidence_ids:
+                conclusion_claim_ids.add(conclusion_claim_id)
+    return len(conclusion_claim_ids)
 
 
 def _proof_candidate_subsumed_by_verified_claim(state: Mapping[str, Any], artifact: Mapping[str, Any]) -> bool:

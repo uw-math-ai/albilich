@@ -3388,8 +3388,9 @@ def _researcher_packet(
                 "whether it contains a local verifier-ready argument, and create exactly one active sufficient route plus one untested "
                 "or plausible route inference citing that artifact as evidence. If the artifact is not route-ready, attach one short "
                 "research_diagnostic and add one precise proof debt instead. When proved_lemma_claim_extraction_required=true, create an "
-                "exact child claim for the locally proved lemma (unless an equivalent claim already exists), make the route and inference "
-                "conclude that lemma rather than the root, and preserve its implication back to the current target. This pass exists to "
+                "exact child claim, active sufficient route, and evidence-linked inference for every missing statement in "
+                "proved_lemma_candidate_statements (unless an equivalent claim already exists); do not stop after the first statement. "
+                "Make each route and inference conclude its lemma rather than the root, and preserve each implication back to the current target. This pass exists to "
                 "make strict verification schedulable."
             ),
             "global_synthesis_rule": (
