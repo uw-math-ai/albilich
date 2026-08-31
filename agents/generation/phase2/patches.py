@@ -262,6 +262,25 @@ def preflight_patch_errors(patch: Mapping[str, Any], actor_role: str) -> List[st
                     errors.append(
                         "referee findings must be writing debts owned by the reviewed final_paper artifact"
                     )
+    if actor_role == "writer":
+        revised_papers = []
+        for op in attached_ops.values():
+            if str(op.get("artifact_type") or "") != "final_paper":
+                continue
+            metadata = op.get("metadata") if isinstance(op.get("metadata"), Mapping) else {}
+            if str(metadata.get("revision_of_artifact_id") or ""):
+                revised_papers.append(op)
+        resolves_writing_debt = any(
+            str(op.get("op") or "") == "update_debt"
+            and str(op.get("status") or "") == "resolved"
+            and bool(op.get("resolution_evidence_artifact_ids"))
+            for op in operations
+        )
+        if revised_papers and not resolves_writing_debt:
+            errors.append(
+                "a revised final_paper must resolve the named writing debts with update_debt operations "
+                "and resolution_evidence_artifact_ids naming the revised paper"
+            )
     for op in attached_ops.values():
         metadata = op.get("metadata") if isinstance(op.get("metadata"), Mapping) else {}
         errors.extend(

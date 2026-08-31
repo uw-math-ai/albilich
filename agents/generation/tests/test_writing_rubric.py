@@ -91,11 +91,9 @@ class WritingRubricLoadTest(unittest.TestCase):
         self.assertEqual("meta", self.by_id["L3-INTRO-10"].checkability)
         self.assertIn("dedicated", self.by_id["L3-INTRO-10"].statement.lower())
 
-    def test_known_hard_house_rules_l4_house_07_08(self) -> None:
-        # The two deterministically enforced house hard rules: section openers
-        # and the "we"-collocation discipline. Both lint, both major.
+    def test_known_house_rules_l4_house_07_08(self) -> None:
         for rule_id, fragment in (
-            ("L4-HOUSE-07", "In this section, we"),
+            ("L4-HOUSE-07", "Claim-first"),
             ("L4-HOUSE-08", "we recall"),
         ):
             rule = self.by_id[rule_id]

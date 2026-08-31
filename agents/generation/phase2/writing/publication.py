@@ -223,6 +223,11 @@ def prepare_final_paper_metadata(
             "publication_workflow": "writer_referee",
         }
     )
+    if predecessor_metadata.get("publication_only_test") is True:
+        # This is a run-safety boundary, not author-controlled paper metadata.
+        # Once an operator marks a publication loop as writing/referee-only,
+        # every descendant paper must preserve that boundary.
+        result["publication_only_test"] = True
     return result
 
 

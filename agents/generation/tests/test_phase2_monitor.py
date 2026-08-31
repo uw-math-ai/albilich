@@ -80,6 +80,11 @@ class MonitorTest(unittest.TestCase):
         self.assertGreaterEqual(INDEX_HTML.count("if (document.hidden) return;"), 4)
         self.assertNotIn("renderArtifacts(p.artifact_catalog)", INDEX_HTML)
 
+    def test_orphan_display_delimiters_are_rendered_as_literal_tokens(self) -> None:
+        self.assertIn("const literalDelimiters = part", INDEX_HTML)
+        self.assertIn(r"String.raw`\(\backslash\mathtt{]}\)`", INDEX_HTML)
+        self.assertIn(r"String.raw`\(\backslash\mathtt{[}\)`", INDEX_HTML)
+
     def _store(self, tmpdir: str) -> ProofStateStore:
         store = ProofStateStore("monitor-test", generation_root=Path(tmpdir) / "generation")
         store.init_problem("Prove the root theorem.")
@@ -172,12 +177,66 @@ class MonitorTest(unittest.TestCase):
             self.assertEqual("/api/paper?id=paper-1", workflow["papers"][0]["pdf_url"])
             payload = build_monitor_payload(store)
             self.assertEqual("accepted", payload["publication_workflow"]["status"])
+            self.assertIn("✓ PUBLICATION ACCEPTED", INDEX_HTML)
+            self.assertIn('String((publication||{}).status || "") === "accepted"', INDEX_HTML)
+            self.assertIn('"publication_accepted"', INDEX_HTML)
 
         self.assertIn('id="publicationCard"', INDEX_HTML)
         self.assertIn("function renderPublicationWorkflow", INDEX_HTML)
         self.assertIn("renderPublicationWorkflow(p.publication_workflow)", INDEX_HTML)
         self.assertIn("Writer</div>", INDEX_HTML)
         self.assertIn("Referee</div>", INDEX_HTML)
+
+    def test_live_writer_overrides_derived_awaiting_referee_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            artifact_dir = store.state_dir / "artifacts"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            paper_path = artifact_dir / "paper.tex"
+            paper_path.write_text("\\documentclass{article}\\begin{document}Paper.\\end{document}", encoding="utf-8")
+            with store.connect() as conn:
+                conn.execute(
+                    """INSERT INTO artifacts(
+                           artifact_id, artifact_type, path, sha256, producer_role, run_id,
+                           state_revision, content_summary, metadata_json, created_at
+                       ) VALUES ('paper-live', 'final_paper', ?, 'paper-sha', 'writer', '', 2,
+                                 'A paper under revision.', ?, ?)""",
+                    (
+                        str(paper_path),
+                        json.dumps(
+                            {
+                                "publication_workflow": "writer_referee",
+                                "paper_version": 1,
+                                "publication_only_test": True,
+                            }
+                        ),
+                        utc_now(),
+                    ),
+                )
+                conn.commit()
+            (store.state_dir / "albilich_run_console.json").write_text(
+                json.dumps(
+                    {
+                        "live_logs": [
+                            {
+                                "run_id": "writer-live",
+                                "actor_role": "writer",
+                                "mode": "write",
+                                "status": "running",
+                                "updated_at": utc_now(),
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            workflow = build_monitor_payload(store)["publication_workflow"]
+
+            self.assertEqual("writer_working", workflow["status"])
+            self.assertEqual("writer", workflow["current_role"])
+            self.assertTrue(workflow["publication_only_test"])
+            self.assertIn("pauses this publication-only test", workflow["loop_policy"])
 
     def test_open_case_counts_exclude_debts_covered_by_integrated_claims(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

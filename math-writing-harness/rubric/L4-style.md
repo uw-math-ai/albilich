@@ -317,10 +317,11 @@ defects before any LLM budget is spent.
   reformulated/later associated" used per the true historical relation; never attribute a
   definition to the later paper that only generalized it. severity: `major` (cross-listed
   L1-FAITH-03). autofix: manual. (`HOUSE` 12)
-- `L4-HOUSE-07` [lint] **Section openers (HARD RULE): every section's first paragraph carries
-  a sentence beginning "In this section, we …"** ("In this appendix, we …" for appendix
-  sections); References/Acknowledgment/bibliography sections (and their starred variants) are
-  exempt. Deterministically enforced on the final_paper — violations block the paper.
+- `L4-HOUSE-07` [lint] **Claim-first section openers:** every section and subsection begins
+  with a self-contained mathematical claim or action of that unit. The Introduction begins
+  with the central object or definition. Notation, table pointers, document-part report
+  voice, and a mechanically repeated stock phrase are not openers. Deterministic lint rejects
+  recognizable structural violations; the referee judges the mathematical content.
   severity: `major`. autofix: assisted. (`HOUSE` 19)
 - `L4-HOUSE-08` [lint] **"We" discipline, deterministic subset (HARD RULE): the habitual
   collocations "we recall", "we record", "we now show", "we now prove", "we now turn",

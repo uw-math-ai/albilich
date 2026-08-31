@@ -1,7 +1,8 @@
 """Tests for the deterministic LaTeX template normalizer (writing/latex_template.py).
 
 Covers the preamble rewrite (bad preamble -> house preamble, author packages
-kept, hyperref last, \\numberwithin after theorem declarations), idempotence
+kept, hyperref after ordinary packages and before cleveref/amsrefs,
+\\numberwithin after theorem declarations), idempotence
 piped-table -> booktabs conversion, the three collapse artifacts, and a real
 pdflatex compile of the normalized output.
 """
@@ -95,6 +96,20 @@ class PreambleNormalizationTest(unittest.TestCase):
         self.assertLess(preamble.index(r"\usepackage{graphicx}"), preamble.index("hyperref"))
         # The house-supplied amsmath is not loaded twice.
         self.assertEqual(1, preamble.count("amsmath"))
+
+    def test_hyperref_precedes_cleveref_after_rewrite(self) -> None:
+        source = BAD_PREAMBLE_PAPER.replace(
+            r"\usepackage{hyperref}",
+            "\\usepackage[capitalize,noabbrev]{cleveref}\n"
+            "\\usepackage{hyperref}",
+        )
+        out = normalize_paper_template(source)
+        preamble = out[: out.index(r"\begin{document}")]
+        self.assertLess(
+            preamble.index(r"{hyperref}"),
+            preamble.index(r"{cleveref}"),
+        )
+        self.assertEqual(out, normalize_paper_template(out))
 
     def test_numberwithin_is_ensured_after_theorem_declarations(self) -> None:
         out = normalize_paper_template(BAD_PREAMBLE_PAPER)

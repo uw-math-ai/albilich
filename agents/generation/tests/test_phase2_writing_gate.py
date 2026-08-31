@@ -89,7 +89,7 @@ A group is trivial when its underlying set is a singleton. We prove that the tri
 \end{abstract}
 \maketitle
 \section{Introduction}
-In this section, we state the main theorem. Groups of very small order occupy a special place in elementary algebra, because complete classifications are available at those orders and because every claim about them can be checked directly from the axioms. The smallest conceivable order is one, and a group of order one is called trivial. Every textbook mentions the trivial group in its opening pages, yet the humble statement that it has exactly one element still deserves a careful written proof, if only as an exercise in reading a definition closely. We prove the following result, recorded in the classical literature~\cite{zorn}.
+The trivial group is the central object of this paper. Groups of very small order occupy a special place in elementary algebra, because complete classifications are available at those orders and because every claim about them can be checked directly from the axioms. The smallest conceivable order is one, and a group of order one is called trivial. Every textbook mentions the trivial group in its opening pages, yet the humble statement that it has exactly one element still deserves a careful written proof, if only as an exercise in reading a definition closely. We prove the following result, recorded in the classical literature~\cite{zorn}.
 \begin{theorem}\label{thm:main}
 The trivial group has exactly one element.
 \end{theorem}
@@ -110,18 +110,20 @@ In this appendix, we describe the finite verification that accompanies the proof
 """
 
 
-# CLEAN_FINAL_PAPER with all three L4-HOUSE-07 section openers removed: the
-# Introduction and proof sections lose "In this section, we ..." and the
-# certification appendix loses "In this appendix, we ..." — three major
-# HOUSE-07 debts, one per section, for the fallthrough/enumeration tests.
+# CLEAN_FINAL_PAPER with pointer/report sentences substituted for all three
+# claim-first openers. These produce three major HOUSE-07 debts for the
+# fallthrough/enumeration tests.
 PAPER_MISSING_THREE_OPENERS = (
     CLEAN_FINAL_PAPER
-    .replace("In this section, we state the main theorem. ", "")
+    .replace("The trivial group is the central object of this paper. ", "Table 1 lists the main theorem. ")
     .replace(
         "In this section, we prove Theorem~\\ref{thm:main} directly from the definition of a group of order one. ",
-        "",
+        "Figure 1 depicts the proof. ",
     )
-    .replace("In this appendix, we describe the finite verification that accompanies the proof. ", "")
+    .replace(
+        "In this appendix, we describe the finite verification that accompanies the proof. ",
+        "Appendix A contains the verification. ",
+    )
 )
 
 
@@ -1068,7 +1070,8 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertEqual(3, len(house07), action["writing_debts"])
             for card in house07:
                 self.assertTrue(card["location"], card)
-                self.assertIn("Insert as the first sentence of section", card["required_fix"])
+                self.assertIn("Rewrite the first sentence of section", card["required_fix"])
+                self.assertIn("mathematical claim or action", card["required_fix"])
 
             prompt = build_session_prompt(
                 context_path=Path("/tmp/context.json"), action=action, actor_role="writer"
@@ -1082,7 +1085,8 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertGreaterEqual(prompt.count("REQUIRED FIX:"), 3)
             self.assertIn("Fix EVERY numbered item", prompt)
             self.assertIn("SELF-CHECK each numbered location", prompt)
-            self.assertIn('"In this appendix, we"', prompt)
+            self.assertIn("central object or definition", prompt)
+            self.assertIn("stock report voice", prompt)
 
     def test_residue_debt_still_forces_revision_past_the_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1230,8 +1234,8 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             )
 
     def test_missing_section_opener_syncs_major_debts_and_dispatches_deterministic_revision(self) -> None:
-        # HARD RULE L4-HOUSE-07: a final_paper whose sections lack the
-        # "In this section, we ..." opener gets major writing debts through the
+        # L4-HOUSE-07: a final_paper whose Introduction opens with a table
+        # pointer gets a major writing debt through the
         # lint sync, forcing the deterministic revision (never a patch
         # rejection — prose fixes need writer judgment).
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1240,7 +1244,10 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             insert_final_paper(
                 store,
                 "final-paper-noopener",
-                CLEAN_FINAL_PAPER.replace("In this section, we state the main theorem. ", ""),
+                CLEAN_FINAL_PAPER.replace(
+                    "The trivial group is the central object of this paper. ",
+                    "Table 1 lists the main theorem. ",
+                ),
             )
 
             action = next_action(store, web_search="disabled")
@@ -1275,8 +1282,8 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
                 store,
                 "final-paper-wenote",
                 CLEAN_FINAL_PAPER.replace(
-                    "In this section, we state the main theorem.",
-                    "In this section, we state the main theorem. We note that the result is classical.",
+                    "The trivial group is the central object of this paper.",
+                    "The trivial group is the central object of this paper. We note that the result is classical.",
                 ),
             )
 
@@ -1843,7 +1850,8 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
                         "artifact_id": "final-paper-noopener",
                         "artifact_type": "final_paper",
                         "content": CLEAN_FINAL_PAPER.replace(
-                            "In this section, we state the main theorem. ", ""
+                            "The trivial group is the central object of this paper. ",
+                            "Table 1 lists the main theorem. ",
                         ),
                         "metadata": {"certificate_artifact_id": "final-proof-1"},
                     }

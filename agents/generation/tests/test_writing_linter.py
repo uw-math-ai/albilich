@@ -368,33 +368,33 @@ class RequiredFixTest(unittest.TestCase):
         self.assertIn("line 42", fix)
         self.assertIn("something new is wrong", fix)
 
-    def test_house07_fix_names_the_section_and_the_exact_opener(self) -> None:
+    def test_house07_fix_names_the_section_and_requires_claim_first_prose(self) -> None:
         finding = Finding(
             "L4-HOUSE-07",
             "major",
             31,
             "\\section{Proof of the main theorem}",
-            "section 'Proof of the main theorem' does not open with a sentence beginning "
-            '"In this section, we ..." in its first paragraph (HARD RULE, HOUSE 19)',
+            "section 'Proof of the main theorem' opens with report voice, notation, or a "
+            "pointer instead of a claim-first mathematical sentence",
         )
         fix = required_fix(finding)
         self.assertIn('section "Proof of the main theorem"', fix)
-        self.assertIn('"In this section, we"', fix)
+        self.assertIn("mathematical claim or action", fix)
         self.assertIn("line 31", fix)
         self.assertIn("first sentence", fix)
 
-    def test_house07_appendix_fix_names_the_appendix_opener(self) -> None:
+    def test_house07_introduction_fix_names_the_central_object_rule(self) -> None:
         finding = Finding(
             "L4-HOUSE-07",
             "major",
             88,
-            "\\section{Certification}",
-            "section 'Certification' does not open with a sentence beginning "
-            '"In this appendix, we ..." in its first paragraph (HARD RULE, HOUSE 19)',
+            "\\section{Introduction}",
+            "section 'Introduction' opens with report voice, notation, or a "
+            "pointer instead of a claim-first mathematical sentence",
         )
         fix = required_fix(finding)
-        self.assertIn('section "Certification"', fix)
-        self.assertIn('"In this appendix, we"', fix)
+        self.assertIn('section "Introduction"', fix)
+        self.assertIn("central object or definition", fix)
 
     def test_required_fix_for_obligation_prefers_the_appended_marker(self) -> None:
         obligation = (

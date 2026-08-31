@@ -17,6 +17,7 @@ from agents.generation.phase2.scheduler import (
     PUBLICATION_WRITER_REVISION_INTENT,
     next_action,
 )
+from agents.generation.phase2.writing.publication import prepare_final_paper_metadata
 from agents.generation.tests.test_phase2_writing_gate import (
     CLEAN_FINAL_PAPER,
     CLEAN_FINAL_PROOF,
@@ -143,6 +144,39 @@ class PublicationLoopTest(unittest.TestCase):
             self.assertTrue(instructions.is_file())
             self.assertIn("## Publication loop", instructions.read_text(encoding="utf-8"))
 
+    def test_preflight_requires_revised_paper_to_resolve_writing_debts(self) -> None:
+        patch = {
+            "schema_version": SCHEMA_VERSION,
+            "problem_id": "publication-preflight",
+            "base_revision": 4,
+            "actor_role": "writer",
+            "target_id": "root",
+            "operations": [
+                {
+                    "op": "attach_artifact",
+                    "artifact_id": "final-paper-2",
+                    "artifact_type": "final_paper",
+                    "path": "/tmp/final-paper-2.tex",
+                    "metadata": {"revision_of_artifact_id": "final-paper-1"},
+                }
+            ],
+            "rationale": "revise the paper",
+        }
+        errors = preflight_patch_errors(patch, "writer")
+        self.assertTrue(any("must resolve the named writing debts" in error for error in errors), errors)
+
+        patch["operations"].append(
+            {
+                "op": "update_debt",
+                "debt_id": "paper-finding-1",
+                "status": "resolved",
+                "resolution_note": "The revised theorem now states the missing hypothesis.",
+                "resolution_evidence_artifact_ids": ["final-paper-2"],
+            }
+        )
+        errors = preflight_patch_errors(patch, "writer")
+        self.assertFalse(any("must resolve the named writing debts" in error for error in errors), errors)
+
     def test_revise_persists_report_and_schedules_unbounded_writer_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._paper_store(tmpdir, "publication-revision-round")
@@ -216,6 +250,32 @@ class PublicationLoopTest(unittest.TestCase):
             self.assertEqual("review_writing", action["mode"], action)
             self.assertEqual("final-paper-2", action["artifact_reviewed"])
 
+    def test_publication_only_boundary_is_inherited_by_writer_revisions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._paper_store(tmpdir, "publication-only-lineage")
+            with sqlite3.connect(store.db_path) as conn:
+                metadata = json.loads(
+                    conn.execute(
+                        "SELECT metadata_json FROM artifacts WHERE artifact_id = 'final-paper-1'"
+                    ).fetchone()[0]
+                )
+                metadata["publication_only_test"] = True
+                conn.execute(
+                    "UPDATE artifacts SET metadata_json = ? WHERE artifact_id = 'final-paper-1'",
+                    (json.dumps(metadata),),
+                )
+                conn.commit()
+
+            with sqlite3.connect(store.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                revised_metadata = prepare_final_paper_metadata(
+                    conn,
+                    actor_role="writer",
+                    artifact_type="final_paper",
+                    metadata={"revision_of_artifact_id": "final-paper-1"},
+                )
+            self.assertTrue(revised_metadata["publication_only_test"])
+
     def test_major_route_error_is_logged_and_reopens_research(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._paper_store(tmpdir, "publication-route-error")
@@ -248,6 +308,44 @@ class PublicationLoopTest(unittest.TestCase):
             self.assertIn("Writer--Referee Publication Loop", report)
             self.assertIn("[major-proof-route-error]", report)
             self.assertIn("returned to research=yes", report)
+
+    def test_major_route_error_pauses_publication_only_test_without_research(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._paper_store(tmpdir, "publication-only-route-error")
+            with sqlite3.connect(store.db_path) as conn:
+                metadata = json.loads(
+                    conn.execute(
+                        "SELECT metadata_json FROM artifacts WHERE artifact_id = 'final-paper-1'"
+                    ).fetchone()[0]
+                )
+                metadata["publication_only_test"] = True
+                conn.execute(
+                    "UPDATE artifacts SET metadata_json = ? WHERE artifact_id = 'final-paper-1'",
+                    (json.dumps(metadata),),
+                )
+                conn.commit()
+            outcome = attach_referee_report(
+                store,
+                report_id="referee-report-publication-only-route-error",
+                paper_id="final-paper-1",
+                verdict="major_proof_route_error",
+                route_error=True,
+            )
+            self.assertTrue(outcome.accepted, outcome.errors)
+
+            action = next_action(store, web_search="disabled")
+
+            self.assertEqual("await_human", action["mode"], action)
+            self.assertTrue(action["publication_only_test"])
+            self.assertFalse(action["referee_route_error_research"])
+            self.assertNotIn("search_intent", action)
+            self.assertEqual("publication_route_error_requires_operator", action["terminal_classification"])
+            state = store.get_scheduler_state()
+            self.assertTrue(state["publication_reviews"][0]["escalated_at"])
+            self.assertEqual(
+                1,
+                len([debt for debt in state["debts"] if debt["debt_type"] == "referee_route_error"]),
+            )
 
     def test_repaired_route_requires_a_new_certificate_and_paper(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

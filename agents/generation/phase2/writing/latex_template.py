@@ -73,11 +73,14 @@ _HOUSE_PREAMBLE_HEAD = [
     r"\usepackage{xcolor}",
     r"\definecolor{linkblue}{RGB}{0,0,128}",
 ]
-# hyperref is loaded LAST (after any kept author packages), then the stretch.
-_HOUSE_PREAMBLE_TAIL = [
-    r"\usepackage[colorlinks=true,linkcolor=linkblue,citecolor=linkblue,urlcolor=linkblue]{hyperref}",
-    r"\emergencystretch=1.5em",
-]
+# Most packages load before hyperref. These packages are the documented
+# exceptions and must retain their original options after hyperref. Treating
+# hyperref as unconditionally last silently inverted a correct package pair
+# during artifact promotion, so the staged paper compiled while the stored
+# paper did not.
+_POST_HYPERREF_PACKAGES = {"amsrefs", "cleveref"}
+_HOUSE_HYPERREF = r"\usepackage[colorlinks=true,linkcolor=linkblue,citecolor=linkblue,urlcolor=linkblue]{hyperref}"
+_HOUSE_STRETCH = r"\emergencystretch=1.5em"
 
 
 def normalize_paper_template(tex: str) -> str:
@@ -108,8 +111,11 @@ def _preamble_region(tex: str) -> tuple[int, int] | None:
 
 
 def _region_is_house(region: str) -> bool:
-    """True when the region already carries the full house package set with
-    hyperref loaded last — the idempotence test for the preamble rewrite."""
+    """Return whether the region carries the house set in a valid load order.
+
+    Hyperref follows ordinary packages but precedes packages such as cleveref
+    and amsrefs that explicitly require it.
+    """
     packages = _USEPACKAGE_RE.findall(region)
     loaded: List[str] = []
     geometry_margin = False
@@ -123,7 +129,12 @@ def _region_is_house(region: str) -> bool:
     required = _HOUSE_SUPPLIED_PACKAGES - {"hyperref"}
     if not required.issubset(set(loaded)):
         return False
-    if "hyperref" not in loaded or loaded[-1] != "hyperref":
+    if "hyperref" not in loaded:
+        return False
+    hyperref_index = loaded.index("hyperref")
+    if any(name in _POST_HYPERREF_PACKAGES for name in loaded[:hyperref_index]):
+        return False
+    if any(name not in _POST_HYPERREF_PACKAGES for name in loaded[hyperref_index + 1 :]):
         return False
     return (
         geometry_margin
@@ -154,13 +165,34 @@ def _normalize_preamble(tex: str) -> str:
     start, end = region_span
     region = tex[start:end]
     if not _region_is_house(region):
-        # Strip everything the house template re-supplies; keep the rest
-        # (author packages, macros) between the xcolor block and hyperref.
+        # Strip everything the house template re-supplies. Keep ordinary
+        # author packages before hyperref and load-order exceptions after it.
         kept = _USEPACKAGE_RE.sub(_rewrite_usepackage, region)
         for pattern in (_ANY_LINKBLUE_DEF_RE, _HYPERSETUP_RE, _EMERGENCYSTRETCH_RE, _NUMBERWITHIN_RE):
             kept = pattern.sub("", kept)
         kept_lines = [line.rstrip() for line in kept.splitlines() if line.strip()]
-        new_region_lines = _HOUSE_PREAMBLE_HEAD + kept_lines + _HOUSE_PREAMBLE_TAIL
+        pre_hyperref_lines: List[str] = []
+        post_hyperref_lines: List[str] = []
+        for line in kept_lines:
+            package_names = {
+                name.strip()
+                for match in _USEPACKAGE_RE.finditer(line)
+                for name in match.group("names").split(",")
+                if name.strip()
+            }
+            target = (
+                post_hyperref_lines
+                if package_names & _POST_HYPERREF_PACKAGES
+                else pre_hyperref_lines
+            )
+            target.append(line)
+        new_region_lines = (
+            _HOUSE_PREAMBLE_HEAD
+            + pre_hyperref_lines
+            + [_HOUSE_HYPERREF]
+            + post_hyperref_lines
+            + [_HOUSE_STRETCH]
+        )
         new_region = "\n" + "\n".join(new_region_lines) + "\n"
         tex = tex[:start] + new_region + tex[end:]
     return _ensure_numberwithin(tex)

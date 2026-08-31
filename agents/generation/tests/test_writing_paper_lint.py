@@ -10,8 +10,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from agents.generation.phase2.writing.linter import Finding, run_paper_lint
 
-# Minimal document satisfying every L5-PAPER-03 structural element; the body
-# hook lets each test inject the text under scrutiny into the main text.
+# Minimal document satisfying every L5-PAPER-03 structural element. The body
+# hook lets each test inject text under scrutiny before an optional appendix.
 GOOD_PAPER = r"""\documentclass[11pt]{amsart}
 \usepackage{amsmath,amssymb,amsthm}
 \newtheorem{theorem}{Theorem}[section]
@@ -140,7 +140,7 @@ class PaperStructureTest(unittest.TestCase):
         removals = {
             r"\documentclass": r"\documentclass[11pt]{amsart}",
             r"\begin{abstract}": "\\begin{abstract}\nWe prove a small result.\n\\end{abstract}",
-            "a theorem environment": "\\begin{theorem}\nThe result holds.\n\\end{theorem}",
+            "a theorem-like environment": "\\begin{theorem}\nThe result holds.\n\\end{theorem}",
             r"\begin{proof}": "\\begin{proof}\nImmediate from the definition.\n\\end{proof}",
             "a bibliography": "\\begin{thebibliography}{9}\n\\bibitem{a} A. Author, A title, J. Math. 1 (2000), 1--2.\n\\end{thebibliography}",
             r"\end{document}": r"\end{document}",
@@ -152,13 +152,22 @@ class PaperStructureTest(unittest.TestCase):
             self.assertTrue(any(label in f.message for f in structural), (label, findings))
             self.assertTrue(all(f.severity == "blocker" for f in structural))
 
-    def test_missing_appendix_is_reported(self) -> None:
-        # Removing \appendix also promotes the Run archive paragraph into the
-        # main text, so the art_* identifier now trips the register rule too.
-        broken = paper_with_body("Body text.").replace("\\appendix\n", "")
-        findings = run_paper_lint(broken)
-        self.assertTrue(any(f.rule_id == "L5-PAPER-03" and "appendix" in f.message for f in findings), findings)
-        self.assertIn("L5-PAPER-02", rule_ids(findings))
+    def test_appendix_is_optional_when_the_article_needs_none(self) -> None:
+        without_appendix = paper_with_body("Body text.").replace(
+            "\\appendix\n\\section{Certification}\n"
+            "Run archive: recorded in internal artifact records under art_final_paper_1.\n",
+            "\\section{Conclusion}\nThe proof is complete.\n",
+        )
+        self.assertNotIn("L5-PAPER-03", rule_ids(run_paper_lint(without_appendix)))
+
+    def test_declared_lettered_headline_theorem_satisfies_structure(self) -> None:
+        alternative = (
+            paper_with_body("Body text.")
+            .replace("\\newtheorem{theorem}{Theorem}[section]", "\\newtheorem{introtheorem}{Theorem}")
+            .replace("\\begin{theorem}", "\\begin{introtheorem}")
+            .replace("\\end{theorem}", "\\end{introtheorem}")
+        )
+        self.assertNotIn("L5-PAPER-03", rule_ids(run_paper_lint(alternative)))
 
     def test_starred_theorem_and_bibliography_command_also_satisfy_structure(self) -> None:
         alternative = (

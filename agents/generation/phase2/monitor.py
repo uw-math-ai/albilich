@@ -409,6 +409,7 @@ def _publication_workflow_payload(
                 "certificate_artifact_id": str(metadata.get("certificate_artifact_id") or ""),
                 "revision_of_artifact_id": str(metadata.get("revision_of_artifact_id") or ""),
                 "addresses_referee_report_id": str(metadata.get("addresses_referee_report_id") or ""),
+                "publication_only_test": bool(metadata.get("publication_only_test")),
                 "pdf_url": (
                     f"/api/paper?id={quote(artifact_id, safe='')}"
                     if _paper_pdf_path(store, artifact) is not None
@@ -469,6 +470,7 @@ def _publication_workflow_payload(
     latest_paper = papers[-1] if papers else {}
     latest_reviews = reviews_by_paper.get(str(latest_paper.get("artifact_id") or ""), [])
     latest_review = latest_reviews[-1] if latest_reviews else {}
+    publication_only_test = any(bool(paper.get("publication_only_test")) for paper in papers)
     verdict = str(latest_review.get("verdict") or "")
     if verdict == "accept":
         status, current_role = "accepted", "complete"
@@ -494,9 +496,14 @@ def _publication_workflow_payload(
         "current_round": int(latest_review.get("round_number") or (len(reviews) + 1 if latest_paper else 0)),
         "current_paper_artifact_id": str(latest_paper.get("artifact_id") or ""),
         "latest_verdict": verdict,
+        "publication_only_test": publication_only_test,
         "papers": papers,
         "reviews": reviews,
-        "loop_policy": "Writer and domain referee alternate until [accept]. A demonstrated false proof route returns the run to research.",
+        "loop_policy": (
+            "Writer and domain referee alternate until [accept]. A demonstrated false proof route pauses this publication-only test for the operator."
+            if publication_only_test
+            else "Writer and domain referee alternate until [accept]. A demonstrated false proof route returns the run to research."
+        ),
     }
 
 
@@ -888,6 +895,23 @@ def _reconcile_live_logs_with_runs(
     return reconciled
 
 
+def _active_publication_role(payload: Mapping[str, Any]) -> str:
+    """Return the actor currently working in the publication loop, if any."""
+
+    for entry in reversed(payload.get("live_logs", []) or []):
+        if not isinstance(entry, Mapping):
+            continue
+        role = str(entry.get("actor_role") or "").lower()
+        mode = str(entry.get("mode") or "").lower()
+        if role not in {"writer", "referee"} or mode not in {"write", "review_writing"}:
+            continue
+        if str(entry.get("status") or "").lower() not in _LIVE_STATUSES:
+            continue
+        if _live_update_is_recent(entry):
+            return role
+    return ""
+
+
 def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
     """Return the console payload plus monitor metadata (source, live flag).
 
@@ -923,7 +947,14 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
         _enrich_human_readable_dashboard_rows(store, payload, state)
         payload["papers"] = _paper_catalog(store, state=state)
         payload["artifact_catalog"] = _artifact_catalog(store, state=state)
-        payload["publication_workflow"] = _publication_workflow_payload(store, state=state)
+        publication_workflow = _publication_workflow_payload(store, state=state)
+        active_publication_role = _active_publication_role(payload)
+        if publication_workflow.get("enabled") and active_publication_role:
+            publication_workflow["current_role"] = active_publication_role
+            publication_workflow["status"] = (
+                "writer_working" if active_publication_role == "writer" else "referee_reviewing"
+            )
+        payload["publication_workflow"] = publication_workflow
     except Exception:
         payload["papers"] = []
         payload["artifact_catalog"] = []
@@ -1718,6 +1749,8 @@ window.MathJax = {
   .runbar .rsub { margin-left: auto; font-weight: 500; font-size: 13px; font-family: var(--mono); color: var(--muted); letter-spacing: 0; }
   .runbar.running { color: var(--good); background: color-mix(in srgb, var(--good) 12%, var(--surface)); border-color: color-mix(in srgb, var(--good) 38%, transparent); }
   .runbar.running .rdot { background: var(--good); box-shadow: 0 0 0 0 color-mix(in srgb, var(--good) 60%, transparent); animation: pulse 1.5s infinite; }
+  .runbar.completed { color: var(--good); background: color-mix(in srgb, var(--good) 12%, var(--surface)); border-color: color-mix(in srgb, var(--good) 38%, transparent); }
+  .runbar.completed .rdot { background: var(--good); }
   .runbar.stalled { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, var(--surface)); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
   .runbar.stalled .rdot { background: var(--warn); animation: pulse 2.4s infinite; }
   .runbar.stopped { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, var(--surface)); border-color: color-mix(in srgb, var(--bad) 50%, transparent); }
@@ -2342,7 +2375,14 @@ function latexCompat(text){
   const parts = String(text == null ? '' : text).split(/(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$[^$\n]+?\$)/g);
   return parts.map(part => {
     const delimited = part.startsWith('$') || part.startsWith('\\(') || part.startsWith('\\[');
-    return replaceUnicodeMath(part, !delimited);
+    if (delimited) return replaceUnicodeMath(part, false);
+    // Lint findings sometimes quote a lone display delimiter such as "\\]".
+    // It is a literal token, not an incomplete formula. Render it explicitly
+    // so MathJax never leaves raw TeX syntax visible in a mathematical card.
+    const literalDelimiters = part
+      .replaceAll(String.raw`\[`, String.raw`\(\backslash\mathtt{[}\)`)
+      .replaceAll(String.raw`\]`, String.raw`\(\backslash\mathtt{]}\)`);
+    return replaceUnicodeMath(literalDelimiters, true);
   }).join('');
 }
 function mathHTML(text){
@@ -2394,7 +2434,7 @@ setInterval(applyTheme, 60000);
 
 const STATUS_CLASS = (s) => {
   s = String(s||"").toLowerCase();
-  if (s.includes("integrat") || s.includes("solved") || s.includes("proved") || s === "verified") return "good";
+  if (s.includes("integrat") || s.includes("solved") || s.includes("proved") || s.includes("accept") || s === "verified") return "good";
   if (s.includes("refut") || s.includes("fail") || s.includes("error")) return "bad";
   if (s.includes("debt") || s.includes("partial") || s.includes("unresolved") || s.includes("stalled")) return "warn";
   if (s.includes("run") || s.includes("progress") || s.includes("active")) return "info";
@@ -2924,6 +2964,8 @@ function publicationStatusLabel(status){
     research_in_progress: "Research in progress",
     awaiting_writer: "Writer is drafting",
     awaiting_referee: "Awaiting referee decision",
+    writer_working: "Writer is revising the paper",
+    referee_reviewing: "Referee is reviewing the paper",
     revision_requested: "Revision requested",
     returning_to_research: "Proof route under challenge",
     returned_to_research: "Returned to mathematical research",
@@ -2947,6 +2989,7 @@ function renderPublicationWorkflow(workflow){
   if (!workflow.enabled){ card.style.display = "none"; return; }
   card.style.display = "";
   const papers = workflow.papers || [];
+  const currentRole = String(workflow.current_role||"");
   $("publicationCount").textContent = `${papers.length} version${papers.length===1?"":"s"} · ${workflow.review_count||0} report${Number(workflow.review_count)===1?"":"s"}`;
   const currentPaperId = String(workflow.current_paper_artifact_id||"");
   const rounds = papers.length ? papers.map((paper) => {
@@ -2965,7 +3008,9 @@ function renderPublicationWorkflow(workflow){
           <div class="report-detail">${mathHTML(detail)}</div></div>
         <button type="button" class="btn pub-open-report" data-report-id="${esc(review.review_id||"")}">Read report</button>
       </div>`;
-    }).join("") : `<div class="pub-report"><div class="report-copy"><div class="report-line info">In review · The domain referee is next.</div><div class="report-detail">The review covers the complete proof certificate and the journal manuscript.</div></div></div>`;
+    }).join("") : currentRole === "writer" && paper.artifact_id === currentPaperId
+      ? `<div class="pub-report"><div class="report-copy"><div class="report-line info">Revision in progress · The writer is preparing the next version.</div><div class="report-detail">The referee will review the revised manuscript after its deterministic writing gates pass.</div></div></div>`
+      : `<div class="pub-report"><div class="report-copy"><div class="report-line info">In review · The domain referee is next.</div><div class="report-detail">The review covers the complete proof certificate and the journal manuscript.</div></div></div>`;
     return `<article class="pub-round${paper.artifact_id===currentPaperId?" current":""}">
       <div class="pub-round-head">
         <span class="pub-version">Paper v${esc(paper.version||"?")}</span>
@@ -2973,7 +3018,6 @@ function renderPublicationWorkflow(workflow){
         <div class="pub-actions">${paper.pdf_url?`<button type="button" class="btn pub-open-paper" data-paper-id="${esc(paper.artifact_id||"")}">View PDF</button>`:""}</div>
       </div>${reports}</article>`;
   }).join("") : `<div class="empty">The proof certificate is ready. The writer has not attached the first paper version yet.</div>`;
-  const currentRole = String(workflow.current_role||"");
   const changed = setStableHTML(body, `<div class="pub-summary">
     <section class="pub-status status-${esc(workflow.status||"")}">
       <div class="eyebrow">Current publication state</div>
@@ -3545,14 +3589,16 @@ $("steerText").addEventListener("keydown", e => { if ((e.metaKey||e.ctrlKey) && 
 refreshSteering();
 setInterval(refreshSteering, 5000);
 
-function renderRunbar(mon){
+function renderRunbar(mon, publication){
   const bar = $("runbar");
   const st = String(mon.run_state || "unknown");
+  const publicationAccepted = String((publication||{}).status || "") === "accepted";
   const live = !!mon.live;
   const secs = Number(mon.seconds_since_activity);
   const ageTxt = isFinite(secs) ? fmtSec(secs)+" ago" : "—";
   let cls, label, sub;
-  if (st === "running"){ cls="running"; label="● SYSTEM RUNNING"; sub="live agent active · last write "+ageTxt; }
+  if (publicationAccepted){ cls="completed"; label="✓ PUBLICATION ACCEPTED"; sub="writer-referee loop completed · static dashboard"; }
+  else if (st === "running"){ cls="running"; label="● SYSTEM RUNNING"; sub="live agent active · last write "+ageTxt; }
   else if (st === "stalled" && live){ cls="running"; label="◑ DEEP STEP ACTIVE"; sub="live child running · quiet output for "+ageTxt+" · tokens may post at step end"; }
   else if (st === "stalled"){ cls="stalled"; label="◐ SYSTEM STALLED?"; sub="no write for "+ageTxt+" · no live child heartbeat found"; }
   else if (st === "stopped"){ cls="stopped"; label="■ SYSTEM STOPPED"; sub="no activity for "+ageTxt+" · the run has exited — needs a resume"; }
@@ -3577,18 +3623,22 @@ async function tick(forceHeavy=false){
     const p = await res.json();
     lastOk = Date.now();
     $("errbar").style.display = "none";
-    const snap = p.snapshot || {}, mon = p._monitor || {};
+    const snap = p.snapshot || {}, mon = p._monitor || {}, publication = p.publication_workflow || {};
+    const displayStatus = String(publication.status || "") === "accepted"
+      ? "publication_accepted"
+      : (snap.public_status || "run");
+    const displaySnap = displayStatus === snap.public_status ? snap : {...snap, public_status: displayStatus};
     const revisionKey = snap.revision == null ? "missing" : String(snap.revision);
     const proofStateChanged = forceHeavy || lastProofRevision !== revisionKey;
     $("pid").textContent = mon.problem_id || p.problem_id || "";
-    document.title = `${(snap.public_status||"run")} · Albilich Monitor`;
-    const sb = $("statusBadge"); sb.className = "badge "+STATUS_CLASS(snap.public_status); sb.textContent = snap.public_status || "—";
+    document.title = `${displayStatus} · Albilich Monitor`;
+    const sb = $("statusBadge"); sb.className = "badge "+STATUS_CLASS(displayStatus); sb.textContent = displayStatus;
     $("revBadge").textContent = "rev " + (snap.revision!=null?snap.revision:"—");
     const live = !!mon.live;
     $("liveDot").className = "dot " + (live?"on":"");
     $("liveText").textContent = live ? "live" : (mon.source==="console_file"?"idle":"snapshot");
-    renderRunbar(mon);
-    renderKpis(snap);
+    renderRunbar(mon, publication);
+    renderKpis(displaySnap);
     renderPipeline(p, activeStep(p));
     renderResearcherMode(p.researcher_mode_state);
     renderTokens(snap, p.usage_summary || {});

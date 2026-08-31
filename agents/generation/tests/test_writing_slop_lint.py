@@ -397,30 +397,30 @@ class HouseColonSemicolonTest(unittest.TestCase):
 
 
 class HouseSectionOpenerTest(unittest.TestCase):
-    def test_section_without_opener_is_major_and_names_the_title(self) -> None:
+    def test_section_with_pointer_opener_is_major_and_names_the_title(self) -> None:
         text = (
             "\\section{Preliminaries}\n"
-            "The group under study is finite, and its order is a prime power.\n"
+            "Table 1 lists the notation used below.\n"
         )
         findings = by_rule(run_slop_lint(text), "L4-HOUSE-07")
         self.assertEqual(1, len(findings), findings)
         self.assertEqual("major", findings[0].severity)
         self.assertIn("'Preliminaries'", findings[0].message)
-        self.assertIn("In this section, we", findings[0].message)
+        self.assertIn("claim-first mathematical sentence", findings[0].message)
 
-    def test_section_with_opener_in_first_paragraph_is_clean(self) -> None:
+    def test_claim_first_opener_is_clean_without_stock_phrase(self) -> None:
         text = (
             "\\section{Preliminaries}\n"
-            "In this section, we fix notation for closures. Permutations act on the right.\n"
+            "Every closure in the argument is finite. Permutations act on the right.\n"
         )
         self.assertEqual([], by_rule(run_slop_lint(text), "L4-HOUSE-07"))
 
-    def test_opener_after_the_first_paragraph_still_flags(self) -> None:
+    def test_claim_after_a_pointer_paragraph_still_flags(self) -> None:
         text = (
             "\\section{Preliminaries}\n"
-            "The group under study is finite.\n"
+            "Table 1 lists the notation.\n"
             "\n"
-            "In this section, we fix notation for closures.\n"
+            "Every closure in the argument is finite.\n"
         )
         self.assertEqual(1, len(by_rule(run_slop_lint(text), "L4-HOUSE-07")))
 
@@ -433,21 +433,20 @@ class HouseSectionOpenerTest(unittest.TestCase):
         )
         self.assertEqual([], by_rule(run_slop_lint(text), "L4-HOUSE-07"))
 
-    def test_appendix_sections_require_the_appendix_variant(self) -> None:
-        flagged = (
-            "\\section{Introduction}\nIn this section, we state the theorem.\n"
+    def test_introduction_report_voice_is_rejected_but_appendix_claim_is_clean(self) -> None:
+        clean = (
+            "\\section{Introduction}\nFinite closures are the central objects of this paper.\n"
             "\\appendix\n"
-            "\\section{Certification}\nIn this section, we record the data.\n"
+            "\\section{Certification}\nThe independent computation reproduces the stated rank.\n"
+        )
+        self.assertEqual([], by_rule(run_slop_lint(clean), "L4-HOUSE-07"))
+        flagged = clean.replace(
+            "Finite closures are the central objects of this paper.",
+            "In this section, we state the theorem.",
         )
         findings = by_rule(run_slop_lint(flagged), "L4-HOUSE-07")
         self.assertEqual(1, len(findings), findings)
-        self.assertIn("In this appendix, we", findings[0].message)
-        clean = (
-            "\\section{Introduction}\nIn this section, we state the theorem.\n"
-            "\\appendix\n"
-            "\\section{Certification}\nIn this appendix, we present the certificate data.\n"
-        )
-        self.assertEqual([], by_rule(run_slop_lint(clean), "L4-HOUSE-07"))
+        self.assertIn("'Introduction'", findings[0].message)
 
     def test_same_line_label_and_blank_line_do_not_hide_the_opener(self) -> None:
         # "\section{X}\label{sec:x}" followed by a blank line: the label is
@@ -457,20 +456,20 @@ class HouseSectionOpenerTest(unittest.TestCase):
         clean = (
             "\\section{Constituents and Coupling}\\label{sec:constituents}\n"
             "\n"
-            "In this section, we reduce an arbitrary finite action to coset constituents.\n"
+            "Every finite action reduces to its coset constituents.\n"
         )
         self.assertEqual([], by_rule(run_slop_lint(clean), "L4-HOUSE-07"))
         flagged = (
             "\\section{Constituents and Coupling}\\label{sec:constituents}\n"
             "\n"
-            "The reduction uses only diagonal triples and the definition of closure.\n"
+            "Figure 1 depicts the reduction.\n"
         )
         self.assertEqual(1, len(by_rule(run_slop_lint(flagged), "L4-HOUSE-07")))
 
     def test_every_violating_section_is_flagged_separately(self) -> None:
         text = (
-            "\\section{Setup}\nThe order of the group is finite.\n"
-            "\\section{Main argument}\nThe bound follows by induction on the rank.\n"
+            "\\section{Setup}\nTable 1 lists the groups.\n"
+            "\\section{Main argument}\nFigure 1 depicts the induction.\n"
         )
         findings = by_rule(run_slop_lint(text), "L4-HOUSE-07")
         self.assertEqual(2, len(findings), findings)
@@ -718,16 +717,15 @@ class PaperContractSlopTest(unittest.TestCase):
         self.assertIn("SLOP HUNT", EDITOR_DIRECTIVE)
         self.assertIn("significance inflation", EDITOR_DIRECTIVE)
 
-    def test_style_core_marks_the_two_house_hard_rules(self) -> None:
-        # Section openers and "we" discipline are HARD RULES: deterministically
-        # enforced (L4-HOUSE-07/08), violations block the paper.
-        self.assertEqual(2, WRITING_STYLE_CORE.count("HARD RULE (deterministically enforced; violations block the paper)"))
-        self.assertIn('sentence beginning "In this section, we ..."', WRITING_STYLE_CORE)
+    def test_style_core_marks_claim_first_openers_and_hard_we_discipline(self) -> None:
+        self.assertIn("Claim-first openers", WRITING_STYLE_CORE)
+        self.assertIn("central object or definition", WRITING_STYLE_CORE)
+        self.assertIn("deterministic lint rejects only mechanically recognizable non-openers", WRITING_STYLE_CORE)
         self.assertIn('"we note that"', WRITING_STYLE_CORE)
 
-    def test_editor_directive_names_the_hard_rules_to_verify(self) -> None:
-        self.assertIn("HARD house rules enforced deterministically", EDITOR_DIRECTIVE)
-        self.assertIn('"In this section, we ..."', EDITOR_DIRECTIVE)
+    def test_editor_directive_names_claim_first_openers_without_stock_formula(self) -> None:
+        self.assertIn("claim-first mathematical opener", EDITOR_DIRECTIVE)
+        self.assertIn("Do not demand a repeated stock formula", EDITOR_DIRECTIVE)
         self.assertIn('"we"-collocation discipline', EDITOR_DIRECTIVE)
 
     def test_style_core_carries_the_section_substantiality_hard_rule(self) -> None:

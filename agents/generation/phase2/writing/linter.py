@@ -347,15 +347,27 @@ _PAPER_REGISTER_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
 _PAPER_STRUCTURE_CHECKS: List[Tuple[re.Pattern[str], str]] = [
     (re.compile(r"\\documentclass\b"), r"\documentclass"),
     (re.compile(r"\\begin\{abstract\}"), r"\begin{abstract}"),
-    (re.compile(r"\\begin\{theorem\*?\}"), r"a theorem environment (\begin{theorem} or \begin{theorem*})"),
     (re.compile(r"\\begin\{proof\}"), r"\begin{proof}"),
-    (re.compile(r"\\appendix\b"), r"\appendix"),
     (
         re.compile(r"\\begin\{thebibliography\}|\\bibliography\b"),
         r"a bibliography (\begin{thebibliography} or \bibliography)",
     ),
     (re.compile(r"\\end\{document\}"), r"\end{document}"),
 ]
+_THEOREM_DECLARATION_RE = re.compile(r"\\newtheorem\*?\{([^}]+)\}")
+_THEOREM_LIKE_NAME_RE = re.compile(r"(?:theorem|proposition|lemma|corollary|claim)", re.IGNORECASE)
+
+
+def _has_theorem_environment(text: str) -> bool:
+    """Recognize standard and explicitly declared theorem-like environments."""
+
+    names = {"theorem"}
+    names.update(
+        match.group(1)
+        for match in _THEOREM_DECLARATION_RE.finditer(text)
+        if _THEOREM_LIKE_NAME_RE.search(match.group(1))
+    )
+    return any(re.search(rf"\\begin\{{{re.escape(name)}\*?\}}", text) for name in names)
 
 
 def _mask_verbatim(text: str) -> str:
@@ -419,6 +431,16 @@ def run_paper_lint(text: str) -> List[Finding]:
                     message=f"paper structure: missing {label}",
                 )
             )
+    if not _has_theorem_environment(text):
+        findings.append(
+            Finding(
+                rule_id="L5-PAPER-03",
+                severity="blocker",
+                line=1,
+                excerpt=_excerpt(lines, 1),
+                message="paper structure: missing a theorem-like environment",
+            )
+        )
     return _dedupe_sort(findings)
 
 
@@ -675,15 +697,16 @@ _HOUSE03_CASE_LABEL_RE = re.compile(r"\b(?:Case|Step|Subcase)[ ~]+[^\s:;]{1,20}$
 _HOUSE03_MARK_RE = re.compile(r"[:;]")
 _BEGIN_DOCUMENT_RE = re.compile(r"\\begin\{document\}")
 
-# L4-HOUSE-07 (major, HARD RULE per HOUSE 19): every section's first paragraph
-# opens with a sentence beginning "In this section, we" ("In this appendix,
-# we" after \appendix). References/Acknowledgment/bibliography sections (and
-# their \section* variants) are exempt.
+# L4-HOUSE-07 (major): section openings are claim-first mathematical prose.
+# The semantic judgment belongs to the referee.  The deterministic layer only
+# rejects mechanically recognizable non-openers: empty first paragraphs,
+# notation/pointer openings, document-part report voice, and an Introduction
+# beginning "In this section".  Requiring one literal phrase here created
+# formulaic duplicate paragraphs and contradicted the article rule that the
+# Introduction opens with the central object.
 _HOUSE07_SECTION_RE = re.compile(r"\\section\*?\{(?P<title>[^}]*)\}")
 _HOUSE07_EXEMPT_TITLE_RE = re.compile(r"references|acknowledgm|bibliography", re.IGNORECASE)
 _HOUSE07_APPENDIX_RE = re.compile(r"^\\appendix\b", re.MULTILINE)
-_HOUSE07_SECTION_OPENER_RE = re.compile(r"\bIn this section, we\b")
-_HOUSE07_APPENDIX_OPENER_RE = re.compile(r"\bIn this appendix, we\b")
 # The first paragraph ends at a blank line or at the next sectioning command.
 _HOUSE07_PARAGRAPH_END_RE = re.compile(r"\n[ \t]*\n|\\section\b|\\appendix\b|\\begin\{thebibliography\}|\\end\{document\}")
 # Between the heading and its first paragraph, skip whitespace and bare
@@ -691,6 +714,16 @@ _HOUSE07_PARAGRAPH_END_RE = re.compile(r"\n[ \t]*\n|\\section\b|\\appendix\b|\\b
 # must not make the label line count as the first paragraph (that false
 # positive kept re-flagging sections whose opener the writer had fixed).
 _HOUSE07_LEADING_NOISE_RE = re.compile(r"(?:\s+|\\label\{[^}]*\})+")
+_HOUSE07_BAD_OPENER_RE = re.compile(
+    r"^(?:"
+    r"\$|\\\(|\\\[|"
+    r"\\(?:Cref|cref|ref)\b|"
+    r"(?:Table|Figure|Equation|Section|Appendix)\b|"
+    r"(?:This|The present) (?:section|appendix)\b"
+    r")",
+    re.IGNORECASE,
+)
+_HOUSE07_INTRO_REPORT_RE = re.compile(r"^In this section,\s+we\b", re.IGNORECASE)
 
 # L4-HOUSE-08 (major, HARD RULE per HOUSE 25): the deterministic subset of the
 # "we" discipline — habitual collocations banned outright in prose (the
@@ -1042,22 +1075,19 @@ def _check_house_colon_semicolon(
 
 
 def _check_house_section_openers(text: str, lines: List[str]) -> List[Finding]:
-    """L4-HOUSE-07 (HARD RULE, HOUSE 19): every \\section's first paragraph
-    carries a sentence beginning "In this section, we" — "In this appendix,
-    we" for sections after \\appendix. References/Acknowledgment/bibliography
-    sections are exempt. Scans the raw text with comments blanked (math never
-    contains the opener, so stripping is unnecessary and would garble titles).
+    """L4-HOUSE-07: reject mechanically recognizable non-mathematical openers.
+
+    A referee decides whether a grammatical opener is genuinely claim-first.
+    Deterministic lint must not force a stock phrase. References,
+    acknowledgments, and bibliography sections are exempt.
     """
     masked = _mask_regions(text, [_LATEX_COMMENT_RE])
     index = _LineIndex(masked)
-    appendix_match = _HOUSE07_APPENDIX_RE.search(masked)
-    appendix_start = appendix_match.start() if appendix_match else len(masked)
     findings: List[Finding] = []
     for section in _HOUSE07_SECTION_RE.finditer(masked):
         title = " ".join(section.group("title").split())
         if _HOUSE07_EXEMPT_TITLE_RE.search(title):
             continue
-        in_appendix = section.start() >= appendix_start
         # First paragraph: skip whitespace and bare \label{...} commands after
         # the heading (a same-line label followed by a blank line is not the
         # first paragraph), then read up to the first blank line or the next
@@ -1066,15 +1096,16 @@ def _check_house_section_openers(text: str, lines: List[str]) -> List[Finding]:
         noise = _HOUSE07_LEADING_NOISE_RE.match(rest)
         body = rest[noise.end():] if noise else rest
         end = _HOUSE07_PARAGRAPH_END_RE.search(body)
-        paragraph = body[: end.start()] if end else body
-        opener = _HOUSE07_APPENDIX_OPENER_RE if in_appendix else _HOUSE07_SECTION_OPENER_RE
-        if opener.search(paragraph):
+        paragraph = (body[: end.start()] if end else body).strip()
+        bad_opener = not paragraph or _HOUSE07_BAD_OPENER_RE.match(paragraph)
+        if title.casefold() == "introduction" and _HOUSE07_INTRO_REPORT_RE.match(paragraph):
+            bad_opener = True
+        if not bad_opener:
             continue
-        wanted = "In this appendix, we" if in_appendix else "In this section, we"
         line = index.line_of(section.start())
         findings.append(Finding("L4-HOUSE-07", "major", line, _excerpt(lines, line),
-                                f'section {title!r} does not open with a sentence beginning '
-                                f'"{wanted} ..." in its first paragraph (HARD RULE, HOUSE 19)'))
+                                f"section {title!r} opens with report voice, notation, or a "
+                                "pointer instead of a claim-first mathematical sentence"))
     return findings
 
 
@@ -1417,7 +1448,6 @@ REQUIRED_FIX_MARKER = " — required fix: "
 # messages that embed ``{title!r}`` (repr quoting: single quotes unless the
 # title itself contains one), the HOUSE-07 opener from its quoted phrase.
 _RF_SECTION_TITLE_RE = re.compile(r"section (?P<q>['\"])(?P<title>.+?)(?P=q)")
-_RF_HOUSE07_OPENER_RE = re.compile(r'"(?P<opener>In this (?:section|appendix), we)')
 # Obligation shape written by the gate's lint sync:
 # "<rule_id>: <message> (line N)[ — excerpt: "..."][ — required fix: ...]".
 _RF_OBLIGATION_RULE_RE = re.compile(r"^([A-Z]\d-[A-Z0-9]+(?:-[A-Z0-9]+)*-\d+):\s*")
@@ -1484,16 +1514,11 @@ def _required_fix_text(rule_id: str, message: str, line: int) -> str:
     if rule_id == "L4-HOUSE-07":
         title_match = _RF_SECTION_TITLE_RE.search(message)
         title = title_match.group("title") if title_match else "the flagged section"
-        opener_match = _RF_HOUSE07_OPENER_RE.search(message)
-        opener = opener_match.group("opener") if opener_match else None
-        if opener:
-            return (
-                f'Insert as the first sentence of section "{title}" ({loc}) a sentence beginning exactly '
-                f'"{opener}" stating what the section does.'
-            )
         return (
-            f'Insert as the first sentence of section "{title}" ({loc}) a sentence beginning exactly '
-            '"In this section, we" (appendix: "In this appendix, we") stating what the section does.'
+            f'Rewrite the first sentence of section "{title}" ({loc}) as a self-contained '
+            "mathematical claim or action of that section. The Introduction must open with "
+            "the central object or definition. Do not begin with notation, a table pointer, "
+            'or stock report voice such as "In this section, we ...".'
         )
     if rule_id == "L4-HOUSE-08":
         return (

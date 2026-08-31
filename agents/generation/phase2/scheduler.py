@@ -10809,6 +10809,13 @@ def _publication_route_error_research_action(
     review = pending_route_error_review(state)
     if review is None:
         return None
+    publication_only_test = any(
+        str(artifact.get("artifact_type") or "") == "final_paper"
+        and bool(_json_object(artifact.get("metadata_json")).get("publication_only_test"))
+        for artifact in (
+            list(state.get("artifacts", [])) + list(state.get("final_artifacts", []))
+        )
+    )
     review_id = str(review.get("review_id") or "")
     route_id = str(review.get("affected_route_id") or "")
     debt_id = f"referee-route-error-{fingerprint_text(review_id + route_id)[:12]}"
@@ -10928,6 +10935,25 @@ def _publication_route_error_research_action(
             },
         )
         conn.commit()
+    if publication_only_test:
+        return _action(
+            "await_human",
+            "root",
+            route_id,
+            (
+                f"publication referee falsified route {route_id}; publication-only test paused "
+                f"after logging {debt_id}, without dispatching mathematical research"
+            ),
+            plan_step_budget(problem, "await_human", 0),
+            research_mode=research_mode,
+            debt_id=debt_id,
+            proof_repair_required=True,
+            referee_route_error_research=False,
+            referee_report_artifact_id=review_id,
+            falsified_route_id=route_id,
+            publication_only_test=True,
+            terminal_classification="publication_route_error_requires_operator",
+        )
     return _action(
         "reduce",
         "root",
