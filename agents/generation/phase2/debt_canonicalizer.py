@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from typing import Any, Dict, Iterable, Mapping, Sequence
 
 from .models import normalize_text
@@ -81,20 +83,24 @@ def central_debt_clusters(
     if len(candidates) < min_alias_count:
         return []
 
-    clusters: list[list[Dict[str, Any]]] = []
+    clusters_by_target: dict[str, list[list[Dict[str, Any]]]] = {}
     for debt in candidates:
+        target_clusters = clusters_by_target.setdefault(
+            str(debt.get("target_id") or "root"), []
+        )
         placed = False
-        for cluster in clusters:
+        for cluster in target_clusters:
             if any(_same_central_obstruction(debt, existing) for existing in cluster):
                 cluster.append(debt)
                 placed = True
                 break
         if not placed:
-            clusters.append([debt])
+            target_clusters.append([debt])
 
     cards = [
         _cluster_card(cluster)
-        for cluster in clusters
+        for target_clusters in clusters_by_target.values()
+        for cluster in target_clusters
         if len(cluster) >= min_alias_count
     ]
     cards.sort(
@@ -228,10 +234,8 @@ def _jsonish_list(value: Any) -> list[str]:
         return []
     if isinstance(value, str):
         try:
-            import json
-
             value = json.loads(value)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             return [value] if value else []
     if isinstance(value, Iterable) and not isinstance(value, (str, bytes, dict)):
         return [str(item) for item in value if str(item)]

@@ -7,7 +7,7 @@ from pathlib import Path
 from agents.generation.phase2.context_builder import build_context_manifest
 from agents.generation.phase2.codex_runner import _base_mode_guidance
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch
 from agents.generation.phase2.research_strategy import (
     ADVISOR_SYNTHESIS_REQUIRED_FIELDS,
     EXPERIMENT_REQUIRED_FIELDS,
@@ -107,7 +107,7 @@ def _advisor_synthesis_metadata(*, base_revision: int, supersedes: str = "") -> 
 
 def _valid_experiment_metadata() -> dict:
     return {
-        "experiment_workflow_version": 1,
+        "experiment_workflow_version": 2,
         "mathematical_question": "Does the selected bridge fail in the smallest admissible case?",
         "competing_hypotheses": ["the bridge always holds", "a small counterexample exists"],
         "finite_scope": "All objects of size at most 8.",
@@ -120,16 +120,43 @@ def _valid_experiment_metadata() -> dict:
         "next_proof_move": "Prove the structural reduction suggested by the equality cases.",
         "decision_changed": "Retire the small-counterexample attack and move to the structural proof.",
         "claims_infinite_statement_verified": False,
+        "reproduction_request": {"kind": "manual"},
     }
 
 
 def _approach_candidate(index: int, *, status: str = "idea") -> dict:
+    methods = (
+        "induction on a canonical filtration",
+        "spectral analysis of an incidence operator",
+        "deformation to a rigid boundary object",
+        "duality and categorical adjunction",
+        "minimal-counterexample extremal argument",
+        "probabilistic sampling followed by derandomization",
+    )
+    starts = (
+        "Pass to the first nontrivial quotient in the filtration.",
+        "Diagonalize the incidence operator and isolate its exceptional eigenspace.",
+        "Construct a one-parameter degeneration to the boundary stratum.",
+        "Apply the contravariant functor and work with the adjoint morphism.",
+        "Choose a counterexample minimal in size and then in defect.",
+        "Sample a random witness and convert the expectation bound into a deterministic choice.",
+    )
+    representations = (
+        "filtered quotient sequence",
+        "eigenspace decomposition",
+        "flat deformation family",
+        "dual category and adjunction unit",
+        "lexicographically minimal obstruction",
+        "probability space with a conditional-expectation potential",
+    )
     return {
         "approach_id": f"approach-{index}",
         "title": f"Approach {index}",
-        "mechanism": f"Use mechanism family {index} to attack the root obstruction.",
+        "method_family": methods[index],
+        "independent_starting_point": starts[index],
+        "mechanism": f"Develop the {methods[index]} through its characteristic construction.",
         "mathematical_objects": [f"object-{index}"],
-        "representation_or_invariant": f"representation-{index}",
+        "representation_or_invariant": representations[index],
         "target_id": "root",
         "target_route_id": "none_yet",
         "root_consequence": "If the bridge is proved, the original theorem follows.",
@@ -140,7 +167,9 @@ def _approach_candidate(index: int, *, status: str = "idea") -> dict:
         "likely_failure_mode": f"Obstruction family {index} may survive.",
         "decisive_test": f"Test boundary family {index}.",
         "estimated_cost": "low" if index < 2 else "medium",
-        "novelty_score": round(0.9 - 0.08 * index, 2),
+        "originality_status": "new_combination",
+        "originality_rationale": f"This combines mechanism and representation family {index} in a distinct way.",
+        "comparison_to_existing_work": f"The nearest known argument does not use the {representations[index]}; this changes the first reduction.",
         "confidence": "medium",
         "confidence_basis": "The analogy matches the main hypotheses but not yet the endpoint.",
         "status": status,
@@ -158,14 +187,21 @@ def _approach_candidate(index: int, *, status: str = "idea") -> dict:
 def _approach_portfolio_metadata(*, kind: str = "initial", supersedes: str = "") -> dict:
     metadata = {
         "strategy_schema_version": 1,
+        "portfolio_contract_version": 3,
         "portfolio_kind": kind,
         "brainstorming_summary": "Six genuinely different mechanisms were compared against the root.",
         "approaches": [_approach_candidate(index, status="selected" if index < 2 else "idea") for index in range(6)],
         "selected_approach_ids": ["approach-0", "approach-1"],
+        "selection_rationale": "The first two mechanisms have complementary starting points and decisive tests.",
         "research_questions": ["Which boundary family distinguishes the first two mechanisms?"],
     }
     if supersedes:
         metadata["supersedes_artifact_id"] = supersedes
+        for candidate in metadata["approaches"]:
+            candidate["originality_status"] = "retained_prior_approach"
+            candidate["originality_rationale"] = (
+                "This is retained from the superseded portfolio for controlled comparison."
+            )
     return metadata
 
 
@@ -294,6 +330,98 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         self.assertIn("no mathematical root-relevant delta", action["reason"])
         self.assertIsNone(lease["wall_clock_timeout"])
 
+    def test_bottleneck_lease_consumes_only_the_exact_selected_obligation(self) -> None:
+        state = _pure_strategy_state()
+        selected_a = "base_recovery:bottleneck_lock:obligation-a"
+        selected_b = "base_recovery:bottleneck_lock:obligation-b"
+        recovery_trace = {
+            "selected_candidate_id": selected_a,
+            "candidates": [
+                {
+                    "candidate_id": selected_a,
+                    "admissible": True,
+                    "disposition": "selected",
+                },
+                {
+                    "candidate_id": selected_b,
+                    "admissible": True,
+                    "disposition": "rejected_by_ordinal_comparison",
+                },
+            ],
+        }
+        outer_trace = {
+            "selected_candidate_id": "base_open_problem:recovery_synthesis",
+            "candidates": [
+                {
+                    "candidate_id": "base_open_problem:recovery_synthesis",
+                    "admissible": True,
+                    "disposition": "selected",
+                }
+            ],
+            "nested_policy_traces": {
+                "base_open_problem:recovery_synthesis": recovery_trace
+            },
+        }
+        state["recent_runs"] = [
+            {
+                "run_id": f"run-{index}",
+                "actor_role": "researcher",
+                "mode": "prove",
+                "target_id": "root",
+                "status": "completed",
+                "selection_design": "deterministic",
+                "decision_trace_json": outer_trace,
+                "decision_trace_history_included": True,
+            }
+            for index in range(2)
+        ]
+        action_a = {
+            "target_id": "root",
+            "debt_id": "obligation-a",
+            "bottleneck_candidate_id": selected_a,
+        }
+        action_b = {
+            "target_id": "root",
+            "debt_id": "obligation-b",
+            "bottleneck_candidate_id": selected_b,
+        }
+
+        lease_a = bottleneck_lease_state(state, action_a)
+        lease_b = bottleneck_lease_state(state, action_b)
+
+        self.assertTrue(lease_a["escape_required"])
+        self.assertEqual(2, lease_a["completed_no_delta_passes"])
+        self.assertFalse(lease_b["escape_required"])
+        self.assertEqual(0, lease_b["completed_no_delta_passes"])
+
+    def test_bottleneck_lease_fails_open_when_exact_trace_is_omitted(self) -> None:
+        state = _pure_strategy_state()
+        state["recent_runs"] = [
+            {
+                "run_id": "run-with-omitted-trace",
+                "actor_role": "researcher",
+                "mode": "prove",
+                "target_id": "root",
+                "status": "completed",
+                "selection_design": "deterministic",
+                "decision_trace_json": "{}",
+                "decision_trace_history_included": False,
+            }
+        ]
+        lease = bottleneck_lease_state(
+            state,
+            {
+                "target_id": "root",
+                "debt_id": "obligation-b",
+                "bottleneck_candidate_id": (
+                    "base_recovery:bottleneck_lock:obligation-b"
+                ),
+            },
+        )
+
+        self.assertFalse(lease["escape_required"])
+        self.assertEqual(0, lease["completed_no_delta_passes"])
+
     def test_fresh_bottleneck_is_not_preempted_only_because_portfolio_is_missing(self) -> None:
         state = _pure_strategy_state()
         state["recent_runs"] = []
@@ -335,7 +463,7 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         self.assertEqual(action["operation"], "approach_pilot")
         self.assertTrue(action["search_intent"].startswith("approach_pilot:"))
 
-    def test_compact_advisory_portfolio_is_retained_and_auto_selects_pilots(self) -> None:
+    def test_compact_legacy_portfolio_cannot_downgrade_the_current_contract(self) -> None:
         compact = {
             "strategy_schema_version": 1,
             "portfolio_kind": "initial",
@@ -360,12 +488,9 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
                 "approach_portfolio",
                 compact,
             )
-            self.assertTrue(accepted.accepted, accepted.errors)
-            view = approach_portfolio_view(store.get_scheduler_state())
+            self.assertFalse(accepted.accepted)
 
-        self.assertEqual(view["approach_count"], 3)
-        self.assertEqual(view["selected_approach_ids"], ["compact-0", "compact-1"])
-        self.assertEqual(view["generation_state"]["status"], "current")
+        self.assertIn("may not downgrade", " ".join(accepted.errors))
 
     def test_failed_brainstorm_without_portfolio_is_visible_as_retry_pending(self) -> None:
         state = _pure_strategy_state()
@@ -407,6 +532,35 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
 
         self.assertFalse(rejected.accepted)
         self.assertTrue(any("duplicates another semantic_signature" in error for error in rejected.errors))
+
+    def test_rediscovered_prior_approach_cannot_be_labelled_original(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "strategy-prior-approach-originality")
+            initial = self._attach(
+                store,
+                "researcher",
+                "portfolio-originality-baseline",
+                "approach_portfolio",
+                _approach_portfolio_metadata(),
+            )
+            self.assertTrue(initial.accepted, initial.errors)
+            refresh = _approach_portfolio_metadata(
+                kind="refresh", supersedes="portfolio-originality-baseline"
+            )
+            refresh["approaches"][0]["originality_status"] = "potentially_original"
+            refresh["approaches"][0]["originality_rationale"] = (
+                "This incorrectly claims that an unchanged prior approach is original."
+            )
+            rejected = self._attach(
+                store,
+                "researcher",
+                "portfolio-originality-mislabel",
+                "approach_portfolio",
+                refresh,
+            )
+
+        self.assertFalse(rejected.accepted)
+        self.assertIn("duplicates a prior portfolio approach", " ".join(rejected.errors))
 
     def test_new_verified_root_evidence_forces_exclusive_portfolio_refresh(self) -> None:
         state = _pure_strategy_state(revision=30)
@@ -568,7 +722,7 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         contract = manifest["approach_portfolio_contract"]
         self.assertEqual(contract["layer_policy"]["ideas"].split()[0], "live")
         self.assertIn("nonblocking", contract["layer_policy"]["research_questions"])
-        self.assertIn("strict", contract["layer_policy"]["proof_debts"])
+        self.assertIn("strict", contract["layer_policy"]["proof_obligations"])
         self.assertTrue(any("manifest.approach_portfolio_contract exactly" in line for line in manifest["instructions"]))
 
     def test_alignment_manifest_exposes_directives_evidence_and_per_approach_impact(self) -> None:
@@ -781,7 +935,8 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         self.assertEqual(action["bridge_candidate_limit"], 3)
         self.assertTrue(action["bridge_search_context"]["forward_frontier"])
         self.assertTrue(action["bridge_search_context"]["backward_frontier"])
-        self.assertIn("expected_value_score", action["information_gain_score"])
+        self.assertIn("scheduler_priority", action["priority_assessment"])
+        self.assertFalse(action["priority_assessment"]["calibrated_probability"])
 
     def test_global_synthesis_trigger_runs_compression_then_phd_advisor(self) -> None:
         state = _pure_strategy_state()
@@ -1230,7 +1385,7 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
                 "researcher",
                 "cas-raw",
                 "cas_experiment_report",
-                {"experiment_workflow_version": 1, "observations": ["42"]},
+                {"experiment_workflow_version": 2, "observations": ["42"]},
             )
             self.assertFalse(raw.accepted)
             self.assertTrue(any("mathematical_question" in error for error in raw.errors))
@@ -1340,8 +1495,8 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
             self.assertTrue(action["experiment_workflow_required"])
             self.assertEqual(action["researcher_work_mode"], "cas")
             self.assertGreater(
-                action["information_gain_score"]["probability_of_refuting_route"],
-                action["information_gain_score"]["verification_cost"],
+                action["priority_assessment"]["refutation_priority"],
+                action["priority_assessment"]["verification_cost_level"],
             )
             self.assertTrue(manifest["workflow_action"]["experiment_workflow_required"])
 
@@ -1458,7 +1613,7 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         self.assertEqual(card["memory_separation"]["strategic_method_cards"], "developer-curated advisory cards; never proof premises")
         self.assertFalse(action["method_cards_are_proof_evidence"])
 
-    def test_information_gain_score_penalizes_duplicate_actions(self) -> None:
+    def test_priority_assessment_penalizes_duplicate_actions(self) -> None:
         state = _pure_strategy_state()
         action = {
             "mode": "reduce",
@@ -1471,8 +1626,8 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         for run in state["recent_runs"]:
             run["search_intent"] = "repeat-me"
         duplicate = score_action(state, action)
-        self.assertGreater(duplicate["duplication_risk"], baseline["duplication_risk"])
-        self.assertLess(duplicate["expected_value_score"], baseline["expected_value_score"])
+        self.assertGreater(duplicate["duplicate_recent_attempts"], baseline["duplicate_recent_attempts"])
+        self.assertLess(duplicate["scheduler_priority"], baseline["scheduler_priority"])
 
 
 if __name__ == "__main__":

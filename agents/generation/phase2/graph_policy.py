@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
-from .models import fingerprint_text, json_loads, normalize_text
+from .models import canonical_math_text, fingerprint_text, json_loads, normalize_text
 
 VERIFIED_VALIDATION_STATUSES = {"informally_verified", "formally_verified"}
 UNRESOLVED_VALIDATION_STATUSES = {"untested", "plausible", "challenged"}
@@ -71,6 +72,8 @@ CLAIM_RESTATEMENT_NOVELTY_STOPWORDS = {
     "top",
 }
 
+SCHEDULER_PLANNING_CACHE_KEY = "_scheduler_planning_cache"
+
 
 @dataclass(frozen=True)
 class GraphPolicyIndex:
@@ -84,10 +87,21 @@ class GraphPolicyIndex:
 
     claims_by_id: Mapping[str, Mapping[str, Any]]
     superseded_claim_ids: frozenset[str]
+    superseded_route_ids: frozenset[str]
+    stale_route_ids: frozenset[str]
     blocking_debt_owner_ids: frozenset[str]
     attempted_target_ids: frozenset[str]
     routed_claim_ids: frozenset[str]
     root_distances: Mapping[str, int]
+
+
+def _scheduler_planning_cache(
+    state: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return the opt-in cache owned by one immutable scheduler snapshot."""
+
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    return cache if isinstance(cache, dict) else None
 
 
 def claim_parent_ids(row: Mapping[str, Any]) -> list[str]:
@@ -180,6 +194,10 @@ def _latest_route_work_directives(state: Mapping[str, Any]) -> dict[str, dict[st
     route must supersede an older pause and may deliberately override the
     scoreboard's heuristic stall classification.
     """
+    cache = _scheduler_planning_cache(state)
+    cached = cache.get("latest_route_work_directives") if cache is not None else None
+    if isinstance(cached, dict):
+        return cached
     pause_keys = (
         "paused_or_abandoned_route_ids",
         "paused_route_ids",
@@ -251,11 +269,17 @@ def _latest_route_work_directives(state: Mapping[str, Any]) -> dict[str, dict[st
                 record(route_id, paused=True, artifact=artifact, reason=f"route decision: {decision}")
             elif any(term in normalized for term in keep_terms):
                 record(route_id, paused=False, artifact=artifact, reason=f"route decision: {decision}")
+    if cache is not None:
+        cache["latest_route_work_directives"] = directives
     return directives
 
 
 def _explicitly_refuted_debt_ids(state: Mapping[str, Any]) -> set[str]:
     """Debts defeated by a validator-confirmed counterexample artifact."""
+    cache = _scheduler_planning_cache(state)
+    cached = cache.get("explicitly_refuted_debt_ids") if cache is not None else None
+    if isinstance(cached, frozenset):
+        return set(cached)
     refuted: set[str] = set()
     for artifact in _artifact_rows(state):
         if str(artifact.get("artifact_type") or "") != "confirmed_counterexample":
@@ -270,16 +294,23 @@ def _explicitly_refuted_debt_ids(state: Mapping[str, Any]) -> set[str]:
                 "refuted_debt_ids",
             )
         )
+    if cache is not None:
+        cache["explicitly_refuted_debt_ids"] = frozenset(refuted)
     return refuted
 
 
 def supersession_index(state: Mapping[str, Any]) -> Dict[str, Any]:
     """Return derived stale/superseded graph ids.
 
-    Supersession is deliberately metadata-driven. A repaired mathematical statement
-    should displace the stale wording without needing a brittle ad hoc scheduler
-    rule, while ordinary paused routes remain distinct from truly abandoned ones.
+    Only explicit lifecycle/route status can supersede mathematics.  Tags and
+    artifact metadata are descriptive provenance, not authority to remove an
+    otherwise active theorem or route from the scheduler.  Ordinary paused
+    routes remain distinct from explicitly superseded ones.
     """
+    cache = _scheduler_planning_cache(state)
+    cached = cache.get("supersession_index") if cache is not None else None
+    if isinstance(cached, dict):
+        return cached
     claims = claim_map(state)
     routes = {str(row.get("route_id") or ""): row for row in state.get("routes", [])}
     route_ids_by_conclusion: dict[str, list[str]] = {}
@@ -338,19 +369,23 @@ def supersession_index(state: Mapping[str, Any]) -> Dict[str, Any]:
 
     for claim in state.get("claims", []):
         claim_id = str(claim.get("claim_id") or "")
-        tags = set(_json_strings(claim.get("tags_json", claim.get("tags", []))))
-        validation = str(claim.get("validation_status") or "")
-        lifecycle = str(claim.get("lifecycle_status") or "")
-        if "statement_repair" in tags and (
-            validation in VERIFIED_VALIDATION_STATUSES or lifecycle in {"integrated", "superseded"}
-        ):
-            for parent_id in claim_parent_ids(claim):
-                mark_claim(
-                    parent_id,
-                    replacement_ids=[claim_id],
-                    reason="verified statement_repair claim supersedes older wording",
-                    source_id=claim_id,
-                )
+        if str(claim.get("lifecycle_status") or "") == "superseded":
+            mark_claim(
+                claim_id,
+                replacement_ids=[],
+                reason="claim lifecycle is explicitly superseded",
+                source_id=claim_id,
+            )
+    for route in state.get("routes", []):
+        route_id = str(route.get("route_id") or "")
+        if str(route.get("status") or "") == "superseded":
+            mark_route(
+                route_id,
+                replacement_route_ids=[],
+                reason="route status is explicitly superseded",
+                source_id=route_id,
+                superseded=True,
+            )
 
     explicit_claim_keys = (
         "supersedes_claim_id",
@@ -394,14 +429,27 @@ def supersession_index(state: Mapping[str, Any]) -> Dict[str, Any]:
         "new_route_ids",
         "kept_route_ids",
     )
-    for artifact in _artifact_rows(state):
+    # Replacement metadata has authority only for entities whose explicit
+    # lifecycle/status was already marked superseded above. Avoid parsing all
+    # artifact metadata in the overwhelmingly common all-active snapshot.
+    supersession_artifacts = (
+        _artifact_rows(state)
+        if superseded_claims or superseded_routes
+        else ()
+    )
+    for artifact in supersession_artifacts:
         metadata = _json_object(artifact.get("metadata_json"))
         if not metadata:
             continue
         source_id = str(artifact.get("artifact_id") or "")
         replacement_claims = [claim_id for claim_id in _metadata_strings(metadata, *replacement_claim_keys) if claim_id in claims]
         replacement_routes = [route_id for route_id in _metadata_strings(metadata, *replacement_route_keys) if route_id in routes]
+        # Metadata may annotate replacement links, but it is consulted only
+        # after an explicit status transition has already superseded the old
+        # entity.  It cannot itself alter scheduler eligibility.
         for old_id in _metadata_strings(metadata, *explicit_claim_keys):
+            if str(claims.get(old_id, {}).get("lifecycle_status") or "") != "superseded":
+                continue
             mark_claim(
                 old_id,
                 replacement_ids=replacement_claims,
@@ -409,6 +457,8 @@ def supersession_index(state: Mapping[str, Any]) -> Dict[str, Any]:
                 source_id=source_id,
             )
         for old_route_id in _metadata_strings(metadata, *explicit_route_keys):
+            if str(routes.get(old_route_id, {}).get("status") or "") != "superseded":
+                continue
             mark_route(
                 old_route_id,
                 replacement_route_ids=replacement_routes,
@@ -427,8 +477,8 @@ def supersession_index(state: Mapping[str, Any]) -> Dict[str, Any]:
             superseded=False,
         )
 
-    return {
-        "policy": "metadata-and-statement-repair-supersession",
+    result = {
+        "policy": "explicit-lifecycle-supersession-with-metadata-provenance",
         "superseded_claim_ids": sorted(superseded_claims),
         "superseded_route_ids": sorted(superseded_routes),
         "stale_route_ids": sorted(stale_routes),
@@ -436,6 +486,9 @@ def supersession_index(state: Mapping[str, Any]) -> Dict[str, Any]:
         "routes": [superseded_routes[key] for key in sorted(superseded_routes)],
         "stale_routes": [stale_routes[key] for key in sorted(stale_routes)],
     }
+    if cache is not None:
+        cache["supersession_index"] = result
+    return result
 
 
 def claim_is_retired(row: Mapping[str, Any]) -> bool:
@@ -455,7 +508,14 @@ def claim_is_verified(row: Mapping[str, Any]) -> bool:
 
 
 def claim_map(state: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
-    return {str(row.get("claim_id")): row for row in state.get("claims", [])}
+    cache = _scheduler_planning_cache(state)
+    cached = cache.get("claims_by_id") if cache is not None else None
+    if isinstance(cached, dict):
+        return cached
+    claims = {str(row.get("claim_id")): row for row in state.get("claims", [])}
+    if cache is not None:
+        cache["claims_by_id"] = claims
+    return claims
 
 
 def _root_distance_from_claims(
@@ -484,25 +544,79 @@ def _root_distance_from_claims(
 
     try:
         depth = int(row.get("reduction_depth", 99))
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         depth = 99
     return depth if depth >= 0 else 99
 
 
+def _root_distances_from_claims(
+    claims: Mapping[str, Mapping[str, Any]],
+) -> dict[str, int]:
+    """Compute every shortest parent-path distance from root in one pass.
+
+    The former index builder ran an independent upward search from every
+    claim.  That is tolerable for a shallow star but quadratic for the long
+    dependency chains that arise in sustained proofs.  Reversing parent edges
+    and traversing outward from the (possibly synthetic) root gives identical
+    shortest-path distances in O(V + E).  Claims disconnected from root keep
+    the historical reduction-depth fallback.
+    """
+
+    children_by_parent: dict[str, list[str]] = {}
+    for claim_id, row in claims.items():
+        if claim_id == "root":
+            continue
+        for parent_id in claim_parent_ids(row):
+            children_by_parent.setdefault(parent_id, []).append(claim_id)
+
+    reachable_distances: dict[str, int] = {"root": 0}
+    frontier = deque(["root"])
+    while frontier:
+        parent_id = frontier.popleft()
+        child_distance = reachable_distances[parent_id] + 1
+        for claim_id in children_by_parent.get(parent_id, []):
+            previous = reachable_distances.get(claim_id)
+            if previous is None or child_distance < previous:
+                reachable_distances[claim_id] = child_distance
+                frontier.append(claim_id)
+
+    distances: dict[str, int] = {}
+    for claim_id, row in claims.items():
+        if claim_id in reachable_distances:
+            distances[claim_id] = reachable_distances[claim_id]
+            continue
+        try:
+            depth = int(row.get("reduction_depth", 99))
+        except (TypeError, ValueError, OverflowError):
+            depth = 99
+        distances[claim_id] = depth if depth >= 0 else 99
+    return distances
+
+
 def build_graph_policy_index(state: Mapping[str, Any]) -> GraphPolicyIndex:
     """Build output-neutral graph lookups for repeated policy queries."""
+    cache = _scheduler_planning_cache(state)
+    cached = cache.get("graph_policy_index") if cache is not None else None
+    if isinstance(cached, GraphPolicyIndex):
+        return cached
     claims = claim_map(state)
+    supersession = supersession_index(state)
     superseded_claim_ids = frozenset(
         str(claim_id)
-        for claim_id in supersession_index(state).get("superseded_claim_ids", [])
+        for claim_id in supersession.get("superseded_claim_ids", [])
     )
-    root_distances = {
-        claim_id: _root_distance_from_claims(claims, claim_id)
-        for claim_id in claims
-    }
-    return GraphPolicyIndex(
+    root_distances = _root_distances_from_claims(claims)
+    index = GraphPolicyIndex(
         claims_by_id=claims,
         superseded_claim_ids=superseded_claim_ids,
+        superseded_route_ids=frozenset(
+            str(route_id)
+            for route_id in supersession.get("superseded_route_ids", [])
+        ),
+        stale_route_ids=frozenset(
+            str(route_id)
+            for route_id in supersession.get("stale_route_ids", [])
+        ),
         blocking_debt_owner_ids=frozenset(
             str(debt.get("owner_id") or "")
             for debt in state.get("debts", [])
@@ -518,6 +632,9 @@ def build_graph_policy_index(state: Mapping[str, Any]) -> GraphPolicyIndex:
         ),
         root_distances=root_distances,
     )
+    if cache is not None:
+        cache["graph_policy_index"] = index
+    return index
 
 
 def root_distance_for_claim_id(
@@ -526,6 +643,8 @@ def root_distance_for_claim_id(
     *,
     policy_index: GraphPolicyIndex | None = None,
 ) -> int:
+    if policy_index is None and _scheduler_planning_cache(state) is not None:
+        policy_index = build_graph_policy_index(state)
     if policy_index is not None:
         if claim_id == "root":
             return 0
@@ -551,11 +670,18 @@ def frontier_claim_ids(
         route_inferences.setdefault(str(inf.get("route_id") or ""), []).append(inf)
 
     selected: list[str] = []
+    selected_ids: set[str] = set()
 
     def add_claim(claim_id: str) -> None:
         row = claims.get(claim_id)
-        if row and claim_id not in superseded_claim_ids and claim_is_unresolved(row) and claim_id not in selected:
+        if (
+            row
+            and claim_id not in superseded_claim_ids
+            and claim_is_unresolved(row)
+            and claim_id not in selected_ids
+        ):
             selected.append(claim_id)
+            selected_ids.add(claim_id)
 
     for route in state.get("routes", []):
         if route.get("status") != "active" or route.get("relation_to_parent") != "sufficient":
@@ -614,13 +740,10 @@ def active_frontier_pressure(
     policy_index: GraphPolicyIndex | None = None,
 ) -> Dict[str, Any]:
     """Summarize whether root-local unresolved claims are getting too wide."""
+    policy_index = policy_index or build_graph_policy_index(state)
     unresolved: list[Dict[str, Any]] = []
     root_local: list[Dict[str, Any]] = []
-    superseded_claim_ids = (
-        set(policy_index.superseded_claim_ids)
-        if policy_index is not None
-        else set(supersession_index(state).get("superseded_claim_ids", []))
-    )
+    superseded_claim_ids = set(policy_index.superseded_claim_ids)
     for row in state.get("claims", []):
         claim_id = str(row.get("claim_id") or "")
         if claim_id == "root" or claim_id in superseded_claim_ids or not claim_is_unresolved(row):
@@ -806,9 +929,36 @@ def route_repair_pending_verifier(
     """
 
     debt_last_seen = str(debt.get("last_seen") or "")
+    timestamp_index = _route_repair_verification_timestamps(state)
+    for key in (
+        (route_id, conclusion_id),
+        (route_id, ""),
+        ("", conclusion_id),
+        ("", ""),
+    ):
+        for created_at in timestamp_index.get(key, ()):
+            if not debt_last_seen or not created_at or created_at > debt_last_seen:
+                return True
+    return False
+
+
+def _route_repair_verification_timestamps(
+    state: Mapping[str, Any],
+) -> Mapping[tuple[str, str], tuple[str, ...]]:
+    """Index proof repairs that explicitly hand a route to verification."""
+
+    cache = _scheduler_planning_cache(state)
+    cached = (
+        cache.get("route_repair_verification_timestamps")
+        if cache is not None
+        else None
+    )
+    if isinstance(cached, dict):
+        return cached
     artifacts = state.get("research_artifacts")
     if not isinstance(artifacts, list):
         artifacts = state.get("artifacts", [])
+    timestamps: dict[tuple[str, str], list[str]] = {}
     for artifact in artifacts:
         if str(artifact.get("artifact_type") or "") not in {"proof_dossier", "deep_session_report"}:
             continue
@@ -821,10 +971,6 @@ def route_repair_pending_verifier(
             continue
         artifact_route_id = str(metadata.get("route_id") or "")
         artifact_target_id = str(metadata.get("target_id") or "")
-        if artifact_route_id and artifact_route_id != route_id:
-            continue
-        if artifact_target_id and artifact_target_id != conclusion_id:
-            continue
         next_action = str(
             metadata.get("next_decisive_action")
             or metadata.get("next_decisive_step")
@@ -834,10 +980,16 @@ def route_repair_pending_verifier(
         if "verif" not in next_action:
             continue
         created_at = str(artifact.get("created_at") or "")
-        if debt_last_seen and created_at and created_at <= debt_last_seen:
-            continue
-        return True
-    return False
+        timestamps.setdefault((artifact_route_id, artifact_target_id), []).append(
+            created_at
+        )
+    result = {
+        key: tuple(sorted(values, reverse=True))
+        for key, values in timestamps.items()
+    }
+    if cache is not None:
+        cache["route_repair_verification_timestamps"] = result
+    return result
 
 
 def route_scoreboard(
@@ -846,12 +998,32 @@ def route_scoreboard(
     limit: int | None = None,
     debt_coverage_index: DebtCoverageIndex | None = None,
 ) -> list[Dict[str, Any]]:
-    claims = claim_map(state)
-    supersession = supersession_index(state)
-    superseded_route_ids = set(supersession.get("superseded_route_ids", []))
-    stale_route_ids = set(supersession.get("stale_route_ids", []))
+    cache = _scheduler_planning_cache(state)
+    cacheable = debt_coverage_index is None
+    cached_rows = (
+        cache.get("route_scoreboard")
+        if cache is not None and cacheable
+        else None
+    )
+    if isinstance(cached_rows, tuple):
+        selected_rows = (
+            cached_rows[:limit] if limit is not None else cached_rows
+        )
+        rows = [
+            {
+                **dict(row),
+                "kill_reasons": list(row.get("kill_reasons", [])),
+            }
+            for row in selected_rows
+        ]
+        return rows
+
+    policy_index = build_graph_policy_index(state)
+    claims = policy_index.claims_by_id
+    superseded_route_ids = set(policy_index.superseded_route_ids)
+    stale_route_ids = set(policy_index.stale_route_ids)
     route_work_directives = _latest_route_work_directives(state)
-    debt_coverage_index = debt_coverage_index or DebtCoverageIndex(state)
+    debt_coverage_index = debt_coverage_index or get_debt_coverage_index(state)
     inferences_by_route: dict[str, list[Mapping[str, Any]]] = {}
     for inf in state.get("inferences", []):
         inferences_by_route.setdefault(str(inf.get("route_id") or ""), []).append(inf)
@@ -890,7 +1062,9 @@ def route_scoreboard(
                 debt=debt,
             )
         ]
-        root_distance = root_distance_for_claim_id(state, conclusion_id)
+        # ``claims`` is already the canonical map for this scoreboard pass.
+        # Rebuilding it once per route made a wide N-route graph quadratic.
+        root_distance = int(policy_index.root_distances.get(conclusion_id, 99))
         root_impact = float(conclusion.get("root_impact", 0.0) or 0.0)
         repeated_blockers = sum(int(debt.get("repeated_count") or 0) for debt in blocking_debts)
         if route_id in superseded_route_ids:
@@ -938,18 +1112,47 @@ def route_scoreboard(
             }
         )
     rows.sort(key=lambda row: (-float(row["score"]), row["root_distance"], row["route_id"]))
+    if cache is not None and cacheable:
+        cache["route_scoreboard"] = tuple(
+            {
+                **dict(row),
+                "kill_reasons": tuple(row.get("kill_reasons", [])),
+            }
+            for row in rows
+        )
+        selected_rows = (
+            cache["route_scoreboard"][:limit]
+            if limit is not None
+            else cache["route_scoreboard"]
+        )
+        rows = [
+            {
+                **dict(row),
+                "kill_reasons": list(row.get("kill_reasons", [])),
+            }
+            for row in selected_rows
+        ]
+        return rows
     return rows[:limit] if limit is not None else rows
 
 
-def paused_route_ids(state: Mapping[str, Any]) -> set[str]:
-    supersession = supersession_index(state)
+def paused_route_ids(state: Mapping[str, Any]) -> set[str] | frozenset[str]:
+    cache = _scheduler_planning_cache(state)
+    cached = cache.get("paused_route_ids") if cache is not None else None
+    if isinstance(cached, frozenset):
+        return cached
+    policy_index = build_graph_policy_index(state)
     paused = {
         row["route_id"]
         for row in route_scoreboard(state)
         if row["scoreboard_status"] in PAUSED_ROUTE_STATUSES
     }
-    paused.update(str(route_id) for route_id in supersession.get("superseded_route_ids", []))
-    paused.update(str(route_id) for route_id in supersession.get("stale_route_ids", []))
+    paused.update(policy_index.superseded_route_ids)
+    paused.update(policy_index.stale_route_ids)
+    if cache is not None:
+        frozen = frozenset(paused)
+        cache["paused_route_ids"] = frozen
+        return frozen
     return paused
 
 
@@ -1049,6 +1252,18 @@ DECISIVE_OBJECT_MARKERS = (
 )
 
 
+def is_decisive_theorem_test_obligation(obligation: Mapping[str, Any]) -> bool:
+    """Cheap exact prefilter for the full graph-local decisive-test policy."""
+
+    text = str(obligation.get("obligation") or "").lower()
+    obligation_type = str(obligation.get("debt_type") or "")
+    has_decision_marker = any(term in text for term in DECISIVE_TEXT_MARKERS)
+    has_object_marker = any(term in text for term in DECISIVE_OBJECT_MARKERS)
+    return has_decision_marker and (
+        obligation_type in DECISIVE_DEBT_TYPES or has_object_marker
+    )
+
+
 def _graph_owner_distance(state: Mapping[str, Any], owner_id: str, *, fallback_target_id: str = "root") -> int:
     if not owner_id:
         return root_distance_for_claim_id(state, fallback_target_id)
@@ -1073,7 +1288,21 @@ def decisive_theorem_test_signal(
     superseded_claim_ids = set(supersession_index(state).get("superseded_claim_ids", []))
     refuted_debt_ids = _explicitly_refuted_debt_ids(state)
     candidates: list[tuple[float, Mapping[str, Any]]] = []
-    for debt in state.get("debts", []):
+    debt_rows: Sequence[Mapping[str, Any]] = state.get("debts", [])
+    if debt_id:
+        cache = _scheduler_planning_cache(state)
+        debts_by_id = cache.get("debts_by_id") if cache is not None else None
+        if not isinstance(debts_by_id, dict):
+            debts_by_id = {
+                str(row.get("debt_id") or ""): row
+                for row in state.get("debts", [])
+                if str(row.get("debt_id") or "")
+            }
+            if cache is not None:
+                cache["debts_by_id"] = debts_by_id
+        selected_debt = debts_by_id.get(debt_id)
+        debt_rows = [selected_debt] if selected_debt is not None else []
+    for debt in debt_rows:
         if debt.get("status") != "active" or debt.get("severity") != "blocking":
             continue
         if str(debt.get("debt_id") or "") in refuted_debt_ids:
@@ -1093,11 +1322,7 @@ def decisive_theorem_test_signal(
             continue
         obligation = str(debt.get("obligation") or "")
         debt_type = str(debt.get("debt_type") or "")
-        obligation_lower = obligation.lower()
-        has_decision_marker = any(term in obligation_lower for term in DECISIVE_TEXT_MARKERS)
-        has_object_marker = any(term in obligation_lower for term in DECISIVE_OBJECT_MARKERS)
-        theoremish = has_decision_marker and (debt_type in DECISIVE_DEBT_TYPES or has_object_marker)
-        if not theoremish:
+        if not is_decisive_theorem_test_obligation(debt):
             continue
         score = (
             2.0
@@ -1593,6 +1818,19 @@ class DebtCoverageIndex:
         )
 
 
+def get_debt_coverage_index(state: Mapping[str, Any]) -> DebtCoverageIndex:
+    """Reuse one semantic-coverage index within an immutable planning snapshot."""
+
+    cache = _scheduler_planning_cache(state)
+    cached = cache.get("debt_coverage_index") if cache is not None else None
+    if isinstance(cached, DebtCoverageIndex):
+        return cached
+    index = DebtCoverageIndex(state)
+    if cache is not None:
+        cache["debt_coverage_index"] = index
+    return index
+
+
 def debt_covered_by_integrated_claim(
     state: Mapping[str, Any],
     debt: Mapping[str, Any],
@@ -1606,7 +1844,7 @@ def debt_covered_by_integrated_claim(
     semantic coverage instead of treating every ``status=active`` row as a live
     proof obligation.
     """
-    index = debt_coverage_index or DebtCoverageIndex(state)
+    index = debt_coverage_index or get_debt_coverage_index(state)
     debt_key = index.debt_key(debt)
     if debt_key in index.coverage_by_debt:
         return index.coverage_by_debt[debt_key]
@@ -1621,6 +1859,12 @@ def debt_covered_by_integrated_claim(
     if target_ids & index.integrated_claim_ids:
         index.coverage_by_debt[debt_key] = True
         return True
+    if not index.integrated_claim_ids:
+        # Semantic or identifier-based coverage requires an integrated claim.
+        # Avoid normalizing a potentially large obligation string when the
+        # comparison set is empty (the common discovery-state case).
+        index.coverage_by_debt[debt_key] = False
+        return False
     debt_id = str(debt.get("debt_id") or "")
     debt_prefix = next((prefix for prefix in ("debt_", "debt-") if debt_id.startswith(prefix)), "")
     if debt_prefix:
@@ -1649,20 +1893,12 @@ def obvious_duplicate_claim_id(
     statement: str,
     fingerprint: str = "",
 ) -> str:
-    normalized = normalize_text(statement)
-    core = claim_core_fingerprint(statement)
+    exact = canonical_math_text(statement)
     for row in existing_claims:
         existing_id = str(row.get("claim_id") or "")
         if fingerprint and row.get("fingerprint") == fingerprint:
             return existing_id
-        if normalize_text(str(row.get("statement") or "")) == normalized:
-            return existing_id
-        if core and claim_core_fingerprint(str(row.get("statement") or "")) == core:
-            return existing_id
-        if _is_integrated_claim_row(row) and _near_integrated_claim_restatement(
-            statement=statement,
-            existing_statement=str(row.get("statement") or ""),
-        ):
+        if canonical_math_text(str(row.get("statement") or "")) == exact:
             return existing_id
     return ""
 

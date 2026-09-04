@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict
 
 from .audit import build_referee_report_lines, is_audit_state
+from .artifacts import read_verified_artifact_text_prefix
 from .branch_summary import build_branch_workbenches, render_branch_workbench
 from .fact_graph import DERIVED_EDGE_TYPES, EDGE_TYPES, STUB_EDGE_TYPES, build_fact_graph
 from .graph_policy import claim_type_label, proof_trunk_maturity, root_distance_for_claim_id, route_scoreboard
@@ -15,18 +18,24 @@ from .research_strategy import strategy_observability
 from .store import ProofStateStore
 
 
+MAX_REPORT_ARTIFACT_CHARS = 2_000_000
+
+
 def build_markdown_report(store: ProofStateStore) -> str:
-    state = store.get_state()
-    metrics = compute_metrics(store)
+    with store.connect() as conn:
+        conn.execute("BEGIN")
+        store.audit_chain_heads(conn)
+        state = store.snapshot_from_conn(conn, include_audit_journal=True)
+    metrics = compute_metrics(store, state=state)
     problem = state["problem_state"]
     root = next((row for row in state["claims"] if row["claim_id"] == "root"), {})
     final_artifact = _final_proof_artifact(state)
     result = classify_state(state)
     storage = metrics.get("benchmark_storage", {})
     run_counts = _benchmark_run_counts(state)
-    debt_label = "Active debts"
+    debt_label = "Active proof obligations"
     if result["public_status"] in {"solved", "solved_pending_final_writer"}:
-        debt_label = "Active debts (ledger only)"
+        debt_label = "Active proof obligations (audit record only)"
     timing = metrics.get("run_timing", {})
     lines = [
         f"# Albilich v1 Report: {store.problem_id}",
@@ -86,7 +95,7 @@ def build_markdown_report(store: ProofStateStore) -> str:
     )
     lines.extend(_run_control_event_lines(timing))
     if is_audit_state(state):
-        # paper_solution_audit (TODO 6): referee-style audit sections with the
+        # paper_solution_audit: referee-style audit sections with the
         # AI-audit warning line; rendered before proof sections so the audit
         # verdict is never confused with a solved-proof deliverable.
         lines.extend(build_referee_report_lines(state))
@@ -128,7 +137,7 @@ def build_markdown_report(store: ProofStateStore) -> str:
                 f"root_distance={route['root_distance']} verified={route['verified_inference_count']}/{route['inference_count']}{reason}"
             )
     lines.append("")
-    # Compact all-branches report (TODOs 1+2): one workbench block per active
+    # Compact all-branches report: one workbench block per active
     # branch — what is proved, what is blocked, the next nearby lemma, the
     # last useful delta/stale count, and the continue-or-rotate adjudication.
     branch_workbenches = build_branch_workbenches(store, state=state, limit=5)
@@ -187,17 +196,17 @@ def build_markdown_report(store: ProofStateStore) -> str:
             f"- `{claim['claim_id']}` `{claim['validation_status']}` `{claim['lifecycle_status']}` "
             f"`{label}` maturity={maturity} root_distance={distance}: {claim['statement']}"
         )
-    lines.extend(["", "## Active Proof Debts", ""])
+    lines.extend(["", "## Active Proof Obligations", ""])
     active_debts = [row for row in state["debts"] if row["status"] == "active"]
     if not active_debts:
-        lines.append("No active proof debts.")
+        lines.append("No active proof obligations.")
     else:
         for debt in active_debts:
             lines.append(f"- `{debt['debt_id']}` `{debt['severity']}` on `{debt['owner_id']}`: {debt['obligation']}")
-    lines.extend(["", "## Refuted Proof Debts", ""])
+    lines.extend(["", "## Refuted Proof Obligations", ""])
     refuted_debts = [row for row in state["debts"] if row["status"] == "refuted"]
     if not refuted_debts:
-        lines.append("No refuted proof debts.")
+        lines.append("No refuted proof obligations.")
     else:
         for debt in refuted_debts:
             lines.append(f"- `{debt['debt_id']}` on `{debt['owner_id']}`: {debt['obligation']}")
@@ -255,7 +264,7 @@ def _research_strategy_lines(state: Dict[str, Any]) -> list[str]:
             f"- Global synthesis due: `{bool(trigger.get('due'))}`; reasons={trigger.get('reasons', [])}",
             f"- Graph-derived decisive obligation: `{(frontier.get('decisive_obligation') or {}).get('obligation_id') or 'none'}`; "
             f"selected route=`{frontier.get('selected_route_id') or 'none'}`, ready_for_verification={bool(frontier.get('selected_route_ready_for_verification'))}",
-            f"- Verifier-filtered outcome learning: family=`{learning.get('current_strategy_family') or 'none'}`; "
+            f"- Causal outcome summary: family=`{learning.get('current_strategy_family') or 'none'}`; "
             f"local families={len(learning.get('families') or {})}; root-contributing successes="
             f"{(learning.get('current_family') or {}).get('root_contributing_successes', 0)}; "
             f"reference_solution_used={bool(learning.get('reference_solution_used'))}",
@@ -264,14 +273,14 @@ def _research_strategy_lines(state: Dict[str, Any]) -> list[str]:
             f"exhaustive-case programs={(programs.get('case_coverage_status_counts') or {}).get('exhaustive', 0)}; no wall-clock abandonment={bool(programs.get('no_wall_clock_abandonment'))}",
             f"- Threat propagation: threatened certified claims={len(threats.get('threatened_verified_claim_ids') or [])}, "
             f"pending strict revalidations={len(threats.get('pending_revalidation_routes') or [])}; certification is not silently revoked",
-            f"- Canonical debt frontier: active blocking={debt_frontier.get('active_blocking_debt_count', 0)}, "
+            f"- Minimal proof-obligation frontier: active blocking={debt_frontier.get('active_blocking_debt_count', 0)}, "
             f"independent work items={debt_frontier.get('minimal_frontier_count', 0)}, aliases={len(debt_frontier.get('alias_to_primary') or {})}",
             f"- Reference solution: available={bool(reference.get('available'))}, pending reconstruction={bool(reference.get('pending_reconstruction'))}, verification authority=false",
             f"- Root leverage: terminal root inferences={leverage.get('root_terminal_inference_count', 0)}, "
             f"verified terminal root inferences={leverage.get('verified_root_terminal_inference_count', 0)}, "
             f"pending threat revalidations={leverage.get('pending_threat_revalidation_count', 0)}",
-            "- Information-gain policy: scheduler exposes closing, refuting, root-progress, information, reuse, duplication, token, wall-time, verification-cost, and verifier-filtered outcome components; speculative work never consumes the protected verification reserve.",
-            "- Creativity policy: ideas and nonblocking research questions may be numerous; blocking proof debts remain exact route obligations. The active portfolio reserves 30% exploration, 50% exploitation, and 20% adversarial testing as a qualitative allocation rather than a hidden probability model.",
+            "- Action-priority policy: the scheduler records ordinal closure, refutation, root-relevance, information, reuse, duplication, token-cost, execution-cost, verification-cost, and verifier-filtered outcome components; these are ranking criteria, not probabilities or expected values, and speculative work never consumes the protected verification reserve.",
+            "- Creativity policy: ideas and nonblocking research questions may be numerous; blocking proof obligations remain exact route obligations. The active portfolio reserves 30% exploration, 50% exploitation, and 20% adversarial testing as a qualitative allocation rather than a hidden probability model.",
             "- Method library policy: 18 developer-curated structural/domain method cards are advisory only and are kept separate from verified facts, external theorem cards, and private speculation.",
             "",
         ]
@@ -280,7 +289,7 @@ def _research_strategy_lines(state: Dict[str, Any]) -> list[str]:
 
 
 def _fact_graph_lines(store: ProofStateStore, state: Dict[str, Any]) -> list[str]:
-    """"Fact Graph" health section (2026-07-09 TODO 3 pilot): node counts by
+    """"Fact Graph" health section: node counts by
     type, edge counts by type (deriving vs stubbed), and the per-branch
     deep/shallow/blocked/converging depth report. The graph is a generated,
     read-only view over the proof state — never a second store."""
@@ -292,7 +301,7 @@ def _fact_graph_lines(store: ProofStateStore, state: Dict[str, Any]) -> list[str
     lines = [
         "## Fact Graph",
         "",
-        "Read-only graph view generated from claims, routes, inferences, debts, and sources.",
+        "Read-only graph view generated from claims, routes, inferences, proof obligations, and sources.",
         "",
         "- Nodes: " + ", ".join(f"{label}={count}" for label, count in node_counts.items()),
         "- Edges: "
@@ -316,7 +325,7 @@ def _fact_graph_lines(store: ProofStateStore, state: Dict[str, Any]) -> list[str
 
 
 def _run_control_event_lines(timing: Dict[str, Any]) -> list[str]:
-    """Pause/resume/stop/interruption ledger so benchmark comparisons can see
+    """Pause/resume/stop/interruption history so benchmark comparisons can see
     exactly when the run was live versus paused or interrupted."""
     events = timing.get("run_control_events") or []
     if not events:
@@ -421,12 +430,12 @@ def _writing_review_lines(state: Dict[str, Any]) -> list[str]:
     open_debts = [row for row in writing_debts if row.get("status") == "active"]
     resolved_debts = [row for row in writing_debts if row.get("status") == "resolved"]
     lines.append(
-        "- Open writing debts: "
+        "- Open writing issues: "
         f"{len(open_debts)} ({_writing_debt_severity_counts(open_debts)}); "
         f"resolved: {len(resolved_debts)} ({_writing_debt_severity_counts(resolved_debts)})"
     )
     if open_debts:
-        lines.extend(["", "Unresolved writing debts:", ""])
+        lines.extend(["", "Unresolved writing issues:", ""])
         for debt in open_debts:
             lines.append(f"- `{debt['debt_id']}` `{debt['severity']}` on `{debt['owner_id']}`: {debt['obligation']}")
     lines.append("")
@@ -474,7 +483,22 @@ def _writing_debt_severity_counts(debts: list[Dict[str, Any]]) -> str:
 
 def write_markdown_report(store: ProofStateStore) -> Path:
     path = store.state_dir / "phase2_report.md"
-    path.write_text(build_markdown_report(store), encoding="utf-8")
+    payload = build_markdown_report(store).encode("utf-8")
+    descriptor, raw_temporary_path = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(raw_temporary_path)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
     return path
 
 
@@ -576,7 +600,15 @@ def _artifact_text(artifact: Dict[str, Any]) -> str:
     path_text = artifact.get("path", "")
     if not path_text:
         return ""
-    path = Path(path_text)
-    if not path.exists() or not path.is_file():
-        return ""
-    return path.read_text(encoding="utf-8").strip()
+    text, complete, _size, total_chars = read_verified_artifact_text_prefix(
+        path=Path(path_text),
+        expected_sha256=str(artifact.get("sha256") or ""),
+        max_chars=MAX_REPORT_ARTIFACT_CHARS,
+    )
+    if not complete:
+        omitted = max(1, total_chars - MAX_REPORT_ARTIFACT_CHARS)
+        text += (
+            f"\n\n[Report excerpt omitted {omitted} authenticated artifact "
+            "characters; inspect the recorded artifact for the complete proof.]"
+        )
+    return text.strip()

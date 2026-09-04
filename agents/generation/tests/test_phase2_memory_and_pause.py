@@ -36,10 +36,11 @@ from agents.generation.phase2.memory_policy import (
 )
 from agents.generation.phase2.models import SCHEMA_VERSION, utc_now
 from agents.generation.phase2.monitor import INDEX_HTML
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch, apply_system_patch
 from agents.generation.phase2.report import build_markdown_report
 from agents.generation.phase2.store import ProofStateStore
 from agents.generation.phase2.workflow import _record_execution_metrics, run_workflow
+from agents.generation.tests._phase2_test_support import journal_legacy_fixture_mutation
 
 
 def _make_store(tmpdir: str, problem_id: str) -> ProofStateStore:
@@ -49,7 +50,12 @@ def _make_store(tmpdir: str, problem_id: str) -> ProofStateStore:
 
 
 def _apply(store: ProofStateStore, operations: list[dict], *, actor_role: str = "researcher") -> None:
-    outcome = apply_patch(
+    applier = (
+        apply_system_patch
+        if any(str(op.get("op") or "") == "record_run_metrics" for op in operations)
+        else apply_patch
+    )
+    outcome = applier(
         store,
         {
             "schema_version": SCHEMA_VERSION,
@@ -66,9 +72,10 @@ def _apply(store: ProofStateStore, operations: list[dict], *, actor_role: str = 
 
 
 def _completed_execution(store: ProofStateStore, action: dict, session_plan: dict, *, tag: str) -> dict:
+    actor_role = str(session_plan.get("actor_role") or "researcher")
     return {
         "run_id": f"run-{tag}",
-        "actor_role": "researcher",
+        "actor_role": actor_role,
         "status": "completed",
         "returncode": 0,
         "wall_time_seconds": 2.0,
@@ -79,7 +86,7 @@ def _completed_execution(store: ProofStateStore, action: dict, session_plan: dic
             "schema_version": SCHEMA_VERSION,
             "problem_id": store.problem_id,
             "base_revision": session_plan["state_revision"],
-            "actor_role": "researcher",
+            "actor_role": actor_role,
             "target_id": action.get("target_id", "root"),
             "operations": [
                 {
@@ -125,7 +132,7 @@ class MemoryStatusClassifierTests(unittest.TestCase):
         self.assertEqual(debt_memory_status({"status": "refuted", "severity": "blocking"}), "failed")
         self.assertEqual(debt_memory_status({"status": "discarded", "severity": "minor"}), "stale")
 
-        self.assertEqual(artifact_memory_status({"artifact_type": "final_proof"}), "verified")
+        self.assertEqual(artifact_memory_status({"artifact_type": "final_proof"}), "candidate")
         self.assertEqual(artifact_memory_status({"artifact_type": "construction_failure"}), "failed")
         self.assertEqual(artifact_memory_status({"artifact_type": "advisor_report"}), "background")
         self.assertEqual(artifact_memory_status({"artifact_type": "proof_dossier"}), "candidate")
@@ -190,7 +197,14 @@ class MemoryStatusClassifierTests(unittest.TestCase):
                 actor_role="literature_researcher",
             )
             manifest = build_context_manifest(store, target_id="lemma-a", route_id="route-a", max_chars=80_000)
-            for section in ("claims", "routes", "inferences", "debts", "artifacts", "retrieval_cards"):
+            for section in (
+                "claims",
+                "routes",
+                "inferences",
+                "proof_obligations",
+                "artifacts",
+                "retrieval_cards",
+            ):
                 items = manifest.get(section) or []
                 self.assertTrue(items, f"expected items in manifest.{section}")
                 for item in items:
@@ -272,7 +286,7 @@ class MemoryCanonicalizationTests(unittest.TestCase):
             store = _make_store(tmpdir, "duplicate-debt-test")
             obligation = "Prove the bridge lemma for all bounded sections."
             now = utc_now()
-            with closing(store.connect()) as conn:
+            def insert_legacy_duplicates(conn, _state_revision: int) -> None:
                 for debt_id, fingerprint, first_seen in (
                     ("debt-dup-b", "fp-variant-b", "2026-07-02T00:00:00+00:00"),
                     ("debt-dup-a", "fp-variant-a", "2026-07-01T00:00:00+00:00"),
@@ -283,11 +297,16 @@ class MemoryCanonicalizationTests(unittest.TestCase):
                             debt_id, owner_type, owner_id, obligation, fingerprint, debt_type,
                             severity, status, first_seen, last_seen, repeated_count,
                             source_artifact_ids_json, suggested_next_target, resolution_evidence_json
-                        ) VALUES (?, 'claim', 'root', ?, ?, 'proof_obligation', 'blocking', 'active', ?, ?, 0, '[]', 'root', '[]')
+                        ) VALUES (?, 'claim', 'root', ?, ?, 'proof_obligation', 'blocking', 'active', ?, ?, 0, '[]', 'root', '{}')
                         """,
                         (debt_id, obligation, fingerprint, first_seen, now),
                     )
-                conn.commit()
+
+            journal_legacy_fixture_mutation(
+                store,
+                insert_legacy_duplicates,
+                fixture_id="duplicate-proof-obligations",
+            )
 
             canonical, duplicates = canonicalize_debts(store.get_state()["debts"])
             self.assertEqual(len(duplicates), 1)
@@ -298,11 +317,18 @@ class MemoryCanonicalizationTests(unittest.TestCase):
             )
 
             manifest = build_context_manifest(store, max_chars=80_000)
-            debt_ids = [row["debt_id"] for row in manifest.get("debts", [])]
+            debt_ids = [
+                row["proof_obligation_id"]
+                for row in manifest.get("proof_obligations", [])
+            ]
             self.assertIn("debt-dup-a", debt_ids)
             self.assertNotIn("debt-dup-b", debt_ids)
             hygiene = manifest.get("memory_hygiene", {})
-            self.assertEqual(hygiene.get("duplicate_debts", [{}])[0].get("canonical_debt_id"), "debt-dup-a")
+            duplicate_report = hygiene.get("duplicate_proof_obligations", [{}])[0]
+            self.assertEqual(
+                duplicate_report.get("canonical_proof_obligation_id"),
+                "debt-dup-a",
+            )
 
     def test_semantic_debt_paraphrases_share_one_canonical_obligation(self) -> None:
         rows = [
@@ -780,14 +806,23 @@ class PauseSemanticsTests(unittest.TestCase):
                 actor_role="scheduler",
             )
             with closing(store.connect()) as conn:
-                for created_at, payload in (
-                    ("2026-07-09T00:00:10+00:00", {"from": "pause_requested", "to": "paused", "reason": "test pause", "source": "test"}),
-                    ("2026-07-09T00:00:25+00:00", {"from": "paused", "to": "running", "reason": "test resume", "source": "test"}),
+                with patch(
+                    "agents.generation.phase2.store.utc_now",
+                    side_effect=(
+                        "2026-07-09T00:00:10+00:00",
+                        "2026-07-09T00:00:25+00:00",
+                    ),
                 ):
-                    conn.execute(
-                        "INSERT INTO events(revision, event_type, payload_json, created_at) VALUES (?, 'run_control', ?, ?)",
-                        (store.get_revision(conn), json.dumps(payload), created_at),
-                    )
+                    for payload in (
+                        {"from": "pause_requested", "to": "paused", "reason": "test pause", "source": "test"},
+                        {"from": "paused", "to": "running", "reason": "test resume", "source": "test"},
+                    ):
+                        store.write_event(
+                            conn,
+                            store.get_revision(conn),
+                            "run_control",
+                            payload,
+                        )
                 conn.commit()
             timing = store.get_run_timing()
             self.assertEqual(timing["active_compute_seconds"], 30.0)

@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from .artifacts import artifact_hash
+from .authority import PatchAuthority
 from .invariants import VERIFIED_STATUSES, validate_conn
 from .models import json_dumps, json_loads
+from .patches import (
+    MAX_COPIED_ARTIFACT_BYTES,
+    PatchRejected,
+    _ArtifactFileJournal,
+    _run_provenance_hash,
+    _state_delta,
+    _state_journal_projection,
+    _state_projection_hash,
+    append_applied_patch_entry,
+)
 from .store import ProofStateStore, utc_now
 
 
@@ -68,12 +78,26 @@ def import_certified_scope(
         _require_quiescent(source_state, label="source")
         _require_quiescent(target_state, label="target")
 
+        source_seal = source.current_state_seal(source_conn)
+        if not source_seal["valid"]:
+            raise ValueError(
+                "source current-state seal is invalid: "
+                + "; ".join(str(error) for error in source_seal["errors"][:8])
+            )
+        target_seal = target.current_state_seal(target_conn)
+        if not target_seal["valid"]:
+            raise ValueError(
+                "target current-state seal is invalid: "
+                + "; ".join(str(error) for error in target_seal["errors"][:8])
+            )
+
         source_errors = validate_conn(source_conn)
         if source_errors:
             raise ValueError("source proof state is invalid: " + "; ".join(source_errors))
         target_errors = validate_conn(target_conn)
         if target_errors:
             raise ValueError("target proof state is invalid: " + "; ".join(target_errors))
+        target_state_before = _state_journal_projection(target_conn)
 
         claims = {row["claim_id"]: dict(row) for row in source_conn.execute("SELECT * FROM claims")}
         routes = {row["route_id"]: dict(row) for row in source_conn.execute("SELECT * FROM routes")}
@@ -172,8 +196,10 @@ def import_certified_scope(
         if leaked_artifacts:
             raise ValueError("certified dependency closure reaches excluded artifacts: " + ", ".join(leaked_artifacts))
 
-        copied_files: list[Path] = []
+        artifact_files = _ArtifactFileJournal()
         try:
+            from .storage_policy import audit_local_storage
+
             existing_target_artifacts = {
                 str(row["artifact_id"]): dict(row)
                 for row in target_conn.execute("SELECT * FROM artifacts")
@@ -184,12 +210,27 @@ def import_certified_scope(
                 existing_target_artifacts,
                 selected_artifact_ids & existing_target_artifact_ids,
             )
+            incoming_artifact_bytes = sum(
+                int(Path(str(all_artifacts[artifact_id]["path"])).stat().st_size)
+                for artifact_id in selected_artifact_ids - existing_target_artifact_ids
+            )
+            storage_before = audit_local_storage(target)
+            if int(storage_before["total_local_bytes"]) + incoming_artifact_bytes >= int(
+                storage_before["hard_limit_bytes"]
+            ):
+                raise ValueError(
+                    "scope import would reach the configured local storage hard limit"
+                )
             artifact_rows = _copy_artifacts(
                 all_artifacts,
                 selected_artifact_ids - existing_target_artifact_ids,
                 target,
-                copied_files=copied_files,
+                artifact_files=artifact_files,
             )
+            if not audit_local_storage(target)["within_hard_limit"]:
+                raise ValueError(
+                    "scope import reached the configured local storage hard limit"
+                )
             target_revision = int(target_state["current_revision"]) + 1
             _insert_claims(
                 target_conn,
@@ -246,18 +287,66 @@ def import_certified_scope(
                 "UPDATE problem_state SET current_revision = ?, updated_at = ? WHERE problem_id = ?",
                 (target_revision, now, target.problem_id),
             )
+            target_state_after = _state_journal_projection(target_conn)
+            state_delta = _state_delta(target_state_before, target_state_after)
+            state_hash_before = _state_projection_hash(target_state_before)
+            state_hash_after = _state_projection_hash(target_state_after)
+            patch_id = f"scope-import-{source.problem_id}-{target_revision}"
+            authority = PatchAuthority(
+                source="operator",
+                actor_role="scope_import",
+                mode="scope_import",
+                target_id="root",
+                context_revision=int(target_state["current_revision"]),
+            )
+            journal_entry_hash = append_applied_patch_entry(
+                target_conn,
+                patch_id=patch_id,
+                problem_id=target.problem_id,
+                base_revision=int(target_state["current_revision"]),
+                actor_role="scope_import",
+                target_id="root",
+                operations=[{"op": "import_certified_scope", **payload}],
+                evidence_artifact_ids=[],
+                rationale="explicitly import a certified dependency-closed theorem subgraph",
+                created_at=now,
+                applied_revision=target_revision,
+                authority=authority,
+                state_delta=state_delta,
+                state_hash_before=state_hash_before,
+                state_hash_after=state_hash_after,
+            )
             target_conn.execute(
-                "INSERT INTO events(revision, event_type, payload_json, created_at) VALUES (?, 'scope_import', ?, ?)",
-                (target_revision, json_dumps(payload), now),
+                "UPDATE problem_state SET proof_state_hash = ?, "
+                "run_provenance_hash = ?, patch_journal_head = ? "
+                "WHERE problem_id = ?",
+                (
+                    state_hash_after,
+                    _run_provenance_hash(target_conn),
+                    journal_entry_hash,
+                    target.problem_id,
+                ),
+            )
+            target.write_event(
+                target_conn,
+                target_revision,
+                "scope_import",
+                {
+                    **payload,
+                    "patch_id": patch_id,
+                    "state_hash_before": state_hash_before,
+                    "state_hash_after": state_hash_after,
+                    "journal_entry_hash": journal_entry_hash,
+                },
             )
             errors = validate_conn(target_conn)
             if errors:
                 raise ValueError("scoped target would be invalid: " + "; ".join(errors))
             target_conn.commit()
-        except Exception:
+            artifact_files.commit()
+        except BaseException:  # intentional-boundary: rollback and remove copied evidence before propagating
             target_conn.rollback()
-            for path in copied_files:
-                path.unlink(missing_ok=True)
+            artifact_files.rollback()
             raise
 
     target.write_snapshot()
@@ -452,7 +541,7 @@ def _copy_artifacts(
     artifact_ids: set[str],
     target: ProofStateStore,
     *,
-    copied_files: list[Path],
+    artifact_files: _ArtifactFileJournal,
 ) -> list[dict[str, Any]]:
     destination_dir = target.state_dir / "artifacts"
     destination_dir.mkdir(parents=True, exist_ok=True)
@@ -460,20 +549,26 @@ def _copy_artifacts(
     for artifact_id in sorted(artifact_ids):
         row = dict(artifacts[artifact_id])
         source_path = Path(str(row["path"]))
-        if not source_path.is_file():
-            raise ValueError(f"source artifact file is missing: {artifact_id} at {source_path}")
-        actual_hash = artifact_hash(path=source_path)
-        if actual_hash != str(row.get("sha256") or ""):
-            raise ValueError(f"source artifact hash mismatch: {artifact_id} at {source_path}")
+        expected_hash = str(row.get("sha256") or "")
         destination_path = destination_dir / source_path.name
         if destination_path.exists():
-            if destination_path.read_bytes() != source_path.read_bytes():
+            if destination_path.is_symlink():
+                raise ValueError(
+                    f"artifact destination must not be a symbolic link: {destination_path}"
+                )
+            if artifact_hash(path=destination_path) != expected_hash:
                 raise ValueError(f"artifact filename collision in target: {destination_path.name}")
         else:
-            shutil.copy2(source_path, destination_path)
-            copied_files.append(destination_path)
+            try:
+                artifact_files.copy_stable_file(
+                    destination_path,
+                    source_path,
+                    max_bytes=MAX_COPIED_ARTIFACT_BYTES,
+                )
+            except PatchRejected as exc:
+                raise ValueError(str(exc)) from exc
         row["path"] = str(destination_path.resolve())
-        if artifact_hash(path=destination_path) != str(row.get("sha256") or ""):
+        if artifact_hash(path=destination_path) != expected_hash:
             raise ValueError(f"copied artifact hash mismatch: {artifact_id} at {destination_path}")
         rows.append(row)
     return rows

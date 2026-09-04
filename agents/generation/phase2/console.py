@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,7 @@ from .graph_policy import (
     route_scoreboard,
 )
 from .metrics import compute_metrics
+from .parallel_exchange import authenticated_parallel_signals
 from .research_policy import researcher_mode_summary
 from .result_status import classify_state
 from .scheduler import verifier_ready_route_summaries
@@ -105,10 +108,10 @@ def write_run_console(store: ProofStateStore, *, history: list[Mapping[str, Any]
 def _render_console_markdown(payload: Mapping[str, Any]) -> str:
     snapshot = _as_mapping(payload.get("snapshot"))
     audit = _as_mapping(payload.get("verifier_audit"))
-    ledger_note = ""
+    complete_record_note = ""
     if snapshot.get("ledger_active_debt_count", 0) != snapshot.get("open_case_count", snapshot.get("active_debt_count", 0)):
-        ledger_note = (
-            f" (ledger: `{snapshot.get('ledger_active_debt_count', 0)}` active, "
+        complete_record_note = (
+            f" (complete proof-state record: `{snapshot.get('ledger_active_debt_count', 0)}` active, "
             f"`{snapshot.get('ledger_blocking_debt_count', 0)}` blocking)"
         )
     lines = [
@@ -123,7 +126,7 @@ def _render_console_markdown(payload: Mapping[str, Any]) -> str:
         f"- Claims: `{snapshot.get('verified_claim_count', 0)}/{snapshot.get('claim_count', 0)}` verified, `{snapshot.get('integrated_claim_count', 0)}` integrated",
         f"- Routes: `{snapshot.get('active_route_count', 0)}` active of `{snapshot.get('route_count', 0)}` total",
         f"- Open cases: `{snapshot.get('open_case_count', snapshot.get('active_debt_count', 0))}` active, "
-        f"`{snapshot.get('open_blocking_case_count', snapshot.get('blocking_debt_count', 0))}` blocking{ledger_note}",
+        f"`{snapshot.get('open_blocking_case_count', snapshot.get('blocking_debt_count', 0))}` blocking{complete_record_note}",
         f"- Current token budget window: `{snapshot.get('tokens_budget_window_spent', 0)}` charged, `{snapshot.get('tokens_remaining', 0)}` remaining, `{snapshot.get('tokens_reserved_verification', 0)}` reserved",
         f"- Lifetime charged usage: `{snapshot.get('tokens_charged_lifetime', 0)}` tokens (cached input excluded)",
         f"- Recorded usage: `{snapshot.get('recorded_tokens', 0)}` tokens / `{_format_seconds(snapshot.get('recorded_wall_seconds', 0))}` child wall / `{_format_memory(snapshot.get('recorded_peak_memory_mb', 0))}` peak memory",
@@ -365,7 +368,7 @@ def _render_open_cases(groups: Mapping[str, Any]) -> list[str]:
     lines = ["## Open Cases", ""]
     total = sum(len(_as_list(value)) for value in groups.values())
     if total == 0:
-        lines.extend(["No active proof debts.", ""])
+        lines.extend(["No active proof obligations.", ""])
         return lines
     for group_name in ("Blocking", "Citation / Hypothesis", "Verifier Repair", "Decomposition / Regulator", "Other"):
         debts = _as_list(groups.get(group_name))
@@ -629,23 +632,7 @@ def _live_usage_row(update: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _parallel_exchange_payload(store: ProofStateStore) -> list[dict[str, Any]]:
-    path = store.state_dir / "parallel_exchange.jsonl"
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return []
-    signals: list[dict[str, Any]] = []
-    for line in lines[-80:]:
-        text = line.strip()
-        if not text:
-            continue
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            signals.append(payload)
-    return signals[-24:]
+    return authenticated_parallel_signals(store, limit=24)
 
 
 def _live_session_updates(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -947,11 +934,11 @@ def _render_researcher_mode_state(state: Mapping[str, Any]) -> list[str]:
     if history:
         trail = " ".join(f"`{item.get('work_mode', '')}`" for item in reversed(history[:10]))
         lines.append(f"- Recent mode trail (oldest to newest): {trail}")
-    villain = _as_mapping(state.get("villain"))
-    if villain:
-        v_current = _as_mapping(villain.get("current"))
-        v_directive = _as_mapping(villain.get("advisor_directive"))
-        v_cycle = " -> ".join(str(item) for item in _as_list(villain.get("cycle")))
+    adversarial = _as_mapping(state.get("adversarial_reviewer") or state.get("villain"))
+    if adversarial:
+        v_current = _as_mapping(adversarial.get("current"))
+        v_directive = _as_mapping(adversarial.get("advisor_directive"))
+        v_cycle = " -> ".join(str(item) for item in _as_list(adversarial.get("cycle")))
         v_bits = [f"loop `{v_cycle}`"]
         if v_current:
             v_bits.append(f"last pass `{v_current.get('work_mode', '')}` ({v_current.get('source', '')})")
@@ -962,11 +949,11 @@ def _render_researcher_mode_state(state: Mapping[str, Any]) -> list[str]:
             )
         else:
             v_bits.append("no directive")
-        v_history = [item for item in _as_list(villain.get("history")) if isinstance(item, Mapping)]
+        v_history = [item for item in _as_list(adversarial.get("history")) if isinstance(item, Mapping)]
         if v_history:
             v_trail = " ".join(f"`{item.get('work_mode', '')}`" for item in reversed(v_history[:10]))
             v_bits.append(f"trail {v_trail}")
-        lines.append(f"- Villain (refuter): {'; '.join(v_bits)}")
+        lines.append(f"- Adversarial reviewer: {'; '.join(v_bits)}")
     lines.append("")
     return lines
 
@@ -1121,7 +1108,7 @@ def _actor_role(row: Mapping[str, Any]) -> str:
     if mode == "triage_routes":
         return "phd_advisor"
     if mode == "refute":
-        return "villain"
+        return "adversarial_reviewer"
     if mode == "write":
         return "writer"
     return "researcher" if mode else ""
@@ -1283,9 +1270,24 @@ def _clip_log_tail(text: str, max_chars: int = 3_000) -> str:
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
-    tmp_path = path.with_name(f".{path.name}.tmp")
-    tmp_path.write_text(text, encoding="utf-8")
-    tmp_path.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_tmp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    tmp_path = Path(raw_tmp_path)
+    try:
+        payload = text.encode("utf-8")
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(tmp_path, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        tmp_path.unlink(missing_ok=True)
 
 
 def _cell(value: Any) -> str:

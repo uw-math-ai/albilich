@@ -39,7 +39,11 @@ from agents.generation.phase2.branch_summary import (
 from agents.generation.phase2.context_builder import build_context_manifest
 from agents.generation.phase2.cli import _add_parallel_branches_arg
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2 import scheduler as scheduler_module
+from agents.generation.phase2.patches import (
+    apply_operator_patch as apply_patch,
+    apply_system_patch,
+)
 from agents.generation.phase2.report import build_markdown_report
 from agents.generation.phase2.research_policy import (
     action_expects_researcher_session,
@@ -57,6 +61,7 @@ from agents.generation.phase2.scheduler import (
 )
 from agents.generation.phase2.store import ProofStateStore
 from agents.generation.phase2.workflow import run_workflow
+from agents.generation.tests._phase2_test_support import strictly_verify_entities
 
 
 def _make_store(tmpdir: str, problem_id: str) -> ProofStateStore:
@@ -96,42 +101,61 @@ def _insert_run(
     output_artifact_ids: list[str] | None = None,
     researcher_work_mode: str = "offline",
 ) -> None:
-    with closing(store.connect()) as conn:
-        conn.execute(
-            """
-            INSERT INTO runs(
-                run_id, actor_role, mode, target_id, route_id, state_revision, context_revision,
-                session_id, model_profile, model, reasoning_effort, search_setting, search_intent,
-                sandbox_setting, budget_requested, input_tokens, cached_input_tokens, output_tokens,
-                reasoning_output_tokens, total_tokens, wall_time_seconds, peak_memory_mb, status,
-                prompt_context_hash, output_artifact_ids_json, error_artifact_id, created_at,
-                researcher_work_mode, work_mode_source, failure_kind
-            ) VALUES (?, ?, ?, ?, ?, 1, 1, '', 'default', 'fake', 'xhigh', 'disabled', ?, 'workspace-write',
-                      1000, 10, 0, 5, 0, 15, 2.0, 1.0, ?, '', ?, '', ?, ?, 'rotation', '')
-            """,
-            (
-                run_id,
-                actor_role,
-                mode,
-                target_id,
-                route_id,
-                search_intent,
-                status,
-                json.dumps(output_artifact_ids or []),
-                created_at,
-                researcher_work_mode,
-            ),
-        )
-        conn.commit()
+    revision = store.get_revision()
+    outcome = apply_system_patch(
+        store,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "problem_id": store.problem_id,
+            "base_revision": revision,
+            "actor_role": "scheduler",
+            "target_id": target_id,
+            "operations": [
+                {
+                    "op": "record_run_metrics",
+                    "run_id": run_id,
+                    "actor_role": actor_role,
+                    "mode": mode,
+                    "target_id": target_id,
+                    "route_id": route_id,
+                    "state_revision": revision,
+                    "context_revision": revision,
+                    "model_profile": "default",
+                    "model": "fixture-model",
+                    "reasoning_effort": "xhigh",
+                    "search_setting": "disabled",
+                    "search_intent": search_intent,
+                    "sandbox_setting": "fixture",
+                    "budget_requested": 1000,
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15,
+                    "wall_time_seconds": 2.0,
+                    "peak_memory_mb": 1.0,
+                    "status": status,
+                    "output_artifact_ids": output_artifact_ids or [],
+                    "researcher_work_mode": researcher_work_mode,
+                    "work_mode_source": "rotation",
+                    "created_at": created_at,
+                }
+            ],
+            "rationale": "record journaled fixture run telemetry",
+        },
+        mode=mode,
+        route_id=route_id,
+    )
+    if not outcome.accepted:
+        raise AssertionError(f"run setup patch rejected: {outcome.errors}")
 
 
 def _set_claim_verified(store: ProofStateStore, claim_id: str) -> None:
-    with closing(store.connect()) as conn:
-        conn.execute(
-            "UPDATE claims SET validation_status = 'informally_verified' WHERE claim_id = ?",
-            (claim_id,),
-        )
-        conn.commit()
+    strictly_verify_entities(
+        store,
+        target_id=claim_id,
+        claim_ids=[claim_id],
+        inference_ids=[],
+        artifact_id=f"verification-{claim_id}",
+    )
 
 
 def _seed_productive_blocked_branch(store: ProofStateStore, *, verified_support: bool = True) -> None:
@@ -489,7 +513,7 @@ class MultiBranchResearchTests(unittest.TestCase):
             workers = [str(action.get("multi_branch_worker")) for action in planned]
             self.assertEqual(len(set(workers)), 4)
             self.assertIn("spine", workers)
-            self.assertIn("villain_toy_model", workers)
+            self.assertIn("adversarial_toy_model", workers)
             philosophies = {str(action.get("research_philosophy") or "") for action in planned}
             self.assertIn("main_spine_construction", philosophies)
             self.assertIn("adversarial_probe", philosophies)
@@ -506,8 +530,10 @@ class MultiBranchResearchTests(unittest.TestCase):
                 self.assertEqual(action.get("multi_branch_mode"), MULTI_BRANCH_RESEARCH_MODE_NAME)
                 self.assertTrue(action.get("branch_focus"))
                 self.assertIn("researcher_work_mode", action)
-                self.assertIn("information_gain_score", action)
-                self.assertIn("expected_value_score", action["information_gain_score"])
+                assessment = action.get("priority_assessment") or {}
+                self.assertEqual(assessment.get("priority_assessment_version"), 2)
+                self.assertFalse(assessment.get("calibrated_probability"))
+                self.assertIn("scheduler_priority", assessment)
                 packet = action.get("branch_packet") or {}
                 claim_ids = {str(cid) for cid in packet.get("claim_ids", []) if str(cid) != "root"}
                 debt_ids = {str(did) for did in packet.get("debt_ids", [])}
@@ -647,14 +673,70 @@ class ParallelBranchModeWiringTests(unittest.TestCase):
             self.assertEqual(result["parallel_branches"], 4)
             entry = result["steps"][0]
             parallel_actions = entry.get("parallel_actions", [])
+            admission = entry["parallel_wave_admission"]
             multi_branch = [a for a in parallel_actions if a.get("multi_branch_worker")]
             self.assertTrue(multi_branch, f"no multi-branch workers planned: {parallel_actions}")
+            self.assertEqual(6, admission["total_wave_capacity"])
+            self.assertLessEqual(1 + len(parallel_actions), 6)
+            self.assertEqual(
+                1 + len(parallel_actions),
+                len(admission["selected_candidate_ids"]),
+            )
+            self.assertTrue(
+                all(action.get("parallel_wave_admission") == admission for action in parallel_actions)
+            )
+            self.assertEqual(
+                admission,
+                entry["action"].get("parallel_wave_admission"),
+            )
+            self.assertEqual(
+                admission,
+                entry["action"]["decision_trace"].get(
+                    "parallel_wave_admission"
+                ),
+            )
             session_count = sum(
                 1
                 for a in [entry["action"], *parallel_actions]
                 if action_expects_researcher_session(a) or action_expects_villain_session(a)
             )
             self.assertLessEqual(session_count, 4, "the wave exceeded the parallel-branches worker cap")
+
+    def test_workflow_admits_complete_wave_against_persisted_token_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore(
+                "parallel-wave-persisted-budget",
+                generation_root=Path(tmpdir) / "generation",
+            )
+            store.init_problem(
+                "Target theorem.",
+                total_token_budget=150_000,
+                reserved_verification_budget=50_000,
+            )
+            _seed_multi_branch_problem(store, routes=4)
+            result = run_workflow(
+                store,
+                steps=1,
+                execute=False,
+                parallel_branches=4,
+            )
+
+        admission = result["steps"][0]["parallel_wave_admission"]
+        self.assertTrue(admission["candidate_set_complete"])
+        self.assertTrue(admission["aggregate_budget_enforced"])
+        self.assertEqual(
+            150_000, admission["initial_remaining_token_budget"]
+        )
+        self.assertGreater(len(admission["candidates"]), 1)
+        self.assertEqual(
+            150_000,
+            admission["admitted_token_budget"]
+            + admission["remaining_uncommitted_token_budget"],
+        )
+        self.assertLessEqual(admission["admitted_token_budget"], 150_000)
+        self.assertEqual(
+            [], scheduler_module._parallel_wave_admission_errors(admission)
+        )
 
 
 if __name__ == "__main__":

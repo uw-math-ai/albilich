@@ -16,8 +16,12 @@ Launch with ``python -m agents.generation.phase2.cli monitor <problem>``.
 from __future__ import annotations
 
 import json
+import hashlib
+import ipaddress
 import os
 import errno
+import secrets
+import sys
 import threading
 import time
 import webbrowser
@@ -28,7 +32,9 @@ from pathlib import Path
 from typing import Any, Dict, Mapping
 from urllib.parse import parse_qs, quote, urlparse
 
+from .artifacts import read_verified_artifact_text_prefix
 from .console import build_run_console_payload
+from .bounded_io import read_bounded_bytes, read_bounded_text, read_text_prefix
 from .graph_policy import claim_is_retired, supersession_index
 from .hmt_sidecar import hmt_paper_by_id, read_hmt_catalog
 from .models import statement_is_interrogative_problem, utc_now
@@ -43,6 +49,9 @@ MONITOR_REFRESH_INTERVAL_ENV = "ALBILICH_MONITOR_REFRESH_INTERVAL_SECONDS"
 DEFAULT_MONITOR_REFRESH_INTERVAL_SECONDS = 60.0
 HUMAN_READABLE_TEXT_ARTIFACT_TYPE = "human_readable_mathematical_text"
 PAPER_ARTIFACT_TYPES = {HUMAN_READABLE_TEXT_ARTIFACT_TYPE, "final_paper"}
+MAX_STEERING_REQUEST_BYTES = 64 * 1024
+MAX_SERVED_PDF_BYTES = 64 * 1024 * 1024
+MAX_CONSOLE_SNAPSHOT_BYTES = 64 * 1024 * 1024
 
 
 def _monitor_refresh_interval_seconds(poll_ms: int) -> float:
@@ -258,8 +267,13 @@ def _artifact_text_excerpt(store: ProofStateStore, artifact: Mapping[str, Any], 
     if path is None or path.suffix.lower() == ".pdf":
         return ""
     try:
-        content = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        content, _truncated, _size = read_text_prefix(
+            path,
+            max_chars=max(4_000, int(limit) * 2),
+            label="dashboard artifact excerpt",
+            errors="replace",
+        )
+    except (OSError, ValueError):
         return ""
     if "\\begin{document}" in content:
         content = content.split("\\begin{document}", 1)[1]
@@ -285,8 +299,28 @@ def _paper_pdf_path(store: ProofStateStore, artifact: Mapping[str, Any]) -> Path
         except (OSError, ValueError):
             continue
         if candidate.is_file() and candidate.suffix.lower() == ".pdf":
+            try:
+                candidate_size = candidate.stat().st_size
+            except OSError:
+                continue
+            if candidate_size > MAX_SERVED_PDF_BYTES:
+                continue
+            expected_size = int(metadata.get("pdf_size_bytes") or 0)
+            if expected_size > 0 and candidate_size != expected_size:
+                continue
+            expected_digest = str(metadata.get("pdf_sha256") or "")
+            if expected_digest and _file_sha256(candidate) != expected_digest:
+                continue
             return candidate
     return None
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _paper_catalog(store: ProofStateStore, *, state: Mapping[str, Any] | None = None) -> list[Dict[str, Any]]:
@@ -518,15 +552,21 @@ def _artifact_document(store: ProofStateStore, artifact_id: str) -> Dict[str, An
     path = _resolved_artifact_path(store, artifact)
     content = ""
     truncated = False
+    integrity_status = "not_read"
+    integrity_error = ""
     if path is not None and path.suffix.lower() != ".pdf":
         try:
-            size = path.stat().st_size
-            with path.open("rb") as handle:
-                raw = handle.read(800_001)
-            truncated = size > 800_000
-            content = raw[:800_000].decode("utf-8", errors="replace")
-        except OSError:
+            content, complete, _size, _total_chars = read_verified_artifact_text_prefix(
+                path=path,
+                expected_sha256=str(artifact.get("sha256") or ""),
+                max_chars=800_000,
+            )
+            truncated = not complete
+            integrity_status = "verified"
+        except (OSError, ValueError) as exc:
             content = ""
+            integrity_status = "invalid"
+            integrity_error = str(exc)[:500]
     return {
         "artifact_id": artifact_id,
         "artifact_type": str(artifact.get("artifact_type") or ""),
@@ -538,6 +578,8 @@ def _artifact_document(store: ProofStateStore, artifact_id: str) -> Dict[str, An
         "content_summary": str(artifact.get("content_summary") or ""),
         "content": content,
         "truncated": truncated,
+        "integrity_status": integrity_status,
+        "integrity_error": integrity_error,
         "pdf_url": (
             f"/api/paper?id={quote(artifact_id, safe='')}"
             if _paper_pdf_path(store, artifact) is not None
@@ -550,7 +592,8 @@ def _producer_role_code(role: str) -> str:
     normalized = str(role or "").strip().lower()
     return {
         "researcher": "R",
-        "villain": "V",
+        "adversarial_reviewer": "A",
+        "villain": "A",
         "literature_researcher": "LR",
         "phd_advisor": "PA",
         "strict_informal_verifier": "SV",
@@ -923,14 +966,30 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
     """
     state = store.get_state()
     payload = build_run_console_payload(store, state=state)
+    monitor_errors: list[Dict[str, str]] = []
+
+    def record_optional_error(section: str, exc: Exception) -> None:
+        monitor_errors.append(
+            {
+                "section": section,
+                "exception_type": type(exc).__name__,
+                "message": str(exc)[:1000],
+            }
+        )
     payload["closed_cases"] = _closed_case_groups(state)
     source = "store"
     console_json = store.state_dir / "albilich_run_console.json"
     file_payload: Dict[str, Any] | None = None
     if console_json.exists():
         try:
-            file_payload = json.loads(console_json.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            file_payload = json.loads(
+                read_bounded_text(
+                    console_json,
+                    max_bytes=MAX_CONSOLE_SNAPSHOT_BYTES,
+                    label="monitor console snapshot",
+                )
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
             file_payload = None
     if isinstance(file_payload, dict):
         source = "store+console"
@@ -955,7 +1014,8 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
                 "writer_working" if active_publication_role == "writer" else "referee_reviewing"
             )
         payload["publication_workflow"] = publication_workflow
-    except Exception:
+    except Exception as exc:  # intentional-boundary: dashboard enrichment has no proof authority
+        record_optional_error("publication_catalog", exc)
         payload["papers"] = []
         payload["artifact_catalog"] = []
         payload["publication_workflow"] = {}
@@ -980,7 +1040,8 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
                 for row in rows
                 if str(row["artifact_id"] or "") and str(row["target_id"] or "")
             }
-        except Exception:
+        except Exception as exc:  # intentional-boundary: dashboard history enrichment is optional
+            record_optional_error("verification_history_overrides", exc)
             artifact_target_overrides = {}
         verification_history = _claim_verification_history(
             state, artifact_target_overrides=artifact_target_overrides
@@ -1067,20 +1128,24 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
         rows.sort(key=lambda r: 0 if r["verified"] else 1)
         payload["claims"] = rows
         payload["verified_claim_total"] = sum(1 for r in rows if r["verified"])
-    except Exception:
+    except Exception as exc:  # intentional-boundary: dashboard rendering failure is exposed in _monitor.errors
+        record_optional_error("claims", exc)
         payload["claims"] = []
         payload["verified_claim_total"] = 0
     try:
         payload["proof_graph"] = _proof_graph_payload(store, state=state)
-    except Exception:
+    except Exception as exc:  # intentional-boundary: dashboard rendering failure is exposed in _monitor.errors
+        record_optional_error("proof_graph", exc)
         payload["proof_graph"] = {"nodes": [], "edges": [], "summary": {}}
     try:
         scheduler_state = store.get_scheduler_state()
-    except Exception:
+    except Exception as exc:  # intentional-boundary: dashboard rendering failure is exposed in _monitor.errors
+        record_optional_error("scheduler_state", exc)
         scheduler_state = {}
     try:
         payload["bottleneck_frontier"] = bottleneck_frontier_summary(scheduler_state)
-    except Exception:
+    except Exception as exc:  # intentional-boundary: dashboard rendering failure is exposed in _monitor.errors
+        record_optional_error("bottleneck_frontier", exc)
         payload["bottleneck_frontier"] = {}
     try:
         payload["proof_spine_status"] = proof_spine_summary(scheduler_state)
@@ -1093,16 +1158,18 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
             and statement_is_interrogative_problem(str(root_claim.get("statement") or ""))
         ):
             payload["proof_spine_status"]["root_status"] = "active_question"
-    except Exception:
+    except Exception as exc:  # intentional-boundary: dashboard rendering failure is exposed in _monitor.errors
+        record_optional_error("proof_spine", exc)
         payload["proof_spine_status"] = {}
     try:
         payload["research_strategy"] = strategy_observability(scheduler_state)
-        alignment_card = steering.approach_alignment_card(store.state_dir)
+        alignment_card = steering.authenticated_approach_alignment_card(store)
         portfolio = payload["research_strategy"].setdefault("approach_portfolio", {})
         portfolio["human_alignment"] = alignment_card
         if alignment_card.get("required"):
             portfolio["alignment_status"] = "stale"
-    except Exception:
+    except Exception as exc:  # intentional-boundary: dashboard rendering failure is exposed in _monitor.errors
+        record_optional_error("research_strategy", exc)
         payload["research_strategy"] = {}
     live = _has_live_child(payload)
     # Robust liveness from real write-activity (survives the run process dying: when
@@ -1128,6 +1195,7 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
         "run_state": run_state,
         "problem_id": store.problem_id,
         "state_dir": str(store.state_dir),
+        "errors": monitor_errors,
     }
     return payload
 
@@ -1211,7 +1279,7 @@ def _run_activity_state(store: ProofStateStore) -> tuple[float | None, str]:
         else:
             state = "stopped"
         return secs, state
-    except Exception:
+    except (OSError, ValueError):
         return None, "unknown"
 
 
@@ -1279,9 +1347,26 @@ def _safe_tail(store: ProofStateStore, rel_path: str, max_bytes: int) -> Dict[st
         return {"error": str(exc), "text": ""}
 
 
-def _make_handler(store: ProofStateStore, poll_ms: int):
+def _make_handler(
+    store: ProofStateStore,
+    poll_ms: int,
+    *,
+    steering_token: str | None = None,
+):
+    steering_token = steering_token or secrets.token_urlsafe(32)
+    script_nonce = secrets.token_urlsafe(24)
     index_html = INDEX_HTML.replace("__POLL_MS__", str(poll_ms)).replace(
         "__PROBLEM_ID__", _html_escape(store.problem_id)
+    ).replace("__STEERING_TOKEN_JSON__", json.dumps(steering_token)).replace(
+        "__SCRIPT_NONCE__", script_nonce
+    )
+    content_security_policy = (
+        "default-src 'self'; "
+        f"script-src 'nonce-{script_nonce}'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self'; frame-src 'self'; "
+        "font-src 'self'; object-src 'none'; base-uri 'none'; "
+        "form-action 'none'; frame-ancestors 'none'"
     )
     # Building the full console payload is intentionally authoritative but can
     # take a couple of seconds for a long run. Multiple open dashboard tabs used
@@ -1302,8 +1387,14 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
 
         path = store.state_dir / "albilich_run_console.json"
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            payload = json.loads(
+                read_bounded_text(
+                    path,
+                    max_bytes=MAX_CONSOLE_SNAPSHOT_BYTES,
+                    label="monitor console snapshot",
+                )
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
             return b""
         if not isinstance(payload, dict):
             return b""
@@ -1335,9 +1426,10 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
             with console_cache_lock:
                 console_cache_body = body
                 console_cache_at = time.monotonic()
-        except Exception:
-            # Keep serving the last valid body; the next poll will retry.
-            pass
+        except Exception as exc:  # intentional-boundary: background UI refresh keeps the last valid snapshot
+            # The failure is visible to an operator even while existing tabs
+            # retain their last complete payload.
+            print(f"Albilich dashboard refresh failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         finally:
             with console_cache_lock:
                 console_refreshing = False
@@ -1373,6 +1465,12 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
         return body
 
     class Handler(BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            super().setup()
+            # A loopback client that advertises a body and then stops sending it
+            # must not occupy a server thread forever.
+            self.connection.settimeout(15.0)
+
         # Silence default stderr request logging; keep the console clean.
         def log_message(self, *args: Any) -> None:  # noqa: D401, N802
             return
@@ -1391,6 +1489,23 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header(
+                    "Permissions-Policy",
+                    "camera=(), microphone=(), geolocation=(), payment=()",
+                )
+                if content_type.startswith("application/pdf"):
+                    # Papers are embedded by the same-origin dashboard.
+                    self.send_header("X-Frame-Options", "SAMEORIGIN")
+                    self.send_header(
+                        "Content-Security-Policy",
+                        "default-src 'none'; frame-ancestors 'self'",
+                    )
+                else:
+                    self.send_header("X-Frame-Options", "DENY")
+                    self.send_header(
+                        "Content-Security-Policy", content_security_policy
+                    )
                 for name, value in (headers or {}).items():
                     self.send_header(name, value)
                 self.end_headers()
@@ -1434,17 +1549,45 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
                     None,
                 )
                 pdf_path = _paper_pdf_path(store, artifact or {})
+                expected_pdf_record: Mapping[str, Any] = artifact or {}
                 if artifact_id and pdf_path is None:
                     sidecar_paper = hmt_paper_by_id(store, artifact_id)
                     if sidecar_paper is not None:
                         pdf_path = Path(str(sidecar_paper.get("pdf_path") or ""))
+                        expected_pdf_record = sidecar_paper
                 if not artifact_id or pdf_path is None or not pdf_path.is_file():
                     self._send(404, b'{"error":"paper PDF not found"}', "application/json")
                     return
                 try:
-                    body = pdf_path.read_bytes()
-                except OSError:
+                    body = read_bounded_bytes(
+                        pdf_path,
+                        max_bytes=MAX_SERVED_PDF_BYTES,
+                        label="dashboard PDF",
+                    )
+                except (OSError, ValueError):
                     self._send(404, b'{"error":"paper PDF not found"}', "application/json")
+                    return
+                expected_metadata = _json_object(
+                    expected_pdf_record.get("metadata_json")
+                )
+                expected_digest = str(
+                    expected_pdf_record.get("pdf_sha256")
+                    or expected_metadata.get("pdf_sha256")
+                    or ""
+                )
+                expected_size = int(
+                    expected_pdf_record.get("pdf_size_bytes")
+                    or expected_metadata.get("pdf_size_bytes")
+                    or 0
+                )
+                if (
+                    (expected_size > 0 and len(body) != expected_size)
+                    or (
+                        expected_digest
+                        and hashlib.sha256(body).hexdigest() != expected_digest
+                    )
+                ):
+                    self._send(409, b'{"error":"paper PDF integrity changed"}', "application/json")
                     return
                 safe_name = "".join(ch for ch in artifact_id if ch.isalnum() or ch in "-_") or "paper"
                 self._send(
@@ -1476,16 +1619,18 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
                 return
             if path == "/api/steering":
                 try:
-                    body = json.dumps(steering.snapshot(store.state_dir), ensure_ascii=False).encode("utf-8")
+                    body = json.dumps(
+                        steering.authenticated_snapshot(store), ensure_ascii=False
+                    ).encode("utf-8")
                     self._send(200, body, "application/json; charset=utf-8")
-                except Exception as exc:  # pragma: no cover - defensive
+                except Exception as exc:  # intentional-boundary: HTTP handler converts endpoint failure to status 500
                     self._send(500, json.dumps({"error": str(exc)}).encode("utf-8"), "application/json")
                 return
             if path == "/api/console":
                 try:
                     body = _console_body()
                     self._send(200, body, "application/json; charset=utf-8")
-                except Exception as exc:  # pragma: no cover - defensive
+                except Exception as exc:  # intentional-boundary: HTTP handler converts endpoint failure to status 500
                     err = json.dumps({"error": str(exc)}).encode("utf-8")
                     self._send(500, err, "application/json")
                 return
@@ -1493,7 +1638,7 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
                 try:
                     body = json.dumps(_proof_graph_payload(store), ensure_ascii=False).encode("utf-8")
                     self._send(200, body, "application/json; charset=utf-8")
-                except Exception as exc:  # pragma: no cover - defensive
+                except Exception as exc:  # intentional-boundary: HTTP handler converts endpoint failure to status 500
                     err = json.dumps({"error": str(exc)}).encode("utf-8")
                     self._send(500, err, "application/json")
                 return
@@ -1504,26 +1649,79 @@ def _make_handler(store: ProofStateStore, poll_ms: int):
             if parsed.path != "/api/steer":
                 self._send(404, b'{"error":"not found"}', "application/json")
                 return
+            supplied_token = str(
+                self.headers.get("X-Albilich-Steering-Token") or ""
+            )
+            if not secrets.compare_digest(supplied_token, steering_token):
+                self._send(
+                    403,
+                    b'{"error":"invalid steering token"}',
+                    "application/json",
+                )
+                return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                self._send(400, b'{"error":"invalid Content-Length"}', "application/json")
+                return
+            if length < 0 or length > MAX_STEERING_REQUEST_BYTES:
+                self._send(
+                    413,
+                    b'{"error":"steering request is too large"}',
+                    "application/json",
+                )
+                return
+            try:
                 raw = self.rfile.read(length) if length > 0 else b"{}"
+            except TimeoutError:
+                self._send(408, b'{"error":"steering request timed out"}', "application/json")
+                return
+            try:
                 data = json.loads(raw.decode("utf-8") or "{}")
-                text = str(data.get("text") or "").strip()
-                blocker_id = data.get("blocker_id") or None
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send(400, b'{"error":"request body is not valid UTF-8 JSON"}', "application/json")
+                return
+            if not isinstance(data, dict):
+                self._send(400, b'{"error":"request body must be a JSON object"}', "application/json")
+                return
+            raw_text = data.get("text")
+            if raw_text is not None and not isinstance(raw_text, str):
+                self._send(400, b'{"error":"steering text must be a string"}', "application/json")
+                return
+            text = str(raw_text or "").strip()
+            if len(text.encode("utf-8")) > steering.MAX_STEERING_TEXT_BYTES:
+                self._send(413, b'{"error":"steering text is too large"}', "application/json")
+                return
+            raw_blocker_id = data.get("blocker_id")
+            if raw_blocker_id is not None and not isinstance(raw_blocker_id, str):
+                self._send(400, b'{"error":"blocker_id must be a string or null"}', "application/json")
+                return
+            blocker_id = str(raw_blocker_id or "").strip() or None
+            requires_alignment = data.get("requires_approach_alignment")
+            if requires_alignment is not None and not isinstance(requires_alignment, bool):
+                self._send(
+                    400,
+                    b'{"error":"requires_approach_alignment must be boolean or null"}',
+                    "application/json",
+                )
+                return
+            if not text:
+                self._send(400, b'{"error":"empty steering text"}', "application/json")
+                return
+            try:
                 requires_alignment = data.get("requires_approach_alignment")
-                if not text:
-                    self._send(400, b'{"error":"empty steering text"}', "application/json")
-                    return
-                msg = steering.submit_steering(
-                    store.state_dir,
+                msg = steering.submit_operator_steering(
+                    store,
                     text,
                     blocker_id=blocker_id,
-                    requires_approach_alignment=(
-                        bool(requires_alignment) if requires_alignment is not None else None
-                    ),
+                    requires_approach_alignment=requires_alignment,
                 )
                 self._send(200, json.dumps({"ok": True, "message": msg}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
-            except Exception as exc:  # pragma: no cover - defensive
+            except ValueError as exc:
+                self._send(400, json.dumps({"error": str(exc)}).encode("utf-8"), "application/json")
+            except steering.SteeringIntegrityError as exc:
+                self._send(503, json.dumps({"error": str(exc)}).encode("utf-8"), "application/json")
+            except Exception as exc:  # intentional-boundary: HTTP handler converts unexpected endpoint failure to status 500
                 self._send(500, json.dumps({"error": str(exc)}).encode("utf-8"), "application/json")
 
     return Handler
@@ -1552,6 +1750,11 @@ def start_background_monitor(
     poll_ms: int = 3000,
     open_browser: bool = True,
 ) -> BackgroundMonitor:
+    if not _dashboard_host_is_loopback(host):
+        raise ValueError(
+            "the Albilich dashboard is a local control plane and may bind only "
+            "to a loopback host; use an authenticated tunnel rather than exposing it"
+        )
     handler = _make_handler(store, poll_ms)
     httpd = _bind_server(host, port, handler, port_search_limit=50)
     actual_host, actual_port = httpd.server_address[:2]
@@ -1564,6 +1767,16 @@ def start_background_monitor(
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     return BackgroundMonitor(store=store, httpd=httpd, thread=thread, url=url, host=display_host, port=int(actual_port))
+
+
+def _dashboard_host_is_loopback(host: str) -> bool:
+    normalized = str(host or "").strip().lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def serve(
@@ -1612,18 +1825,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Albilich Monitor · __PROBLEM_ID__</title>
-<script>
-window.MathJax = {
-  tex: {inlineMath: {'[+]': [['$', '$']]}, processEscapes: true},
-  svg: {fontCache: 'global'},
-  options: {enableMenu: false},
-  startup: {typeset: false}
-};
-</script>
-<script defer src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-svg.js"></script>
-<!-- Text fonts remain system-local. MathJax is loaded separately to typeset
-     delimiter-marked mathematical prose; raw LaTeX remains readable if its
-     CDN is temporarily unavailable. -->
+<!-- The dashboard is deliberately self-contained. Loading third-party script
+     into this control-plane origin would give it access to proof data and the
+     per-instance steering token. Raw escaped LaTeX remains readable. -->
 <style>
   /* ===== UW Math AI Lab palette: purple #4b2e83 + gold #b7a57a ===== */
   :root {
@@ -2180,8 +2384,8 @@ window.MathJax = {
   </div>
 
   <div class="card">
-    <h2>Work Modes · researcher &amp; villain <span class="count" id="rmodeCount"></span></h2>
-    <div class="body" id="researcherMode"><div class="empty">No researcher or villain passes yet.</div></div>
+    <h2>Work Modes · prover &amp; adversarial reviewer <span class="count" id="rmodeCount"></span></h2>
+    <div class="body" id="researcherMode"><div class="empty">No prover or adversarial-review passes yet.</div></div>
   </div>
 
   <div class="card now">
@@ -2298,8 +2502,9 @@ window.MathJax = {
   <div class="foot" id="foot"></div>
 </div>
 
-<script>
+<script nonce="__SCRIPT_NONCE__">
 const POLL_MS = __POLL_MS__;
+const STEERING_TOKEN = __STEERING_TOKEN_JSON__;
 let paused = false, lastOk = 0;
 let tickInFlight = false;
 let lastProofRevision = null;
@@ -2461,7 +2666,7 @@ function renderKpis(snap){
   const ledgerBlocking = snap.ledger_blocking_debt_count ?? snap.blocking_debt_count ?? 0;
   const solvedLike = String(snap.public_status||"").includes("solved");
   const openCaseSub = solvedLike && (ledgerActive || ledgerBlocking)
-    ? `<span>ledger ${num(ledgerActive)} · ${num(ledgerBlocking)} blocking</span>`
+    ? `<span>proof obligations ${num(ledgerActive)} · ${num(ledgerBlocking)} blocking</span>`
     : `<span style="color:var(--bad)">${num(openBlocking)} blocking</span>`;
   $("kpis").innerHTML = [
     kpiCard("Status", `<span class="badge ${STATUS_CLASS(snap.public_status)}">${esc(snap.public_status||"—")}</span>`,
@@ -2537,7 +2742,7 @@ function renderTokens(snap, usage){
 const PIPE = [
   {role:"literature_researcher", label:"Literature", modes:"retrieve · synthesize · digest", cat:"lit"},
   {role:"researcher", label:"Researcher", modes:"prove · reduce · decompose", cat:"res"},
-  {role:"villain", label:"Villain", modes:"refute · counterexample", cat:"vil"},
+  {role:"adversarial_reviewer", label:"Adversarial reviewer", modes:"refute · counterexample", cat:"vil"},
   {role:"strict_informal_verifier", label:"Strict Verifier", modes:"citations · route check", cat:"ver"},
   {role:"counterexample_validator", label:"CX Validator", modes:"validate counterexample", cat:"ver"},
   {role:"integration_verifier", label:"Integration", modes:"root alignment", cat:"int"},
@@ -2583,12 +2788,12 @@ function renderPipeline(payload, step){
       modesText = ["online","offline","cas"].map(m =>
         (on && workMode === m) ? `<b style="color:var(--uw-purple)">${m}</b>` : m
       ).join(" · ");
-    } else if (n.role === "villain"){
+    } else if (n.role === "adversarial_reviewer" || n.role === "villain"){
       modesText = ["cas","offline","online"].map(m =>
         (on && workMode === m) ? `<b style="color:var(--uw-purple)">${m}</b>` : m
       ).join(" · ");
     }
-    const modeChip = ((n.role==="researcher" || n.role==="villain") && on && workMode)
+    const modeChip = ((n.role==="researcher" || n.role==="adversarial_reviewer" || n.role==="villain") && on && workMode)
       ? ` <span class="pill">${esc(workMode)}</span>` : "";
     return `<div class="node ${on?"active":""}" title="${n.role}">
       <span class="nowtag">▶ now</span>
@@ -2596,7 +2801,7 @@ function renderPipeline(payload, step){
       <div class="nm">${modesText}</div></div>`;
   }).join("");
   $("pipeline").innerHTML = `<div class="flow">${hub}<div class="conn">▼ &nbsp; ↻ patch → re-plan</div><div class="flowrow">${cells}</div></div>`;
-  const workChip = ((role === "researcher" || role === "villain") && workMode) ? ` · <b>${esc(workMode)}</b>` : "";
+  const workChip = ((role === "researcher" || role === "adversarial_reviewer" || role === "villain") && workMode) ? ` · <b>${esc(workMode)}</b>` : "";
   if (step.live){
     $("pipeNow").innerHTML = `▶ <b style="color:var(--uw-purple)">${esc(role||"?")}</b>${workChip} · ${esc(step.mode||"")}${step.target?` · ${esc(step.target)}`:""} · ${fmtSec(step.elapsed)}`;
   } else {
@@ -2686,12 +2891,12 @@ function renderApproachPortfolio(strategy){
         <div class="approach-row"><div class="ak">Bridge</div><div class="av">${mathHTML(a.bridge_statement||"None yet")}</div></div>
         <div class="approach-row"><div class="ak">Decisive test</div><div class="av">${mathHTML(a.decisive_test||"Not specified")}</div></div>
         <div class="approach-row"><div class="ak">May fail by</div><div class="av">${mathHTML(a.likely_failure_mode||"Unknown")}</div></div>
-        <div class="approach-row"><div class="ak">Profile</div><div class="av">cost ${esc(a.estimated_cost||"?")} · novelty ${esc(a.novelty_score??"?")} · confidence ${esc(a.confidence||"?")}</div></div>
+        <div class="approach-row"><div class="ak">Profile</div><div class="av">cost ${esc(a.estimated_cost||"?")} · originality ${esc(a.originality_status||"unknown")} · confidence ${esc(a.confidence||"?")}</div></div>
         <div class="approach-actions"><button class="btn approach-steer" data-prompt="${esc(prompt)}">Steer to pilot</button></div>
       </div>`;
     }).join("");
     portfolioChanged = setStableHTML($("approachPortfolio"), `${alignmentPending?`<div class="blocker"><div class="bhead">Portfolio refresh queued</div><div class="bdetail">Processed steering or ${num(alignmentEvidence.length)} newer verified root development(s) changed the strategy baseline. Root effects below are visibly stale until one dedicated replacement portfolio is accepted.</div></div>`:""}<div class="portfolio-head">
-      <div><div class="portfolio-policy"><span class="pill info">50% exploit</span><span class="pill">30% explore</span><span class="pill warn">20% adversarial</span><span class="pill ${leaseClass}">${esc(leaseText)}</span></div><div class="bmini" style="margin-top:7px">Ideas are advisory; research questions are nonblocking; proof debts remain strict.</div></div>
+	      <div><div class="portfolio-policy"><span class="pill info">50% exploit</span><span class="pill">30% explore</span><span class="pill warn">20% adversarial</span><span class="pill ${leaseClass}">${esc(leaseText)}</span></div><div class="bmini" style="margin-top:7px">Ideas are advisory; research questions are nonblocking; proof obligations remain exact.</div></div>
       <button class="btn approach-refresh">Generate new approaches</button></div><div class="approach-grid">${cards}</div>`);
   }
   if (!portfolioChanged) return;
@@ -2769,15 +2974,15 @@ function renderResearcherMode(rmode){
   // Prover and refuter are equals (Nagata working mode): two symmetric columns.
   $("researcherMode").innerHTML = `<div style="display:flex; gap:16px; flex-wrap:wrap">
     ${renderWorkModeColumn(
-      "Researcher · prover",
+	      "Researcher · prover",
       {online:"search & read", offline:"think & prove", cas:"compute & experiment"},
       researcher,
       "No researcher passes yet — the loop starts online → offline → cas.")}
     ${renderWorkModeColumn(
-      "Villain · refuter",
+	      "Adversarial reviewer",
       {cas:"compute & sweep", offline:"construct & stress", online:"hunt prior art"},
       villain,
-      "No villain passes yet — the refuter loop starts cas → offline → online.")}
+	      "No adversarial-review passes yet — the review loop starts cas → offline → online.")}
   </div>`;
 }
 
@@ -3050,7 +3255,7 @@ $("paperNext").addEventListener("click", () => { const i=paperRows.findIndex(row
 function routeStatusHint(r){
   const status = String(r.scoreboard_status||"");
   const reasons = Array.isArray(r.kill_reasons) && r.kill_reasons.length ? ` Reasons: ${r.kill_reasons.join("; ")}` : "";
-  if (status === "blocked") return `Explicit route.status=blocked; paused pending an obstruction or proof debt.${reasons}`;
+  if (status === "blocked") return `Explicit route.status=blocked; paused pending an obstruction or proof obligation.${reasons}`;
   if (status === "stalled") return `Heuristic stalled label from repeated blockers or failed route health checks; the route may need repair before reuse.${reasons}`;
   return reasons.trim() || status;
 }
@@ -3086,7 +3291,7 @@ function renderDebts(groups, closedGroups){
   $("debtCount").textContent = total || closedTotal ? `${total} open · ${closedTotal} closed` : "";
   if (!total && !closedTotal){ setStableHTML($("debts"), `<div class="empty">No proof obligations.</div>`); return; }
   let h = "";
-  if (!total) h += `<div class="empty">No active proof debts.</div>`;
+  if (!total) h += `<div class="empty">No active proof obligations.</div>`;
   for (const g of order){
     const list = groups[g] || [];
     if (!list.length) continue;
@@ -3102,7 +3307,7 @@ function renderDebts(groups, closedGroups){
     }
   }
   if (closedTotal){
-    h += `<div class="closed-debt-ledger"><div class="group-h">Closed obligation ledger · ${closedTotal}</div>`;
+    h += `<div class="closed-debt-ledger"><div class="group-h">Closed proof obligations · ${closedTotal}</div>`;
     for (const g of closedOrder){
       const list = closedGroups[g] || [];
       if (!list.length) continue;
@@ -3374,7 +3579,7 @@ function graphMeta(n){
   if (n.kind === "claim") return `d=${n.root_distance ?? "?"} · impact=${Number(n.root_impact||0).toFixed(2)} · routes=${n.route_count||0}`;
   if (n.kind === "route") return `${n.verified_inference_count||0}/${n.inference_count||0} inf · ${n.verifier_readiness_level||"needs work"}`;
   if (n.kind === "inference") return `${n.premise_count||0} premise(s) · route ${n.route_id||""}`;
-  if (n.kind === "debt") return `${n.debt_type||"debt"} · repeat ${n.repeated_count||0}`;
+  if (n.kind === "debt") return `${n.debt_type||"proof obligation"} · repeat ${n.repeated_count||0}`;
   if (n.kind === "artifact") return `${n.producer_role||"artifact"} · rev ${n.state_revision ?? ""}`;
   return "";
 }
@@ -3578,7 +3783,7 @@ async function sendSteering(){
   if (!text){ $("steerMsg").textContent = "type some guidance first"; return; }
   $("steerMsg").textContent = "sending…";
   try {
-    const r = await fetch("/api/steer", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({text, blocker_id: $("steerBlockerSel").value || null})});
+    const r = await fetch("/api/steer", {method:"POST", headers:{"Content-Type":"application/json", "X-Albilich-Steering-Token":STEERING_TOKEN}, body: JSON.stringify({text, blocker_id: $("steerBlockerSel").value || null})});
     const j = await r.json();
     if (j.ok){ $("steerText").value = ""; $("steerMsg").textContent = "✓ sent — the run picks it up on the next step"; refreshSteering(); }
     else { $("steerMsg").textContent = j.error || "error"; }

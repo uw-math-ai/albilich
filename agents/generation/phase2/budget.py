@@ -3,9 +3,14 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, Mapping, Optional
 
+from .action_contract import (
+    RESEARCH_MANAGEMENT_MODES,
+    VERIFICATION_BUDGET_MODES,
+    scheduler_budget_class_for_action,
+)
 
-VERIFICATION_MODES = {"integrate", "formalize", "validate_counterexample", "write", "review_writing"}
-RESEARCH_MANAGEMENT_MODES = {"synthesize_sources", "audit_definitions", "triage_routes", "regulate_decomposition"}
+VERIFICATION_MODES = VERIFICATION_BUDGET_MODES
+VERIFICATION_RESERVE_ACTOR_ROLES = {"strict_informal_verifier"}
 DEFAULT_STEP_BUDGET = 200_000
 DEFAULT_RESEARCH_MANAGEMENT_BUDGET = 120_000
 MIN_STEP_BUDGET = 10_000
@@ -56,10 +61,13 @@ def parse_token_usage(payload: Any) -> Dict[str, int]:
         _first_int(output_details, "reasoning_tokens"),
         _first_int(completion_details, "reasoning_tokens"),
     )
+    # A malformed or lossy provider envelope must never make a component
+    # larger than the aggregate against which it is charged.
+    input_tokens = max(input_tokens, cached_input_tokens)
+    output_tokens = max(output_tokens, reasoning_output_tokens)
 
     total_tokens = _first_int(usage, "total_tokens", "total")
-    if total_tokens <= 0:
-        total_tokens = input_tokens + output_tokens
+    total_tokens = max(total_tokens, input_tokens + output_tokens)
 
     return {
         "input_tokens": input_tokens,
@@ -82,6 +90,7 @@ def plan_step_budget(problem_state: Mapping[str, Any], mode: str, requested_toke
         return {
             "allowed": False,
             "requested_tokens": 0,
+            "request_limit_tokens": desired,
             "spendable_tokens": spendable,
             "remaining_token_budget": remaining,
             "reserved_verification_budget": reserve,
@@ -89,9 +98,11 @@ def plan_step_budget(problem_state: Mapping[str, Any], mode: str, requested_toke
         }
 
     granted = min(desired, spendable)
-    allowed = granted >= MIN_STEP_BUDGET or mode in VERIFICATION_MODES
+    allowed = granted >= MIN_STEP_BUDGET
     if allowed:
         reason = "ok"
+    elif granted > 0 and mode in VERIFICATION_MODES:
+        reason = "remaining verification allocation is below the minimum useful step size"
     elif granted > 0:
         reason = "remaining non-verification budget is below the minimum useful step size; stop or run a verification/integration action only"
     else:
@@ -99,6 +110,7 @@ def plan_step_budget(problem_state: Mapping[str, Any], mode: str, requested_toke
     return {
         "allowed": allowed,
         "requested_tokens": granted,
+        "request_limit_tokens": desired,
         "spendable_tokens": spendable,
         "remaining_token_budget": remaining,
         "reserved_verification_budget": reserve,
@@ -164,6 +176,65 @@ def plan_action_budget(
     return budget
 
 
+def normalize_resource_allocation_for_action(
+    action: Mapping[str, Any],
+    allocation: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Resolve a provisional mode allocation against the completed action.
+
+    Mode-only planning cannot distinguish direct proof construction from a
+    strict route-verification action because both use ``prove``.  The central
+    action constructor calls this after adding the route and discriminating
+    flags.  The explicit request limit preserves the allocator's original
+    request if the verification reserve changes the spendable amount.
+    """
+
+    result = dict(allocation)
+    try:
+        budget_class = scheduler_budget_class_for_action(action)
+    except ValueError:
+        return result
+    if budget_class != "verification":
+        return result
+    remaining = result.get("remaining_token_budget")
+    reserve = result.get("reserved_verification_budget")
+    if (
+        isinstance(remaining, bool)
+        or not isinstance(remaining, int)
+        or remaining < 0
+        or isinstance(reserve, bool)
+        or not isinstance(reserve, int)
+        or reserve < 0
+    ):
+        return result
+    desired = result.get("request_limit_tokens")
+    if isinstance(desired, bool) or not isinstance(desired, int) or desired <= 0:
+        requested = result.get("requested_tokens")
+        desired = (
+            requested
+            if not isinstance(requested, bool)
+            and isinstance(requested, int)
+            and requested > 0
+            else DEFAULT_STEP_BUDGET
+        )
+    desired = max(MIN_STEP_BUDGET, min(MAX_STEP_BUDGET, desired))
+    granted = min(desired, remaining)
+    result.update(
+        allowed=granted >= MIN_STEP_BUDGET,
+        requested_tokens=granted,
+        request_limit_tokens=desired,
+        spendable_tokens=remaining,
+        reason=(
+            "ok"
+            if granted >= MIN_STEP_BUDGET
+            else "remaining verification allocation is below the minimum useful step size"
+            if granted > 0
+            else "no spendable tokens"
+        ),
+    )
+    return result
+
+
 def summarize_runs(runs: list[Mapping[str, Any]]) -> Dict[str, Any]:
     input_tokens = sum(int(row.get("input_tokens", 0)) for row in runs)
     cached_input_tokens = sum(int(row.get("cached_input_tokens", 0)) for row in runs)
@@ -189,41 +260,41 @@ def summarize_runs(runs: list[Mapping[str, Any]]) -> Dict[str, Any]:
 
 
 def run_spend_from_operation(op: Mapping[str, Any]) -> int:
-    """Tokens charged against the budget for one run.
+    """Gross model tokens charged against the allocation for one run.
 
-    Cached prompt input is excluded: it is reused context priced at a small
-    fraction of new tokens, so charging it at full weight (a 90%+ cache ratio is
-    common here) would deplete the budget many times faster than the real work.
-    The budget is spent on new input + output + reasoning. When no breakdown is
-    available (a collapsed CLI footer carrying only a total), fall back to total.
+    Gross usage is the larger of provider ``total_tokens`` and input plus
+    output. Cached input remains input, and reasoning tokens are already a
+    subset of output, so neither is subtracted or added a second time. Taking
+    the maximum prevents an inconsistent provider envelope from undercharging.
     """
     # Periodic HMT is an expository sidecar, not mathematical research.  Keep
     # its usage visible in the sidecar catalog without consuming the proof
     # run's token allocation if an older workflow records such a run in SQLite.
     if str(op.get("search_intent") or "") == "periodic_human_readable_mathematical_text":
         return 0
-    input_tokens = _first_int(op, "input_tokens")
-    cached_input_tokens = min(_first_int(op, "cached_input_tokens"), input_tokens)
-    effective = (
-        max(0, input_tokens - cached_input_tokens)
-        + _first_int(op, "output_tokens")
-        + _first_int(op, "reasoning_output_tokens")
+    total = _first_int(op, "total_tokens")
+    components = _first_int(op, "input_tokens") + _first_int(
+        op, "output_tokens"
     )
-    if effective > 0:
-        return effective
-    return _first_int(op, "total_tokens")
+    return max(total, components)
+
+
+def run_may_use_verification_reserve(op: Mapping[str, Any]) -> bool:
+    """Whether recorded work is part of verification/delivery, not exploration."""
+
+    return (
+        str(op.get("mode") or "") in VERIFICATION_MODES
+        or str(op.get("actor_role") or "") in VERIFICATION_RESERVE_ACTOR_ROLES
+    )
 
 
 def _run_total_tokens(row: Mapping[str, Any]) -> int:
     explicit = _first_int(row, "total_tokens")
-    if explicit > 0:
-        return explicit
-    return max(
-        0,
+    components = (
         _first_int(row, "input_tokens")
         + _first_int(row, "output_tokens")
-        + _first_int(row, "reasoning_output_tokens"),
     )
+    return max(explicit, components)
 
 
 def _first_int(mapping: Mapping[str, Any], *keys: str) -> int:

@@ -5,17 +5,18 @@ import re
 from typing import Any, Dict, Mapping
 
 from .graph_policy import (
-    DebtCoverageIndex,
     VERIFIED_VALIDATION_STATUSES,
+    build_graph_policy_index,
     claim_is_unresolved,
     debt_covered_by_integrated_claim,
+    get_debt_coverage_index,
     paused_route_ids,
     root_distance_for_claim_id,
 )
 from .models import json_loads, normalize_text
 
 
-OUTCOME_LEARNING_VERSION = 2
+OUTCOME_LEARNING_VERSION = 4
 OBLIGATION_FRONTIER_VERSION = 2
 DEEP_SESSION_ROI_VERSION = 1
 REPRESENTATION_SWITCH_VERSION = 1
@@ -258,43 +259,41 @@ def infer_domain_tags(text: str) -> list[str]:
 
 
 def strategy_family(row: Mapping[str, Any]) -> str:
-    explicit = str(row.get("research_philosophy") or "").strip()
-    if explicit:
-        explicit_family = {
-            "main_spine_construction": "global_assembly",
-            "global_assembly": "global_assembly",
-            "local_support_lemma": "bridge_lemma",
-            "external_theorem_adaptation": "theorem_adaptation",
-            "adversarial_probe": "adversarial_probe",
-            "conceptual_invariant": "conceptual_invariant",
-            "conceptual_invariant_discovery": "conceptual_invariant",
-            "alternative_construction": "alternative_construction",
-            "representation_switch": "representation_switch",
-            "direct_proof": "direct_proof",
-        }.get(explicit)
-        if explicit_family:
-            return explicit_family
-    text = " ".join(
-        [
-            str(row.get("search_intent") or ""),
-            str(row.get("researcher_work_mode") or ""),
-            str(row.get("mode") or ""),
-        ]
-    ).lower()
-    families = (
-        ("adversarial_probe", ("refute", "villain", "counterexample", "obstruction")),
-        ("theorem_adaptation", ("retrieve", "literature", "citation", "source", "theorem_search")),
-        ("conceptual_invariant", ("conceptual", "invariant")),
-        ("experimental_mathematics", ("experiment", "cas", "compute")),
-        ("global_assembly", ("compression", "spine", "synthesis", "assembly")),
-        ("bridge_lemma", ("bridge", "support_lemma", "nearby_lemma")),
-        ("alternative_construction", ("alternative", "construction")),
-        ("direct_proof", ("prove", "direct_solve")),
-    )
-    for family, cues in families:
-        if any(cue in text for cue in cues):
-            return family
-    return str(row.get("mode") or "research")
+    recorded = str(row.get("strategy_family") or "").strip()
+    if recorded:
+        return recorded
+    philosophy = str(row.get("research_philosophy") or "").strip()
+    explicit_family = {
+        "main_spine_construction": "global_assembly",
+        "global_approach_generation": "approach_portfolio",
+        "global_assembly": "global_assembly",
+        "local_support_lemma": "bridge_lemma",
+        "external_theorem_adaptation": "theorem_adaptation",
+        "adversarial_probe": "adversarial_probe",
+        "conceptual_invariant": "conceptual_invariant",
+        "conceptual_invariant_discovery": "conceptual_invariant",
+        "alternative_construction": "alternative_construction",
+        "representation_switch": "representation_switch",
+        "direct_proof": "direct_proof",
+    }.get(philosophy)
+    if explicit_family:
+        return explicit_family
+    # Only exact structured fields are used.  Free-text search intents are not
+    # classification data and must never silently move outcome statistics.
+    work_mode = str(row.get("researcher_work_mode") or "").strip()
+    mode = str(row.get("mode") or "").strip()
+    if work_mode == "cas":
+        return "experimental_mathematics"
+    return {
+        "refute": "adversarial_probe",
+        "validate_counterexample": "adversarial_validation",
+        "retrieve": "theorem_adaptation",
+        "synthesize_sources": "theorem_adaptation",
+        "audit_definitions": "definition_audit",
+        "integrate": "global_assembly",
+        "formalize": "formal_verification",
+        "prove": "direct_proof",
+    }.get(mode, "unclassified")
 
 
 def _artifact_rows(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -379,33 +378,65 @@ def _verified_evidence_ids(state: Mapping[str, Any]) -> set[str]:
     return evidence
 
 
+def _explicit_certificate_sources(
+    state: Mapping[str, Any], certificate_ids: set[str]
+) -> set[str]:
+    """Return exact artifact provenance named by current host certificates."""
+
+    artifacts = {
+        str(row.get("artifact_id") or ""): row
+        for row in _artifact_rows(state)
+        if str(row.get("artifact_id") or "")
+    }
+    source_ids: set[str] = set()
+    pending = list(sorted(certificate_ids))
+    visited: set[str] = set()
+    while pending:
+        artifact_id = pending.pop()
+        if artifact_id in visited:
+            continue
+        visited.add(artifact_id)
+        artifact = artifacts.get(artifact_id)
+        if artifact is None:
+            continue
+        metadata = _artifact_metadata(artifact)
+        bindings = metadata.get("host_certificate_bindings")
+        if not isinstance(bindings, Mapping) or not bindings:
+            continue
+        direct_sources: set[str] = set()
+        for item in _json_list(metadata.get("source_artifact_ids")):
+            if str(item):
+                direct_sources.add(str(item))
+        for key in (
+            "audit_subject_artifact_id",
+            "candidate_artifact_id",
+            "strict_report_artifact_id",
+        ):
+            if str(metadata.get(key) or ""):
+                direct_sources.add(str(metadata[key]))
+        source_ids.update(direct_sources)
+        # Follow a certificate-to-certificate chain (for example integration
+        # report -> strict report -> audited proof), but only while every hop
+        # is an explicit identifier and the next artifact is host-bound.
+        pending.extend(sorted(direct_sources - visited))
+    return source_ids
+
+
 def verifier_filtered_outcome_learning(
     state: Mapping[str, Any], action: Mapping[str, Any] | None = None
 ) -> Dict[str, Any]:
-    """Calibrate strategy families only from accepted proof-state outcomes.
+    """Compute verifier-filtered *descriptive* strategy yields.
 
-    This is deliberately not benchmark scoring and never consults a reference
-    solution. A research run earns success only when one of its output
-    artifacts later appears in verified/integrated evidence, or when its
-    concrete route is integrated. Rejections and timeouts remain negative
-    evidence; merely producing prose is not a success.
+    A run is counted as accepted only when an artifact produced by that run is
+    current verified evidence, or is explicitly named as the source of a
+    current host-bound certificate. Merely sharing a target or route with a
+    later successful run is intentionally insufficient. Scheduler assignment
+    is ordinarily adaptive rather than randomized, so these observations are
+    not causal estimates and have no effect on action ranking.
     """
 
     verified_evidence = _verified_evidence_ids(state)
-    integrated_routes = {
-        str(row.get("route_id") or "")
-        for row in state.get("routes", []) or []
-        if str(row.get("status") or "") == "integrated"
-    }
-    verified_claims = {
-        str(row.get("claim_id") or "")
-        for row in state.get("claims", []) or []
-        if str(row.get("claim_id") or "") != "root"
-        and (
-            str(row.get("validation_status") or "") in VERIFIED_VALIDATION_STATUSES
-            or str(row.get("lifecycle_status") or "") == "integrated"
-        )
-    }
+    accepted_evidence = verified_evidence | _explicit_certificate_sources(state, verified_evidence)
     routes_by_id = {
         str(row.get("route_id") or ""): row
         for row in state.get("routes", []) or []
@@ -460,71 +491,80 @@ def verifier_filtered_outcome_learning(
                 for item in _json_list(route.get("evidence_artifact_ids_json") or route.get("evidence_artifact_ids"))
                 if str(item)
             )
+    root_accepted_evidence = root_evidence_ids | _explicit_certificate_sources(state, root_evidence_ids)
     grouped: Dict[str, Dict[str, float]] = defaultdict(
         lambda: {
             "trials": 0.0,
-            "verified_successes": 0.0,
+            "accepted_successes": 0.0,
             "root_contributing_successes": 0.0,
             "execution_failures": 0.0,
             "tokens": 0.0,
+            "observational_trials": 0.0,
+            "deterministic_trials": 0.0,
+            "randomized_trials": 0.0,
         }
     )
-    for run in state.get("recent_runs", []) or []:
+    for run in (state.get("outcome_runs") or state.get("recent_runs") or []):
         role = str(run.get("actor_role") or "")
-        if role not in {"researcher", "villain", "literature_researcher"}:
+        if role not in {"researcher", "adversarial_reviewer", "villain", "literature_researcher"}:
             continue
         family = strategy_family(run)
         stats = grouped[family]
         stats["trials"] += 1
         stats["tokens"] += float(run.get("total_tokens") or 0.0)
+        design = str(run.get("selection_design") or "observational")
+        if design == "randomized":
+            stats["randomized_trials"] += 1
+        elif design == "deterministic":
+            stats["deterministic_trials"] += 1
+            stats["observational_trials"] += 1
+        else:
+            stats["observational_trials"] += 1
         status = str(run.get("status") or "").lower()
         if status in {"patch_rejected", "timeout", "no_patch", "failed", "error", "cancelled"}:
             stats["execution_failures"] += 1
         output_ids = {str(item) for item in _json_list(run.get("output_artifact_ids_json")) if str(item)}
-        route_id = str(run.get("route_id") or "")
-        target_id = str(run.get("target_id") or "")
-        success = bool(output_ids & verified_evidence)
-        success = success or bool(route_id and route_id in integrated_routes)
-        success = success or bool(target_id and target_id in verified_claims)
-        if success:
-            stats["verified_successes"] += 1
-        route = routes_by_id.get(route_id, {})
-        route_reaches_root = bool(
-            route_id
-            and route_id in integrated_routes
-            and (
-                str(route.get("conclusion_claim_id") or "") == "root"
-                or str(route.get("conclusion_claim_id") or "") in root_dependency_claim_ids
-            )
-        )
-        target_reaches_root = bool(target_id in root_dependency_claim_ids and target_id in verified_claims)
-        if bool(output_ids & root_evidence_ids) or route_reaches_root or target_reaches_root:
+        if output_ids & accepted_evidence:
+            stats["accepted_successes"] += 1
+        if output_ids & root_accepted_evidence:
             stats["root_contributing_successes"] += 1
 
     families: Dict[str, Dict[str, Any]] = {}
     for family, raw in sorted(grouped.items()):
         trials = int(raw["trials"])
-        successes = int(raw["verified_successes"])
+        successes = int(raw["accepted_successes"])
         root_successes = int(raw["root_contributing_successes"])
-        posterior = (successes + 1.0) / (trials + 2.0)
-        root_posterior = (root_successes + 1.0) / (trials + 2.0)
-        confidence = min(1.0, trials / 8.0)
-        # A locally checked lemma is useful, but a checked lemma placed in a
-        # sufficient root route is the outcome this scheduler should learn to
-        # reproduce. Keep a small local-yield component so early runs are not
-        # treated as failures while their root interface is still forming.
-        blended_posterior = 0.25 * posterior + 0.75 * root_posterior
-        adjustment = (blended_posterior - 0.5) * confidence
+        accepted_rate = successes / trials if trials else 0.0
+        root_rate = root_successes / trials if trials else 0.0
+        # Laplace smoothing prevents a single early run from dominating. This
+        # is a fixed heuristic transformation, not a Bayesian posterior claim.
+        smoothed_accepted_rate = (successes + 1.0) / (trials + 2.0)
+        smoothed_root_rate = (root_successes + 1.0) / (trials + 2.0)
+        sample_weight = min(1.0, trials / 8.0)
+        blended_rate = 0.25 * smoothed_accepted_rate + 0.75 * smoothed_root_rate
+        # Even rows labelled randomized are not used here: a valid causal
+        # comparison additionally needs a preregistered candidate set,
+        # contemporaneous controls, and a fixed outcome horizon. The current
+        # harness does not yet run that protocol. Fail closed instead of
+        # laundering adaptive historical choices into a ranking signal.
+        adjustment = 0.0
         families[family] = {
             "trials": trials,
-            "verified_successes": successes,
+            "observational_trials": int(raw["observational_trials"]),
+            "deterministic_trials": int(raw["deterministic_trials"]),
+            "randomized_trials": int(raw["randomized_trials"]),
+            "accepted_successes": successes,
             "root_contributing_successes": root_successes,
             "execution_failures": int(raw["execution_failures"]),
-            "posterior_verified_yield": round(posterior, 4),
-            "posterior_root_contribution": round(root_posterior, 4),
-            "blended_root_weighted_yield": round(blended_posterior, 4),
-            "confidence": round(confidence, 3),
-            "score_adjustment": round(adjustment, 4),
+            "observed_accepted_rate": round(accepted_rate, 4),
+            "observed_root_contribution_rate": round(root_rate, 4),
+            "laplace_smoothed_accepted_rate": round(smoothed_accepted_rate, 4),
+            "laplace_smoothed_root_rate": round(smoothed_root_rate, 4),
+            "root_weighted_heuristic_rate": round(blended_rate, 4),
+            "sample_weight": round(sample_weight, 3),
+            "heuristic_score_adjustment": round(adjustment, 4),
+            "ranking_effect": "disabled",
+            "causal_eligible": False,
             "average_tokens": round(raw["tokens"] / max(1, trials)),
         }
 
@@ -533,20 +573,32 @@ def verifier_filtered_outcome_learning(
         current_family,
         {
             "trials": 0,
-            "verified_successes": 0,
+            "observational_trials": 0,
+            "deterministic_trials": 0,
+            "randomized_trials": 0,
+            "accepted_successes": 0,
             "root_contributing_successes": 0,
             "execution_failures": 0,
-            "posterior_verified_yield": 0.5,
-            "posterior_root_contribution": 0.5,
-            "blended_root_weighted_yield": 0.5,
-            "confidence": 0.0,
-            "score_adjustment": 0.0,
+            "observed_accepted_rate": 0.0,
+            "observed_root_contribution_rate": 0.0,
+            "laplace_smoothed_accepted_rate": 0.5,
+            "laplace_smoothed_root_rate": 0.5,
+            "root_weighted_heuristic_rate": 0.5,
+            "sample_weight": 0.0,
+            "heuristic_score_adjustment": 0.0,
+            "ranking_effect": "disabled",
+            "causal_eligible": False,
             "average_tokens": 0,
         },
     )
     return {
         "outcome_learning_version": OUTCOME_LEARNING_VERSION,
-        "policy": "verifier-filtered outcome learning weighted toward verified contribution to a sufficient root route",
+        "policy": "descriptive verifier-filtered outcomes; adaptive assignments never affect scheduler ranking",
+        "history_scope": dict(state.get("outcome_history") or {}),
+        "causal_estimate": False,
+        "ranking_effect": "disabled_until_preregistered_randomized_comparison",
+        "confounding_controls": "not available for adaptive historical runs",
+        "calibrated_probabilities": False,
         "reference_solution_used": False,
         "private_cross_problem_cache_used": False,
         "current_strategy_family": current_family,
@@ -558,7 +610,7 @@ def verifier_filtered_outcome_learning(
 def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the smallest active sufficient-route obligation cut near root."""
 
-    debt_coverage_index = DebtCoverageIndex(state)
+    debt_coverage_index = get_debt_coverage_index(state)
     advisor_root_cut_order, advisor_retired_debt_ids = _advisor_root_cut_policy(state)
     advisor_root_cut_rank = {
         debt_id: index for index, debt_id in enumerate(advisor_root_cut_order)
@@ -578,6 +630,21 @@ def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
             debt_coverage_index=debt_coverage_index,
         )
     ]
+    # A route only needs obligations attached to its route, conclusion,
+    # inferences, or premises.  Index both supported attachment fields once;
+    # scanning every active obligation for every route made this cut
+    # computation quadratic on wide proof states.
+    active_debts_by_scope_id: Dict[
+        str, list[tuple[int, Mapping[str, Any]]]
+    ] = defaultdict(list)
+    for position, debt in enumerate(active_debts):
+        owner_id = str(debt.get("owner_id") or "")
+        suggested = str(debt.get("suggested_next_target") or "")
+        if owner_id:
+            active_debts_by_scope_id[owner_id].append((position, debt))
+        if suggested and suggested != owner_id:
+            active_debts_by_scope_id[suggested].append((position, debt))
+    policy_index = build_graph_policy_index(state)
     paused = paused_route_ids(state)
     route_cuts: list[Dict[str, Any]] = []
 
@@ -596,7 +663,9 @@ def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
             )
         ):
             continue
-        if conclusion_id != "root" and root_distance_for_claim_id(state, conclusion_id) > 2:
+        if conclusion_id != "root" and root_distance_for_claim_id(
+            state, conclusion_id, policy_index=policy_index
+        ) > 2:
             continue
         route_inferences = inferences_by_route.get(route_id, [])
         owner_ids = {route_id, conclusion_id}
@@ -609,11 +678,17 @@ def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
             if key and key not in obligations:
                 obligations[key] = payload
 
-        for debt in active_debts:
+        scoped_debts: dict[str, tuple[int, Mapping[str, Any]]] = {}
+        for owner_id in owner_ids:
+            for position, debt in active_debts_by_scope_id.get(owner_id, []):
+                debt_id = str(debt.get("debt_id") or "")
+                key = debt_id or f"row:{position}"
+                previous = scoped_debts.get(key)
+                if previous is None or position < previous[0]:
+                    scoped_debts[key] = (position, debt)
+        for _, debt in sorted(scoped_debts.values(), key=lambda item: item[0]):
             owner_id = str(debt.get("owner_id") or "")
             suggested = str(debt.get("suggested_next_target") or "")
-            if owner_id not in owner_ids and suggested not in owner_ids:
-                continue
             severity = str(debt.get("severity") or "major")
             add_obligation(
                 f"debt:{debt.get('debt_id')}",
@@ -680,7 +755,11 @@ def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
                     str(item.get("obligation_id") or ""), len(advisor_root_cut_rank)
                 ),
                 -int(item.get("weight") or 0),
-                root_distance_for_claim_id(state, str(item.get("target_id") or "")),
+                root_distance_for_claim_id(
+                    state,
+                    str(item.get("target_id") or ""),
+                    policy_index=policy_index,
+                ),
                 str(item.get("obligation_id") or ""),
             ),
         )
@@ -710,7 +789,9 @@ def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
             key=lambda row: (
                 str(row.get("severity") or "") != "blocking",
                 root_distance_for_claim_id(
-                    state, str(row.get("suggested_next_target") or row.get("owner_id") or "")
+                    state,
+                    str(row.get("suggested_next_target") or row.get("owner_id") or ""),
+                    policy_index=policy_index,
                 ),
                 str(row.get("debt_id") or ""),
             ),
@@ -750,34 +831,45 @@ def decisive_obligation_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
 
 def deep_session_roi(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[str, Any]:
     target_id = str(action.get("target_id") or "root")
+    deep_artifacts = {
+        str(row.get("artifact_id") or "")
+        for row in _artifact_rows(state)
+        if str(row.get("artifact_type") or "") == "deep_session_report"
+        or (
+            str(row.get("artifact_type") or "") in {"proof_dossier", "proof_blueprint"}
+            and int(_artifact_metadata(row).get("deep_session_roi_version") or 0)
+            == DEEP_SESSION_ROI_VERSION
+        )
+    }
+    accepted_run_ids = {
+        str(row.get("run_id") or "")
+        for row in state.get("accepted_mathematical_deltas", []) or []
+        if isinstance(row, Mapping) and row.get("changes")
+    }
     candidates: list[Dict[str, Any]] = []
-    for row in _artifact_rows(state):
-        artifact_type = str(row.get("artifact_type") or "")
-        metadata = _artifact_metadata(row)
-        if artifact_type not in {"deep_session_report", "proof_dossier", "proof_blueprint"}:
+    for run in (state.get("outcome_runs") or state.get("recent_runs") or []):
+        if str(run.get("target_id") or "") != target_id:
             continue
-        if artifact_type != "deep_session_report" and int(metadata.get("deep_session_roi_version") or 0) != DEEP_SESSION_ROI_VERSION:
+        output_ids = {
+            str(item)
+            for item in _json_list(run.get("output_artifact_ids_json"))
+            if str(item)
+        }
+        if not output_ids & deep_artifacts:
             continue
-        artifact_target = str(metadata.get("exact_local_target") or metadata.get("target_id") or "root")
-        if artifact_target != target_id:
-            continue
-        delta_kind = str(metadata.get("mathematical_delta_kind") or "")
-        changed = metadata.get("changed_proof_state") is True
-        if not delta_kind:
-            roi = str(metadata.get("artifact_roi") or "")
-            changed = changed or roi in {"verifier_ready_route", "route_repaired", "debt_closed_or_sharpened"}
-            delta_kind = "legacy_productive_delta" if changed else "none"
+        run_id = str(run.get("run_id") or "")
+        changed = bool(run_id and run_id in accepted_run_ids)
         candidates.append(
             {
-                "artifact_id": str(row.get("artifact_id") or ""),
-                "state_revision": int(row.get("state_revision") or 0),
-                "delta_kind": delta_kind,
-                "productive": changed and delta_kind != "none",
+                "run_id": run_id,
+                "artifact_ids": sorted(output_ids & deep_artifacts),
+                "state_revision": int(run.get("state_revision") or 0),
+                "accepted_graph_change": changed,
             }
         )
-    candidates.sort(key=lambda item: (item["state_revision"], item["artifact_id"]), reverse=True)
+    candidates.sort(key=lambda item: (item["state_revision"], item["run_id"]), reverse=True)
     recent = candidates[:2]
-    stalled = len(recent) >= 2 and not any(item["productive"] for item in recent)
+    stalled = len(recent) >= 2 and not any(item["accepted_graph_change"] for item in recent)
     current_philosophy = str(action.get("research_philosophy") or "")
     philosophy_cycle = (
         "direct_proof",
@@ -794,8 +886,8 @@ def deep_session_roi(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dic
         "allowed": not stalled,
         "recent_sessions": recent,
         "consecutive_no_delta_limit": 2,
-        "delta_only_persistence": True,
-        "management_only_report_is_progress": False,
+        "host_journal_is_authoritative": True,
+        "artifact_self_assessment_used": False,
         "forced_next_philosophy": next_philosophy if stalled else "",
         "reason": (
             "two recent long sessions produced no proof-state mathematical delta"
@@ -811,7 +903,7 @@ def representation_switch_contract(state: Mapping[str, Any], action: Mapping[str
         1
         for run in (state.get("recent_runs", []) or [])[:12]
         if str(run.get("target_id") or "") == target_id
-        and str(run.get("actor_role") or "") in {"researcher", "villain"}
+        and str(run.get("actor_role") or "") in {"researcher", "adversarial_reviewer", "villain"}
     )
     due = repeated >= 2 or any(
         action.get(key)

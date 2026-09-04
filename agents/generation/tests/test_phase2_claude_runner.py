@@ -1,12 +1,16 @@
+import hashlib
 import json
 import os
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 from agents.generation.phase2.claude_runner import (
     _claude_usage,
     _claude_child_env,
+    _spawn_pty_session,
     build_claude_command,
     execute_claude_session,
     make_claude_executor,
@@ -14,6 +18,13 @@ from agents.generation.phase2.claude_runner import (
     latest_stream_usage,
     parse_stream_events,
     stream_activity_tail,
+)
+from agents.generation.phase2.codex_runner import AggregateProcessTreeRSSGovernor
+from agents.generation.phase2.dispatch_execution import (
+    CUSTOM_EXECUTOR_AGGREGATE_RSS_CAPABILITY,
+    CUSTOM_EXECUTOR_CONCURRENCY_ATTRIBUTE,
+    CUSTOM_EXECUTOR_PARALLEL_CAPABILITY,
+    CUSTOM_EXECUTOR_RESOURCE_ATTRIBUTE,
 )
 from agents.generation.phase2.codex_runner import prepare_session
 from agents.generation.phase2.context_builder import build_context_manifest
@@ -40,12 +51,80 @@ def _write_fake_claude(path: Path, patch: dict, *, usage: dict, session_id: str 
 
 
 class ClaudeRunnerTest(unittest.TestCase):
+    def test_claude_session_enforces_shared_aggregate_rss_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_bin = root / "fake-memory-claude"
+            fake_bin.write_text(
+                "#!/usr/bin/env python3\n"
+                "import time\n"
+                "memory = bytearray(16 * 1024 * 1024)\n"
+                "print('memory-ready', flush=True)\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+            store = ProofStateStore(
+                "claude-aggregate-rss-test",
+                generation_root=root / "generation",
+            )
+            store.init_problem("Prove the root theorem.")
+            action = {"mode": "prove", "target_id": "root"}
+            session_plan = prepare_session(store, action, max_context_chars=8_000)
+            governor = AggregateProcessTreeRSSGovernor(1.0)
+
+            execution = execute_claude_session(
+                store,
+                action,
+                session_plan,
+                claude_bin=str(fake_bin),
+                timeout_sec=5,
+                progress_callback=lambda _progress: None,
+                stop_event=threading.Event(),
+                aggregate_rss_governor=governor,
+                enforce_backend_contract=False,
+            )
+
+            self.assertEqual("failed", execution["status"])
+            self.assertEqual("resource_limit", execution["failure_kind"])
+            self.assertGreater(
+                execution["observed_aggregate_peak_memory_mb"],
+                1.0,
+            )
+            self.assertEqual(
+                1.0,
+                execution["resource_limits"][
+                    "max_aggregate_child_process_tree_rss_mb"
+                ],
+            )
+            self.assertEqual(0, governor.snapshot()["participant_count"])
+
+    def test_pty_capture_discards_output_after_hard_byte_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_path = root / "stream.jsonl"
+            log_path = root / "claude.log"
+            reached = threading.Event()
+            with log_path.open("w", encoding="utf-8") as log_file:
+                process, reader = _spawn_pty_session(
+                    [sys.executable, "-c", "print('x' * 10000)"],
+                    cwd=root,
+                    raw_path=raw_path,
+                    log_file=log_file,
+                    limit_event=reached,
+                    max_bytes=64,
+                )
+                self.assertEqual(0, process.wait(timeout=10))
+                reader.join(timeout=2)
+            self.assertTrue(reached.is_set())
+            self.assertLessEqual(raw_path.stat().st_size, 64)
+
     def test_build_claude_command_shape(self) -> None:
         cmd = build_claude_command(
             prompt="do the thing",
             claude_bin="claude",
             model="claude-opus-4-8",
-            permission_mode="bypassPermissions",
+            permission_mode="dontAsk",
             max_turns=12,
             effort="xhigh",
             add_dirs=["/repo"],
@@ -54,14 +133,49 @@ class ClaudeRunnerTest(unittest.TestCase):
         self.assertIn("-p", cmd)
         self.assertEqual(cmd[cmd.index("--model") + 1], "claude-opus-4-8")
         self.assertEqual(cmd[cmd.index("--effort") + 1], "xhigh")
-        self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "bypassPermissions")
+        self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
         # Default is stream-json (timeout-resilient) and requires --verbose.
         self.assertEqual(cmd[cmd.index("--output-format") + 1], "stream-json")
         self.assertIn("--verbose", cmd)
         self.assertEqual(cmd[cmd.index("--max-turns") + 1], "12")
         self.assertEqual(cmd[cmd.index("--add-dir") + 1], "/repo")
+        settings = json.loads(cmd[cmd.index("--settings") + 1])
+        self.assertTrue(settings["sandbox"]["enabled"])
+        self.assertTrue(settings["sandbox"]["failIfUnavailable"])
+        self.assertEqual(settings["sandbox"]["network"]["deniedDomains"], ["*"])
+        self.assertIn("--tools", cmd)
         # Prompt is the trailing positional argument.
         self.assertEqual(cmd[-1], "do the thing")
+
+    def test_bypass_permissions_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "bypassPermissions"):
+            build_claude_command(prompt="unsafe", permission_mode="bypassPermissions")
+
+    def test_caller_cannot_disable_the_claude_sandbox(self) -> None:
+        unsafe = {
+            "disableAllHooks": True,
+            "permissions": {"defaultMode": "dontAsk", "deny": ["mcp__*", "Agent", "Skill"]},
+            "sandbox": {
+                "enabled": False,
+                "failIfUnavailable": False,
+                "allowUnsandboxedCommands": True,
+                "filesystem": {
+                    "denyRead": ["/", "~/"],
+                    "allowRead": ["."],
+                    "denyWrite": ["/", "~/"],
+                    "allowWrite": ["."],
+                },
+                "network": {"deniedDomains": ["*"]},
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "sandbox must be enabled"):
+            build_claude_command(prompt="unsafe", settings=unsafe)
+
+    def test_caller_cannot_load_user_settings_or_delegated_tools(self) -> None:
+        with self.assertRaisesRegex(ValueError, "setting_sources must be explicitly empty"):
+            build_claude_command(prompt="unsafe", setting_sources=["user"])
+        with self.assertRaisesRegex(ValueError, "forbidden delegated capabilities"):
+            build_claude_command(prompt="unsafe", tools=["Read", "Agent"])
 
     def test_parse_stream_prefers_result_event(self) -> None:
         stream = "\n".join([
@@ -162,6 +276,7 @@ class ClaudeRunnerTest(unittest.TestCase):
                 session_plan,
                 claude_bin=str(fake_bin),
                 timeout_sec=30,
+                enforce_backend_contract=False,
             )
 
             self.assertEqual(execution["status"], "completed", execution.get("patch_error"))
@@ -171,6 +286,10 @@ class ClaudeRunnerTest(unittest.TestCase):
             self.assertEqual(execution["output_artifact_ids"], ["claude-notebook"])
             self.assertEqual(execution["usage"]["input_tokens"], 2012)
             self.assertEqual(execution["usage"]["total_tokens"], 2092)
+            self.assertEqual(
+                "supervisor polling plus bounded host capture",
+                execution["resource_limits"]["enforcement"],
+            )
             self.assertTrue(Path(execution["final_message_path"]).exists())
 
     def test_make_claude_executor_matches_workflow_call_shape(self) -> None:
@@ -193,7 +312,19 @@ class ClaudeRunnerTest(unittest.TestCase):
             }
             fake_bin = tmp / "fake-claude"
             _write_fake_claude(fake_bin, patch, usage={"input_tokens": 1, "output_tokens": 1})
-            executor = make_claude_executor(claude_bin=str(fake_bin), timeout_sec=30)
+            executor = make_claude_executor(
+                claude_bin=str(fake_bin),
+                timeout_sec=30,
+                enforce_backend_contract=False,
+            )
+            self.assertEqual(
+                CUSTOM_EXECUTOR_PARALLEL_CAPABILITY,
+                getattr(executor, CUSTOM_EXECUTOR_CONCURRENCY_ATTRIBUTE),
+            )
+            self.assertEqual(
+                CUSTOM_EXECUTOR_AGGREGATE_RSS_CAPABILITY,
+                getattr(executor, CUSTOM_EXECUTOR_RESOURCE_ATTRIBUTE),
+            )
             # workflow.py calls executor(store=..., action=..., session_plan=...)
             execution = dict(executor(store=store, action=action, session_plan=session_plan))
             self.assertEqual(execution["status"], "completed")
@@ -201,6 +332,26 @@ class ClaudeRunnerTest(unittest.TestCase):
 
 
 class CasToolingManifestTest(unittest.TestCase):
+    def test_existing_cas_asset_is_content_bound(self) -> None:
+        from agents.generation.phase2.context_builder import _cas_tooling_card
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            asset = Path(tmpdir) / "check.py"
+            asset.write_text("print(42)\n", encoding="utf-8")
+            prev = os.environ.get("ALBILICH_CAS_ASSETS")
+            os.environ["ALBILICH_CAS_ASSETS"] = str(asset)
+            try:
+                card = _cas_tooling_card()
+            finally:
+                if prev is None:
+                    os.environ.pop("ALBILICH_CAS_ASSETS", None)
+                else:
+                    os.environ["ALBILICH_CAS_ASSETS"] = prev
+            self.assertEqual(
+                hashlib.sha256(b"print(42)\n").hexdigest(),
+                card["assets"][0]["sha256"],
+            )
+
     def test_cas_assets_surface_in_manifest_and_search_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("cas-tooling-test", generation_root=Path(tmpdir) / "generation")

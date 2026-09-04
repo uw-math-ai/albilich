@@ -1,5 +1,8 @@
 # Albilich v0.5 Architecture
 
+> Historical architecture note for the retired v0.5 branch. Its terminology
+> and trust model do not describe current Albilich.
+
 Albilich v0.5 is a reset branch. It adds CAS as a direct agent tool, not as a separate research pipeline.
 
 ## Core Shape
@@ -16,7 +19,7 @@ Albilich v0.5 is a reset branch. It adds CAS as a direct agent tool, not as a se
 - `cas_poll` returns status, elapsed time, return code, and new stdout/stderr since the previous poll.
 - `cas_stop` terminates a running session.
 
-Agents are responsible for deciding whether a run is useful enough to continue. The tool layer does not impose the v1 requested-experiment gate, claim ledger, computation ledger, pattern miner, or experimentalist flow.
+Agents are responsible for deciding whether a run is useful enough to continue. The tool layer does not impose the v1 requested-experiment gate, theorem-status table, computation register, pattern miner, or experimentalist flow.
 
 ## Search And Tool Policy
 
@@ -45,8 +48,8 @@ Do not copy these v1 mechanisms into this branch:
 
 - mandatory first CAS pass;
 - nested experimentalist agent;
-- requested experiment ledgers;
-- claim/conjecture/strategy/computation ledgers;
+- requested-experiment registers;
+- theorem/conjecture/strategy/computation status tables;
 - verifier CAS-audit bundles;
 - broad-status runner logic;
 - custom large-log or raw-output runner guardrails.

@@ -19,7 +19,7 @@ from agents.generation.phase2.console import build_run_console_payload, build_ru
 from agents.generation.phase2.context_builder import build_context_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.monitor import build_monitor_payload
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch, apply_system_patch
 from agents.generation.phase2.research_policy import (
     RESEARCHER_WORK_MODES,
     action_expects_researcher_session,
@@ -75,7 +75,7 @@ def _record_mode_run(
         model="test-model",
     )
     op["search_intent"] = search_intent
-    outcome = apply_patch(
+    outcome = apply_system_patch(
         store,
         {
             "schema_version": SCHEMA_VERSION,
@@ -86,6 +86,7 @@ def _record_mode_run(
             "operations": [op],
             "rationale": "record synthetic run metrics",
         },
+        mode=mode,
     )
     if not outcome.accepted:
         raise AssertionError(outcome.errors)
@@ -651,24 +652,24 @@ class VillainWorkModeTest(unittest.TestCase):
         online_prompt = build_session_prompt(
             context_path=Path("/tmp/context.json"),
             action={**base, "researcher_work_mode": "online", "work_mode_source": "rotation"},
-            actor_role="villain",
+            actor_role="adversarial_reviewer",
         )
         self.assertIn("ONLINE refutation pass", online_prompt)
-        self.assertIn("VILLAIN WORK MODE: online", online_prompt)
+        self.assertIn("ADVERSARIAL REVIEW WORK MODE: online", online_prompt)
         cas_prompt = build_session_prompt(
             context_path=Path("/tmp/context.json"),
             action={**base, "researcher_work_mode": "cas", "work_mode_source": "rotation"},
-            actor_role="villain",
+            actor_role="adversarial_reviewer",
         )
         self.assertIn("CAS REFUTATION pass", cas_prompt)
         self.assertIn("Never launch an interactive CAS REPL", cas_prompt)
         offline_prompt = build_session_prompt(
             context_path=Path("/tmp/context.json"),
             action={**base, "researcher_work_mode": "offline", "work_mode_source": "rotation"},
-            actor_role="villain",
+            actor_role="adversarial_reviewer",
         )
         self.assertIn("OFFLINE refutation pass", offline_prompt)
-        self.assertIn("not available in this villain work mode", offline_prompt)
+        self.assertIn("not available in this adversarial_reviewer work mode", offline_prompt)
 
     def test_stamp_covers_refute_actions(self) -> None:
         state = {"recent_runs": [], "research_artifacts": []}
@@ -691,8 +692,8 @@ class VillainWorkModeTest(unittest.TestCase):
             "research_artifacts": [],
         }
         summary = researcher_mode_summary(state)
-        self.assertEqual(summary["villain"]["current"]["work_mode"], "cas")
-        self.assertEqual(summary["villain"]["cycle"], ["cas", "offline", "online"])
+        self.assertEqual(summary["adversarial_reviewer"]["current"]["work_mode"], "cas")
+        self.assertEqual(summary["adversarial_reviewer"]["cycle"], ["cas", "offline", "online"])
 
 
 class ResearcherWorkModeGatesTest(unittest.TestCase):
@@ -897,7 +898,7 @@ class ResearcherWorkModeManifestTest(unittest.TestCase):
             self.assertTrue(cas_manifest["role_context_policy"]["cas_access"])
             policy = cas_manifest.get("researcher_packet", {}).get("researcher_mode_policy", {})
             self.assertEqual(policy.get("work_mode"), "cas")
-            self.assertIn("villain", policy.get("policy", ""))
+            self.assertIn("adversarial-review", policy.get("policy", ""))
             offline_action = dict(unstamped, researcher_work_mode="offline", work_mode_source="rotation")
             offline_manifest = build_context_manifest(store, target_id="root", action=offline_action, max_chars=60_000)
             self.assertFalse(offline_manifest["role_context_policy"]["cas_access"])

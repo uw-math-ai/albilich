@@ -484,6 +484,7 @@ def test_route_less_context_does_not_demand_a_canonical_route_id() -> None:
         )
 
     instructions = "\n".join(manifest["instructions"])
-    assert "Continue the existing route-less canonical proof dossier" in instructions
+    assert "Continue the existing route-less canonical proof draft" in instructions
     assert "Do not set canonical_route_owner_version or canonical_route_id" in instructions
-    assert "selected nonempty route has one canonical proof dossier" not in instructions
+    assert "selected nonempty route has one canonical proof draft" not in instructions
+    assert "creates_parallel_proof_draft=false" in instructions

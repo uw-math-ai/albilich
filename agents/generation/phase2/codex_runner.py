@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import codecs
+import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
+import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
+from .action_contract import ACTION_MODE_SPECS, scheduler_actor_role_for_action
 from .audit import (
     AUDIT_CLAIM_STATUSES,
     AUDIT_STATUS_TO_VALIDATION,
@@ -20,7 +26,18 @@ from .audit import (
     PROPOSED_REPAIR_ARTIFACT_TYPE,
     is_paper_audit_mode,
 )
+from .assurance import assurance_backend_conflict
 from .budget import parse_token_usage
+from .backend_contract import (
+    attest_backend,
+    attested_backend_unchanged,
+    validate_launch_command,
+)
+from .bounded_io import (
+    read_bounded_bytes,
+    read_bytes_prefix,
+    read_text_tail as read_stable_text_tail,
+)
 from .completion_policy import (
     ADVISOR_PARTIAL_TRANSITION_CODE_KEY,
     ADVISOR_PARTIAL_TRANSITION_KEY,
@@ -28,11 +45,21 @@ from .completion_policy import (
     CANONICAL_STOP_REASON_CODES,
     LANGUAGE_DEBT_TYPES,
 )
-from .context_builder import build_context_manifest, build_resume_delta_manifest, manifest_hash, render_manifest
-from .models import sha256_text, utc_now
+from .context_builder import (
+    ContextTooLargeError,
+    ResumeDeltaUnavailableError,
+    build_context_manifest,
+    build_resume_delta_manifest,
+    manifest_hash,
+    render_manifest,
+)
+from .models import SCHEMA_VERSION, sha256_text, utc_now
 from .patches import preflight_patch_errors
+from .research_intelligence import strategy_family
+from .randomized_assignment import randomized_assignment_metadata
 from .role_capabilities import advisor_enabled, role_can_use_cas, session_cas_enabled
 from .store import ProofStateStore
+from .storage_policy import enforce_local_storage_limit
 from .writing.paper_contract import (
     EDITOR_DIRECTIVE,
     INTRODUCTION_EDITOR_DIRECTIVE,
@@ -45,16 +72,33 @@ from .writing.rubric import load_rubric, rules_for_critic
 
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "xhigh"
-DEFAULT_SANDBOX = "workspace-write"
+DEFAULT_CODEX_PERMISSION_PROFILE = "albilich-evidence-capsule"
+# Kept under the historical name because this value is persisted in run
+# metrics and exposed by the CLI.  It now names a least-privilege permission
+# profile, not Codex's older broad ``workspace-write`` sandbox.
+DEFAULT_SANDBOX = f"permission-profile:{DEFAULT_CODEX_PERMISSION_PROFILE}"
 DEFAULT_CHILD_TIMEOUT_SECONDS = 7200
 LOG_PARSE_HEAD_BYTES = 64_000
 LOG_PARSE_TAIL_BYTES = 256_000
 LIVE_LOG_TAIL_BYTES = 12_000
+MAX_CHILD_LOG_BYTES = 64 * 1024 * 1024
+MAX_MODEL_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_SESSION_USAGE_TAIL_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_CHILD_RSS_MB = 8 * 1024
+DEFAULT_MAX_AGGREGATE_CHILD_RSS_MB = 16 * 1024
+MAX_CONFIGURED_RSS_MB = 1024.0 * 1024.0
+MAX_RESOURCE_POLL_SECONDS = 30.0
+MAX_TRACKED_PROCESS_TREE_PIDS = 4096
+RESOURCE_SAMPLE_FAIL_CLOSED_MB = 1024.0 * 1024.0 + 1.0
+CHILD_MAX_RSS_ENV = "ALBILICH_CHILD_MAX_RSS_MB"
+AGGREGATE_CHILD_MAX_RSS_ENV = "ALBILICH_MAX_AGGREGATE_CHILD_RSS_MB"
 CODEX_SESSION_ROOT_ENV = "ALBILICH_CODEX_SESSION_ROOT"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 15.0
 DEFAULT_CODEX_STALE_RETRY_SECONDS = 90.0
 DEFAULT_CODEX_ACTIVE_RETRY_GRACE_SECONDS = 300.0
 DEFAULT_CODEX_CHILD_TMPDIR = Path(__file__).resolve().parents[3] / ".albilich" / "tmp" / "codex-child"
+MAX_EVIDENCE_FILE_BYTES = 256 * 1024 * 1024
+MAX_EVIDENCE_CAPSULE_BYTES = 768 * 1024 * 1024
 DEFAULT_CODEX_CHILD_RUST_LOG = (
     "warn,codex_core_plugins::manifest=error,codex_core_skills::loader=error,"
     "codex_mcp::rmcp_client=error,codex_core::shell_snapshot=error,"
@@ -66,6 +110,89 @@ DEFAULT_CODEX_BIN_FALLBACKS = (
     Path("~/.local/bin/codex").expanduser(),
     Path("/Applications/Codex.app/Contents/Resources/codex"),
 )
+
+
+class AggregateProcessTreeRSSGovernor:
+    """Conservatively bound aggregate local child-process memory.
+
+    Each supervised session reports its complete process-tree RSS.  Crossing
+    the shared limit trips the governor permanently for this workflow and
+    signals every registered participant, including a concurrent expository
+    sidecar using a different cancellation event.
+    """
+
+    def __init__(self, limit_mb: float) -> None:
+        limit = float(limit_mb)
+        if (
+            not (limit > 0.0)
+            or limit != limit
+            or limit == float("inf")
+            or limit > MAX_CONFIGURED_RSS_MB
+        ):
+            raise ValueError(
+                "aggregate process-tree RSS limit must be finite, positive, and "
+                f"no larger than {MAX_CONFIGURED_RSS_MB:.0f} MiB"
+            )
+        self.limit_mb = limit
+        self._lock = threading.Lock()
+        self._current_mb: dict[str, float] = {}
+        self._stop_events: dict[str, threading.Event] = {}
+        self._tripped = False
+        self._peak_mb = 0.0
+
+    def observe(
+        self,
+        participant_id: str,
+        current_rss_mb: float,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> tuple[float, bool]:
+        participant = str(participant_id or "")
+        if not participant:
+            raise ValueError("aggregate RSS participant identifier must be nonempty")
+        try:
+            current = float(current_rss_mb)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("aggregate RSS observation must be finite and nonnegative") from exc
+        if current < 0.0 or current != current or current == float("inf"):
+            raise ValueError("aggregate RSS observation must be finite and nonnegative")
+        with self._lock:
+            if current == 0.0:
+                self._current_mb.pop(participant, None)
+                self._stop_events.pop(participant, None)
+            else:
+                self._current_mb[participant] = current
+                if stop_event is not None:
+                    self._stop_events[participant] = stop_event
+            total = sum(self._current_mb.values())
+            self._peak_mb = max(self._peak_mb, total)
+            if total > self.limit_mb:
+                self._tripped = True
+            tripped = self._tripped
+            events = tuple(self._stop_events.values()) if tripped else ()
+        for event in events:
+            event.set()
+        if tripped and stop_event is not None:
+            # A new participant must observe a limit already crossed by an
+            # earlier wave, including before it has launched its subprocess.
+            stop_event.set()
+        return total, tripped
+
+    def release(self, participant_id: str) -> None:
+        participant = str(participant_id or "")
+        with self._lock:
+            self._current_mb.pop(participant, None)
+            self._stop_events.pop(participant, None)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "limit_mb": self.limit_mb,
+                "current_mb": sum(self._current_mb.values()),
+                "peak_mb": self._peak_mb,
+                "participant_count": len(self._current_mb),
+                "tripped": self._tripped,
+            }
 DEFAULT_CODEX_CHILD_EXEC_ARGS = ("--ignore-user-config",)
 DEFAULT_CODEX_CHILD_DISABLED_FEATURES = (
     "apps",
@@ -131,45 +258,13 @@ _SESSION_PATH_CACHE: dict[str, Optional[Path]] = {}
 
 def actor_role_for_action(action: Mapping[str, Any]) -> str:
     mode = str(action.get("mode") or "prove")
-    route_id = str(action.get("route_id") or "")
-    if mode == "integrate":
-        return "integration_verifier"
-    if mode == "formalize":
-        return "formal_backend"
-    if mode == "validate_counterexample":
-        return "counterexample_validator"
-    if mode == "retrieve":
-        return "literature_researcher"
-    if mode == "synthesize_sources":
-        return "literature_researcher"
-    if mode == "audit_definitions":
-        return "literature_researcher"
-    if mode == "triage_routes":
+    mode_spec = ACTION_MODE_SPECS.get(mode)
+    role_class = mode_spec.role_class if mode_spec is not None else ""
+    role = scheduler_actor_role_for_action({**action, "mode": mode})
+    if role_class == "advisor":
         if not advisor_enabled():
             raise RuntimeError("advisor-only action escaped the disabled-advisor scheduler guard")
-        return "phd_advisor"
-    if mode == "regulate_decomposition":
-        if not advisor_enabled():
-            raise RuntimeError("advisor-only action escaped the disabled-advisor scheduler guard")
-        return "phd_advisor"
-    if mode == "refute":
-        return "villain"
-    if mode == "write":
-        return "writer"
-    if mode == "review_writing":
-        return "referee" if action.get("publication_referee") else "writing_critic"
-    if mode == "prove" and (
-        route_id
-        or action.get("citation_certification_required")
-        or action.get("citation_triage_required")
-        or action.get("paper_audit_document_review_required")
-    ):
-        return "strict_informal_verifier"
-    if mode in {"reduce", "weaken", "strengthen"} and action.get("debt_id"):
-        if route_id or action.get("proof_repair_required") or action.get("research_diagnostic_required"):
-            return "researcher"
-        return "phd_advisor"
-    return "researcher"
+    return role
 
 
 def build_session_prompt(*, context_path: Path, action: Mapping[str, Any], actor_role: str, resume: bool = False) -> str:
@@ -193,21 +288,21 @@ def build_session_prompt(*, context_path: Path, action: Mapping[str, Any], actor
             "If manifest.cas_tooling is present, you may read, run, and query the listed CAS/data assets through tool calls (run a Macaulay2 .m2 file with M2, a Julia .jl script with julia, and query a .jsonl/.csv h*-vector dataset with jq/julia/python) for bounded computations and example/counterexample search, even though their directory is otherwise excluded; filter large datasets rather than loading them whole, and attach a cas_experiment_report when the computation matters.",
             "Use CAS lifecycle tools for CAS computations when available. Never launch an interactive CAS REPL with no finite input; run a bounded script or provide finite stdin that exits explicitly. Do not start unbounded shell computations, and never use broad process-control commands such as pkill, killall, or pattern-based kill to manage stuck work; stop only CAS sessions you started via cas_stop, or abandon a failed shell probe and record the obstruction. Do not assume optional Python packages such as sympy are installed; if plain Python is enough, use the standard library.",
         ]
-    elif actor_role in {"researcher", "villain"}:
+    elif actor_role in {"researcher", "adversarial_reviewer", "villain"}:
         cas_guidance = [
             f"CAS lifecycle tools are not available in this {actor_role} work mode (see manifest.workflow_action.researcher_work_mode). Do not call discover_cas_backends, cas_start, cas_poll, or cas_stop, and do not run CAS/data assets directly in this pass. If a bounded computation is genuinely the next decisive move, say so precisely (backend, finite scope, expected decisive output) in your artifact metadata so the advisor or scheduler can route a cas-mode pass.",
         ]
     else:
         cas_guidance = [
-            "CAS lifecycle tools and CAS/data asset execution are not available to this role. Do not compute independently. Do not call discover_cas_backends, cas_start, cas_poll, or cas_stop, and do not run CAS/data assets directly. If a computation would help, request a bounded researcher or villain CAS check and reason from existing cas_experiment_report artifacts only.",
+            "CAS lifecycle tools and CAS/data asset execution are not available to this role. Do not compute independently. Do not call discover_cas_backends, cas_start, cas_poll, or cas_stop, and do not run CAS/data assets directly. If a computation would help, request a bounded researcher or adversarial-review CAS check and reason from existing cas_experiment_report artifacts only.",
         ]
-    return "\n".join(
+    prompt = "\n".join(
         [
             *header,
             "Return only one JSON object, with no markdown fence and no prose.",
-            "It must be an Albilich v1 patch with schema_version=1, the manifest problem_id, the manifest state_revision as base_revision, this exact actor_role, target_id, and a nonempty operations list.",
+            f"It must be an Albilich v1 patch with schema_version={SCHEMA_VERSION}, the manifest problem_id, the manifest state_revision as base_revision, this exact actor_role, target_id, and a nonempty operations list.",
             "Do not set producer_role on artifacts; the workflow records it from actor_role and rejects spoofing.",
-            "For add_debt/update_debt, owner_id must be a concrete claim_id, route_id, or inference_id from the manifest or same patch (writing debts alone use owner_type='artifact' with the reviewed final_proof artifact_id); never use role names like researcher, phd_advisor, advisor, verifier, or literature_researcher as graph owners.",
+            "Use add_proof_obligation/update_proof_obligation with proof_obligation_id and obligation_type. owner_id must be a concrete claim_id, route_id, or inference_id from the manifest or same patch (writing revision obligations alone use owner_type='artifact' with the reviewed final_proof artifact_id); never use role names as graph owners.",
             "Use manifest.patch_contract for patch shape; do not inspect framework source, schemas, tests, or README just to learn patch syntax.",
             "Do not add a new active sufficient route concluding an already integrated claim; closed branches should feed root synthesis by updating an existing inference with genuinely new evidence or by attacking the next root-level gap.",
             "Do not call tool_search, plugin discovery, connector discovery, plugin installation, browser/app/thread tools, or memory tools. "
@@ -222,6 +317,136 @@ def build_session_prompt(*, context_path: Path, action: Mapping[str, Any], actor
             guidance,
         ]
     )
+    return _standardize_prompt_terminology(
+        prompt,
+        protected_values=(str(context_path), *_prompt_protocol_values(action)),
+    )
+
+
+def _prompt_protocol_values(action: Mapping[str, Any]) -> tuple[str, ...]:
+    """Collect action values whose exact spelling is part of the protocol."""
+
+    protected: set[str] = set()
+
+    def visit(value: Any, *, identifier_context: bool = False) -> None:
+        if isinstance(value, Mapping):
+            for raw_key, item in value.items():
+                key = str(raw_key)
+                is_identifier = (
+                    key == "path"
+                    or key.endswith("_path")
+                    or key.endswith("_paths")
+                    or key.endswith("_id")
+                    or key.endswith("_ids")
+                    or key.endswith("_hash")
+                )
+                visit(item, identifier_context=is_identifier)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                visit(item, identifier_context=identifier_context)
+            return
+        if identifier_context and isinstance(value, str) and value:
+            protected.add(value)
+
+    visit(action)
+    return tuple(sorted(protected, key=lambda item: (-len(item), item)))
+
+
+def _standardize_prompt_terminology(
+    text: str, *, protected_values: Sequence[str] = ()
+) -> str:
+    """Normalize model-facing vocabulary without rewriting protocol identifiers."""
+
+    legacy_role_marker = "__ALBILICH_EXACT_LEGACY_ROLE__"
+    sentinels: Dict[str, str] = {}
+    for index, value in enumerate(
+        sorted({item for item in protected_values if item}, key=lambda item: -len(item))
+    ):
+        sentinel = f"__ALBILICH_PROTOCOL_VALUE_{index}__"
+        if value in text:
+            text = text.replace(value, sentinel)
+            sentinels[sentinel] = value
+    text = text.replace("actor_role=villain", legacy_role_marker)
+    for old, new in (
+        ("negative_result_ledger", "failed_approaches"),
+        ("negative-result ledger", "record of failed approaches"),
+        ("literature ledger", "source catalog"),
+        ("artifact_ledger", "artifact_catalog"),
+        ("citation_ledger", "citation_catalog"),
+        ("proof_dossier", "proof_draft"),
+        ("creates_parallel_dossier", "creates_parallel_proof_draft"),
+        ("proof dossiers", "proof drafts"),
+        ("proof dossier", "proof draft"),
+        ("test batteries", "test suites"),
+        ("test battery", "test suite"),
+        ("rethlas_defeat_loop", "decisive_proof_obligation_cycle"),
+        ("Rethlas defeat loop", "decisive proof-obligation cycle"),
+        ("paperwork_throttle", "mathematical_output_focus"),
+        ("paperwork throttle", "mathematical-output focus"),
+        ("proof_pressure_scheduler", "proof_strategy_review"),
+        ("proof-pressure scheduler", "proof-strategy review"),
+        ("resolved_debt_justifications", "resolved_proof_obligation_justifications"),
+        ("resolved_debt_ids", "resolved_proof_obligation_ids"),
+        ("verifier_gap_debt_ids", "verifier_gap_proof_obligation_ids"),
+        ("closure_debt_id", "closure_proof_obligation_id"),
+        ("central_debt_id", "central_proof_obligation_id"),
+        ("add_debt", "add_proof_obligation"),
+        ("update_debt", "update_proof_obligation"),
+        ("resolve_debt", "resolve_proof_obligation"),
+        ("debt_type", "obligation_type"),
+        ("debt_id", "proof_obligation_id"),
+        ("manifest.debts", "manifest.proof_obligations"),
+        ("directed_villain_mode", "directed_adversarial_review_mode"),
+        ("villain_obstruction", "adversarial_reviewer_obstruction"),
+        ("writing debts", "writing revision obligations"),
+        ("proof debts", "proof obligations"),
+        ("active debts", "active proof obligations"),
+    ):
+        text = text.replace(old, new)
+    # These final prose substitutions must not touch stable identifiers such
+    # as ``debt-p1`` or ``villain-review-1``. Child patches have to echo those
+    # identifiers exactly even while the surrounding vocabulary is public and
+    # mathematical.
+    text = re.sub(
+        r"(?<![A-Za-z0-9_-])debts(?![A-Za-z0-9_-])",
+        "proof obligations",
+        text,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_-])debt(?![A-Za-z0-9_-])",
+        "proof obligation",
+        text,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_-])villain(?![A-Za-z0-9_-])",
+        "adversarial reviewer",
+        text,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_-])dossiers(?![A-Za-z0-9_-])",
+        "proof drafts",
+        text,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_-])dossier(?![A-Za-z0-9_-])",
+        "proof draft",
+        text,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_-])ledgers?(?![A-Za-z0-9_-])",
+        "records",
+        text,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_-])batter(?:y|ies)(?![A-Za-z0-9_-])",
+        "test suites",
+        text,
+    )
+    text = text.replace(legacy_role_marker, "actor_role=villain")
+    for sentinel, value in sentinels.items():
+        text = text.replace(sentinel, value)
+    return text
 
 
 def _researcher_work_mode_guidance(action: Mapping[str, Any]) -> str:
@@ -269,13 +494,14 @@ def _researcher_work_mode_guidance(action: Mapping[str, Any]) -> str:
 
 
 def _villain_work_mode_guidance(action: Mapping[str, Any]) -> str:
+    """Compatibility-named helper for the adversarial review work mode."""
     work_mode = str(action.get("researcher_work_mode") or "").strip().lower()
     if not work_mode:
         return ""
     reason = str(action.get("researcher_work_mode_reason") or "").strip()
     source = str(action.get("work_mode_source") or "").strip()
     header = (
-        f"VILLAIN WORK MODE: {work_mode} (source: {source or 'scheduler'}). "
+        f"ADVERSARIAL REVIEW WORK MODE: {work_mode} (source: {source or 'scheduler'}). "
         + (f"Why: {reason} " if reason else "")
         + "The refuter runs the same online/offline/cas loop as the researcher (computation-first cycle), and the PhD "
         "advisor may direct your next mode when you should search more, construct more, or compute more. Respect this "
@@ -325,10 +551,7 @@ def _writing_rubric_rule_block(
     stay bounded even as the rubric grows.
     """
     if "rules" not in _WRITING_RUBRIC_CACHE:
-        try:
-            _WRITING_RUBRIC_CACHE["rules"] = tuple(load_rubric(WRITING_RUBRIC_DIR))
-        except Exception:
-            _WRITING_RUBRIC_CACHE["rules"] = ()
+        _WRITING_RUBRIC_CACHE["rules"] = tuple(load_rubric(WRITING_RUBRIC_DIR))
     all_rules = list(_WRITING_RUBRIC_CACHE["rules"])
     rules = [
         rule
@@ -349,7 +572,7 @@ def _writing_rubric_rule_block(
 
 
 def _writing_debt_lines(action: Mapping[str, Any]) -> str:
-    """Render EVERY open writing debt as a numbered location -> required-fix
+    """Render every open writing issue as a numbered location -> required-fix
     checklist. The list is deliberately UNCAPPED: the deterministic scan
     re-flags every location it still finds, so a revision that fixes only some
     items burns a whole gate round for nothing. Debt cards built by the
@@ -381,7 +604,7 @@ def _writing_debt_lines(action: Mapping[str, Any]) -> str:
     if not lines:
         return ""
     return (
-        "Open writing debts to resolve in this revision, as a numbered location -> required-fix checklist: "
+        "Open writing issues to resolve in this revision, as a numbered location -> required-fix checklist: "
         + " ".join(lines)
         + " Fix EVERY numbered item — a revision that leaves any item unfixed will be re-flagged by the exact "
         "same deterministic scan and the round is wasted. Before attaching, SELF-CHECK each numbered location "
@@ -420,8 +643,8 @@ def _writer_hmt_guidance(action: Mapping[str, Any]) -> str:
         f"mathematician after {source_integrated_claim_count} claims have been integrated, using accepted proof "
         f"state revision {source_revision} (snapshot {sequence}; cadence {integrated_claim_interval} newly "
         "integrated claims). This is a "
-        "non-certifying ONE-SHOT exposition pass: do not open writing debts, request critic passes, revise an older HMT, do new "
-        "research, or change any claim, route, inference, debt, or certification status. Use "
+        "non-certifying ONE-SHOT exposition pass: do not open editorial issues, request critic passes, revise an older HMT, do new "
+        "research, or change any claim, proof approach, inference, proof obligation, or certification status. Use "
         "manifest.human_readable_text_packet as the status map and manifest-listed mathematical artifacts as the "
         "evidence. Write a complete standalone LaTeX article with a descriptive title, abstract, precise problem "
         "statement, notation, an organized account of established results and their proofs, a coherent explanation "
@@ -442,7 +665,7 @@ def _writer_hmt_guidance(action: Mapping[str, Any]) -> str:
         f"source_integrated_claim_count={source_integrated_claim_count}, "
         f"integrated_claim_interval={integrated_claim_interval}, sequence={sequence}, title, "
         "snapshot_kind='cumulative_partial_paper', and non_certifying=true. Attach no "
-        "final_paper, final_proof, report, debt, status transition, or other artifact."
+        "final_paper, final_proof, report, proof obligation, status transition, or other artifact."
     )
 
 
@@ -470,14 +693,14 @@ def _writer_writing_revision_guidance(action: Mapping[str, Any]) -> str:
             f"EXTERNAL MANUSCRIPT REVISION PASS: revise revision_document {revised_id} in its original "
             f"{document_format} source format. This manuscript was authored outside Albilich and is not a verified "
             "proof artifact. Preserve the author's voice, mathematical claims, notation, labels, citations, and "
-            "source organization. Make the smallest changes that discharge the listed debts; do not homogenize "
+            "source organization. Make the smallest changes that address the listed editorial issues; do not homogenize "
             "unflagged prose, strengthen claims, invent references, or convert formats. "
             + _writing_debt_lines(action)
-            + "For terminology debt, use established literature language. Retain a coined term only when the human "
+            + "For a terminology issue, use established literature language. Retain a coined term only when the human "
             "has authorized it or the manuscript explicitly defines it and explains why the nearest standard term is "
             "inadequate. Incorporate any manifest.human_steering answer exactly; never guess at consensus. For "
-            "introduction debt, rewrite the affected passage as a natural big-picture and causal proof narrative, not "
-            "a mechanical list of results. Resolve each named debt with update_debt and cite the new revision_document "
+            "an introduction issue, rewrite the affected passage as a natural big-picture and causal proof narrative, not "
+            "a mechanical list of results. Resolve each named issue with the legacy update_debt operation and cite the new revision_document "
             "in resolution_evidence_artifact_ids. "
             + _writer_external_revision_path_contract(document_format)
         )
@@ -496,7 +719,7 @@ def _writer_writing_revision_guidance(action: Mapping[str, Any]) -> str:
             "needed to answer the referee, including structural changes when the identified defect cannot be fixed "
             "locally. Keep mathematical claims within the certificate and keep verified bibliography entries intact. "
             + _writing_debt_lines(action)
-            + "Address every open writing debt: fix each one in the text, then resolve each via an update_debt "
+            + "Address every open editorial issue: fix each one in the text, then resolve each via the legacy update_debt "
             "operation with debt_id, status='resolved', a one-line resolution_note saying what changed, and "
             "resolution_evidence_artifact_ids naming the revised final_paper artifact you attach in this patch. "
             "Attach exactly one revised final_paper artifact (a NEW artifact_id): the artifact you attach must be the "
@@ -511,12 +734,12 @@ def _writer_writing_revision_guidance(action: Mapping[str, Any]) -> str:
     revised_id = str(action.get("revision_of_artifact_id") or "the current final_proof")
     return (
         f"WRITING REVISION PASS: a final_proof already exists ({revised_id}) and the writing gate found open writing "
-        "debts against it. Revise the existing final proof DIFF-MINIMALLY and voice-preservingly: keep the structure, "
-        "notation, and prose voice of the current text, and change only what the listed writing debts require. Do not "
-        "restructure sections, do not rewrite passages the debts do not touch, and keep the References section intact "
+        "issues against it. Revise the existing final proof DIFF-MINIMALLY and voice-preservingly: keep the structure, "
+        "notation, and prose voice of the current text, and change only what the listed editorial issues require. Do not "
+        "restructure sections, do not rewrite passages the issues do not touch, and keep the References section intact "
         "(the existing writer reference guards still apply). "
         + _writing_debt_lines(action)
-        + "Address exactly these open writing debts: fix each one in the text, then resolve each via an update_debt "
+        + "Address exactly these open editorial issues: fix each one in the text, then resolve each via the legacy update_debt "
         "operation with debt_id, status='resolved', a one-line resolution_note saying what changed, and "
         "resolution_evidence_artifact_ids naming the revised final_proof artifact you attach in this patch. "
         "Attach exactly one revised final_proof artifact (a NEW artifact_id) with the full revised text and the same "
@@ -538,7 +761,7 @@ def _writer_paper_authoring_guidance(action: Mapping[str, Any]) -> str:
         + PAPER_CONTRACT
         + " OP CONTRACT: return one Albilich v1 patch whose operations are exactly: one attach_artifact with "
         "artifact_type='final_paper' attached BY PATH with metadata.certificate_artifact_id and source_artifact_ids; "
-        "update_debt only when a paper-revision packet names open writing debts; "
+        "the legacy update_debt operation only when a paper-revision packet names open editorial issues; "
         "record_run_metrics as usual. "
         + _WRITER_PAPER_PATH_ATTACH_CONTRACT
         + "Do not attach any other artifact type, do not verify, refute, or integrate, "
@@ -568,11 +791,11 @@ def _writing_critic_guidance(action: Mapping[str, Any]) -> str:
             "manifest.theorem_library. Live web search, when enabled for this run, is allowed only for bounded "
             "terminology checks against authoritative mathematical sources. "
             + _writing_rubric_rule_block("skeptical_editor", rule_prefixes=("L3-TERM-",))
-            + "MECHANICS: each finding is one add_debt owned by the reviewed artifact with debt_type='writing'. "
-            "Use severity major for L3-TERM-01/02 and blocking for L3-TERM-03. An uncertainty debt MUST preserve "
+            + "MECHANICS: each finding is one editorial issue, recorded by the compatibility operation add_debt with debt_type='writing' and owned by the reviewed artifact. "
+            "Use severity major for L3-TERM-01/02 and blocking for L3-TERM-03. An uncertainty issue MUST preserve "
             "the literal marker `HUMAN CONSULTATION REQUIRED:` in its obligation. On pass attach exactly one "
             "writing_review with metadata {verdict:'pass', lens:'terminology_editor', artifact_reviewed, "
-            "state_revision_reviewed}; on fail attach the debts and one fail review. writing_review is the only "
+            "state_revision_reviewed}; on fail attach the issues and one fail review. writing_review is the only "
             "artifact type you may attach."
         )
     if lens == "introduction_editor":
@@ -593,11 +816,11 @@ def _writing_critic_guidance(action: Mapping[str, Any]) -> str:
                 "skeptical_editor",
                 rule_prefixes=("L3-SELL-", "L3-INTRO-", "L3-STORY-", "L3-SKIM-"),
             )
-            + "MECHANICS: each finding is one located add_debt owned by the reviewed artifact with "
+            + "MECHANICS: each finding is one located editorial issue, recorded by the compatibility operation add_debt and owned by the reviewed artifact with "
             "debt_type='writing', severity blocking|major|minor, and a concrete revision strategy or replacement "
             "passage. At most 10 findings. On pass attach exactly one writing_review with metadata "
             "{verdict:'pass', lens:'introduction_editor', artifact_reviewed, state_revision_reviewed}; on fail attach "
-            "the debts and one fail review. writing_review is the only artifact type you may attach."
+            "the issues and one fail review. writing_review is the only artifact type you may attach."
         )
     if lens == "editor":
         # Final whole-paper lens: exposition only, one pass, at most 12 located
@@ -606,11 +829,11 @@ def _writing_critic_guidance(action: Mapping[str, Any]) -> str:
             common_head
             + EDITOR_DIRECTIVE
             + " CONTEXT: manifest.writing_review_packet carries the paper; manifest.retrieval_cards and "
-            "manifest.theorem_library are the literature ledger for checking that bibliography entries are real, "
-            "cited works (a bibliography entry absent from the ledger and not a standard, unambiguously identifiable "
+            "manifest.theorem_library are the source catalog for checking that bibliography entries are real, "
+            "cited works (a bibliography entry absent from the catalog and not a standard, unambiguously identifiable "
             "reference is a finding). "
             + _writing_rubric_rule_block("skeptical_editor", extra_critics=("pedant",))
-            + "MECHANICS: each finding is exactly one add_debt operation with owner_type='artifact', owner_id set to "
+            + "MECHANICS: each finding is exactly one editorial issue recorded by the compatibility add_debt operation with owner_type='artifact', owner_id set to "
             "the reviewed artifact id, debt_type='writing', severity blocking|major|minor, and an "
             "obligation formatted '<rule_id>: <location> — <what is wrong> — suggested rewrite: <replacement text>'. "
             "At most 12 findings, ranked by importance. On pass, attach exactly one writing_review artifact with "
@@ -639,12 +862,12 @@ def _writing_critic_guidance(action: Mapping[str, Any]) -> str:
         )
     else:
         lens_body = (
-            f"CONTEXT ISOLATION: you receive the {reviewed_kind} text plus the citation/artifact ledger "
-            "(manifest.retrieval_cards, manifest.theorem_library, and manifest.writing_review_packet.artifact_ledger"
+            f"CONTEXT ISOLATION: you receive the {reviewed_kind} text plus the citation and artifact register "
+            "(manifest.retrieval_cards, manifest.theorem_library, and manifest.writing_review_packet.artifact_catalog"
             + (
                 ") together with the internal certificate (manifest.writing_review_packet.certificate.content). "
                 "You are the ONLY critic permitted to compare the paper against its sources. Audit provenance both "
-                "ways: every bibliography entry and citation must be a real, locatable work drawn from the ledger "
+                "ways: every bibliography entry and citation must be a real, locatable work drawn from the source catalog "
                 "(flag invented, embellished, or unverifiable references), and every mathematical claim in the paper "
                 "must be supported by the certificate or a cited work — flag claims stronger than what the "
                 "certificate establishes, silently strengthened cited theorems, misattributed statements, and "
@@ -653,8 +876,8 @@ def _writing_critic_guidance(action: Mapping[str, Any]) -> str:
                 else "). "
                 "You are the ONLY critic permitted to compare the paper against its sources. Audit provenance: every "
                 "external citation must name a locatable source with an exact theorem/page location matching the "
-                "ledger; every claimed hypothesis check must exist in the cited card; flag citations to sources "
-                "absent from the ledger, misattributed statements, silently strengthened cited theorems, and "
+                "source catalog; every claimed hypothesis check must exist in the cited card; flag citations to sources "
+                "absent from the catalog, misattributed statements, silently strengthened cited theorems, and "
                 "generation residue. "
             )
         )
@@ -668,12 +891,12 @@ def _writing_critic_guidance(action: Mapping[str, Any]) -> str:
         + lens_body
         + paper_standard
         + _writing_rubric_rule_block(lens, extra_critics=extra_critics)
-        + "Report only genuine findings. For each finding, emit exactly one add_debt operation with "
+        + "Report only genuine findings. For each finding, emit exactly one editorial issue using the compatibility add_debt operation with "
         f"owner_type='artifact', owner_id set to the reviewed {reviewed_kind.replace(' ', '_')} artifact id, debt_type='writing', "
         "severity blocking|major|minor (map rubric blocker->blocking, major->major, minor/nit->minor), and an "
         "obligation formatted '<rule_id>: <finding> (line N)' that quotes a short excerpt from the paper. Do not "
-        "restate debts already listed in manifest.writing_review_packet.open_writing_debts. You may use update_debt "
-        "only on debts you opened in this same session. "
+        "restate issues already listed in manifest.writing_review_packet.open_writing_debts. You may use update_debt "
+        "only on issues you opened in this same session. "
         "If you find nothing at blocker/major severity and at most stylistic nits, the paper PASSES this lens: attach "
         "exactly one writing_review artifact with metadata {verdict:'pass', lens:'" + lens + "', artifact_reviewed, "
         "state_revision_reviewed} and a short content note; false positives are penalized, so do not invent findings "
@@ -703,22 +926,22 @@ def _publication_referee_guidance(action: Mapping[str, Any]) -> str:
         "with exact locations, a writing and notation assessment, and a citation/reproducibility assessment. Omit an "
         "empty findings section, but never replace the report with workflow metadata.\n"
         "[accept]: use metadata.verdict='accept' only when the article is mathematically sound, journal-ready, "
-        "self-contained at the promised level, and has no issue that warrants another author revision. Open no debts.\n"
+        "self-contained at the promised level, and has no issue that warrants another author revision. Open no editorial issues.\n"
         "[revise]: use metadata.verdict='revise' for every correctable mathematical-exposition, local proof, "
         "citation, architecture, notation, or prose defect. metadata.findings must be a nonempty array of located "
-        "objects with severity, location, problem, and required_fix. For each finding, also add one writing debt owned "
-        "by the reviewed paper. The writer receives the full report and every debt on the next round.\n"
+        "objects with severity, location, problem, and required_fix. For each finding, also add one editorial issue owned "
+        "by the reviewed paper. The writer receives the full report and every issue on the next round.\n"
         "[major-proof-route-error]: use metadata.verdict='major_proof_route_error' only when you have concrete "
         "mathematical evidence that the entire integrated proof route is false, not for an omitted explanation, a "
         "repairable gap, a doubtful stylistic choice, or a citation that could be replaced. Supply affected_route_id, "
         "a precise falsified_step, and substantive mathematical_evidence that states the counterargument or "
-        "contradiction. Open no writing debts. The scheduler will log this decision in SQL, challenge the root, block "
-        "the false route, create a research debt, and return control to the research harness."
+        "contradiction. Open no editorial issues. The scheduler will log this decision in SQL, challenge the root, block "
+        "the false proof approach, create a research proof obligation, and return control to the research harness."
     )
 
 
 def _advisor_completion_policy_directive() -> str:
-    """Advisor contract for the full-proof-first completion policy (TODO 7)."""
+    """Advisor contract for the full-proof-first completion policy."""
     return (
         "COMPLETION POLICY (full-proof-first): the root theorem stays the target even when the problem file "
         "contains soft wording such as 'possible partial results' or 'try to find'; soft wording never "
@@ -731,15 +954,15 @@ def _advisor_completion_policy_directive() -> str:
         + ". Do this only when no active plausible route, verifier-ready route, narrowed actionable blocker, "
         "productive branch, or untried high-score route remains worth its budget; the scheduler records the "
         "artifact and only then allows a partial stop. Language or formulation problems in the user's "
-        "statement (ambiguity, over-broad scope, missing quantifiers, root scope mismatch) become precise "
-        "debts with debt_type "
+        "statement (ambiguity, over-broad scope, missing quantifiers, root scope mismatch) become precise proof "
+        "obligations stored under the compatibility field debt_type "
         + "|".join(sorted(LANGUAGE_DEBT_TYPES))
         + " — they trigger root-alignment clarification, never a silently weakened target. "
     )
 
 
 def _paper_audit_guidance(actor_role: str, action: Mapping[str, Any]) -> str:
-    """Conservative referee directives for paper_solution_audit (TODO 6).
+    """Conservative referee directives for paper_solution_audit.
 
     Prefixed onto every role's guidance in audit mode: the run audits the
     submitted document (manifest.paper_audit.audit_subject_artifact_id); it
@@ -765,9 +988,9 @@ def _paper_audit_guidance(actor_role: str, action: Mapping[str, Any]) -> str:
         + AUDIT_WARNING_LINE
         + " "
     )
-    if actor_role == "villain":
+    if actor_role in {"adversarial_reviewer", "villain"}:
         return common + (
-            "As the audit villain, hunt the submitted argument adversarially: hidden hypotheses the author "
+            "As the adversarial reviewer, test the submitted argument for hidden hypotheses the author "
             "silently uses, boundary/degenerate cases the proof skips, notation mismatches between sections, "
             "and concrete counterexamples to intermediate claims. Record each finding against the exact "
             "paper claim and source location it threatens (audit_status gap, overclaim, or "
@@ -787,7 +1010,7 @@ def _paper_audit_guidance(actor_role: str, action: Mapping[str, Any]) -> str:
                 "VERIFIER-ONLY DOCUMENT REVIEW: the immutable audit_subject is already the researcher's submitted "
                 "output. Read it directly and review the entire paper as written; do not request proof_dossier "
                 "packaging, do not ask a researcher to repair a step, and do not invent an alternative proof. "
-                "Attach exactly one verification_report and no status transitions or debts. Its content must give "
+                "Attach exactly one verification_report and no status transitions or proof obligations. Its content must give "
                 "a source-located claim/lemma/theorem map, a local correctness verdict for every substantive proof "
                 "step, and explicit critical errors or gaps. Metadata must set paper_audit_document_review=true, "
                 "audit_subject_artifact_id to the manifest's audit subject id, verdict to one of verified | "
@@ -811,7 +1034,7 @@ def _paper_audit_guidance(actor_role: str, action: Mapping[str, Any]) -> str:
                 "claims reviewed there assemble into the paper's stated conclusions: hypotheses must propagate, "
                 "citations must be used only as stated in the submission, cases must be exhaustive, and no circular "
                 "or missing dependency may be hidden. Attach exactly one integration_report and no lifecycle "
-                "transition or debt. Metadata must set paper_audit_document_integration=true, "
+                "transition or proof obligation. Metadata must set paper_audit_document_integration=true, "
                 "strict_report_artifact_id to the supplied id, integrates to the actual Boolean result, outcome to "
                 "integrates | does_not_integrate, and missing to a concrete list. Do not repair or rewrite any "
                 "argument and do not use errata or external paper-specific correction material. "
@@ -907,7 +1130,7 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             return (
                 "Treat manifest.artifacts[artifact_type=audit_subject] as the complete submitted researcher output. "
                 "Read the full file, audit it claim by claim, and return exactly one verification_report artifact. "
-                "Do not add claims, routes, inferences, debts, or status transitions, and do not search for or suggest "
+                "Do not add claims, proof approaches, inferences, proof obligations, or status transitions, and do not search for or suggest "
                 "repairs."
             )
         route_text = f"route {route_id}" if route_id else "the selected route"
@@ -918,7 +1141,8 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
                 "retrieval card gives a source that is actually locatable, a named theorem/proposition/lemma/corollary or precise page/section "
                 "location, a statement close enough to compare, no visible missing hypotheses, and a plausible exact/equivalent/stronger "
                 "deduction to the target. Do not certify the root during triage; attach a verification_report with verdict "
-                "citation_triage_pass or citation_triage_fail, checked_items, gaps, and the single next missing item if it fails. "
+                "citation_triage_pass or citation_triage_fail, retrieval_card_id copied exactly from the workflow action, checked_items, "
+                "gaps, and the single next missing item if it fails. "
                 "If manifest.workflow_action.citation_certification_required=true, this is an external citation certification task, "
                 "not an internal reconstruction task. Inspect manifest.workflow_action.retrieval_card_id and the matching retrieval card. "
                 "If and only if the card gives source metadata precise enough for a reader to locate the result, a theorem/proposition/lemma/"
@@ -1044,7 +1268,7 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             return _writer_hmt_guidance(action)
         return (
             _writer_writing_revision_guidance(action)
-            + "Act as a mathematically careful proof-writing agent, not a ledger dumper. Write polished, LaTeX-friendly mathematical "
+            + "Act as a mathematically careful proof-writing agent, not a database-export generator. Write polished, LaTeX-friendly mathematical "
             "exposition: distinguish prose from formulas, put genuine formulas and mathematical objects in inline/display LaTeX math, "
             "use theorem/lemma/proof-style paragraphs when appropriate, and separate certified facts from conjectural, plausible, failed, "
             "or unresolved material. Make the main body read as mathematics: statement, proof, certification status, and references. "
@@ -1089,7 +1313,7 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "For stop-writer reports, keep the artifact content compact and JSON-safe: use plain prose where possible, avoid display math and "
             "unnecessary backslashes, do not paste long artifact excerpts, and keep content under roughly 8000 characters. "
             "If the result is partial or unresolved, copy every manifest.partial_result_receipt.verified_side_lemmas item into a "
-            "'Verified Side Lemmas' section and every manifest.partial_result_receipt.other_claims item into a 'Claim Status Ledger' "
+            "'Verified Side Lemmas' section and every manifest.partial_result_receipt.other_claims item into a 'Claim Status Summary' "
             "section, preserving claim_id, validation_status, lifecycle_status, relation_to_target, statement, conditions, evidence ids, "
             "and the proof_artifacts proof/report material for each verified side lemma; rewrite surrounding prose for readability but "
             "do not change claim ids, statuses, mathematical content, or certification level. "
@@ -1180,7 +1404,8 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
                 "Act as a definition-auditing mathematical literature researcher. Compare the target statement with the local definitions in retrieval cards, "
                 "theorem-library entries, and artifacts. Check whether terms such as ring hypotheses, local/noetherian/completion/formal fiber, "
                 "smooth/stable/projective, and other domain-specific words mean the same thing in the source and target. Attach a "
-                "definition_audit_report artifact with metadata: audited_source_ids, matched_definitions, mismatched_definitions, "
+                "definition_audit_report artifact with metadata: retrieval_card_id copied exactly from the workflow action, "
+                "audited_source_ids, matched_definitions, mismatched_definitions, "
                 "hidden_hypotheses, notation_translation, verdict='definitions_match'|'definitions_mismatch'|'needs_more_source_context', "
                 "and recommended_next_action. If definitions do not match, add one precise missing_hypothesis or missing_reference debt. "
                 "If they match, you may add a route or claim saying a verifier should certify the exact citation, but do not verify, refute, "
@@ -1203,22 +1428,23 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
                 "Act as the human-style PhD advisor for the proof project: you are responsible for steering the next research direction, "
                 "not merely summarizing the state. Inspect the route scoreboard, active debts, active trunk pressure, and recent runs. "
                 "Every advisor patch must make one decisive steering recommendation: keep/repair one route, block/abandon one route, "
-                "promote one central obstruction, or send one exact task to researcher, villain, verifier, or literature. "
+                "promote one central obstruction, or send one exact task to a researcher, adversarial reviewer, verifier, or literature researcher. "
                 "You also supervise both work-mode loops (Nagata working mode: prover and refuter equally capable). The researcher "
                 "rotates through online (live literature search), offline (pure proof thinking), and cas (bounded computation) passes; "
-                "the villain runs the same loop computation-first. manifest.researcher_mode_state shows both recent mode histories and "
+                "the adversarial reviewer runs the same loop computation-first. manifest.researcher_mode_state shows both recent mode histories and "
                 "any active directives. When the researcher should search more, think more, or experiment more, add metadata "
                 "directed_researcher_mode='online'|'offline'|'cas' with directed_researcher_mode_reason (one sentence naming what to "
                 "search for, prove, or compute) and optionally directed_researcher_mode_steps (1-3, default 1) to your advisor_report. "
-                "When the VILLAIN should hunt published counterexamples/prior art (online), construct counterexamples by hand "
+                "When the adversarial reviewer should hunt published counterexamples or prior art (online), construct counterexamples by hand "
                 "(offline), or run adversarial sweeps (cas), add directed_villain_mode with directed_villain_mode_reason and optional "
                 "directed_villain_mode_steps the same way; the two directives are independent. Direct online when a missing known "
                 "theorem, survey, or counterexample family is the bottleneck; offline when search keeps returning nothing and the "
                 "attack needs invention or repair; cas when a finite computation or example sweep would decide the next step. Do not "
                 "issue a directive when the default rotation is already doing the right thing. "
-                "Do not use CAS yourself; when computation is needed, request a bounded researcher or villain check with exact acceptance criteria. "
+                "Do not use CAS yourself; when computation is needed, request a bounded researcher or adversarial-review check with exact acceptance criteria. "
                 "Keep route_triage_report compact: keep/repair/block/abandon, one reason, one next action, and no broad narrative unless new "
-                "mathematical evidence changed the route decision. "
+                "mathematical evidence changed the route decision. If manifest.workflow_action.route_decision_artifact_id is nonempty, "
+                "the route_triage_report or advisor_report metadata must copy that identifier exactly as route_decision_artifact_id. "
                 "If manifest.workflow_action.advisor_evidence_synthesis_required=true, act as a parallel evidence-synthesis advisor: keep the "
                 "original root problem in view, read the fresh artifacts named in workflow_action.advisor_evidence_signal, and think hard about "
                 "how the current evidence could become a full proof. Attach a compact advisor_report with metadata current_best_plan, "
@@ -1249,7 +1475,9 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
                 "fresh obstruction. Do the compact mathematical triage yourself: classify the obstruction as route_killing_obstruction, "
                 "route_repair_signal, missing_hypothesis, generalized_construction_needed, or candidate_counterexample_needing_validator; attach "
                 "a route_triage_report or advisor_report with the classification, the affected route or root bottleneck, and exactly one next role/task. "
-                "Do not ask for the same broad researcher synthesis again unless you narrow it to one lemma or construction test with acceptance criteria. "
+                "Its metadata must copy manifest.workflow_action.obstruction_cluster_id exactly and copy the complete "
+                "obstruction_claim_ids, obstruction_artifact_ids, and obstruction_proof_obligation_ids lists exactly. Do not ask for the same broad "
+                "researcher synthesis again unless you narrow it to one lemma or construction test with acceptance criteria. "
                 "If manifest.workflow_action.stream_stall_recovery_required=true, the preceding researcher failed from a Codex transport retry stall, "
                 "not from a mathematical refutation. Do not summarize the infrastructure problem as proof evidence. Instead, preserve the current "
                 "mathematical state, choose the smallest next proof obligation or route repair, and hand the researcher one compact task with "
@@ -1270,7 +1498,7 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "and research_diagnostic artifacts before proposing management actions. First try to repair the current mathematical route or identify "
             "a direct proof trunk. Decomposition is primarily researcher-owned; as advisor, triage, prune, and ask for key_failure_analysis "
             "before another split rather than making decomposition your default output. "
-            "You also supervise the researcher's and the villain's online/offline/cas work-mode loops "
+            "You also supervise the researcher's and the adversarial reviewer's online/offline/cas work-mode loops "
             "(manifest.researcher_mode_state shows both mode histories and any active directives). When the researcher should search "
             "more, think more, or experiment more, add metadata directed_researcher_mode='online'|'offline'|'cas' with "
             "directed_researcher_mode_reason and optionally directed_researcher_mode_steps (1-3) to your advisor_report; use "
@@ -1297,7 +1525,7 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "subgoals. If manifest.workflow_action.duplicate_work_guard=true, do not ask for another broad pass over the same target. "
             "Name the exact repeated task, preserve useful previous content, and recommend one sharper next delta: verifier check, route repair, "
             "source synthesis, regulator decision, or abandonment of a low-yield route. "
-            "If a computation would clarify a route, do not run it yourself; ask researcher or villain for one bounded CAS check with backend/task, "
+            "If a computation would clarify a route, do not run it yourself; ask a researcher or adversarial reviewer for one bounded CAS check with backend/task, "
             "finite scope, expected decisive output, and stop condition. "
             + _advisor_completion_policy_directive()
             + "If the current debt is already far from the target theorem or mainly about bookkeeping, stop decomposing: attach "
@@ -1305,10 +1533,10 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "(exact, stronger, equivalent, partial, conditional, or unrelated), and the nearest remaining mathematical obstruction; then "
             "add at most one blocking proof debt pointing back to that obstruction. Do not verify, refute, or integrate anything."
         )
-    if actor_role == "villain":
+    if actor_role in {"adversarial_reviewer", "villain"}:
         return (
             _villain_work_mode_guidance(action)
-            + "Act as the villain: an independent refutation researcher whose job is to attack the target, not to help the proof branch. "
+            + "Act as an independent adversarial reviewer: try to refute the target rather than extending the proof branch. "
             "Attack one named inference or theorem interface per pass. End with either a concrete counterexample, the smallest unsupported "
             "hypothesis, or an explicit not_refuted result; do not emit a second global proof inventory. A CAS attack must name competing "
             "hypotheses and a bounded outcome that would change the proof decision. "
@@ -1419,7 +1647,7 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "obstruction or decision change, not another broad inventory. "
             "If workflow_action.experiment_workflow_required=true or workflow_action.researcher_work_mode='cas', use the precise obstruction -> "
             "discriminating experiment -> structured observations -> candidate pattern -> counterexample search -> sharpened conjecture -> proof-attempt "
-            "loop. Follow manifest.cas_experiment_contract exactly when stamping experiment_workflow_version=1: include mathematical_question, "
+            "loop. Follow manifest.cas_experiment_contract exactly when stamping experiment_workflow_version=2: include mathematical_question, "
             "competing_hypotheses, finite_scope, backend_or_manual_method, code_or_calculation, expected_decisive_outputs, observations, counterexamples, "
             "interpretation, next_proof_move, and decision_changed. Raw output is not progress and cannot certify an infinite statement. "
             "If workflow_action.proof_compression_operation_required=true, follow manifest.proof_compression_contract exactly. Attach proof_compression "
@@ -1436,7 +1664,7 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "metadata.proved_lemma_statements to exactly the proved statements; exclude conjectures, bridges to test, and remaining obligations. "
             "Ordinary patch and verifier gates still apply. "
             "If workflow_action.closure_pressure_required=true, do not request another "
-            "broad search; prove the bridge, refute it, or make a strictly narrower theorem/case split. Consult manifest.negative_result_ledger "
+            "broad search; prove the bridge, refute it, or make a strictly narrower theorem/case split. Consult manifest.failed_approaches "
             "before reusing an old idea. Use manifest.proof_architecture_templates only when a template matches the domain. "
             "If workflow_action.closure_pipeline_required=true, the proof has left discovery mode. Freeze integrated premises and the selected "
             "route, work only workflow_action.closure_debt_id, and treat workflow_action.canonical_proof_artifact_id as the current manuscript. "
@@ -1500,7 +1728,7 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "reuse that claim_id as a premise and state only the strict mathematical delta; do not bundle the accepted theorem into a new claim. "
             "If workflow_action.near_miss_memory_required=true, name the strongest failed route in one sentence and either remove that "
             "obstruction, promote it to a lemma, or abandon the route precisely. "
-            "If workflow_action.villain_obstruction_to_lemma_required=true, try to convert construction failures or counterexample pressure "
+            "If workflow_action.adversarial_reviewer_obstruction_to_lemma_required=true, try to convert construction failures or counterexample pressure "
             "into a route obstruction, necessary condition, or usable proof step. "
             "If workflow_action.cas_check_recommended=true or manifest.cas_trigger_policy.recommended=true, run a bounded computation when "
             "a toy model, construction lemma, finite case, or obstruction can change the next mathematical decision. "
@@ -1508,7 +1736,8 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "Read the named proof_candidate_artifact_id and either create exactly one active sufficient route plus one untested/plausible "
             "inference whose evidence_artifact_ids include that proof dossier, or attach one short research_diagnostic explaining why the "
             "candidate is not verifier-ready and add one precise blocking debt. Do not request literature or decompose before making that "
-            "route/diagnostic decision. If workflow_action.proved_lemma_claim_extraction_required=true, create an exact child claim, active "
+            "route/diagnostic decision. A negative research_diagnostic must copy proof_candidate_artifact_id exactly into its metadata. "
+            "If workflow_action.proved_lemma_claim_extraction_required=true, create an exact child claim, active "
             "sufficient route, and evidence-linked inference for every missing statement in proved_lemma_candidate_statements (unless an "
             "equivalent claim already exists); do not stop after the first statement. Make each route and inference conclude its lemma rather "
             "than falsely asserting a route to the root. "
@@ -1527,11 +1756,14 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "material when possible: add or repair a route, add inference evidence, attach a proof_dossier, or state the exact remaining gap. "
             "If workflow_action.advisor_proof_candidate=true, do not leave the proof sketch as advice; translate it into a route/inference/"
             "proof_dossier for strict verification. Do not mark it verified yourself. "
-            "If workflow_action.obstruction_route_conversion_required=true, treat the villain obstruction or candidate "
+            "If workflow_action.obstruction_route_conversion_required=true, treat the adversarial-review obstruction or candidate "
             "counterexample as a route-level research signal: classify it as route_killing_obstruction, route_repair_signal, missing_hypothesis, "
             "generalized_construction_needed, or candidate_counterexample_needing_validator, then attach a proof_dossier or research_notebook "
             "that chooses exactly one next action: repair the route/inference, pause or abandon the route with a precise reason, create an "
-            "approach_portfolio decomposition plan, request one narrow source, or send the candidate counterexample to validation. "
+            "approach_portfolio decomposition plan, request one narrow source, or send the candidate counterexample to validation. The primary "
+            "response artifact metadata must copy workflow_action.obstruction_cluster_id exactly and copy the complete "
+            "workflow_action.obstruction_claim_ids, workflow_action.obstruction_artifact_ids, and "
+            "workflow_action.obstruction_proof_obligation_ids lists exactly. "
             "If workflow_action.global_obstruction_architecture_required=true, treat the run as a possible false-root situation: build a "
             "global obstruction architecture with host/composition-factor/quotient constraints, promote obstruction lemmas into claims/routes "
             "for verification, and stop defaulting to repair of the positive construction route unless the obstruction analysis genuinely supports it. "
@@ -1544,9 +1776,10 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
             "inventory. End with exactly one of: a verifier-ready route/inference, a narrower theorem-level proof debt, a precise literature/CAS "
             "request, or a route-killing obstruction. Do not mark anything verified yourself. "
             "Use manifest.researcher_packet as the active workbench when present; if it contains source_adaptation_artifacts, translate those "
-            "sources into the local proof dossier instead of merely citing them. If workflow_action.source_adaptation_digest_required=true, "
-            "digest the named source artifact first: either turn it into a local proof dossier/inference, record the exact missing hypothesis, "
-            "or attach a sharper literature_search_request for the remaining theorem. "
+            "sources into the local proof draft instead of merely citing them. If workflow_action.source_adaptation_digest_required=true, "
+            "digest the named source artifact first: copy its identifier into adapted_source_artifact_id in the primary artifact metadata, "
+            "then either turn it into a local proof draft/inference, record the exact missing hypothesis, or attach a sharper "
+            "literature_search_request for the remaining theorem. "
             "If workflow_action.proof_architecture_required=true, stop doing isolated local moves. Attach a proof_blueprint, proof_dossier, "
             "or research_notebook whose metadata includes current_best_plan, route_contracts, bottleneck_obligation, repair_attempt, "
             "speculative_proof_attempt, remaining_gaps, next_decisive_action, and paused_route_ids_respected. The current_best_plan must be "
@@ -1602,6 +1835,62 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
 
 def _codex_config(key: str, value: Any) -> str:
     return f"{key}={json.dumps(value)}"
+
+
+def _codex_permission_profile_args(codex_bin: str, profile_name: str) -> list[str]:
+    """Return a self-contained, least-privilege Codex permission profile.
+
+    The child starts with ``--ignore-user-config``, so the profile must be
+    supplied on the command line.  ``:minimal`` exposes only runtime files;
+    the current ``-C`` directory is the sole workspace root.  Evidence and
+    the exact context packet are narrowed back to read-only even though the
+    child may write ordinary scratch files in its capsule.  Direct command
+    network access stays disabled; Codex web search, when scheduled, is a
+    separately governed model tool.
+    """
+
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", profile_name):
+        raise ValueError(f"invalid Codex permission profile name: {profile_name!r}")
+    resolved_bin = Path(resolve_codex_executable(codex_bin)).expanduser().resolve(strict=False)
+    # ``codex sandbox`` re-executes the CLI inside bubblewrap.  Make only the
+    # executable directory visible, never the surrounding CODEX_HOME (which
+    # can contain credentials, sessions, and unrelated memories).
+    executable_dir = str(resolved_bin.parent)
+
+    def toml_string(value: str) -> str:
+        # JSON strings are also valid TOML basic strings for these values.
+        return json.dumps(value, ensure_ascii=False)
+
+    workspace_rules = {
+        ".": "write",
+        "context.json": "read",
+        "evidence": "read",
+        "evidence/**": "read",
+        "AGENTS.md": "read",
+        ".agents": "read",
+        ".agents/**": "read",
+        "**/.env": "deny",
+        "**/.env.*": "deny",
+        "**/.git": "deny",
+        "**/.git/**": "deny",
+    }
+    workspace_toml = ", ".join(
+        f"{toml_string(path)} = {toml_string(permission)}"
+        for path, permission in workspace_rules.items()
+    )
+    profile_toml = (
+        "{ description = \"Per-run Albilich evidence capsule\", filesystem = { "
+        f"\":minimal\" = \"read\", {toml_string(executable_dir)} = \"read\", "
+        f"\":workspace_roots\" = {{ {workspace_toml} }}"
+        " }, network = { enabled = false } }"
+    )
+    return [
+        "--strict-config",
+        "--config",
+        f"permissions.{profile_name}={profile_toml}",
+        "--config",
+        _codex_config("default_permissions", profile_name),
+    ]
 
 
 def resolve_codex_executable(codex_bin: str = "codex") -> str:
@@ -1666,12 +1955,27 @@ def build_codex_command(
         argv.extend(["-C", str(codex_workdir)])
     if model:
         argv.extend(["-m", model])
+    secure_profile = bool(sandbox and sandbox.startswith("permission-profile:"))
     if model_profile and model_profile != "default":
+        if secure_profile:
+            raise ValueError(
+                "custom Codex config profiles are incompatible with the enforced child permission profile; "
+                "pass model/reasoning settings explicitly"
+            )
         argv.extend(["--profile", model_profile])
     if reasoning_effort:
         argv.extend(["--config", _codex_config("model_reasoning_effort", reasoning_effort)])
     if sandbox:
-        argv.extend(["--sandbox", sandbox])
+        permission_prefix = "permission-profile:"
+        if sandbox.startswith(permission_prefix):
+            profile_name = sandbox.removeprefix(permission_prefix)
+            argv.extend(_codex_permission_profile_args(codex_bin, profile_name))
+        elif sandbox == "read-only":
+            # Read-only is retained for diagnostics on older Codex CLIs. Patch
+            # producing sessions require the capsule permission profile.
+            argv.extend(["--sandbox", sandbox])
+        else:
+            raise ValueError(f"unsupported Codex sandbox policy: {sandbox}")
     if web_search:
         if web_search not in {"disabled", "live"}:
             raise ValueError(f"unsupported web_search policy: {web_search}")
@@ -1695,9 +1999,29 @@ def _codex_child_exec_args(extra_args: Sequence[str] | None = None) -> list[str]
     """
 
     args = list(extra_args or ())
-    use_user_config = os.environ.get(CODEX_CHILD_USE_USER_CONFIG_ENV, "").strip().lower()
-    if use_user_config in {"1", "true", "yes", "on"}:
-        return args
+    forbidden = {
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--sandbox",
+        "-s",
+        "--profile",
+        "-p",
+        "--config",
+        "-c",
+    }
+    attempted = sorted(
+        {
+            token
+            for token in args
+            if token in forbidden
+            or any(token.startswith(flag + "=") for flag in forbidden if flag.startswith("--"))
+            or token.startswith("-c=")
+            or (token.startswith("-c") and token != "-c")
+        }
+    )
+    if attempted:
+        raise ValueError(
+            "child extra_args may not override the host permission boundary: " + ", ".join(attempted)
+        )
     guards: list[str] = []
     for guard in DEFAULT_CODEX_CHILD_EXEC_ARGS:
         if guard not in args:
@@ -1721,19 +2045,49 @@ def prepare_session(
     model_profile: str = "default",
     resume_session_id: str | None = None,
     resume_since_revision: int | None = None,
+    prior_context_hash: str = "",
+    prior_authorized_entity_ids: Sequence[str] | None = None,
 ) -> Dict[str, Any]:
     actor_role = actor_role_for_action(action)
     context_char_budget = _context_char_budget_for_action(max_context_chars, action, actor_role)
-    if resume_session_id:
-        # Same-role continuation: send only a compact delta of what changed; the agent
-        # keeps the prior manifest + read artifacts in its session context.
-        manifest = build_resume_delta_manifest(
+    effective_resume_id = str(resume_session_id or "")
+    resume_fallback_reason = ""
+    if effective_resume_id and not str(prior_context_hash or ""):
+        # A provider session id alone does not identify the mathematical
+        # context it is expected to retain.  Cold-start when the exact prior
+        # packet hash is unavailable.
+        effective_resume_id = ""
+        resume_fallback_reason = "resume refused because the prior context hash is unavailable"
+        manifest = build_context_manifest(
             store,
             target_id=str(action.get("target_id") or "root"),
             route_id=str(action.get("route_id") or "") or None,
+            max_chars=context_char_budget,
             action=action,
-            since_revision=int(resume_since_revision or 0),
         )
+    elif effective_resume_id:
+        try:
+            manifest = build_resume_delta_manifest(
+                store,
+                target_id=str(action.get("target_id") or "root"),
+                route_id=str(action.get("route_id") or "") or None,
+                action=action,
+                since_revision=int(resume_since_revision or 0),
+                prior_context_hash=prior_context_hash,
+                max_chars=context_char_budget,
+            )
+        except (ResumeDeltaUnavailableError, ContextTooLargeError) as exc:
+            # A cold session with a complete current packet is safer than a
+            # continuation whose intervening history is missing or over limit.
+            effective_resume_id = ""
+            resume_fallback_reason = str(exc)
+            manifest = build_context_manifest(
+                store,
+                target_id=str(action.get("target_id") or "root"),
+                route_id=str(action.get("route_id") or "") or None,
+                max_chars=context_char_budget,
+                action=action,
+            )
     else:
         manifest = build_context_manifest(
             store,
@@ -1742,8 +2096,8 @@ def prepare_session(
             max_chars=context_char_budget,
             action=action,
         )
-    context_hash = manifest_hash(manifest)
-    path = _context_path(store, action, context_hash)
+    preliminary_context_hash = manifest_hash(manifest)
+    path = _context_path(store, action, preliminary_context_hash)
     path.parent.mkdir(parents=True, exist_ok=True)
     capsule = _materialize_evidence_capsule(
         manifest,
@@ -1757,13 +2111,23 @@ def prepare_session(
     )
     manifest_for_child = capsule["manifest"]
     path = capsule["context_path"]
+    # Evidence materialization rewrites paths. Bind the session authority to
+    # the exact packet the child reads, not the pre-capsule source manifest.
+    context_hash = manifest_hash(manifest_for_child)
+    manifest_for_child["manifest_hash"] = context_hash
     path.write_text(render_manifest(manifest_for_child), encoding="utf-8")
+    authorized_existing_entity_ids = _disclosed_entity_ids(
+        manifest_for_child,
+        action,
+        prior_authorized_entity_ids if effective_resume_id else None,
+    )
     command = build_codex_command(
         context_path=path,
         mode=str(action.get("mode", "prove")),
         model_profile=model_profile,
         actor_role=actor_role,
         extra_args=_codex_child_exec_args(),
+        sandbox=DEFAULT_SANDBOX,
         codex_workdir=capsule["workdir"],
     )
     return {
@@ -1771,8 +2135,9 @@ def prepare_session(
         "created_at": utc_now(),
         "problem_id": store.problem_id,
         "state_revision": manifest_for_child["state_revision"],
-        "resume_session_id": resume_session_id or "",
-        "resume_delta": bool(resume_session_id),
+        "resume_session_id": effective_resume_id,
+        "resume_delta": bool(effective_resume_id),
+        "resume_fallback_reason": resume_fallback_reason,
         "mode": action.get("mode"),
         "actor_role": actor_role,
         "target_id": action.get("target_id"),
@@ -1780,16 +2145,69 @@ def prepare_session(
         "context_path": str(path),
         "codex_workdir": str(capsule["workdir"]),
         "context_hash": context_hash,
+        "audit_chain_heads": dict(
+            manifest_for_child.get("audit_chain_heads") or {}
+        ),
+        "policy_event_head": str(
+            (manifest_for_child.get("audit_chain_heads") or {}).get(
+                "policy_event_head"
+            )
+            or ""
+        ),
+        "context_request_ids": [
+            str(item)
+            for item in action.get("context_request_ids", []) or []
+            if str(item)
+        ],
+        "authorized_existing_entity_ids": authorized_existing_entity_ids,
         "estimated_context_tokens": manifest_for_child.get("estimated_context_tokens", 0),
         "context_char_budget": context_char_budget,
         "search_intent": action.get("search_intent", ""),
         "researcher_work_mode": action.get("researcher_work_mode", ""),
         "work_mode_source": action.get("work_mode_source", ""),
+        "strategy_family": strategy_family(action),
+        "cas_enabled": session_cas_enabled(actor_role, action),
         "model_profile": model_profile,
         "model_routing_hint": _model_routing_hint(action, actor_role),
         "command": command,
         "execute": False,
     }
+
+
+def _disclosed_entity_ids(
+    manifest: Mapping[str, Any],
+    action: Mapping[str, Any],
+    prior_ids: Sequence[str] | None = None,
+) -> list[str]:
+    """Return identifiers the host intentionally disclosed to this session."""
+
+    result = {str(item) for item in (prior_ids or ()) if str(item)}
+
+    def visit(value: Any, key: str = "") -> None:
+        if isinstance(value, Mapping):
+            for child_key, child_value in value.items():
+                visit(child_value, str(child_key))
+            return
+        if isinstance(value, list):
+            if key.endswith("_ids"):
+                result.update(str(item) for item in value if str(item))
+            else:
+                for item in value:
+                    visit(item, key)
+            return
+        if key.endswith("_id") and value is not None and str(value):
+            result.add(str(value))
+
+    visit(manifest)
+    visit(action)
+    result.update(
+        {
+            str(action.get("target_id") or ""),
+            str(action.get("route_id") or ""),
+        }
+    )
+    result.discard("")
+    return sorted(result)
 
 
 def _materialize_evidence_capsule(
@@ -1800,7 +2218,10 @@ def _materialize_evidence_capsule(
     agent_instructions_path: Path | None = None,
 ) -> Dict[str, Any]:
     """Copy manifest-listed local evidence into a per-context child workspace."""
-    capsule_dir = context_path.with_suffix("")
+    # A content hash can recur across retries.  Never reuse its former
+    # workspace: a killed or malicious child may have left unlisted files
+    # there, and a later child must not inherit them as ambient evidence.
+    capsule_dir = context_path.with_suffix("") / f"capsule-{uuid.uuid4().hex}"
     evidence_dir = capsule_dir / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
     if project_agents_dir is not None and project_agents_dir.is_dir():
@@ -1812,21 +2233,72 @@ def _materialize_evidence_capsule(
         shutil.copy2(agent_instructions_path, capsule_dir / "AGENTS.md")
     child_manifest = json.loads(json.dumps(manifest))
     path_map: dict[str, str] = {}
+    path_hashes: dict[str, str] = {}
+    materialized_bytes = 0
 
-    def capsule_path_for(source: str) -> str:
+    def capsule_path_for(
+        source: str,
+        *,
+        expected_sha256: str = "",
+        require_integrity: bool = False,
+    ) -> str:
+        nonlocal materialized_bytes
         if source in path_map:
+            expected = expected_sha256.strip().lower()
+            if require_integrity and not re.fullmatch(r"[0-9a-f]{64}", expected):
+                raise ValueError(f"evidence artifact has no valid sha256: {source}")
+            if expected and path_hashes.get(source) != expected:
+                raise ValueError(f"evidence artifact hash mismatch: {source}")
             return path_map[source]
-        source_path = Path(source)
+        source_path = Path(source).expanduser()
         if not source_path.exists() or not source_path.is_file():
+            if require_integrity:
+                raise ValueError(f"evidence artifact file is missing: {source}")
             path_map[source] = source
             return source
-        target = evidence_dir / source_path.name
-        counter = 1
-        while target.exists() and target.read_bytes() != source_path.read_bytes():
-            target = evidence_dir / f"{source_path.stem}_{counter}{source_path.suffix}"
-            counter += 1
-        if not target.exists():
-            shutil.copy2(source_path, target)
+        absolute_path = Path(os.path.abspath(source_path))
+        resolved_path = source_path.resolve(strict=True)
+        if resolved_path != absolute_path:
+            raise ValueError(f"evidence path traverses a symbolic link: {source}")
+        source_stat = resolved_path.stat()
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError(f"evidence path is not a regular file: {source}")
+        if source_stat.st_size > MAX_EVIDENCE_FILE_BYTES:
+            raise ValueError(
+                f"evidence file exceeds {MAX_EVIDENCE_FILE_BYTES} bytes: {source}"
+            )
+        if materialized_bytes + source_stat.st_size > MAX_EVIDENCE_CAPSULE_BYTES:
+            raise ValueError(
+                f"evidence capsule exceeds {MAX_EVIDENCE_CAPSULE_BYTES} bytes"
+            )
+        materialized_bytes += source_stat.st_size
+        source_key = sha256_text(str(resolved_path))[:12]
+        target = evidence_dir / f"{source_key}_{resolved_path.name}"
+        shutil.copy2(resolved_path, target)
+        # Detect a source swap during the copy without loading large assets in
+        # memory. Size/mtime/inode changes fail closed, and registered artifact
+        # bytes are checked against the proof-state SHA-256 below.
+        after_stat = resolved_path.stat()
+        if (
+            after_stat.st_dev != source_stat.st_dev
+            or after_stat.st_ino != source_stat.st_ino
+            or after_stat.st_size != source_stat.st_size
+            or after_stat.st_mtime_ns != source_stat.st_mtime_ns
+        ):
+            raise ValueError(f"evidence file changed while being materialized: {source}")
+        digest = hashlib.sha256()
+        with target.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual_sha256 = digest.hexdigest()
+        expected = expected_sha256.strip().lower()
+        if require_integrity and not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ValueError(f"evidence artifact has no valid sha256: {source}")
+        if expected and actual_sha256 != expected:
+            raise ValueError(
+                f"evidence artifact hash mismatch: {actual_sha256} != {expected} for {source}"
+            )
+        path_hashes[source] = actual_sha256
         path_map[source] = str(target)
         return path_map[source]
 
@@ -1834,12 +2306,20 @@ def _materialize_evidence_capsule(
     if isinstance(artifacts, list):
         for artifact in artifacts:
             if isinstance(artifact, dict) and artifact.get("path"):
-                artifact["path"] = capsule_path_for(str(artifact["path"]))
-    negative_result_ledger = child_manifest.get("negative_result_ledger", [])
-    if isinstance(negative_result_ledger, list):
-        for artifact in negative_result_ledger:
+                artifact["path"] = capsule_path_for(
+                    str(artifact["path"]),
+                    expected_sha256=str(artifact.get("sha256") or ""),
+                    require_integrity=True,
+                )
+    failed_approaches = child_manifest.get("failed_approaches", [])
+    if isinstance(failed_approaches, list):
+        for artifact in failed_approaches:
             if isinstance(artifact, dict) and artifact.get("path"):
-                artifact["path"] = capsule_path_for(str(artifact["path"]))
+                artifact["path"] = capsule_path_for(
+                    str(artifact["path"]),
+                    expected_sha256=str(artifact.get("sha256") or ""),
+                    require_integrity=True,
+                )
     policy = child_manifest.get("local_search_policy")
     if isinstance(policy, dict):
         allowed = policy.get("allowed_local_evidence_paths")
@@ -1852,7 +2332,12 @@ def _materialize_evidence_capsule(
     if isinstance(cas_tooling, dict) and isinstance(cas_tooling.get("assets"), list):
         for asset in cas_tooling["assets"]:
             if isinstance(asset, dict) and asset.get("path"):
-                asset["path"] = capsule_path_for(str(asset["path"]))
+                expected = str(asset.get("sha256") or "")
+                asset["path"] = capsule_path_for(
+                    str(asset["path"]),
+                    expected_sha256=expected,
+                    require_integrity=bool(expected),
+                )
 
     # Artifact cards can be repeated in role packets, decomposition summaries,
     # proof-spine views, and research-strategy cards.  Rewrite every exact
@@ -1876,7 +2361,7 @@ def _materialize_evidence_capsule(
 
 def _model_routing_hint(action: Mapping[str, Any], actor_role: str) -> Dict[str, Any]:
     mode = str(action.get("mode") or "")
-    if actor_role in {"researcher", "villain", "strict_informal_verifier", "integration_verifier"}:
+    if actor_role in {"researcher", "adversarial_reviewer", "villain", "strict_informal_verifier", "integration_verifier"}:
         return {
             "tier": "strong_math",
             "reason": "proof construction, refutation pressure, strict verification, or integration alignment needs maximum mathematical reasoning",
@@ -1924,11 +2409,13 @@ def _context_char_budget_for_action(max_context_chars: int, action: Mapping[str,
         return max(max_context_chars, 60_000)
     if actor_role == "strict_informal_verifier" and (action.get("route_id") or action.get("proof_repair_verification_required")):
         return max(max_context_chars, 60_000)
+    if actor_role in {"integration_verifier", "formal_backend"}:
+        return max(max_context_chars, 60_000)
     if actor_role == "researcher" and action.get("creative_proof_attack_required"):
         return max(max_context_chars, 80_000)
     if actor_role == "researcher" and mode in {"prove", "reduce", "weaken", "strengthen"}:
         return max(max_context_chars, 50_000)
-    if actor_role == "villain":
+    if actor_role in {"adversarial_reviewer", "villain"}:
         return max(max_context_chars, 50_000)
     if actor_role == "literature_researcher":
         return max(max_context_chars, 30_000)
@@ -1969,8 +2456,22 @@ def execute_session(
     extra_args: Sequence[str] | None = None,
     progress_callback: ProgressCallback | None = None,
     stop_event: threading.Event | None = None,
+    aggregate_rss_governor: AggregateProcessTreeRSSGovernor | None = None,
+    enforce_backend_contract: bool = True,
 ) -> Dict[str, Any]:
+    storage_admission = enforce_local_storage_limit(store)
     codex_bin = resolve_codex_executable(codex_bin)
+    backend_attestation: Dict[str, Any] = (
+        attest_backend(codex_bin, "codex")
+        if enforce_backend_contract
+        else {
+            "backend_contract_version": 0,
+            "backend": "codex",
+            "status": "explicit_test_override",
+        }
+    )
+    if enforce_backend_contract:
+        codex_bin = str(backend_attestation["executable_path"])
     actor_role = str(session_plan.get("actor_role") or actor_role_for_action(action))
     mode = str(action.get("mode") or "step")
     target_id = str(action.get("target_id") or "root")
@@ -1983,6 +2484,45 @@ def execute_session(
     plan_workdir = str(session_plan.get("codex_workdir") or "")
     workdir = codex_workdir or (Path(plan_workdir) if plan_workdir else store.generation_root.parents[1])
     resume_session_id = str(session_plan.get("resume_session_id") or "")
+    assurance_conflict = assurance_backend_conflict(
+        action,
+        backend="codex",
+        model=model,
+    )
+    if assurance_conflict:
+        message = str(assurance_conflict["message"])
+        log_path.write_text(f"[albilich] {message}\n", encoding="utf-8")
+        return {
+            "backend": "codex",
+            "backend_attestation": backend_attestation,
+            "storage_admission": {
+                "storage_policy_version": storage_admission["storage_policy_version"],
+                "total_local_bytes": storage_admission["total_local_bytes"],
+                "hard_limit_bytes": storage_admission["hard_limit_bytes"],
+            },
+            "run_id": run_id,
+            "actor_role": actor_role,
+            "status": "blocked",
+            "returncode": -1,
+            "wall_time_seconds": 0.0,
+            "peak_memory_mb": 0.0,
+            "usage": parse_session_usage({}),
+            "session_id": "",
+            "patch": None,
+            "patch_error": message,
+            "output_artifact_ids": [],
+            "final_message_path": str(final_path),
+            "log_path": str(log_path),
+            "command": [],
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "sandbox": sandbox,
+            "web_search": web_search or "",
+            "preflight_repair": {},
+            "failure_kind": str(assurance_conflict["failure_kind"]),
+            "progress_callback_errors": [],
+            "assurance_backend_conflict": assurance_conflict,
+        }
     prompt = build_session_prompt(context_path=context_path, action=action, actor_role=actor_role, resume=bool(resume_session_id))
     session_extra_args = list(extra_args or ())
     if actor_role == "writer" and (
@@ -2014,6 +2554,8 @@ def execute_session(
         codex_workdir=workdir,
         resume_session_id=resume_session_id or None,
     )
+    if enforce_backend_contract:
+        validate_launch_command("codex", command, backend_attestation)
 
     started = time.monotonic()
     returncode = -1
@@ -2022,12 +2564,59 @@ def execute_session(
     process: subprocess.Popen[str] | None = None
     stream_thread: threading.Thread | None = None
     peak_memory_mb = 0.0
+    aggregate_current_rss_mb = 0.0
+    progress_callback_errors: list[str] = []
+    child_output_limit = threading.Event()
+    max_child_rss_mb = _child_max_rss_mb()
+    resource_limits = {
+        "max_process_tree_rss_mb": max_child_rss_mb,
+        "max_aggregate_child_process_tree_rss_mb": (
+            aggregate_rss_governor.limit_mb
+            if aggregate_rss_governor is not None
+            else None
+        ),
+        "max_child_log_bytes": MAX_CHILD_LOG_BYTES,
+        "max_model_response_bytes": MAX_MODEL_RESPONSE_BYTES,
+        "resource_poll_seconds_max": MAX_RESOURCE_POLL_SECONDS,
+        "enforcement": "supervisor polling plus bounded host capture",
+    }
 
-    def sample_peak_memory_mb() -> float:
-        nonlocal peak_memory_mb
-        if process is not None:
-            peak_memory_mb = max(peak_memory_mb, _process_tree_rss_mb(process.pid))
-        return peak_memory_mb
+    def sample_process_memory() -> tuple[float, float, bool]:
+        nonlocal peak_memory_mb, aggregate_current_rss_mb
+        current_rss_mb = (
+            _process_tree_rss_mb(process.pid) if process is not None else 0.0
+        )
+        peak_memory_mb = max(peak_memory_mb, current_rss_mb)
+        aggregate_exceeded = False
+        if aggregate_rss_governor is not None:
+            aggregate_current_rss_mb, aggregate_exceeded = (
+                aggregate_rss_governor.observe(
+                    run_id,
+                    current_rss_mb,
+                    stop_event=stop_event,
+                )
+            )
+        else:
+            aggregate_current_rss_mb = current_rss_mb
+        return current_rss_mb, aggregate_current_rss_mb, aggregate_exceeded
+
+    def aggregate_limit_tripped() -> bool:
+        return bool(
+            aggregate_rss_governor is not None
+            and aggregate_rss_governor.snapshot()["tripped"]
+        )
+
+    def aggregate_limit_detail() -> str:
+        snapshot = (
+            aggregate_rss_governor.snapshot()
+            if aggregate_rss_governor is not None
+            else {"peak_mb": 0.0, "limit_mb": 0.0}
+        )
+        return (
+            "aggregate child process-tree RSS "
+            f"{float(snapshot['peak_mb']):.3f} MB exceeded "
+            f"{float(snapshot['limit_mb']):.3f} MB"
+        )
 
     def emit_progress(phase: str, *, progress_status: str = "running", current_returncode: int | str = "") -> None:
         if progress_callback is None:
@@ -2036,6 +2625,9 @@ def execute_session(
         live_parse_log = _join_log_samples(_read_text_head(log_path), log_tail)
         live_session_id = parse_session_id(live_parse_log)
         live_usage = resolve_cli_usage(live_parse_log, session_id=live_session_id)
+        _current_rss_mb, aggregate_rss_mb, _aggregate_exceeded = (
+            sample_process_memory()
+        )
         payload = {
             "run_id": run_id,
             "actor_role": actor_role,
@@ -2047,7 +2639,8 @@ def execute_session(
             "status": progress_status,
             "returncode": current_returncode,
             "elapsed_seconds": round(time.monotonic() - started, 3),
-            "peak_memory_mb": round(sample_peak_memory_mb(), 1),
+            "peak_memory_mb": round(peak_memory_mb, 1),
+            "aggregate_child_process_tree_rss_mb": round(aggregate_rss_mb, 1),
             "updated_at": utc_now(),
             "session_id": live_session_id,
             "usage": live_usage,
@@ -2059,8 +2652,8 @@ def execute_session(
         }
         try:
             progress_callback(payload)
-        except Exception:
-            pass
+        except Exception as exc:  # intentional-boundary: observer callbacks cannot control the child process
+            progress_callback_errors.append(f"{type(exc).__name__}: {exc}"[:1000])
 
     try:
         with log_path.open("w", encoding="utf-8") as log_file:
@@ -2072,9 +2665,27 @@ def execute_session(
                     log_file.flush()
 
             if stop_event is not None and stop_event.is_set():
-                status = "cancelled"
-                write_log("[albilich] session cancelled before launch.\n")
-                emit_progress("cancelled", progress_status=status, current_returncode=returncode)
+                if aggregate_limit_tripped():
+                    status = "failed"
+                    failure_kind = "resource_limit"
+                    write_log(
+                        "[albilich] resource limit before launch: "
+                        f"{aggregate_limit_detail()}.\n"
+                    )
+                    emit_progress(
+                        "resource_limit",
+                        progress_status=status,
+                        current_returncode=returncode,
+                    )
+                else:
+                    status = "cancelled"
+                    failure_kind = "cancelled"
+                    write_log("[albilich] session cancelled before launch.\n")
+                    emit_progress(
+                        "cancelled",
+                        progress_status=status,
+                        current_returncode=returncode,
+                    )
             else:
                 process = subprocess.Popen(
                     command,
@@ -2083,6 +2694,7 @@ def execute_session(
                         actor_role=actor_role,
                         cas_enabled=session_cas_enabled(actor_role, action),
                         codex_bin=codex_bin,
+                        workspace_dir=workdir,
                     ),
                     text=True,
                     stdout=subprocess.PIPE,
@@ -2092,7 +2704,13 @@ def execute_session(
                 if process.stdout is not None:
                     stream_thread = threading.Thread(
                         target=_stream_child_log,
-                        args=(process.stdout, log_file, log_lock),
+                        args=(
+                            process.stdout,
+                            log_file,
+                            log_lock,
+                            child_output_limit,
+                            MAX_CHILD_LOG_BYTES,
+                        ),
                         daemon=True,
                     )
                     stream_thread.start()
@@ -2108,14 +2726,85 @@ def execute_session(
                 retry_stall_started_at: float | None = None
                 while True:
                     if stop_event is not None and stop_event.is_set():
-                        status = "cancelled"
-                        failure_kind = "cancelled"
+                        resource_cancel = aggregate_limit_tripped()
+                        status = "failed" if resource_cancel else "cancelled"
+                        failure_kind = (
+                            "resource_limit" if resource_cancel else "cancelled"
+                        )
                         _terminate_process(process)
                         returncode = process.returncode if process.returncode is not None else -1
                         if stream_thread is not None:
                             stream_thread.join(timeout=2)
-                        write_log("\n[albilich] session cancelled and was terminated.\n")
-                        emit_progress("cancelled", progress_status=status, current_returncode=returncode)
+                        if resource_cancel:
+                            write_log(
+                                "\n[albilich] resource limit: "
+                                f"{aggregate_limit_detail()}; session was terminated.\n"
+                            )
+                            progress_phase = "resource_limit"
+                        else:
+                            write_log(
+                                "\n[albilich] session cancelled and was terminated.\n"
+                            )
+                            progress_phase = "cancelled"
+                        emit_progress(
+                            progress_phase,
+                            progress_status=status,
+                            current_returncode=returncode,
+                        )
+                        break
+                    (
+                        current_rss_mb,
+                        aggregate_rss_mb,
+                        aggregate_rss_exceeded,
+                    ) = sample_process_memory()
+                    final_response_too_large = False
+                    try:
+                        final_response_too_large = (
+                            final_path.is_file()
+                            and final_path.stat().st_size > MAX_MODEL_RESPONSE_BYTES
+                        )
+                    except OSError:
+                        pass
+                    if (
+                        child_output_limit.is_set()
+                        or final_response_too_large
+                        or current_rss_mb > max_child_rss_mb
+                        or aggregate_rss_exceeded
+                    ):
+                        status = "failed"
+                        failure_kind = "resource_limit"
+                        if child_output_limit.is_set():
+                            detail = (
+                                f"child log exceeded {MAX_CHILD_LOG_BYTES} bytes"
+                            )
+                        elif final_response_too_large:
+                            detail = (
+                                "model response exceeded "
+                                f"{MAX_MODEL_RESPONSE_BYTES} bytes"
+                            )
+                        elif current_rss_mb > max_child_rss_mb:
+                            detail = (
+                                f"child process tree RSS {current_rss_mb:.1f} MB exceeded "
+                                f"{max_child_rss_mb:.1f} MB"
+                            )
+                        else:
+                            detail = aggregate_limit_detail()
+                            if stop_event is not None:
+                                stop_event.set()
+                        _terminate_process(process)
+                        returncode = (
+                            process.returncode
+                            if process.returncode is not None
+                            else -1
+                        )
+                        if stream_thread is not None:
+                            stream_thread.join(timeout=2)
+                        write_log(f"\n[albilich] resource limit: {detail}.\n")
+                        emit_progress(
+                            "resource_limit",
+                            progress_status=status,
+                            current_returncode=returncode,
+                        )
                         break
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -2172,7 +2861,7 @@ def execute_session(
     except OSError as exc:
         log_path.write_text(f"[albilich] failed to launch Codex session: {exc}\n", encoding="utf-8")
         emit_progress("failed_to_launch", progress_status="failed", current_returncode=returncode)
-    except BaseException:
+    except BaseException:  # intentional-boundary: terminate the subprocess before propagating interruption
         if process is not None and process.poll() is None:
             _terminate_process(process)
             returncode = process.returncode if process.returncode is not None else -1
@@ -2182,17 +2871,53 @@ def execute_session(
             except OSError:
                 pass
             emit_progress("interrupted", progress_status="cancelled", current_returncode=returncode)
+        if aggregate_rss_governor is not None:
+            aggregate_rss_governor.release(run_id)
         raise
     wall = time.monotonic() - started
-    sample_peak_memory_mb()
+    sample_process_memory()
+
+    if child_output_limit.is_set():
+        status = "failed"
+        failure_kind = "resource_limit"
+
+    backend_integrity_error = ""
+    if enforce_backend_contract and not attested_backend_unchanged(
+        backend_attestation
+    ):
+        backend_integrity_error = (
+            "attested Codex executable changed while the child session was running"
+        )
+        status = "failed"
+        failure_kind = "backend_executable_changed"
 
     log_head = _read_text_head(log_path)
     log_tail = _read_text_tail(log_path)
     parse_log = _join_log_samples(log_head, log_tail)
     if status == "failed" and not failure_kind:
         failure_kind = _failed_process_kind(log_tail)
-    final_text = final_path.read_text(encoding="utf-8") if final_path.exists() else log_tail
-    patch, patch_error = extract_patch_from_text(final_text)
+    final_text, final_response_too_large = _read_bounded_text(
+        final_path,
+        max_bytes=MAX_MODEL_RESPONSE_BYTES,
+    )
+    if not final_path.exists():
+        final_text = log_tail
+    if final_response_too_large:
+        status = "failed"
+        failure_kind = "resource_limit"
+        patch = None
+        patch_error = (
+            f"model response exceeds {MAX_MODEL_RESPONSE_BYTES} bytes"
+        )
+        _replace_oversized_model_output(
+            final_path,
+            max_bytes=MAX_MODEL_RESPONSE_BYTES,
+        )
+    else:
+        patch, patch_error = extract_patch_from_text(final_text)
+    if backend_integrity_error:
+        patch = None
+        patch_error = backend_integrity_error
     _persist_normalized_final_patch(final_path, final_text, patch)
     if patch is None and status in {"failed", "timeout", "cancelled"}:
         patch_error = _session_failure_summary(
@@ -2219,7 +2944,7 @@ def execute_session(
         )
         repair_window = max(1, timeout_sec) - (time.monotonic() - started)
         if preflight_errors and session_id and repair_window > 180:
-            repair_prompt = "\n".join(
+            repair_prompt = _standardize_prompt_terminology("\n".join(
                 [
                     "PATCH PRE-FLIGHT REJECTION. The patch you just returned would be rejected by the Albilich workflow:",
                     *[f"- {error}" for error in preflight_errors],
@@ -2232,7 +2957,7 @@ def execute_session(
                     "text without LaTeX backslash commands.",
                     "Return only the JSON object, with no markdown fence and no prose.",
                 ]
-            )
+            ), protected_values=_prompt_protocol_values(action))
             repair_command = build_codex_command(
                 context_path=context_path,
                 mode=mode,
@@ -2249,33 +2974,120 @@ def execute_session(
                 codex_workdir=workdir,
                 resume_session_id=session_id,
             )
+            if enforce_backend_contract:
+                validate_launch_command(
+                    "codex", repair_command, backend_attestation
+                )
             emit_progress("preflight_repair")
             try:
                 with log_path.open("a", encoding="utf-8") as log_file:
                     log_file.write("\n[albilich] pre-flight repair attempt: " + "; ".join(preflight_errors) + "\n")
-                repair_process = subprocess.Popen(
-                    repair_command,
-                    cwd=workdir,
-                    env=_codex_child_env(
-                        actor_role=actor_role,
-                        cas_enabled=session_cas_enabled(actor_role, action),
-                        codex_bin=codex_bin,
-                    ),
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-                try:
-                    repair_stdout, _ = repair_process.communicate(timeout=min(repair_window, 1800.0))
-                except subprocess.TimeoutExpired:
-                    _terminate_process(repair_process)
-                    repair_stdout = ""
-                with log_path.open("a", encoding="utf-8") as log_file:
-                    log_file.write(repair_stdout or "")
+                    log_file.flush()
+                    repair_log_lock = threading.Lock()
+                    repair_output_limit = threading.Event()
+                    repair_process = subprocess.Popen(
+                        repair_command,
+                        cwd=workdir,
+                        env=_codex_child_env(
+                            actor_role=actor_role,
+                            cas_enabled=session_cas_enabled(actor_role, action),
+                            codex_bin=codex_bin,
+                            workspace_dir=workdir,
+                        ),
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    repair_stream: threading.Thread | None = None
+                    if repair_process.stdout is not None:
+                        repair_stream = threading.Thread(
+                            target=_stream_child_log,
+                            args=(
+                                repair_process.stdout,
+                                log_file,
+                                repair_log_lock,
+                                repair_output_limit,
+                                MAX_CHILD_LOG_BYTES,
+                            ),
+                            daemon=True,
+                        )
+                        repair_stream.start()
+                    repair_deadline = time.monotonic() + min(
+                        repair_window, 1800.0
+                    )
+                    repair_limit_error = ""
+                    while repair_process.poll() is None:
+                        repair_rss_mb = _process_tree_rss_mb(repair_process.pid)
+                        repair_aggregate_rss_mb = repair_rss_mb
+                        repair_aggregate_exceeded = False
+                        if aggregate_rss_governor is not None:
+                            (
+                                repair_aggregate_rss_mb,
+                                repair_aggregate_exceeded,
+                            ) = aggregate_rss_governor.observe(
+                                run_id,
+                                repair_rss_mb,
+                                stop_event=stop_event,
+                            )
+                        final_too_large = False
+                        try:
+                            final_too_large = (
+                                final_path.is_file()
+                                and final_path.stat().st_size
+                                > MAX_MODEL_RESPONSE_BYTES
+                            )
+                        except OSError:
+                            pass
+                        if repair_output_limit.is_set() or final_too_large:
+                            repair_limit_error = "repair output exceeded its byte limit"
+                        elif repair_rss_mb > max_child_rss_mb:
+                            repair_limit_error = (
+                                f"repair process tree RSS {repair_rss_mb:.1f} MB "
+                                f"exceeded {max_child_rss_mb:.1f} MB"
+                            )
+                        elif repair_aggregate_exceeded:
+                            repair_limit_error = (
+                                "aggregate child process-tree RSS "
+                                f"{repair_aggregate_rss_mb:.1f} MB exceeded "
+                                f"{aggregate_rss_governor.limit_mb:.1f} MB"
+                            )
+                        if repair_limit_error:
+                            _terminate_process(repair_process)
+                            break
+                        if time.monotonic() >= repair_deadline:
+                            _terminate_process(repair_process)
+                            break
+                        try:
+                            repair_process.wait(timeout=0.5)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    if repair_stream is not None:
+                        repair_stream.join(timeout=2)
+                    if repair_limit_error:
+                        status = "failed"
+                        failure_kind = "resource_limit"
+                        log_file.write(
+                            f"\n[albilich] repair resource limit: {repair_limit_error}.\n"
+                        )
                     log_file.write("\n[albilich] pre-flight repair finished.\n")
-                repaired_text = final_path.read_text(encoding="utf-8") if final_path.exists() else ""
-                repaired_patch, repaired_error = extract_patch_from_text(repaired_text)
+                repaired_text, repaired_too_large = _read_bounded_text(
+                    final_path,
+                    max_bytes=MAX_MODEL_RESPONSE_BYTES,
+                )
+                if repaired_too_large:
+                    _replace_oversized_model_output(
+                        final_path,
+                        max_bytes=MAX_MODEL_RESPONSE_BYTES,
+                    )
+                    repaired_patch, repaired_error = (
+                        None,
+                        f"repair response exceeds {MAX_MODEL_RESPONSE_BYTES} bytes",
+                    )
+                else:
+                    repaired_patch, repaired_error = extract_patch_from_text(
+                        repaired_text
+                    )
                 errors_after = (
                     preflight_patch_errors(repaired_patch, actor_role)
                     if repaired_patch is not None
@@ -2291,6 +3103,16 @@ def execute_session(
                     _persist_normalized_final_patch(final_path, repaired_text, repaired_patch)
                     patch = repaired_patch
                     patch_error = ""
+                if enforce_backend_contract and not attested_backend_unchanged(
+                    backend_attestation
+                ):
+                    backend_integrity_error = (
+                        "attested Codex executable changed while the repair session was running"
+                    )
+                    status = "failed"
+                    failure_kind = "backend_executable_changed"
+                    patch = None
+                    patch_error = backend_integrity_error
                 wall = time.monotonic() - started
                 repair_parse_log = _join_log_samples(_read_text_head(log_path), _read_text_tail(log_path))
                 usage = resolve_cli_usage(repair_parse_log, session_id=session_id)
@@ -2300,13 +3122,31 @@ def execute_session(
     output_artifact_ids = attached_artifact_ids(patch) if patch else []
     if patch is None and status == "completed":
         status = "no_patch"
-    return {
+    aggregate_rss_snapshot = (
+        aggregate_rss_governor.snapshot()
+        if aggregate_rss_governor is not None
+        else {
+            "peak_mb": peak_memory_mb,
+        }
+    )
+    result = {
+        "backend": "codex",
+        "backend_attestation": backend_attestation,
+        "storage_admission": {
+            "storage_policy_version": storage_admission["storage_policy_version"],
+            "total_local_bytes": storage_admission["total_local_bytes"],
+            "hard_limit_bytes": storage_admission["hard_limit_bytes"],
+        },
         "run_id": run_id,
         "actor_role": actor_role,
         "status": status,
         "returncode": returncode,
         "wall_time_seconds": round(wall, 3),
         "peak_memory_mb": round(peak_memory_mb, 1),
+        "observed_aggregate_peak_memory_mb": round(
+            float(aggregate_rss_snapshot["peak_mb"]),
+            3,
+        ),
         "usage": usage,
         "session_id": session_id,
         "patch": patch,
@@ -2321,7 +3161,12 @@ def execute_session(
         "web_search": web_search or "",
         "preflight_repair": preflight_repair,
         "failure_kind": failure_kind,
+        "progress_callback_errors": progress_callback_errors,
+        "resource_limits": resource_limits,
     }
+    if aggregate_rss_governor is not None:
+        aggregate_rss_governor.release(run_id)
+    return result
 
 
 def _session_failure_summary(*, status: str, returncode: int, log_tail: str, fallback: str) -> str:
@@ -2368,9 +3213,18 @@ def _codex_child_env(
     actor_role: str = "",
     cas_enabled: Optional[bool] = None,
     codex_bin: str = "",
+    workspace_dir: Path | str | None = None,
 ) -> Dict[str, str]:
     env = os.environ.copy()
-    tmp_root = Path(env.get("ALBILICH_CODEX_TMPDIR") or DEFAULT_CODEX_CHILD_TMPDIR).expanduser()
+    if workspace_dir is not None:
+        # Keep all model-generated temporary material inside the permission
+        # profile's unique workspace.  A global shared temp directory would
+        # permit cross-session reads and writes.
+        tmp_root = Path(workspace_dir).resolve() / ".tmp"
+    else:
+        # Compatibility for direct helper use and existing administrative
+        # tooling; production child launches always pass ``workspace_dir``.
+        tmp_root = Path(env.get("ALBILICH_CODEX_TMPDIR") or DEFAULT_CODEX_CHILD_TMPDIR).expanduser()
     pycache_root = tmp_root / "pycache"
     dot_sage_root = tmp_root / ".sage"
     try:
@@ -2461,18 +3315,73 @@ def _should_suppress_child_log_line(line: str) -> bool:
     return any(fragment in line for fragment in NOISY_CODEX_LOG_FRAGMENTS)
 
 
-def _stream_child_log(pipe: Any, log_file: Any, log_lock: threading.Lock) -> None:
+def _stream_child_log(
+    pipe: Any,
+    log_file: Any,
+    log_lock: threading.Lock,
+    limit_event: threading.Event | None = None,
+    max_bytes: int = MAX_CHILD_LOG_BYTES,
+) -> None:
+    """Drain child output while bounding the persisted host log.
+
+    Reading fixed-size chunks avoids allocating an attacker-controlled line.
+    Once the cap is reached the pipe is still drained so the child cannot block
+    on a full stdout pipe while the supervising loop notices ``limit_event``.
+    """
+
     try:
-        for line in pipe:
-            if _should_suppress_child_log_line(line):
-                continue
-            with log_lock:
-                log_file.write(line)
-                log_file.flush()
+        written_bytes = int(os.fstat(log_file.fileno()).st_size)
+    except (AttributeError, OSError, ValueError):
+        written_bytes = 0
+    pending = ""
+
+    def emit(fragment: str) -> None:
+        nonlocal written_bytes
+        if not fragment or _should_suppress_child_log_line(fragment):
+            return
+        encoded = fragment.encode("utf-8", errors="replace")
+        remaining = max(0, max_bytes - written_bytes)
+        if remaining <= 0:
+            if limit_event is not None:
+                limit_event.set()
+            return
+        kept = encoded[:remaining]
+        with log_lock:
+            log_file.write(kept.decode("utf-8", errors="ignore"))
+            log_file.flush()
+        written_bytes += len(kept)
+        if len(encoded) > remaining and limit_event is not None:
+            limit_event.set()
+
+    try:
+        try:
+            pipe_fd = pipe.fileno()
+        except (AttributeError, OSError, ValueError):
+            pipe_fd = None
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        while True:
+            if pipe_fd is None:
+                chunk = pipe.read(64 * 1024)
+            else:
+                raw_chunk = os.read(pipe_fd, 64 * 1024)
+                if not raw_chunk:
+                    pending += decoder.decode(b"", final=True)
+                    break
+                chunk = decoder.decode(raw_chunk, final=False)
+            if not chunk:
+                break
+            pending += chunk
+            while "\n" in pending:
+                line, pending = pending.split("\n", 1)
+                emit(line + "\n")
+            if len(pending) > 128 * 1024:
+                emit(pending[:64 * 1024])
+                pending = pending[64 * 1024 :]
+        emit(pending)
     finally:
         try:
             pipe.close()
-        except Exception:
+        except (OSError, ValueError):
             pass
 
 
@@ -2613,23 +3522,33 @@ def _find_codex_session_file(session_id: str, *, session_root: Path | str | None
     cache_key = f"{root}:{session_id}"
     if cache_key in _SESSION_PATH_CACHE:
         cached = _SESSION_PATH_CACHE[cache_key]
-        if cached is not None and cached.exists():
+        if (
+            cached is not None
+            and not cached.is_symlink()
+            and cached.is_file()
+        ):
             return cached
     if not root.exists():
         return None
+    best_path: Optional[Path] = None
+    best_key: tuple[float, str] = (-1.0, "")
     try:
-        candidates = sorted(
-            (path for path in root.rglob(f"*{session_id}*.jsonl") if session_id in path.name),
-            key=lambda path: (path.stat().st_mtime, str(path)),
-            reverse=True,
-        )
+        for path in root.rglob(f"*{session_id}*.jsonl"):
+            if session_id not in path.name or path.is_symlink() or not path.is_file():
+                continue
+            try:
+                candidate_key = (path.stat().st_mtime, str(path))
+            except OSError:
+                continue
+            if candidate_key > best_key:
+                best_path = path
+                best_key = candidate_key
     except OSError:
-        candidates = []
-    if not candidates:
+        best_path = None
+    if best_path is None:
         return None
-    path = candidates[0]
-    _SESSION_PATH_CACHE[cache_key] = path
-    return path
+    _SESSION_PATH_CACHE[cache_key] = best_path
+    return best_path
 
 
 def _codex_session_root(session_root: Path | str | None = None) -> Path:
@@ -2647,8 +3566,13 @@ def _codex_session_root(session_root: Path | str | None = None) -> Path:
 def _parse_codex_session_usage_file(path: Path) -> Dict[str, int]:
     latest = parse_token_usage({})
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
+        text, _prefix_omitted, _size = read_stable_text_tail(
+            path,
+            max_bytes=MAX_SESSION_USAGE_TAIL_BYTES,
+            label="Codex session telemetry",
+        )
+        lines = text.splitlines()
+    except (OSError, ValueError):
         return latest
     for line in lines:
         if "token_count" not in line and "total_token_usage" not in line:
@@ -2701,7 +3625,7 @@ def extract_patch_from_text(text: str) -> Tuple[Optional[Dict[str, Any]], str]:
             if obj is None:
                 continue
             return obj, ""
-        if isinstance(obj, dict) and obj.get("schema_version") == 1 and isinstance(obj.get("operations"), list):
+        if isinstance(obj, dict) and obj.get("schema_version") == SCHEMA_VERSION and isinstance(obj.get("operations"), list):
             return obj, ""
     return None, first_decode_error or "no Albilich v1 patch JSON object found"
 
@@ -2776,7 +3700,7 @@ def _repair_invalid_json_escapes(
                 return None
             repaired = repaired[:pos] + "\\" + repaired[pos:]
             continue
-        if isinstance(obj, dict) and obj.get("schema_version") == 1 and isinstance(obj.get("operations"), list):
+        if isinstance(obj, dict) and obj.get("schema_version") == SCHEMA_VERSION and isinstance(obj.get("operations"), list):
             return obj
         return None
     return None
@@ -2824,7 +3748,7 @@ def _repair_extra_object_close_before_array(
         obj, _ = decoder.raw_decode(repaired)
     except json.JSONDecodeError:
         return None
-    if isinstance(obj, dict) and obj.get("schema_version") == 1 and isinstance(obj.get("operations"), list):
+    if isinstance(obj, dict) and obj.get("schema_version") == SCHEMA_VERSION and isinstance(obj.get("operations"), list):
         return obj
     return None
 
@@ -2866,6 +3790,28 @@ def run_metrics_operation(
     model: str = "",
 ) -> Dict[str, Any]:
     usage = parse_session_usage(usage_payload)
+    decision_trace = dict(action.get("decision_trace") or {})
+    candidate_set_hash = str(decision_trace.get("candidate_set_sha256") or "")
+    selection_policy_version = int(
+        decision_trace.get("decision_policy_version") or 0
+    )
+    if decision_trace.get("randomized_assignment") is not None:
+        selection_metadata = randomized_assignment_metadata(decision_trace)
+        selection_design = selection_metadata["selection_design"]
+        assignment_probability = selection_metadata["assignment_probability"]
+        exploration_stratum = selection_metadata["exploration_stratum"]
+        candidate_set_hash = selection_metadata["candidate_set_hash"]
+        selection_policy_version = selection_metadata[
+            "selection_policy_version"
+        ]
+    else:
+        selection_design = (
+            "deterministic"
+            if candidate_set_hash and selection_policy_version > 0
+            else "observational"
+        )
+        assignment_probability = 0.0
+        exploration_stratum = ""
     return {
         "op": "record_run_metrics",
         "run_id": run_id,
@@ -2873,10 +3819,26 @@ def run_metrics_operation(
         "mode": action.get("mode", "prove"),
         "target_id": action.get("target_id", ""),
         "route_id": action.get("route_id", ""),
+        "search_intent": session_plan.get(
+            "search_intent", action.get("search_intent", "")
+        ),
         "researcher_work_mode": action.get("researcher_work_mode", ""),
         "work_mode_source": action.get("work_mode_source", ""),
+        "strategy_family": session_plan.get("strategy_family", strategy_family(action)),
+        "selection_design": selection_design,
+        "assignment_probability": assignment_probability,
+        "exploration_stratum": exploration_stratum,
+        "candidate_set_hash": candidate_set_hash,
+        "selection_policy_version": selection_policy_version,
+        "decision_trace": decision_trace,
         "state_revision": session_plan.get("state_revision", 0),
+        "decision_state_revision": session_plan.get(
+            "scheduler_decision_state_revision",
+            session_plan.get("state_revision", 0),
+        ),
         "context_revision": session_plan.get("state_revision", 0),
+        "scheduler_dispatch_id": session_plan.get("scheduler_dispatch_id", ""),
+        "dispatched_action_hash": session_plan.get("dispatched_action_hash", ""),
         "session_id": session_plan.get("session_id", ""),
         "model_profile": session_plan.get("model_profile", "default"),
         "model": model,
@@ -2901,23 +3863,29 @@ def _context_path(store: ProofStateStore, action: Mapping[str, Any], context_has
 
 
 def _run_id(mode: str, target_id: str) -> str:
-    stamp = utc_now().replace(":", "").replace("-", "").replace(".", "_").replace("+", "Z")
+    stamp = (
+        utc_now()
+        .replace("+00:00", "Z")
+        .replace(":", "")
+        .replace("-", "")
+        .replace(".", "_")
+    )
     safe_mode = re.sub(r"[^A-Za-z0-9_.-]+", "_", mode).strip("_") or "step"
     safe_target = re.sub(r"[^A-Za-z0-9_.-]+", "_", target_id).strip("_") or "root"
-    return f"v1_{safe_mode}_{safe_target}_{stamp}"
+    return f"v1_{safe_mode}_{safe_target}_{stamp}_{uuid.uuid4().hex[:10]}"
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except Exception:
+    except OSError:
         process.terminate()
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except Exception:
+        except OSError:
             process.kill()
         process.wait(timeout=5)
 
@@ -2926,6 +3894,79 @@ def _process_tree_rss_mb(root_pid: int) -> float:
     """Best-effort resident memory sample for a Codex subprocess tree."""
     if root_pid <= 0:
         return 0.0
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        pids: set[int] = set()
+        frontier = [root_pid]
+        rss_kb = 0
+        while frontier:
+            pid = frontier.pop()
+            if pid in pids:
+                continue
+            if len(pids) >= MAX_TRACKED_PROCESS_TREE_PIDS:
+                return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+            process_root = proc_root / str(pid)
+            try:
+                status = (process_root / "status").read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except (FileNotFoundError, ProcessLookupError):
+                # A process may exit between samples; an absent root is not a
+                # resource-monitor failure once the child is disappearing.
+                if pid == root_pid:
+                    return 0.0
+                continue
+            except (OSError, PermissionError):
+                return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+            pids.add(pid)
+            rss_observed = False
+            for line in status.splitlines():
+                if line.startswith("VmRSS:"):
+                    fields = line.split()
+                    try:
+                        rss_kb += int(fields[1])
+                    except (IndexError, ValueError):
+                        return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                    rss_observed = True
+                    break
+            if not rss_observed:
+                return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+            # Linux records children per task, not just per thread-group
+            # leader. A multithreaded child may fork from any task, so reading
+            # only task/<pid>/children misses a real resource-cap bypass.
+            task_root = process_root / "task"
+            observed_tasks = 0
+            try:
+                task_entries = task_root.iterdir()
+                for task_entry in task_entries:
+                    if not task_entry.name.isdigit():
+                        continue
+                    observed_tasks += 1
+                    if observed_tasks > MAX_TRACKED_PROCESS_TREE_PIDS:
+                        return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                    try:
+                        child_text = (task_entry / "children").read_text(
+                            encoding="ascii", errors="strict"
+                        )
+                    except (FileNotFoundError, ProcessLookupError):
+                        continue
+                    except (OSError, UnicodeError):
+                        return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                    for raw in child_text.split():
+                        try:
+                            child_pid = int(raw)
+                        except ValueError:
+                            return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                        if child_pid not in pids:
+                            frontier.append(child_pid)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except OSError:
+                return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+        return round(rss_kb / 1024.0, 3) if rss_kb > 0 else 0.0
+
+    # Portable fallback for systems without procfs. Every helper has a short
+    # timeout and the traversal has a hard process-count ceiling.
     pids = {root_pid}
     frontier = [root_pid]
     for _ in range(8):
@@ -2936,8 +3977,9 @@ def _process_tree_rss_mb(root_pid: int) -> float:
                     ["pgrep", "-P", str(pid)],
                     text=True,
                     stderr=subprocess.DEVNULL,
+                    timeout=2.0,
                 )
-            except Exception:
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 continue
             for raw in output.split():
                 try:
@@ -2945,6 +3987,8 @@ def _process_tree_rss_mb(root_pid: int) -> float:
                 except ValueError:
                     continue
                 if child_pid not in pids:
+                    if len(pids) >= MAX_TRACKED_PROCESS_TREE_PIDS:
+                        return RESOURCE_SAMPLE_FAIL_CLOSED_MB
                     pids.add(child_pid)
                     next_frontier.append(child_pid)
         if not next_frontier:
@@ -2955,9 +3999,10 @@ def _process_tree_rss_mb(root_pid: int) -> float:
             ["ps", "-o", "rss=", "-p", ",".join(str(pid) for pid in sorted(pids))],
             text=True,
             stderr=subprocess.DEVNULL,
+            timeout=2.0,
         )
-    except Exception:
-        return 0.0
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return RESOURCE_SAMPLE_FAIL_CLOSED_MB
     rss_kb = 0
     for raw in output.split():
         try:
@@ -2968,10 +4013,154 @@ def _process_tree_rss_mb(root_pid: int) -> float:
 
 
 def _read_text_head(path: Path, max_bytes: int = LOG_PARSE_HEAD_BYTES) -> str:
-    if not path.exists():
+    try:
+        payload, _truncated, _size = read_bytes_prefix(
+            path, max_bytes=max_bytes, label="Codex log"
+        )
+    except ValueError:
         return ""
-    with path.open("rb") as fh:
-        return fh.read(max_bytes).decode("utf-8", errors="replace")
+    return payload.decode("utf-8", errors="replace")
+
+
+def _read_bounded_text(path: Path, *, max_bytes: int) -> tuple[str, bool]:
+    """Read UTF-8 only when the complete file fits the advertised bound."""
+
+    try:
+        payload = read_bounded_bytes(
+            path, max_bytes=max_bytes, label="Codex model response"
+        )
+    except ValueError as exc:
+        return "", "exceeds" in str(exc)
+    return payload.decode("utf-8", errors="replace"), False
+
+
+def _replace_oversized_model_output(path: Path, *, max_bytes: int) -> None:
+    """Retain a bounded forensic sample and replace an oversized patch file."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif path.is_symlink():
+        return
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            return
+        size = int(before.st_size)
+        sample_bytes = min(64 * 1024, max(1, max_bytes // 4))
+        head = os.read(descriptor, sample_bytes)
+        if size > sample_bytes:
+            os.lseek(descriptor, max(0, size - sample_bytes), os.SEEK_SET)
+            tail = os.read(descriptor, sample_bytes)
+        else:
+            tail = b""
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            return
+
+        def atomic_write(destination: Path, payload: bytes) -> None:
+            temporary_descriptor, raw_temporary_path = tempfile.mkstemp(
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                dir=destination.parent,
+            )
+            temporary_path = Path(raw_temporary_path)
+            try:
+                offset = 0
+                while offset < len(payload):
+                    offset += os.write(temporary_descriptor, payload[offset:])
+                os.fsync(temporary_descriptor)
+                os.close(temporary_descriptor)
+                temporary_descriptor = -1
+                os.replace(temporary_path, destination)
+            finally:
+                if temporary_descriptor >= 0:
+                    os.close(temporary_descriptor)
+                temporary_path.unlink(missing_ok=True)
+
+        sample_path = path.with_name(path.stem + ".rejected-sample.txt")
+        atomic_write(
+            sample_path,
+            head
+            + f"\n[albilich omitted oversized model output: {size} bytes]\n".encode(
+                "utf-8"
+            )
+            + tail,
+        )
+        atomic_write(
+            path,
+            f"[albilich rejected model response exceeding {max_bytes} bytes]\n".encode(
+                "utf-8"
+            ),
+        )
+    except OSError:
+        return
+    finally:
+        os.close(descriptor)
+
+
+def _child_max_rss_mb() -> float:
+    return _configured_rss_limit_mb(
+        CHILD_MAX_RSS_ENV,
+        DEFAULT_MAX_CHILD_RSS_MB,
+        label="per-child process-tree RSS",
+    )
+
+
+def aggregate_child_max_process_tree_rss_mb() -> float:
+    """Return the finite workflow-wide local child RSS ceiling."""
+
+    return _configured_rss_limit_mb(
+        AGGREGATE_CHILD_MAX_RSS_ENV,
+        DEFAULT_MAX_AGGREGATE_CHILD_RSS_MB,
+        label="aggregate child process-tree RSS",
+    )
+
+
+def _configured_rss_limit_mb(
+    environment_name: str,
+    default_mb: float,
+    *,
+    label: str,
+) -> float:
+    """Read a memory limit without silently replacing invalid operator input."""
+
+    raw = os.environ.get(environment_name, "").strip()
+    if not raw:
+        return float(default_mb)
+    try:
+        value = float(raw)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{environment_name} must specify a finite positive {label} limit in MiB"
+        ) from exc
+    if (
+        not (value > 0.0)
+        or value != value
+        or value == float("inf")
+        or value > MAX_CONFIGURED_RSS_MB
+    ):
+        raise ValueError(
+            f"{environment_name} must specify a finite positive {label} limit "
+            f"no larger than {MAX_CONFIGURED_RSS_MB:.0f} MiB"
+        )
+    return value
 
 
 def _compact_live_log_tail(path: Path) -> str:
@@ -2982,7 +4171,7 @@ def _progress_interval_seconds() -> float:
     raw = os.environ.get("ALBILICH_UI_HEARTBEAT_SECONDS", "").strip()
     if raw:
         try:
-            return max(0.1, float(raw))
+            return min(MAX_RESOURCE_POLL_SECONDS, max(0.1, float(raw)))
         except ValueError:
             pass
     return DEFAULT_PROGRESS_INTERVAL_SECONDS
@@ -3104,10 +4293,10 @@ def _retry_suffix_has_meaningful_progress(data: bytes) -> bool:
 
 
 def _read_text_tail(path: Path, max_bytes: int = LOG_PARSE_TAIL_BYTES) -> str:
-    if not path.exists():
+    try:
+        text, _truncated, _size = read_stable_text_tail(
+            path, max_bytes=max_bytes, label="Codex log", errors="replace"
+        )
+    except ValueError:
         return ""
-    size = path.stat().st_size
-    with path.open("rb") as fh:
-        if size > max_bytes:
-            fh.seek(-max_bytes, os.SEEK_END)
-        return fh.read().decode("utf-8", errors="replace")
+    return text

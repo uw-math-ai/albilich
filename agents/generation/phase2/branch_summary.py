@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Compact per-route branch summaries and workbenches (2026-07-09 TODOs 1+4).
+"""Compact per-route branch summaries and workbenches.
 
 Branch definition (update-advice open question 1, decided 2026-07-10): a
 *branch* is a route-anchored cluster. ``branch_id`` IS the ``route_id`` of the
@@ -15,7 +15,7 @@ while still meaning "one mathematical proof direction" rather than one claim.
     Branch / Goal / Status / Verified facts / Candidate facts /
     Active blockers / Failed methods / Useful sources / Next recommended lemma
 
-``build_branch_workbench`` (TODO 1) extends the summary into the full branch
+``build_branch_workbench`` extends the summary into the full branch
 workbench: similar lemmas worth trying next, failed methods that must not be
 retried unchanged (from the negative-result ledger artifacts), the last useful
 mathematical delta plus the stale pass count since it, and the explicit
@@ -46,24 +46,23 @@ branch directive.
 
 import json
 import re
-from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from .graph_policy import route_scoreboard
 from .memory_policy import FAILED_ARTIFACT_TYPES, VERIFIED_VALIDATION_STATUSES, claim_memory_status
-from .models import json_dumps, json_loads, normalize_text, sha256_text, utc_now
+from .models import SCHEMA_VERSION, json_dumps, json_loads, normalize_text, sha256_text, utc_now
 from .store import ProofStateStore
 
 BRANCH_STATUSES = {"keep_exploiting", "needs_source", "needs_cas", "pause_or_merge"}
 PAUSED_SCOREBOARD_STATUSES = {"blocked", "stalled", "low_yield", "abandoned", "superseded"}
 
-# --- Branch persistence policy constants (TODO 1) -------------------------
+# --- Branch persistence policy constants ----------------------------------
 # Rotate away from a branch only on: the same failure fingerprint repeating,
 # no useful mathematical delta for this many branch passes, or an explicit
 # advisor pause_or_merge adjudication.
 BRANCH_STALE_PASS_LIMIT = 3
 BRANCH_FAILURE_REPEAT_LIMIT = 2
-# Advisor branch adjudication contract (TODO 1.3): the PhD advisor attaches
+# Advisor branch adjudication contract: the PhD advisor attaches
 # metadata.branch_states = {<branch_id>: {"state": <one of BRANCH_STATUSES>,
 # "reason": ...}} (a bare state string is also accepted) on an advisor_report.
 # A directive is honored while fresh (within the revision TTL) and overrides
@@ -151,7 +150,7 @@ def build_branch_summary(
     conclusion_id = str(route.get("conclusion_claim_id") or "")
     branch_claim_ids = branch_cluster_claim_ids(state, route_id)
 
-    # Fact-graph pilot (2026-07-09 TODO 3, first use): the verified/candidate
+    # Fact-graph policy: the verified/candidate
     # fact lists come from the generated read-only fact_graph view. The
     # classification boundary is identical by construction — both the graph
     # and the old direct query classify through claim_memory_status — and the
@@ -429,7 +428,7 @@ def _next_recommended_lemma(
 
 
 # ---------------------------------------------------------------------------
-# Advisor branch adjudication (TODO 1.3)
+# Advisor branch adjudication
 # ---------------------------------------------------------------------------
 
 
@@ -496,7 +495,7 @@ def advisor_branch_directive(state: Mapping[str, Any], route_id: str) -> Optiona
 
 
 # ---------------------------------------------------------------------------
-# Useful mathematical delta + branch rotation decision (TODO 1.2)
+# Useful mathematical delta + branch rotation decision
 # ---------------------------------------------------------------------------
 
 
@@ -609,7 +608,7 @@ def _branch_linked_artifacts(
 
 
 def _branch_pass_rows(state: Mapping[str, Any], route_id: str, claim_id_set: set[str]) -> List[Mapping[str, Any]]:
-    """Researcher/villain passes on this branch, newest first."""
+    """Researcher/adversarial-review passes on this branch, newest first."""
     rows = state.get("recent_runs")
     if not isinstance(rows, list):
         rows = [row for row in state.get("runs", []) if isinstance(row, Mapping) and row.get("created_at")]
@@ -659,7 +658,7 @@ def branch_rotation_decision(
     *,
     stale_pass_limit: int = BRANCH_STALE_PASS_LIMIT,
 ) -> Dict[str, Any]:
-    """Continue-or-rotate decision for one branch (TODO 1.2).
+    """Continue-or-rotate decision for one branch.
 
     Continue while the last few passes produced a useful delta (verified
     lemma, narrowed/resolved debt, usable source, clean obstruction, improved
@@ -774,7 +773,7 @@ def branch_rotation_decision(
 
 
 # ---------------------------------------------------------------------------
-# Branch workbench (TODO 1.1)
+# Branch workbench
 # ---------------------------------------------------------------------------
 
 
@@ -785,7 +784,7 @@ def build_branch_workbench(
     state: Optional[Mapping[str, Any]] = None,
     fact_graph: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """The full branch workbench: summary + persistence fields (TODO 1)."""
+    """The full branch workbench: summary + persistence fields."""
     if state is None:
         if store is None:
             raise ValueError("build_branch_workbench needs a store or a state snapshot")
@@ -897,7 +896,7 @@ def _failed_methods_do_not_retry(
     route_id: str,
     claim_id_set: set[str],
 ) -> List[str]:
-    """Failed methods from the negative-result ledger artifacts on the branch:
+    """Failed methods from the negative-result archive on the branch:
     never retry these unchanged."""
     lines: List[str] = []
     for artifact in _branch_linked_artifacts(state, route_id, claim_id_set):
@@ -927,14 +926,17 @@ def _failed_methods_do_not_retry(
 
 
 # ---------------------------------------------------------------------------
-# Workbench persistence (TODO 1.1): small JSON artifact per branch, producer
-# scheduler, updated idempotently (no write when the content is unchanged).
+# Workbench persistence: immutable JSON artifacts produced by the scheduler.
+# A changed workbench gets a new version; an identical one is a no-op.  This
+# keeps every context-affecting artifact mutation inside the patch journal.
 # ---------------------------------------------------------------------------
 
 
 def branch_workbench_artifact_id(route_id: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9_-]", "_", route_id)
-    return f"branch_workbench_{slug}"
+    # The digest prevents distinct route ids with the same sanitized spelling
+    # (for example ``a/b`` and ``a_b``) from sharing an artifact namespace.
+    return f"branch_workbench_{slug}_{sha256_text(route_id)[:12]}"
 
 
 def sync_branch_workbenches(
@@ -943,12 +945,12 @@ def sync_branch_workbenches(
     limit: int = 5,
     state: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Persist one branch_workbench JSON artifact per active branch.
+    """Persist an immutable branch_workbench JSON artifact per active branch.
 
-    Follows the deterministic-sync pattern (compute desired rows, diff against
-    existing, no-op when unchanged). Rows are written directly by the
-    scheduler (like store.record_interruption_artifact) because attach_artifact
-    patches are append-only while a workbench must be updatable in place.
+    The latest artifact for a branch is compared by content hash.  Unchanged
+    content is a no-op; changed content is appended as a new, revision-stamped
+    artifact through a system-authorized patch.  No artifact row is overwritten
+    outside the replay journal.
     """
     if state is None:
         state = store.get_state()
@@ -957,62 +959,89 @@ def sync_branch_workbenches(
     unchanged: List[str] = []
     if not workbenches:
         return {"updated": updated, "unchanged": unchanged}
-    artifact_dir = store.state_dir / "artifacts"
     with store.connect() as conn:
         revision = int(store.get_problem_row(conn)["current_revision"])
-        for workbench in workbenches:
-            route_id = str(workbench.get("branch_id") or "")
-            artifact_id = branch_workbench_artifact_id(route_id)
-            content = json.dumps(workbench, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-            digest = sha256_text(content)
-            existing = conn.execute(
-                "SELECT sha256, created_at FROM artifacts WHERE artifact_id = ?", (artifact_id,)
-            ).fetchone()
-            if existing is not None and str(existing["sha256"]) == digest:
-                unchanged.append(artifact_id)
-                continue
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            path = artifact_dir / f"{artifact_id}.json"
-            path.write_text(content, encoding="utf-8")
-            now = utc_now()
-            created_at = str(existing["created_at"]) if existing is not None else now
-            summary = (
-                f"Branch workbench for {route_id}: status={workbench.get('status')}, "
-                f"next={workbench.get('next_recommended_lemma')}"
-            )[:500]
-            conn.execute(
+        existing_rows = [
+            dict(row)
+            for row in conn.execute(
                 """
-                INSERT OR REPLACE INTO artifacts(
-                    artifact_id, artifact_type, path, sha256, producer_role, run_id,
-                    state_revision, content_summary, metadata_json, created_at
-                ) VALUES (?, ?, ?, ?, 'scheduler', '', ?, ?, ?, ?)
+                SELECT artifact_id, sha256, state_revision, metadata_json, created_at
+                FROM artifacts
+                WHERE artifact_type = ?
+                ORDER BY state_revision DESC, created_at DESC, artifact_id DESC
                 """,
-                (
-                    artifact_id,
-                    BRANCH_WORKBENCH_ARTIFACT_TYPE,
-                    str(path),
-                    digest,
-                    revision,
-                    summary,
-                    json_dumps(
-                        {
-                            "branch_id": route_id,
-                            "route_id": route_id,
-                            "target_id": str(workbench.get("target_id") or ""),
-                            "status": str(workbench.get("status") or ""),
-                            "updated_at": now,
-                        }
-                    ),
-                    created_at,
-                ),
-            )
-            updated.append(artifact_id)
-        if updated:
+                (BRANCH_WORKBENCH_ARTIFACT_TYPE,),
+            ).fetchall()
+        ]
+    latest_by_route: Dict[str, Dict[str, Any]] = {}
+    for row in existing_rows:
+        metadata = json_loads(row.get("metadata_json"), {})
+        route_id = str(metadata.get("route_id") or metadata.get("branch_id") or "") if isinstance(metadata, Mapping) else ""
+        if route_id and route_id not in latest_by_route:
+            latest_by_route[route_id] = row
+
+    operations: List[Dict[str, Any]] = []
+    now = utc_now()
+    for workbench in workbenches:
+        route_id = str(workbench.get("branch_id") or "")
+        base_artifact_id = branch_workbench_artifact_id(route_id)
+        content = json.dumps(workbench, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        digest = sha256_text(content)
+        existing = latest_by_route.get(route_id)
+        if existing is not None and str(existing.get("sha256") or "") == digest:
+            unchanged.append(str(existing.get("artifact_id") or base_artifact_id))
+            continue
+        artifact_id = base_artifact_id
+        if existing is not None:
+            artifact_id = f"{base_artifact_id}_r{revision + 1}_{digest[:12]}"
+        summary = (
+            f"Branch workbench for {route_id}: status={workbench.get('status')}, "
+            f"next={workbench.get('next_recommended_lemma')}"
+        )[:500]
+        operations.append(
+            {
+                "op": "attach_artifact",
+                "artifact_id": artifact_id,
+                "artifact_type": BRANCH_WORKBENCH_ARTIFACT_TYPE,
+                "content": content,
+                "content_summary": summary,
+                "metadata": {
+                    "branch_id": route_id,
+                    "route_id": route_id,
+                    "target_id": str(workbench.get("target_id") or ""),
+                    "status": str(workbench.get("status") or ""),
+                    "updated_at": now,
+                    "supersedes_artifact_id": str(existing.get("artifact_id") or "") if existing else "",
+                },
+            }
+        )
+        updated.append(artifact_id)
+    if operations:
+        # Local import avoids a store/patches/branch_summary import cycle.
+        from .patches import apply_system_patch
+
+        outcome = apply_system_patch(
+            store,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "problem_id": store.problem_id,
+                "base_revision": revision,
+                "actor_role": "scheduler",
+                "target_id": "branch_workbenches",
+                "operations": operations,
+                "evidence_artifact_ids": [],
+                "rationale": "persist immutable branch workbench snapshots",
+            },
+            mode="branch_workbench_sync",
+        )
+        if not outcome.accepted:
+            raise RuntimeError("branch workbench patch rejected: " + "; ".join(outcome.errors))
+        with store.connect() as conn:
             store.write_event(
                 conn,
-                revision,
+                outcome.revision,
                 "branch_workbench_sync",
-                {"updated": updated, "unchanged_count": len(unchanged)},
+                {"updated": updated, "unchanged_count": len(unchanged), "patch_id": outcome.patch_id},
             )
-        conn.commit()
+            conn.commit()
     return {"updated": updated, "unchanged": unchanged}

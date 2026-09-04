@@ -14,7 +14,7 @@ RESEARCH_MODES = {
     "hard_problem",
     "citation_first",
     "citation_pass",
-    # Conservative referee mode (2026-07-09 TODO 6): audit a submitted proof
+    # Conservative referee mode: audit a submitted proof
     # document instead of proving the statement; see phase2/audit.py.
     "paper_solution_audit",
     # Writing-only mode for an externally authored Markdown/LaTeX manuscript.
@@ -26,7 +26,8 @@ RESEARCH_MODE_ALIASES = {
     "citation_first": "balanced",
 }
 # Per-session work modes (rethlas-style online/offline loop plus CAS), used by
-# both adversarial mathematicians: the researcher (prover) and the villain
+# both adversarial mathematicians: the researcher (prover) and the
+# adversarial reviewer
 # (refuter) run the same loop with separate histories and directives — the
 # Nagata working mode, both agents equally capable. Distinct from the run-level
 # research_mode strategy and from the action verb mode.
@@ -191,7 +192,7 @@ def action_expects_researcher_session(action: Mapping[str, Any] | None) -> bool:
 
 
 def action_expects_villain_session(action: Mapping[str, Any] | None) -> bool:
-    """Mirror codex_runner.actor_role_for_action for the villain role."""
+    """Mirror codex_runner.actor_role_for_action for the adversarial-review role."""
     return str((action or {}).get("mode") or "") == "refute"
 
 
@@ -199,7 +200,7 @@ def _work_mode_role_for_action(action: Mapping[str, Any] | None) -> str:
     if action_expects_researcher_session(action):
         return "researcher"
     if action_expects_villain_session(action):
-        return "villain"
+        return "adversarial_reviewer"
     return ""
 
 
@@ -243,6 +244,7 @@ def _advisor_artifact_rows(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 _ROLE_DIRECTIVE_KEYS = {
     "researcher": (ADVISOR_MODE_DIRECTIVE_KEY, ADVISOR_MODE_DIRECTIVE_REASON_KEY, ADVISOR_MODE_DIRECTIVE_STEPS_KEY),
+    "adversarial_reviewer": (ADVISOR_VILLAIN_DIRECTIVE_KEY, ADVISOR_VILLAIN_DIRECTIVE_REASON_KEY, ADVISOR_VILLAIN_DIRECTIVE_STEPS_KEY),
     "villain": (ADVISOR_VILLAIN_DIRECTIVE_KEY, ADVISOR_VILLAIN_DIRECTIVE_REASON_KEY, ADVISOR_VILLAIN_DIRECTIVE_STEPS_KEY),
 }
 
@@ -313,7 +315,13 @@ def _researcher_work_mode_history(
     """Recent work modes for one role's sessions, newest first."""
     history: list[Dict[str, Any]] = []
     for run in _recent_run_rows(state):
-        if str(run.get("actor_role") or "") != actor_role:
+        recorded_role = str(run.get("actor_role") or "")
+        accepted_roles = (
+            {"adversarial_reviewer", "villain"}
+            if actor_role in {"adversarial_reviewer", "villain"}
+            else {actor_role}
+        )
+        if recorded_role not in accepted_roles:
             continue
         work_mode = str(run.get("researcher_work_mode") or "").strip().lower()
         if work_mode not in RESEARCHER_WORK_MODES:
@@ -485,12 +493,12 @@ def _villain_work_mode_decision(
 ) -> Dict[str, Any]:
     """Work mode for a refutation pass — same loop, refuter-flavored defaults.
 
-    Villain sessions are almost always parallel companions, so unlike
+    Adversarial-review sessions are almost always parallel companions, so unlike
     researcher companions they rotate on their own history (there is no primary
     villain stream for rotation to act on otherwise).
     """
     cas_allowed = cas_globally_enabled()
-    directive = advisor_mode_directive(state, role="villain")
+    directive = advisor_mode_directive(state, role="adversarial_reviewer")
     if directive:
         directed = str(directive.get("work_mode") or "")
         if directed == "cas" and not cas_allowed:
@@ -510,7 +518,7 @@ def _villain_work_mode_decision(
         return {
             "work_mode": directed,
             "source": "advisor_directive",
-            "reason": directive.get("reason") or f"PhD advisor directed the villain to work in {directed} mode",
+            "reason": directive.get("reason") or f"PhD advisor directed the adversarial reviewer to work in {directed} mode",
             "advisor_mode_directive_artifact_id": str(directive.get("artifact_id") or ""),
         }
     if cas_allowed and action.get("cas_check_recommended"):
@@ -524,7 +532,7 @@ def _villain_work_mode_decision(
         for m in VILLAIN_WORK_MODE_CYCLE
         if (m != "online" or online_allowed) and (m != "cas" or cas_allowed)
     ]
-    history = _researcher_work_mode_history(state, actor_role="villain", include_companions=True)
+    history = _researcher_work_mode_history(state, actor_role="adversarial_reviewer", include_companions=True)
     last = history[0]["work_mode"] if history else ""
     if last in cycle:
         next_mode = cycle[(cycle.index(last) + 1) % len(cycle)]
@@ -544,7 +552,7 @@ def stamp_researcher_work_mode(
     research_mode: str | None,
     web_search: str | None,
 ) -> Any:
-    """Attach the work mode to a scheduled researcher or villain action in place."""
+    """Attach the work mode to a scheduled researcher or adversarial-review action in place."""
     if not isinstance(action, dict):
         return action
     if str(action.get("mode") or "") in {"stop_with_partial_results", "stop_solved"}:
@@ -571,8 +579,8 @@ def researcher_mode_summary(
     history = _researcher_work_mode_history(state, include_companions=True)
     primary_history = [item for item in history if item.get("source") != "companion_default"]
     directive = advisor_mode_directive(state)
-    villain_history = _researcher_work_mode_history(state, actor_role="villain", include_companions=True)
-    villain_directive = advisor_mode_directive(state, role="villain")
+    villain_history = _researcher_work_mode_history(state, actor_role="adversarial_reviewer", include_companions=True)
+    villain_directive = advisor_mode_directive(state, role="adversarial_reviewer")
     try:
         predicted = researcher_work_mode_decision(
             state,
@@ -592,13 +600,13 @@ def researcher_mode_summary(
     except ValueError:
         villain_predicted = {}
     return {
-        "policy": "researcher and villain online/offline/cas work-mode loops with PhD-advisor supervision",
+        "policy": "researcher and adversarial-reviewer online/offline/CAS work-mode loops with advisor supervision",
         "cycle": list(RESEARCHER_WORK_MODE_CYCLE),
         "current": primary_history[0] if primary_history else {},
         "history": history[:10],
         "advisor_directive": directive or {},
         "predicted_next": predicted,
-        "villain": {
+        "adversarial_reviewer": {
             "cycle": list(VILLAIN_WORK_MODE_CYCLE),
             "current": villain_history[0] if villain_history else {},
             "history": villain_history[:10],
@@ -663,6 +671,13 @@ def research_intent_for_action(
 
 
 def _retrieve_run_count(state: Mapping[str, Any], *, intent: str | None = None) -> int:
+    run_counts = state.get("run_counts")
+    if isinstance(run_counts, Mapping):
+        if intent is None:
+            return int(run_counts.get("retrieve_total") or 0)
+        by_intent = run_counts.get("retrieve_by_intent")
+        if isinstance(by_intent, Mapping):
+            return int(by_intent.get(intent) or 0)
     count = 0
     for row in state.get("runs", []):
         if row.get("mode") != "retrieve":

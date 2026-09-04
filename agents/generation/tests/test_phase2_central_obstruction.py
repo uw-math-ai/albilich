@@ -8,7 +8,7 @@ from agents.generation.phase2.context_builder import build_context_manifest
 from agents.generation.phase2.debt_canonicalizer import central_debt_clusters
 from agents.generation.phase2.graph_policy import paused_route_ids, route_scoreboard
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch
 from agents.generation.phase2.scheduler import next_action
 from agents.generation.phase2.store import ProofStateStore
 
@@ -174,12 +174,12 @@ class Phase2CentralObstructionTest(unittest.TestCase):
             "narrowed obligation",
             manifest["researcher_packet"]["staged_attack_policy"]["bridge_lemma_workbench_rule"],
         )
-        self.assertIn("negative_result_ledger", manifest)
-        self.assertEqual(manifest["negative_result_ledger"][0]["artifact_id"], "route-obstruction-dhr")
-        self.assertEqual(manifest["negative_result_ledger"][0]["failure_fingerprint"], "termwise-DHR-not-pure-complex")
+        self.assertIn("failed_approaches", manifest)
+        self.assertEqual(manifest["failed_approaches"][0]["artifact_id"], "route-obstruction-dhr")
+        self.assertEqual(manifest["failed_approaches"][0]["failure_fingerprint"], "termwise-DHR-not-pure-complex")
         self.assertNotIn(
             "zz-generic-diagnostic",
-            {row["artifact_id"] for row in manifest["negative_result_ledger"]},
+            {row["artifact_id"] for row in manifest["failed_approaches"]},
         )
         self.assertIn("proof_architecture_templates", manifest)
         self.assertIn(

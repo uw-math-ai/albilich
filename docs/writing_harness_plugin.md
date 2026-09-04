@@ -16,19 +16,19 @@ the submitted mathematics has been verified.
    compilation gate run on the complete source. Blocking defects return it to
    the writer before refereeing.
 3. A clean current version is sent to the `referee`. This agent receives the
-   complete paper, final proof certificate, integrated route, route
-   inferences, route evidence, citation records, and all prior referee rounds.
+   complete paper, final proof certificate, integrated proof approach,
+   inferences, evidence, citation records, and all prior referee rounds.
 4. The referee attaches one `referee_report` beginning with exactly one
    decision token:
 
    - `[accept]` ends the publication loop.
-   - `[revise]` opens one located writing debt per finding. The writer receives
+   - `[revise]` opens one located editorial issue per finding. The writer receives
      the complete report, revises the latest paper, and preserves every correct
      and rule-compliant passage unless a finding requires structural repair.
    - `[major-proof-route-error]` is reserved for substantive mathematical
-     evidence that the integrated route itself is false. The scheduler records
-     the report in proof-state SQL, challenges the root and route inferences,
-     blocks the route, opens a root proof debt, and returns control to the
+     evidence that the integrated proof approach itself is false. The scheduler records
+     the report in proof-state SQL, challenges the root and its inferences,
+     blocks the approach, opens a root proof obligation, and returns control to the
      research harness.
 
 There is no artificial writer--referee round cap. A repairable local gap,
@@ -57,12 +57,13 @@ preserves already-running databases without weakening new runs.
 
 ## Role boundaries
 
-The writer may attach and revise the complete paper and resolve its writing
-debts. It may not strengthen the certified mathematics.
+The writer may attach and revise the complete paper and resolve its editorial
+issues. It may not strengthen the certified mathematics.
 
 The referee may attach exactly one `referee_report`. On `[revise]`, it may also
-add located `debt_type=writing` debts owned by the reviewed paper. It may not
-edit artifacts or transition claims, routes, or inferences. The scheduler alone
+add located editorial issues (stored under the legacy
+`debt_type=writing` compatibility field) owned by the reviewed paper. It may
+not edit artifacts or transition claims, proof approaches, or inferences. The scheduler alone
 applies a route-error escalation after the report has been committed.
 
 `actor_role_for_action` maps publication review to `referee`. Writer and
@@ -123,7 +124,7 @@ Paper buttons open PDFs in the existing same-window reader. Report buttons
 open the readable referee artifact in the mathematical artifact reader.
 
 The phase2 Markdown report contains the same version and decision history in
-its writing-review section. Proof-route rejections state the affected route,
+its writing-review section. Proof-approach rejections state the affected approach,
 the falsified step, and whether the scheduler returned the run to research.
 
 ## External manuscript revision

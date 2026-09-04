@@ -7,7 +7,7 @@ from pathlib import Path
 from agents.generation.phase2.cli import DEFAULT_ATTEMPT_STEPS, DEFAULT_ATTEMPT_WALL_SECONDS
 from agents.generation.phase2.context_builder import build_context_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch
 from agents.generation.phase2.reference_solution import ingest_reference_solution
 from agents.generation.phase2.research_strategy import (
     advisor_synthesis_trigger,

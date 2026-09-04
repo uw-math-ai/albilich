@@ -10,6 +10,7 @@ import urllib.request
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Mapping, Protocol, Sequence
 
+from .action_contract import LITERATURE_SEARCH_MODES
 from .models import SCHEMA_VERSION, fingerprint_text, normalize_text
 from .research_policy import normalize_retrieval_relation
 from .store import ProofStateStore
@@ -78,7 +79,6 @@ def retrieval_patch(store: ProofStateStore, *, target_id: str, cards: Sequence[M
 # ---------------------------------------------------------------------------
 
 LITERATURE_RESEARCHER_ROLE = "literature_researcher"
-LITERATURE_SEARCH_MODES = frozenset({"retrieve", "synthesize_sources", "audit_definitions"})
 INFORMAL_PROVIDER_NAMES = frozenset({"matlas", "theoremsearch"})
 MATLAS_CONTRACT_VERSION = "openapi-0.1.0"
 THEOREMSEARCH_CONTRACT_VERSION = "openapi-0.1.0"
@@ -910,7 +910,7 @@ def execute_informal_theorem_search(
                 filters=filters,
                 timeout_seconds=timeout_seconds,
             )
-        except Exception as exc:  # provider outage is evidence, not a workflow error
+        except Exception as exc:  # intentional-boundary: provider outage is recorded and has no proof authority
             error_code = exc.error_code if isinstance(exc, ProviderRequestError) else type(exc).__name__
             provider_status.append(
                 {

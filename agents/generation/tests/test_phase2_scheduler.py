@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -16,13 +17,17 @@ from agents.generation.phase2.graph_policy import active_frontier_pressure, buil
 from agents.generation.phase2.codex_runner import _materialize_evidence_capsule, _persist_normalized_final_patch, actor_role_for_action, attached_artifact_ids, build_session_prompt, extract_patch_from_text, prepare_session, run_metrics_operation
 from agents.generation.phase2.context_builder import _fit_manifest, _retrieval_card, _select_artifacts, build_context_manifest, build_resume_delta_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch, apply_system_patch
 from agents.generation.phase2.receipt import build_partial_receipt_inventory, format_partial_receipt_appendix
 from agents.generation.phase2.research_policy import DEFAULT_RESEARCH_MODE, normalize_research_mode, theorem_matching_confidence
 from agents.generation.phase2.scheduler import _active_main_trunk_pressure, _active_route_for_claim, _advisor_followup_report, _advisor_requested_strict_verifier_action, _advisor_requested_validation_action, _advisor_requested_villain_action, _bottleneck_lock_action, _bottleneck_lock_debt_candidates, _branch_packet_card, _central_obstruction_payload, _claim_target_for_debt, _cooldown_proof_action, _executive_advisor_bottleneck_action, _first_blocking_debt, _frontier_pressure_action, _integration_candidates, _is_exact_citation_debt, _near_solution_spine_synthesis_action, _next_unverified_claim, _pending_source_handoff_digest, _proof_architecture_pressure_action, _recursive_meta_drift, _root_refinement_signals, _route_without_inference, _unrouted_proof_candidate, _unrouted_proof_claim_action, _verifier_blocked_citation_action, bottleneck_frontier_summary, multi_branch_research_actions, next_action, parallel_companion_actions, proof_spine_summary, route_verifier_readiness, verifier_ready_route_summaries
-from agents.generation.phase2.steering import mark_consumed, submit_steering
+from agents.generation.phase2.steering import (
+    mark_authenticated_consumed,
+    submit_operator_steering,
+)
 from agents.generation.phase2.store import ProofStateStore
 from agents.generation.phase2.workflow import _evidence_boundary_errors, _stop_writer_action, _stop_writer_safety_blocker
+from agents.generation.tests._phase2_test_support import strictly_verify_entities
 
 
 def claim(
@@ -169,7 +174,7 @@ def record_run(
             }
         )
     operations.append(op)
-    outcome = apply_patch(
+    outcome = apply_system_patch(
         store,
         {
             "schema_version": SCHEMA_VERSION,
@@ -180,6 +185,8 @@ def record_run(
             "operations": operations,
             "rationale": "record synthetic run metrics",
         },
+        mode=mode,
+        route_id=route_id,
     )
     if not outcome.accepted:
         raise AssertionError(outcome.errors)
@@ -187,7 +194,7 @@ def record_run(
 
 class Phase2CodexRunnerParsingTest(unittest.TestCase):
     def test_extract_patch_repairs_invalid_latex_json_escape(self) -> None:
-        text = r'{"schema_version":1,"operations":[{"op":"attach_artifact","content":"Since \(q\mid N\), continue."}]}'
+        text = r'{"schema_version":3,"operations":[{"op":"attach_artifact","content":"Since \(q\mid N\), continue."}]}'
 
         patch, error = extract_patch_from_text(text)
 
@@ -199,7 +206,7 @@ class Phase2CodexRunnerParsingTest(unittest.TestCase):
     def test_extract_patch_repairs_more_than_64_invalid_latex_json_escapes(self) -> None:
         content = " ".join(rf"\(x_{{{index}}}\)" for index in range(70))
         text = (
-            '{"schema_version":1,"operations":[{"op":"attach_artifact","content":"'
+            '{"schema_version":3,"operations":[{"op":"attach_artifact","content":"'
             + content
             + '"}]}'
         )
@@ -212,7 +219,7 @@ class Phase2CodexRunnerParsingTest(unittest.TestCase):
         self.assertEqual(content, patch["operations"][0]["content"])
 
     def test_extract_patch_repairs_latex_commands_with_valid_json_escape_prefixes(self) -> None:
-        text = r'{"schema_version":1,"operations":[{"op":"attach_artifact","content":"\\[\nK=G/C,\qquad J=M/C,\quad \bigwedge\nolimits^2 V,\quad \beta:T\times T\longrightarrow A\\]"}]}'
+        text = r'{"schema_version":3,"operations":[{"op":"attach_artifact","content":"\\[\nK=G/C,\qquad J=M/C,\quad \bigwedge\nolimits^2 V,\quad \beta:T\times T\longrightarrow A\\]"}]}'
 
         patch, error = extract_patch_from_text(text)
 
@@ -227,7 +234,7 @@ class Phase2CodexRunnerParsingTest(unittest.TestCase):
 
     def test_extract_patch_repairs_extra_object_close_before_parallel_signals(self) -> None:
         text = (
-            '{"schema_version":1,"operations":[{"op":"cache_retrieval_card",'
+            '{"schema_version":3,"operations":[{"op":"cache_retrieval_card",'
             '"metadata":{"content_hashes":{"source":"sha256:abc"}}}],'
             '"parallel_signals":[{"signal_type":"no_hit"}],"rationale":"ok"}'
         )
@@ -243,7 +250,7 @@ class Phase2CodexRunnerParsingTest(unittest.TestCase):
 
     def test_extract_patch_repairs_extra_object_close_between_operations(self) -> None:
         text = (
-            '{"schema_version":1,"operations":[{"op":"cache_retrieval_card",'
+            '{"schema_version":3,"operations":[{"op":"cache_retrieval_card",'
             '"card_id":"card-a","exact_statement":"A","source_cache_status":"metadata_only"},'
             '{"op":"attach_artifact","artifact_id":"note-a","artifact_type":"source_adaptation_notes",'
             '"content":"ok"}],"rationale":"ok"}'
@@ -260,7 +267,7 @@ class Phase2CodexRunnerParsingTest(unittest.TestCase):
 
     def test_persist_normalized_final_patch_keeps_raw_repaired_response(self) -> None:
         text = (
-            '{"schema_version":1,"operations":[{"op":"cache_retrieval_card",'
+            '{"schema_version":3,"operations":[{"op":"cache_retrieval_card",'
             '"card_id":"card-a","exact_statement":"A","source_cache_status":"metadata_only"},'
             '{"op":"attach_artifact","artifact_id":"note-a","artifact_type":"source_adaptation_notes",'
             '"content":"ok"}],"rationale":"ok"}'
@@ -336,7 +343,7 @@ class Phase2PartialReceiptTest(unittest.TestCase):
         self.assertIn("## Verified Side Lemmas", appendix)
         self.assertIn("`lem-a` validation=informally_verified", appendix)
         self.assertIn("`lem-c` validation=formally_verified", appendix)
-        self.assertIn("## Claim Status Ledger", appendix)
+        self.assertIn("## Claim Status Summary", appendix)
         self.assertIn("`root` validation=untested", appendix)
         self.assertIn("`lem-b` validation=untested", appendix)
 
@@ -387,7 +394,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(DEFAULT_RESEARCH_MODE, "hard_problem")
         self.assertEqual(normalize_research_mode(None), "hard_problem")
 
-    def test_verified_statement_repair_supersedes_stale_parent_wording(self) -> None:
+    def test_verified_statement_repair_does_not_implicitly_supersede_parent_wording(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("statement-repair-supersession-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("Target theorem.")
@@ -495,11 +502,11 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
 
         claims = {row["claim_id"]: row for row in state["claims"]}
         routes = {row["route_id"]: row for row in state["routes"]}
-        self.assertEqual(claims["old-wording"]["lifecycle_status"], "superseded")
-        self.assertEqual(routes["route-old-wording"]["status"], "superseded")
+        self.assertEqual(claims["old-wording"]["lifecycle_status"], "active")
+        self.assertEqual(routes["route-old-wording"]["status"], "active")
         supersession = supersession_index(state)
-        self.assertIn("old-wording", supersession["superseded_claim_ids"])
-        self.assertIn("route-old-wording", supersession["superseded_route_ids"])
+        self.assertNotIn("old-wording", supersession["superseded_claim_ids"])
+        self.assertNotIn("route-old-wording", supersession["superseded_route_ids"])
 
     def test_manifest_proof_spine_exposes_verified_facts_supersession_and_decisive_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -539,8 +546,8 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             manifest = build_context_manifest(store, action=action, max_chars=30_000)
 
         self.assertIn("proof_spine", manifest)
-        self.assertEqual(manifest["proof_spine"]["decisive_theorem_test"]["debt_id"], "debt-decide-bridge")
-        self.assertEqual(manifest["researcher_packet"]["proof_spine"]["decisive_theorem_test"]["debt_id"], "debt-decide-bridge")
+        self.assertEqual(manifest["proof_spine"]["decisive_theorem_test"]["proof_obligation_id"], "debt-decide-bridge")
+        self.assertEqual(manifest["researcher_packet"]["proof_spine"]["decisive_theorem_test"]["proof_obligation_id"], "debt-decide-bridge")
 
     def test_manifest_proof_spine_prefers_advisor_bottleneck_over_older_debt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -586,7 +593,10 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         decisive = manifest["proof_spine"]["decisive_theorem_test"]
         self.assertEqual(decisive["policy"], "advisor-decisive-theorem-test")
         self.assertEqual(decisive["theorem_obligation"], advisor_obligation)
-        self.assertNotEqual(decisive["debt_id"], "debt-obsolete-classification")
+        self.assertNotEqual(
+            decisive["proof_obligation_id"],
+            "debt-obsolete-classification",
+        )
         self.assertEqual(
             manifest["researcher_packet"]["proof_spine"]["decisive_theorem_test"]["theorem_obligation"],
             advisor_obligation,
@@ -718,8 +728,10 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("scheduler-steering-alignment", generation_root=Path(tmpdir) / "generation")
             store.init_problem("Target theorem.")
-            message = submit_steering(store.state_dir, "The new example changes the sharp lower bound.")
-            mark_consumed(store.state_dir, [message["id"]])
+            message = submit_operator_steering(
+                store, "The new example changes the sharp lower bound."
+            )
+            mark_authenticated_consumed(store, [message["id"]])
 
             action = next_action(store, research_mode="hard_problem", web_search="disabled")
             companions = parallel_companion_actions(
@@ -772,8 +784,10 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                 },
             )
             self.assertTrue(setup.accepted, setup.errors)
-            message = submit_steering(store.state_dir, "Refresh every approach before other work.")
-            mark_consumed(store.state_dir, [message["id"]])
+            message = submit_operator_steering(
+                store, "Refresh every approach before other work."
+            )
+            mark_authenticated_consumed(store, [message["id"]])
 
             with mock_patch.dict(
                 "os.environ", {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "1"}
@@ -864,8 +878,9 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(action["search_intent"], "literature_scoping")
         self.assertEqual(len(companions), 2)
         for planned in companions:
-            self.assertIn("information_gain_score", planned)
-            self.assertIn("expected_value_score", planned["information_gain_score"])
+            self.assertIn("priority_assessment", planned)
+            self.assertIn("scheduler_priority", planned["priority_assessment"])
+            self.assertFalse(planned["priority_assessment"]["calibrated_probability"])
         companion = next(item for item in companions if item["mode"] == "prove")
         counterexample = next(item for item in companions if item["mode"] == "refute")
         self.assertEqual(companion["mode"], "prove")
@@ -882,7 +897,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertTrue(counterexample["counterexample_search_required"])
         self.assertEqual(counterexample["research_attack_stage"], "counterexample")
         self.assertEqual(counterexample["budget"]["requested_tokens"], 80_000)
-        self.assertEqual(actor_role_for_action(counterexample), "villain")
+        self.assertEqual(actor_role_for_action(counterexample), "adversarial_reviewer")
 
     def test_parallel_attack_wave_schedules_researcher_synthesis(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2587,6 +2602,11 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
 
             action = next_action(store, research_mode="balanced", web_search="disabled")
             manifest = build_context_manifest(store, action=action)
+            prompt = build_session_prompt(
+                context_path=Path("context.json"),
+                action=action,
+                actor_role=actor_role_for_action(action),
+            )
 
         self.assertEqual(action["mode"], "prove")
         self.assertEqual(action["target_id"], "root")
@@ -2599,7 +2619,22 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(actor_role_for_action(action), "researcher")
         self.assertTrue(manifest["workflow_action"]["obstruction_route_conversion_required"])
         self.assertTrue(manifest["workflow_action"]["global_obstruction_architecture_required"])
+        self.assertEqual(
+            "root:unrouted",
+            manifest["workflow_action"]["obstruction_cluster_key"],
+        )
+        self.assertTrue(
+            manifest["workflow_action"]["obstruction_cluster_id"].startswith(
+                "root:unrouted:"
+            )
+        )
+        self.assertEqual(
+            action["obstruction_debt_ids"],
+            manifest["workflow_action"]["obstruction_proof_obligation_ids"],
+        )
         self.assertIn("candidate_counterexample_needs_validation", manifest["workflow_action"]["obstruction_cluster"]["conversion_choices"])
+        self.assertIn("obstruction_cluster_id exactly", prompt)
+        self.assertIn("obstruction_proof_obligation_ids lists exactly", prompt)
 
     def test_route_obstruction_artifact_from_snapshot_schedules_route_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2783,6 +2818,24 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(action["search_intent"], "counterexample_validation")
         self.assertTrue(action["counterexample_validation_required"])
         self.assertEqual(action["candidate_counterexample_artifact_id"], "villain-concrete-counterexample")
+        base_trace = action["decision_trace"]["nested_policy_traces"][
+            "base:mandatory_constraint"
+        ]
+        self.assertEqual(
+            "base_open_problem:verification_handoff",
+            base_trace["selected_candidate_id"],
+        )
+        verification_trace = base_trace["nested_policy_traces"][
+            "base_open_problem:verification_handoff"
+        ]
+        self.assertEqual(
+            "base_verification:counterexample_validation:"
+            "villain-concrete-counterexample",
+            verification_trace["selected_candidate_id"],
+        )
+        self.assertIn(
+            "policy generators", verification_trace["candidate_set_scope"]
+        )
         self.assertEqual(actor_role_for_action(action), "counterexample_validator")
         self.assertTrue(manifest["workflow_action"]["counterexample_validation_required"])
         self.assertEqual("counterexample_validator", manifest["role_context_policy"]["context_role"])
@@ -3424,6 +3477,12 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             self.assertTrue(artifact_outcome.accepted, artifact_outcome.errors)
 
             action = next_action(store, research_mode="balanced", web_search="disabled")
+            manifest = build_context_manifest(store, action=action)
+            prompt = build_session_prompt(
+                context_path=Path("context.json"),
+                action=action,
+                actor_role=actor_role_for_action(action),
+            )
 
         self.assertEqual(action["mode"], "triage_routes")
         self.assertEqual(action["route_id"], "route-root-main")
@@ -3431,6 +3490,11 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertTrue(action["route_triage_required"])
         self.assertEqual(action["route_decision_artifact_id"], "route-decision-dossier")
         self.assertEqual(actor_role_for_action(action), "phd_advisor")
+        self.assertEqual(
+            "route-decision-dossier",
+            manifest["workflow_action"]["route_decision_artifact_id"],
+        )
+        self.assertIn("route_decision_artifact_id", prompt)
 
     def test_route_triage_report_pauses_route_for_blocking_debt_routing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3750,9 +3814,9 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
 
         self.assertEqual(manifest["workflow_action"]["research_attack_stage"], "counterexample")
         self.assertTrue(manifest["workflow_action"]["counterexample_search_required"])
-        self.assertEqual(manifest["role_context_policy"]["context_role"], "villain")
+        self.assertEqual(manifest["role_context_policy"]["context_role"], "adversarial_reviewer")
         packet = manifest["researcher_packet"]
-        self.assertEqual(packet["role_contract"], "villain_refutation_researcher")
+        self.assertEqual(packet["role_contract"], "adversarial_mathematical_reviewer")
         self.assertEqual(packet["staged_attack_policy"]["research_attack_stage"], "counterexample")
         self.assertTrue(packet["staged_attack_policy"]["counterexample_search_required"])
         self.assertTrue(packet["citation_policy"]["citations_are_allowed"])
@@ -3776,7 +3840,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertIn("parallel_exchange", manifest)
         self.assertIn("local_search_policy", manifest)
         self.assertIn("role_context_policy", manifest)
-        self.assertEqual(manifest["role_context_policy"]["context_role"], "villain")
+        self.assertEqual(manifest["role_context_policy"]["context_role"], "adversarial_reviewer")
         self.assertTrue(manifest["patch_contract"].get("compact"))
         self.assertTrue(manifest["parallel_exchange"].get("compact"))
         self.assertTrue(manifest["local_search_policy"].get("compact"))
@@ -3799,7 +3863,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
 
             manifest = build_context_manifest(store, action=action, max_chars=60_000)
             prompt = build_session_prompt(
-                context_path=Path(manifest["parallel_exchange"]["path"]).with_name("context.json"),
+                context_path=store.state_dir / "contexts" / "context.json",
                 action=action,
                 actor_role=actor_role_for_action(action),
             )
@@ -3929,11 +3993,14 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             }
             manifest = build_context_manifest(store, action=action, max_chars=12_000)
 
-        packet_debt_ids = [row["debt_id"] for row in manifest["researcher_packet"]["active_debts"]]
+        packet_debt_ids = [
+            row["proof_obligation_id"]
+            for row in manifest["researcher_packet"]["active_proof_obligations"]
+        ]
         self.assertIn("branch-repair-debt", packet_debt_ids)
         self.assertIn("branch-inference-debt", packet_debt_ids)
-        self.assertIn("branch-repair-debt", manifest["researcher_packet"]["protected_debt_ids"])
-        self.assertIn("branch-inference-debt", manifest["researcher_packet"]["protected_debt_ids"])
+        self.assertIn("branch-repair-debt", manifest["researcher_packet"]["protected_proof_obligation_ids"])
+        self.assertIn("branch-inference-debt", manifest["researcher_packet"]["protected_proof_obligation_ids"])
         self.assertIn("branch-inference", branch_packet["inference_ids"])
 
     def test_evidence_boundary_rejects_unlisted_download_paths(self) -> None:
@@ -4342,7 +4409,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertIn("root-obstruction-context", artifact_ids)
         allowed_paths = manifest["local_search_policy"]["allowed_local_evidence_paths"]
         self.assertTrue(any(path.endswith("root-obstruction-context.txt") for path in allowed_paths))
-        packet_artifacts = manifest["researcher_packet"]["proof_dossier_artifacts"]
+        packet_artifacts = manifest["researcher_packet"]["proof_draft_artifacts"]
         self.assertIn("root-obstruction-context", [artifact["artifact_id"] for artifact in packet_artifacts])
 
     def test_verified_root_route_integrates_before_unrelated_blocking_debt(self) -> None:
@@ -4644,16 +4711,13 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with store.connect() as conn:
-                conn.execute(
-                    "UPDATE claims SET validation_status='informally_verified' "
-                    "WHERE claim_id IN ('verified-premise', 'ready-lemma')"
-                )
-                conn.execute(
-                    "UPDATE inferences SET validation_status='informally_verified' "
-                    "WHERE inference_id='inf-ready-terminal'"
-                )
-                conn.commit()
+            strictly_verify_entities(
+                store,
+                target_id="ready-lemma",
+                claim_ids=["verified-premise", "ready-lemma"],
+                inference_ids=["inf-ready-terminal"],
+                artifact_id="verification-ready-lemma",
+            )
 
             action = next_action(store, research_mode="balanced", web_search="disabled")
             companions = parallel_companion_actions(
@@ -4741,16 +4805,13 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with store.connect() as conn:
-                conn.execute(
-                    "UPDATE claims SET validation_status='informally_verified' "
-                    "WHERE claim_id LIKE 'ready-lemma-%' OR claim_id='verified-premise'"
-                )
-                conn.execute(
-                    "UPDATE inferences SET validation_status='informally_verified' "
-                    "WHERE inference_id LIKE 'inf-ready-lemma-%'"
-                )
-                conn.commit()
+            strictly_verify_entities(
+                store,
+                target_id="root",
+                claim_ids=["verified-premise", "ready-lemma-0", "ready-lemma-1"],
+                inference_ids=["inf-ready-lemma-0", "inf-ready-lemma-1"],
+                artifact_id="verification-two-ready-routes",
+            )
             store.set_parallel_branches(3, reason="exercise parallel integration wave")
 
             primary = next_action(store, research_mode="balanced", web_search="disabled")
@@ -5306,7 +5367,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertTrue(action["source_adaptation_digest_required"])
         self.assertEqual(action["source_artifact_id"], "source-adaptation-method")
         self.assertEqual(manifest["workflow_action"]["search_request_id"], "req-method")
-        self.assertTrue(any(row["artifact_id"] == "source-adaptation-method" for row in manifest["researcher_packet"]["proof_dossier_artifacts"]))
+        self.assertTrue(any(row["artifact_id"] == "source-adaptation-method" for row in manifest["researcher_packet"]["proof_draft_artifacts"]))
 
     def test_source_adaptation_digest_normalizes_inference_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5479,7 +5540,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                 },
             )
 
-        loaded_ids = [row["artifact_id"] for row in manifest["researcher_packet"]["proof_dossier_artifacts"]]
+        loaded_ids = [row["artifact_id"] for row in manifest["researcher_packet"]["proof_draft_artifacts"]]
         self.assertIn("fresh-source-adaptation", loaded_ids)
         self.assertIn("fresh-source-synthesis", loaded_ids)
         self.assertLess(loaded_ids.index("fresh-source-adaptation"), loaded_ids.index("big-old-dossier-1"))
@@ -6258,7 +6319,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(counterexample["target_id"], "root")
         self.assertTrue(counterexample["counterexample_search_required"])
         self.assertTrue(counterexample["counterexample_probe_required"])
-        self.assertEqual(actor_role_for_action(counterexample), "villain")
+        self.assertEqual(actor_role_for_action(counterexample), "adversarial_reviewer")
 
     def test_duplicate_research_loop_schedules_route_triage_guard(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -6678,7 +6739,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(len(companions), 1)
         self.assertEqual(companions[0]["mode"], "refute")
         self.assertEqual(companions[0]["search_intent"], "parallel_counterexample_search")
-        self.assertEqual(actor_role_for_action(companions[0]), "villain")
+        self.assertEqual(actor_role_for_action(companions[0]), "adversarial_reviewer")
         self.assertNotEqual(companions[0].get("search_intent"), "parallel_decomposition_branch")
 
     def test_high_impact_root_local_branch_gets_counterexample_companion(self) -> None:
@@ -6720,7 +6781,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(companions[0]["mode"], "refute")
         self.assertEqual(companions[0]["target_id"], "high-impact-branch")
         self.assertTrue(companions[0]["counterexample_search_required"])
-        self.assertEqual(actor_role_for_action(companions[0]), "villain")
+        self.assertEqual(actor_role_for_action(companions[0]), "adversarial_reviewer")
 
     def test_blocked_decomposition_plan_schedules_advisor_regulator(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -8097,7 +8158,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                 target_id="packet-target",
                 route_id="route-packet-target",
                 action=action,
-                max_chars=12_000,
+                max_chars=20_000,
             )
             resume_manifest = build_resume_delta_manifest(
                 store,
@@ -8107,7 +8168,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                 since_revision=0,
             )
 
-        self.assertLessEqual(len(json.dumps(manifest)), 12_000)
+        self.assertLessEqual(len(json.dumps(manifest)), 20_000)
         self.assertEqual(manifest["role_context_policy"]["context_role"], "integration_verifier")
         self.assertIn("packet-target", {row["claim_id"] for row in manifest["claims"]})
         self.assertIn("inf-packet-target", {row["inference_id"] for row in manifest["inferences"]})
@@ -8115,20 +8176,20 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertIn("proof-artifact-packet", artifact_ids)
         self.assertIn("verif-packet-target", artifact_ids)
         self.assertEqual(
-            {row["debt_id"] for row in manifest["debts"]},
+            {row["proof_obligation_id"] for row in manifest["proof_obligations"]},
             {"debt-local-integration-route", "debt-related-root-obligation"},
         )
         self.assertEqual(
-            {row["debt_id"] for row in full_manifest["debts"]},
+            {row["proof_obligation_id"] for row in full_manifest["proof_obligations"]},
             {"debt-local-integration-route", "debt-related-root-obligation"},
         )
         candidate = next(
-            row for row in full_manifest["debts"]
-            if row["debt_id"] == "debt-related-root-obligation"
+            row for row in full_manifest["proof_obligations"]
+            if row["proof_obligation_id"] == "debt-related-root-obligation"
         )
         compact_candidate = next(
-            row for row in manifest["debts"]
-            if row["debt_id"] == "debt-related-root-obligation"
+            row for row in manifest["proof_obligations"]
+            if row["proof_obligation_id"] == "debt-related-root-obligation"
         )
         self.assertTrue(candidate["integration_resolution_candidate"])
         self.assertTrue(candidate["full_discharge_justification_required"])
@@ -8137,23 +8198,35 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertNotIn(
             "debt-unrelated-root-route",
             {
-                row["debt_id"]
+                row["proof_obligation_id"]
                 for row in full_manifest["proof_spine"].get("current_bottlenecks", [])
             },
         )
         self.assertEqual(
-            {row["debt_id"] for row in resume_manifest["active_debts"]},
+            {
+                row["proof_obligation_id"]
+                for row in resume_manifest["active_proof_obligations"]
+            },
             {"debt-local-integration-route"},
         )
         self.assertTrue(
-            any("only debt ids listed in manifest.debts" in item for item in full_manifest["instructions"])
+            any(
+                "only proof-obligation ids listed in manifest.proof_obligations" in item
+                for item in full_manifest["instructions"]
+            )
         )
         self.assertTrue(
-            any("resolved_debt_justifications" in item for item in full_manifest["instructions"])
+            any(
+                "resolved_proof_obligation_justifications" in item
+                for item in full_manifest["instructions"]
+            )
         )
+        operation_names = [
+            row["op"] for row in manifest["patch_contract"]["operation_templates"]
+        ]
         self.assertEqual(
-            manifest["patch_contract"]["allowed_operation_names"],
-            ["attach_artifact", "propose_status_transition", "add_debt"],
+            operation_names,
+            ["attach_artifact", "propose_status_transition", "add_proof_obligation"],
         )
 
     def test_role_specific_context_policy_and_model_routing_hint(self) -> None:
@@ -8270,7 +8343,13 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             source.parent.mkdir(parents=True)
             source.write_text("Proof dossier.\n", encoding="utf-8")
             manifest = {
-                "artifacts": [{"artifact_id": "dossier", "path": str(source)}],
+                "artifacts": [
+                    {
+                        "artifact_id": "dossier",
+                        "path": str(source),
+                        "sha256": hashlib.sha256(b"Proof dossier.\n").hexdigest(),
+                    }
+                ],
                 "researcher_packet": {
                     "proof_dossier_artifacts": [{"artifact_id": "dossier", "path": str(source)}],
                     "decomposition_artifacts": [{"artifact_id": "dossier", "path": str(source)}],
@@ -8345,7 +8424,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             child_manifest = json.loads(Path(session_plan["context_path"]).read_text(encoding="utf-8"))
 
             workdir = Path(session_plan["codex_workdir"])
-            ledger_path = Path(child_manifest["negative_result_ledger"][0]["path"])
+            ledger_path = Path(child_manifest["failed_approaches"][0]["path"])
             self.assertNotEqual(ledger_path, original_path)
             self.assertTrue(ledger_path.is_relative_to(workdir))
             self.assertEqual(ledger_path.read_text(encoding="utf-8"), original_path.read_text(encoding="utf-8"))
@@ -8788,15 +8867,15 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             )
         )
 
-    def test_obvious_claim_restatement_is_duplicate(self) -> None:
+    def test_prose_restatement_is_not_automatically_merged(self) -> None:
         existing = [{"claim_id": "claim-a", "statement": "Prove that every smooth curve has property P.", "fingerprint": ""}]
 
         self.assertEqual(
             obvious_duplicate_claim_id(existing, statement="Show every smooth curve has property P."),
-            "claim-a",
+            "",
         )
 
-    def test_near_restatement_of_integrated_claim_is_duplicate(self) -> None:
+    def test_near_restatement_of_integrated_claim_is_not_automatically_merged(self) -> None:
         existing = [
             {
                 "claim_id": "closed-psl2-branch",
@@ -8822,10 +8901,10 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                     "transitive on Omega. Then no pair x,y in K with |x|=2 and |y|=ell invariably generates K."
                 ),
             ),
-            "closed-psl2-branch",
+            "",
         )
 
-    def test_concise_symbolic_restatement_of_integrated_claim_is_duplicate(self) -> None:
+    def test_concise_symbolic_restatement_is_not_automatically_merged(self) -> None:
         existing = [
             {
                 "claim_id": "central-vector-theorem",
@@ -8851,7 +8930,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                     "Thus X is not 3-rigid."
                 ),
             ),
-            "central-vector-theorem",
+            "",
         )
 
     def test_concise_symbolic_claim_with_changed_bound_is_not_duplicate(self) -> None:
@@ -8883,7 +8962,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
             "",
         )
 
-    def test_integrated_claim_closing_qualification_is_duplicate(self) -> None:
+    def test_integrated_claim_closing_qualification_is_not_automatically_merged(self) -> None:
         existing = [
             {
                 "claim_id": "proper-two-anchor",
@@ -8911,7 +8990,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                     "Thus no such x,m can occur in the proper restricted-normalizer branch."
                 ),
             ),
-            "proper-two-anchor",
+            "",
         )
 
     def test_distinct_group_family_template_is_not_duplicate(self) -> None:
@@ -9156,11 +9235,32 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with store.connect() as conn:
-                conn.execute(
-                    "UPDATE debts SET repeated_count=3 WHERE debt_id='debt-root-repeated-bridge'"
-                )
-                conn.commit()
+            repeated = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "add_debt",
+                            "debt_id": "debt-root-repeated-bridge",
+                            "owner_type": "claim",
+                            "owner_id": "root",
+                            "debt_type": "blocking_bridge",
+                            "severity": "blocking",
+                            "status": "active",
+                            "obligation": "Prove or refute the exact bridge lemma that unlocks the root route.",
+                            "suggested_next_target": "root",
+                        }
+                        for _ in range(3)
+                    ],
+                    "rationale": "record three further sightings of the same bottleneck",
+                },
+            )
+            self.assertTrue(repeated.accepted, repeated.errors)
             for index in range(3):
                 record_run(
                     store,
@@ -10229,7 +10329,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertEqual(action["advisor_report_id"], "advisor-villain-cas")
         self.assertTrue(action["counterexample_search_required"])
         self.assertTrue(action["cas_check_recommended"])
-        self.assertEqual(actor_role_for_action(action), "villain")
+        self.assertEqual(actor_role_for_action(action), "adversarial_reviewer")
 
     def test_near_solution_portfolio_schedules_root_spine_synthesis(self) -> None:
         proof_artifacts = [
@@ -10527,7 +10627,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
 
         self.assertIn("CAS lifecycle tools and CAS/data asset execution are not available", advisor_prompt)
         self.assertIn("Do not call discover_cas_backends", advisor_prompt)
-        self.assertIn("request a bounded researcher or villain CAS check", advisor_prompt)
+        self.assertIn("request a bounded researcher or adversarial-review CAS check", advisor_prompt)
         self.assertIn("Do not compute independently", verifier_prompt)
         self.assertIn("cas_experiment_report artifacts", verifier_prompt)
         self.assertIn("Use CAS lifecycle tools", researcher_prompt)
@@ -10544,7 +10644,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertIn("do not add new route-less claims", prompt)
         self.assertIn("working mathematician", prompt)
         self.assertIn("Albilich-native research loop", prompt)
-        self.assertIn("proof_dossier", prompt)
+        self.assertIn("proof_draft", prompt)
         self.assertIn("research_diagnostic", prompt)
         self.assertIn("decomposition_plan", prompt)
         self.assertIn("failed_decomposition_plan", prompt)
@@ -10672,7 +10772,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertIn("missing_theorem", prompt)
         self.assertIn("bad_strategy", prompt)
         self.assertIn("abandon_or_pause_route", prompt)
-        self.assertIn("verifier_gap_debt_ids", prompt)
+        self.assertIn("verifier_gap_proof_obligation_ids", prompt)
         self.assertIn("Do not certify the proof yourself", prompt)
 
     def test_phd_advisor_prompt_classifies_obstruction_after_researcher_timeout(self) -> None:
@@ -10762,8 +10862,12 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
 
         self.assertIn("workflow_action.bridge_lemma_workbench_required=true", prompt)
         self.assertIn("If the output is an obstruction, construction_failure, or sharper sub-bridge", prompt)
-        self.assertIn("include an update_debt for workflow_action.central_debt_id", prompt)
-        self.assertIn("one new precise blocking add_debt", prompt)
+        self.assertIn(
+            "include an update_proof_obligation for "
+            "workflow_action.central_proof_obligation_id",
+            prompt,
+        )
+        self.assertIn("one new precise blocking add_proof_obligation", prompt)
         self.assertIn("narrowed obligation instead of repeating this pass", prompt)
         self.assertIn("never emit forward_support=[]", prompt)
 
@@ -10796,7 +10900,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
         self.assertIn("short proof spine", prompt)
         self.assertIn("duplicate_math_guard_required", prompt)
         self.assertIn("near_miss_memory_required", prompt)
-        self.assertIn("villain_obstruction_to_lemma_required", prompt)
+        self.assertIn("adversarial_reviewer_obstruction_to_lemma_required", prompt)
         self.assertIn("executive_advisor_lock_required=true", prompt)
         self.assertIn("binding steering decision", prompt)
         self.assertIn("hard theorem workbench", prompt)
@@ -10804,14 +10908,14 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
 
     def test_villain_refute_mode_records_candidate_counterexamples_only(self) -> None:
         action = {"mode": "refute", "target_id": "root"}
-        self.assertEqual(actor_role_for_action(action), "villain")
+        self.assertEqual(actor_role_for_action(action), "adversarial_reviewer")
         prompt = build_session_prompt(
             context_path=Path("/tmp/context.json"),
             action=action,
-            actor_role="villain",
+            actor_role="adversarial_reviewer",
         )
 
-        self.assertIn("Act as the villain", prompt)
+        self.assertIn("independent adversarial reviewer", prompt)
         self.assertIn("candidate_counterexample", prompt)
         self.assertIn("counterexample_validator", prompt)
         self.assertIn("CAS tools", prompt)

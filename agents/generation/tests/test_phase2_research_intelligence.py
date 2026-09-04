@@ -314,9 +314,14 @@ class ResearchIntelligenceTests(unittest.TestCase):
         )
         self.assertFalse(learned["reference_solution_used"])
         self.assertFalse(learned["private_cross_problem_cache_used"])
-        self.assertEqual(learned["current_family"]["verified_successes"], 1)
+        self.assertEqual(learned["current_family"]["accepted_successes"], 1)
         self.assertEqual(learned["current_family"]["root_contributing_successes"], 1)
-        self.assertIn("posterior_root_contribution", learned["current_family"])
+        self.assertIn("observed_root_contribution_rate", learned["current_family"])
+        self.assertFalse(learned["calibrated_probabilities"])
+        self.assertFalse(learned["causal_estimate"])
+        self.assertEqual(learned["ranking_effect"], "disabled_until_preregistered_randomized_comparison")
+        self.assertEqual(learned["current_family"]["heuristic_score_adjustment"], 0.0)
+        self.assertEqual(learned["current_family"]["observational_trials"], 2)
         self.assertEqual(learned["current_family"]["execution_failures"], 1)
 
     def test_two_no_delta_sessions_force_philosophy_change(self) -> None:
@@ -335,6 +340,25 @@ class ResearchIntelligenceTests(unittest.TestCase):
                 "metadata_json": '{"target_id":"root","mathematical_delta_kind":"none","changed_proof_state":false}',
             },
         ]
+        state["recent_runs"] = [
+            {
+                "run_id": "deep-run-1",
+                "actor_role": "researcher",
+                "mode": "reduce",
+                "target_id": "root",
+                "state_revision": 11,
+                "output_artifact_ids_json": '["deep-1"]',
+            },
+            {
+                "run_id": "deep-run-2",
+                "actor_role": "researcher",
+                "mode": "reduce",
+                "target_id": "root",
+                "state_revision": 10,
+                "output_artifact_ids_json": '["deep-2"]',
+            },
+        ]
+        state["accepted_mathematical_deltas"] = []
         roi = deep_session_roi(state, {"mode": "reduce", "target_id": "root", "research_philosophy": "direct_proof"})
         self.assertFalse(roi["allowed"])
         action = enrich_action(

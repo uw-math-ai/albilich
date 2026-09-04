@@ -67,11 +67,28 @@ def _candidate_databases(store: ProofStateStore, *, limit: int) -> Iterable[Path
                     paths.append(candidate)
                 continue
             stack.append(Path(entry.path))
-    paths.sort(
-        key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
-        reverse=True,
-    )
-    return [path for path in paths if path.resolve() != store.db_path.resolve()][:limit]
+    def modification_time(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    paths.sort(key=modification_time, reverse=True)
+    try:
+        active_path = store.db_path.resolve()
+    except OSError:
+        active_path = store.db_path.absolute()
+    candidates: list[Path] = []
+    for path in paths:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved != active_path:
+            candidates.append(path)
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def certified_cross_run_candidates(

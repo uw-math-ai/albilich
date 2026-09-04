@@ -2,7 +2,7 @@
 
 This is the minimal port of the v1.5 informal search tools. The two providers
 are available only to `literature_researcher` sessions in `retrieve` mode.
-Researchers, villains, advisors, and verifiers do not receive a search
+Researchers, adversarial reviewers, advisors, and verifiers do not receive a search
 capability; they consume persisted retrieval cards.
 
 ## Informal providers

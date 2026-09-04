@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Normalized memory-status policy for phase2 manifests (2026-07-09 TODO 4).
+"""Normalized memory-status policy for phase2 manifests.
 
 Every proof-state row an agent can see is classified into one normalized
 ``memory_status`` from the update-advice vocabulary:
@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 from .models import fingerprint_text, json_loads, normalize_text
+from .verification import clean_verification_metadata
 
 MEMORY_STATUSES = {
     "verified",
@@ -47,7 +48,7 @@ def role_memory_view_policy(context_role: str) -> Dict[str, Any]:
             "failed_use": "test whether the submitted proof repeats a known failure",
             "authoritative_boundary": "role packet",
         }
-    if role == "villain":
+    if role in {"adversarial_reviewer", "villain"}:
         return {
             "role": role,
             "settled_premise_statuses": ["verified"],
@@ -93,10 +94,7 @@ RAW_LOG_ARTIFACT_TYPES = {
 }
 RAW_LOG_ARTIFACT_ID_PREFIXES = ("session_failure_",)
 
-VERIFIED_ARTIFACT_TYPES = {
-    "final_proof",
-    "final_paper",
-    "verified_blueprint",
+CERTIFICATE_ARTIFACT_TYPES = {
     "verification_report",
     "integration_report",
     "formal_backend_result",
@@ -118,7 +116,7 @@ BACKGROUND_ARTIFACT_TYPES = {
     "run_interruption_event",
     "writing_review",
     "writer_report",
-    # Scheduler-maintained per-branch workbench digests (TODO 1): curated
+    # Scheduler-maintained per-branch workbench digests: curated
     # context, never proof evidence.
     "branch_workbench",
 }
@@ -193,12 +191,61 @@ def debt_memory_status(row: Mapping[str, Any]) -> str:
     return "blocked"
 
 
-def artifact_memory_status(row: Mapping[str, Any], *, current_revision: int | None = None) -> str:
+def current_certificate_artifact_ids(state: Mapping[str, Any]) -> set[str]:
+    """Certificate ids currently supporting a verified graph entity.
+
+    Store invariants require every such entity to have a current host binding,
+    so this context-derived set is stronger than trusting certificate metadata
+    in isolation.
+    """
+
+    result: set[str] = set()
+    for claim in state.get("claims", []) or []:
+        if (
+            str(claim.get("validation_status") or "") in VERIFIED_VALIDATION_STATUSES
+            or str(claim.get("lifecycle_status") or "") == "integrated"
+        ):
+            result.update(str(item) for item in json_loads(claim.get("evidence_artifact_ids_json")) if str(item))
+    for inference in state.get("inferences", []) or []:
+        if str(inference.get("validation_status") or "") in VERIFIED_VALIDATION_STATUSES:
+            result.update(str(item) for item in json_loads(inference.get("evidence_artifact_ids_json")) if str(item))
+    for route in state.get("routes", []) or []:
+        if str(route.get("status") or "") == "integrated":
+            result.update(str(item) for item in json_loads(route.get("evidence_artifact_ids_json")) if str(item))
+    return result
+
+
+def artifact_memory_status(
+    row: Mapping[str, Any],
+    *,
+    current_revision: int | None = None,
+    current_certificate_ids: set[str] | None = None,
+) -> str:
     if artifact_is_raw_log(row):
         return "failed"
     artifact_type = str(row.get("artifact_type") or "")
-    if artifact_type in VERIFIED_ARTIFACT_TYPES:
-        return "verified"
+    metadata = row.get("metadata")
+    if not isinstance(metadata, Mapping):
+        metadata = json_loads(row.get("metadata_json"), {})
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+    if metadata.get("certificate_revoked") is True or metadata.get("stale") is True:
+        return "stale"
+    if artifact_type in CERTIFICATE_ARTIFACT_TYPES:
+        artifact_id = str(row.get("artifact_id") or "")
+        if current_certificate_ids is None:
+            # A row-local view cannot recompute dependency digests.  Do not
+            # advertise an old certificate as current merely because its
+            # historical binding remains in metadata.
+            return "candidate" if metadata.get("host_certificate_bindings") else "background"
+        if artifact_id not in current_certificate_ids:
+            return "stale" if metadata.get("host_certificate_bindings") else "background"
+        return _certificate_artifact_memory_status(row, metadata)
+    if artifact_type in {"final_proof", "final_paper", "verified_blueprint"}:
+        # Expository or proposed proof artifacts are never certificates in
+        # their own right. Their mathematical claims are settled only through
+        # separately indexed, host-bound verification entities.
+        return "candidate"
     if artifact_type in FAILED_ARTIFACT_TYPES:
         return "failed"
     if artifact_type in BACKGROUND_ARTIFACT_TYPES:
@@ -211,6 +258,41 @@ def artifact_memory_status(row: Mapping[str, Any], *, current_revision: int | No
         if int(current_revision) - revision > STALE_ARTIFACT_REVISION_GAP:
             return "stale"
     return "candidate"
+
+
+def _certificate_artifact_memory_status(
+    row: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> str:
+    artifact_type = str(row.get("artifact_type") or "")
+    producer = str(row.get("producer_role") or "")
+    bindings = metadata.get("host_certificate_bindings")
+    if not isinstance(bindings, Mapping) or not bindings:
+        return "background"
+    if artifact_type == "verification_report":
+        if producer != "strict_informal_verifier":
+            return "failed"
+        if clean_verification_metadata(metadata, outcome="positive"):
+            return "verified"
+        return "failed" if metadata.get("verdict") else "background"
+    if artifact_type == "integration_report":
+        if producer != "integration_verifier":
+            return "failed"
+        integrates = metadata.get("integrates") is True
+        no_gaps = not list(metadata.get("critical_errors") or []) and not list(metadata.get("gaps") or [])
+        return "verified" if integrates and no_gaps else "failed"
+    if artifact_type == "formal_backend_result":
+        if producer != "formal_backend":
+            return "failed"
+        host_check = metadata.get("host_formal_check")
+        checked = isinstance(host_check, Mapping) and host_check.get("host_checked") is True
+        return "verified" if checked else "failed"
+    if artifact_type == "confirmed_counterexample":
+        if producer != "counterexample_validator":
+            return "failed"
+        confirmed = metadata.get("confirmed") is True or str(metadata.get("validation_result") or "") == "confirmed"
+        return "verified" if confirmed else "failed"
+    return "background"
 
 
 def retrieval_card_memory_status(row: Mapping[str, Any]) -> str:
@@ -226,8 +308,14 @@ def retrieval_card_memory_status(row: Mapping[str, Any]) -> str:
 
 
 def theorem_library_memory_status(row: Mapping[str, Any]) -> str:
-    certification = str(row.get("certification_type") or "")
-    if certification == "external_citation" or "certif" in certification or "verified" in certification:
+    certification = str(row.get("certification_type") or "").strip().lower()
+    if certification in {
+        "external_citation",
+        "independently_reviewed",
+        "informally_verified",
+        "formally_verified",
+        "machine_checked",
+    }:
         return "verified"
     return "background"
 

@@ -16,13 +16,16 @@ if str(REPO_ROOT) not in sys.path:
 from agents.generation.phase2 import cli as cli_mod
 from agents.generation.phase2.context_builder import build_context_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch, apply_system_patch
 from agents.generation.phase2.result_status import classify_result
 from agents.generation.phase2.scheduler import (
     WRITING_GATE_REVIEW_INTENT_PREFIX,
     next_action,
 )
-from agents.generation.phase2.steering import snapshot, submit_steering
+from agents.generation.phase2.steering import (
+    authenticated_snapshot,
+    submit_operator_steering,
+)
 from agents.generation.phase2.store import ProofStateStore
 from agents.generation.phase2.workflow import run_workflow
 from agents.generation.phase2.writing.paper_contract import (
@@ -87,6 +90,21 @@ def attach_pass_review(store: ProofStateStore, action: dict) -> None:
                         "state_revision_reviewed": action["state_revision_reviewed"],
                     },
                 },
+            ],
+            "rationale": f"complete the independent {lens} audit",
+        },
+    )
+    if not outcome.accepted:
+        raise AssertionError(outcome.errors)
+    metrics = apply_system_patch(
+        store,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "problem_id": store.problem_id,
+            "base_revision": store.get_revision(),
+            "actor_role": "scheduler",
+            "target_id": "root",
+            "operations": [
                 {
                     "op": "record_run_metrics",
                     "run_id": f"run-{lens}-{artifact_id}",
@@ -95,13 +113,13 @@ def attach_pass_review(store: ProofStateStore, action: dict) -> None:
                     "search_intent": f"{WRITING_GATE_REVIEW_INTENT_PREFIX}{lens}",
                     "state_revision": store.get_revision(),
                     "status": "completed",
-                },
+                }
             ],
-            "rationale": f"complete the independent {lens} audit",
+            "rationale": "record host-observed writing-review completion",
         },
     )
-    if not outcome.accepted:
-        raise AssertionError(outcome.errors)
+    if not metrics.accepted:
+        raise AssertionError(metrics.errors)
 
 
 def add_terminology_consultation(store: ProofStateStore) -> None:
@@ -326,7 +344,7 @@ class WritingRevisionWorkflowTest(unittest.TestCase):
                 }
                 for lens in REQUIRED_WRITING_REVIEW_LENSES
             ]
-            outcome = apply_patch(
+            outcome = apply_system_patch(
                 store,
                 {
                     "schema_version": SCHEMA_VERSION,
@@ -369,7 +387,7 @@ class WritingRevisionWorkflowTest(unittest.TestCase):
                 blocked["terminal_classification"],
             )
             self.assertEqual("writing-term-consultation", blocked["terminology_debt_id"])
-            self.assertEqual(1, len(snapshot(store.state_dir)["open_blockers"]))
+            self.assertEqual(1, len(authenticated_snapshot(store)["open_blockers"]))
             self.assertEqual(
                 "writing_revision_awaiting_human",
                 classify_result(store)["report_classification"],
@@ -385,8 +403,8 @@ class WritingRevisionWorkflowTest(unittest.TestCase):
             )
             self.assertEqual("awaiting_human", store.get_run_status())
 
-            submit_steering(
-                store.state_dir,
+            submit_operator_steering(
+                store,
                 "Use the standard term ‘identity element’ throughout.",
                 blocker_id=blocked["human_blocker_id"],
             )

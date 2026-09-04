@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import tempfile
 import threading
@@ -24,6 +25,7 @@ from agents.generation.phase2.monitor import (
     start_background_monitor,
 )
 from agents.generation.phase2.models import utc_now
+from agents.generation.phase2.steering import MAX_STEERING_TEXT_BYTES
 from agents.generation.phase2.store import ProofStateStore
 
 
@@ -323,6 +325,19 @@ class MonitorTest(unittest.TestCase):
             with store.connect() as conn:
                 for status in ("active", "refuted", "discarded", "resolved"):
                     conn.execute(
+                        """INSERT INTO artifacts(
+                               artifact_id, artifact_type, path, sha256, producer_role,
+                               run_id, state_revision, content_summary, metadata_json, created_at
+                           ) VALUES (?, 'verification_report', '', ?, 'strict_informal_verifier',
+                                     'monitor-fixture', 0, ?, '{}', ?)""",
+                        (
+                            f"evidence-{status}",
+                            "a" * 64,
+                            f"Evidence classifying the obligation as {status}.",
+                            now,
+                        ),
+                    )
+                    conn.execute(
                         """INSERT INTO debts(
                                debt_id, owner_type, owner_id, obligation, fingerprint, debt_type,
                                severity, status, first_seen, last_seen, repeated_count,
@@ -363,7 +378,7 @@ class MonitorTest(unittest.TestCase):
             ["evidence-refuted"],
         )
         self.assertIn("Proof Obligations", INDEX_HTML)
-        self.assertIn("Closed obligation ledger", INDEX_HTML)
+        self.assertIn("Closed proof obligations", INDEX_HTML)
         self.assertIn("renderDebts(p.open_cases, p.closed_cases);", INDEX_HTML)
 
     def test_token_ui_distinguishes_processed_from_budget_spend(self) -> None:
@@ -380,7 +395,7 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("30% explore", INDEX_HTML)
         self.assertIn("20% adversarial", INDEX_HTML)
         self.assertIn("Generate new approaches", INDEX_HTML)
-        self.assertIn("Ideas are advisory; research questions are nonblocking; proof debts remain strict.", INDEX_HTML)
+        self.assertIn("Ideas are advisory; research questions are nonblocking; proof obligations remain exact.", INDEX_HTML)
         self.assertIn("Portfolio refresh queued", INDEX_HTML)
         self.assertIn("Root effect${alignmentPending?' (stale)':''}", INDEX_HTML)
         self.assertIn("Steering impact", INDEX_HTML)
@@ -755,6 +770,11 @@ class MonitorTest(unittest.TestCase):
                 self.assertIn("bottleneckFrontier", html)
                 self.assertIn("Proof Graph", html)
                 self.assertIn("proofGraph", html)
+                self.assertNotIn("__STEERING_TOKEN_JSON__", html)
+                self.assertNotIn("__SCRIPT_NONCE__", html)
+                self.assertNotIn("cdn.jsdelivr.net", html)
+                self.assertIn("Content-Security-Policy", resp.headers)
+                self.assertIn("script-src 'nonce-", resp.headers["Content-Security-Policy"])
 
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/console") as resp:
                     data = json.loads(resp.read().decode("utf-8"))
@@ -775,6 +795,106 @@ class MonitorTest(unittest.TestCase):
                     self.assertEqual(resp.status, 200)
                 self.assertIn("nodes", graph)
                 self.assertIn("edges", graph)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_steering_post_requires_instance_token_and_has_size_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            token = "monitor-test-steering-token"
+            handler = _make_handler(store, poll_ms=2000, steering_token=token)
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            port = httpd.server_address[1]
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            url = f"http://127.0.0.1:{port}/api/steer"
+            body = json.dumps({"text": "Check the endpoint case first."}).encode(
+                "utf-8"
+            )
+            try:
+                missing = urllib.request.Request(
+                    url,
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as rejected:
+                    urllib.request.urlopen(missing)
+                self.assertEqual(403, rejected.exception.code)
+                rejected.exception.close()
+
+                oversized = urllib.request.Request(
+                    url,
+                    data=b"{}",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(64 * 1024 + 1),
+                        "X-Albilich-Steering-Token": token,
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as rejected:
+                    urllib.request.urlopen(oversized)
+                self.assertEqual(413, rejected.exception.code)
+                rejected.exception.close()
+
+                oversized_text = urllib.request.Request(
+                    url,
+                    data=json.dumps(
+                        {"text": "x" * (MAX_STEERING_TEXT_BYTES + 1)}
+                    ).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Albilich-Steering-Token": token,
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as rejected:
+                    urllib.request.urlopen(oversized_text)
+                self.assertEqual(413, rejected.exception.code)
+                rejected.exception.close()
+
+                wrong_alignment_type = urllib.request.Request(
+                    url,
+                    data=json.dumps(
+                        {
+                            "text": "Check the endpoint case first.",
+                            "requires_approach_alignment": "false",
+                        }
+                    ).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Albilich-Steering-Token": token,
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as rejected:
+                    urllib.request.urlopen(wrong_alignment_type)
+                self.assertEqual(400, rejected.exception.code)
+                rejected.exception.close()
+
+                accepted = urllib.request.Request(
+                    url,
+                    data=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Albilich-Steering-Token": token,
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(accepted) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                self.assertTrue(payload["ok"])
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/steering"
+                ) as response:
+                    steering_view = json.loads(response.read().decode("utf-8"))
+                self.assertEqual("verified_event_journal", steering_view["source"])
+                self.assertEqual(
+                    "Check the endpoint case first.",
+                    steering_view["recent_inbox"][0]["text"],
+                )
             finally:
                 httpd.shutdown()
                 httpd.server_close()
@@ -1056,11 +1176,12 @@ class MonitorTest(unittest.TestCase):
                     INSERT INTO artifacts(
                         artifact_id, artifact_type, path, sha256, producer_role, run_id,
                         state_revision, content_summary, metadata_json, created_at
-                    ) VALUES (?, 'proof_dossier', ?, 'sha-dossier', 'researcher', 'research-1', 9, ?, ?, ?)
+                    ) VALUES (?, 'proof_dossier', ?, ?, 'researcher', 'research-1', 9, ?, ?, ?)
                     """,
                     (
                         "proof-dossier",
                         str(dossier_path),
+                        hashlib.sha256(dossier_path.read_bytes()).hexdigest(),
                         "Every subgroup of a cyclic group is normal.",
                         json.dumps({"title": "Normality of subgroups of a cyclic group"}),
                         now,
@@ -1106,6 +1227,15 @@ class MonitorTest(unittest.TestCase):
                     document = json.loads(response.read().decode("utf-8"))
                 self.assertEqual(document["title"], "Normality of subgroups of a cyclic group")
                 self.assertIn("every subgroup of $G$", document["content"])
+                self.assertEqual("verified", document["integrity_status"])
+
+                dossier_path.write_text("tampered dashboard bytes", encoding="utf-8")
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/artifact?id=proof-dossier"
+                ) as response:
+                    tampered_document = json.loads(response.read().decode("utf-8"))
+                self.assertEqual("", tampered_document["content"])
+                self.assertEqual("invalid", tampered_document["integrity_status"])
 
                 with self.assertRaises(urllib.error.HTTPError) as rejected:
                     urllib.request.urlopen(
@@ -1120,7 +1250,7 @@ class MonitorTest(unittest.TestCase):
         self.assertIn('id="paperFrame"', INDEX_HTML)
         self.assertIn('id="paperSelect"', INDEX_HTML)
         self.assertIn("Mathematical Artifact Library", INDEX_HTML)
-        self.assertIn("https://cdn.jsdelivr.net/npm/mathjax@4/tex-svg.js", INDEX_HTML)
+        self.assertNotIn("https://cdn.jsdelivr.net", INDEX_HTML)
         self.assertIn("function latexCompat", INDEX_HTML)
         self.assertIn("function typesetPending", INDEX_HTML)
         self.assertIn("function setStableHTML", INDEX_HTML)
@@ -1142,6 +1272,17 @@ class MonitorTest(unittest.TestCase):
                 monitor.stop()
 
         self.assertFalse(monitor.thread.is_alive())
+
+    def test_background_monitor_refuses_non_loopback_control_plane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            with self.assertRaisesRegex(ValueError, "loopback"):
+                start_background_monitor(
+                    store,
+                    host="0.0.0.0",
+                    port=0,
+                    open_browser=False,
+                )
 
     def test_run_dashboard_helper_is_enabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

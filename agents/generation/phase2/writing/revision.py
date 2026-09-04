@@ -12,7 +12,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-from ..models import json_dumps, sha256_text, utc_now
+from ..bounded_io import read_bounded_text
+from ..models import SCHEMA_VERSION, sha256_text
 
 WRITING_REVISION_RESEARCH_MODE = "writing_revision"
 REVISION_DOCUMENT_ARTIFACT_TYPE = "revision_document"
@@ -104,12 +105,11 @@ def ingest_writing_revision(
     if not document.is_file():
         raise FileNotFoundError(document)
     document_format = document_format_from_suffix(document.suffix)
-    size = document.stat().st_size
-    if size > MAX_REVISION_DOCUMENT_BYTES:
-        raise ValueError(
-            f"writing document is {size} bytes; maximum supported size is {MAX_REVISION_DOCUMENT_BYTES} bytes"
-        )
-    text = document.read_text(encoding="utf-8")
+    text = read_bounded_text(
+        document,
+        max_bytes=MAX_REVISION_DOCUMENT_BYTES,
+        label="writing revision document",
+    )
     if not text.strip():
         raise ValueError("writing document is empty")
     with store.connect() as conn:
@@ -137,12 +137,7 @@ def ingest_writing_revision(
     )
 
     original_sha256 = sha256_text(text)
-    artifact_dir = store.state_dir / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifact_dir / f"{REVISION_DOCUMENT_ARTIFACT_ID}{document.suffix.lower()}"
     stored_text = text if text.endswith("\n") else text + "\n"
-    artifact_path.write_text(stored_text, encoding="utf-8")
-    now = utc_now()
     metadata = {
         "source_file": str(document),
         "title": resolved_title,
@@ -154,35 +149,50 @@ def ingest_writing_revision(
         "voice_preserving": True,
         "mathematical_status": "not_verified_by_writing_harness",
     }
+    from ..patches import apply_operator_patch
+
+    revision = store.get_revision()
+    outcome = apply_operator_patch(
+        store,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "problem_id": store.problem_id,
+            "base_revision": revision,
+            "actor_role": "human_operator",
+            "target_id": REVISION_DOCUMENT_ARTIFACT_ID,
+            "operations": [
+                {
+                    "op": "attach_artifact",
+                    "artifact_id": REVISION_DOCUMENT_ARTIFACT_ID,
+                    "artifact_type": REVISION_DOCUMENT_ARTIFACT_TYPE,
+                    "content": stored_text,
+                    "content_summary": (
+                        f"External {document_format} manuscript for writing revision: {resolved_title}"
+                    )[:500],
+                    "metadata": metadata,
+                }
+            ],
+            "evidence_artifact_ids": [],
+            "rationale": "ingest the operator-submitted manuscript as immutable writing input",
+        },
+    )
+    if not outcome.accepted:
+        raise RuntimeError("revision-document patch rejected: " + "; ".join(outcome.errors))
     with store.connect() as conn:
-        revision = int(store.get_problem_row(conn)["current_revision"])
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO artifacts(
-                artifact_id, artifact_type, path, sha256, producer_role, run_id,
-                state_revision, content_summary, metadata_json, created_at
-            ) VALUES (?, ?, ?, ?, 'human_operator', '', ?, ?, ?, ?)
-            """,
-            (
-                REVISION_DOCUMENT_ARTIFACT_ID,
-                REVISION_DOCUMENT_ARTIFACT_TYPE,
-                str(artifact_path),
-                sha256_text(stored_text),
-                revision,
-                f"External {document_format} manuscript for writing revision: {resolved_title}"[:500],
-                json_dumps(metadata),
-                now,
-            ),
-        )
+        artifact = conn.execute(
+            "SELECT path FROM artifacts WHERE artifact_id = ?", (REVISION_DOCUMENT_ARTIFACT_ID,)
+        ).fetchone()
+        artifact_path = Path(str(artifact["path"]))
         store.write_event(
             conn,
-            revision,
+            outcome.revision,
             WRITING_REVISION_INGESTED_EVENT,
             {
                 "artifact_id": REVISION_DOCUMENT_ARTIFACT_ID,
                 "title": resolved_title,
                 "document_format": document_format,
                 "original_sha256": original_sha256,
+                "patch_id": outcome.patch_id,
             },
         )
         conn.commit()

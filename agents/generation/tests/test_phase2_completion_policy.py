@@ -28,7 +28,7 @@ from agents.generation.phase2.completion_policy import (
 )
 from agents.generation.phase2.context_builder import build_context_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch
 from agents.generation.phase2.report import build_markdown_report
 from agents.generation.phase2.result_status import classify_state
 from agents.generation.phase2.scheduler import _action, next_action

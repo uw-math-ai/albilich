@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -15,10 +16,15 @@ if str(REPO_ROOT) not in sys.path:
 
 from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.console import build_run_console_payload
-from agents.generation.phase2.patches import _stale_rebase_assessment, apply_patch
+from agents.generation.phase2.patches import (
+    _stale_rebase_assessment,
+    apply_operator_patch as apply_patch,
+    apply_system_patch,
+)
 from agents.generation.phase2.receipt import format_receipt_latex
 from agents.generation.phase2.report import build_markdown_report
 from agents.generation.phase2.store import ProofStateStore
+from agents.generation.tests._phase2_test_support import certify_and_integrate_claim
 
 
 def add_debt_patch(*, problem_id: str, base_revision: int, debt_id: str, obligation: str) -> dict:
@@ -46,7 +52,7 @@ def add_debt_patch(*, problem_id: str, base_revision: int, debt_id: str, obligat
 
 
 class Phase2PatchDebtTest(unittest.TestCase):
-    def test_confirmed_counterexample_resolves_only_matching_candidate_validation_debts(self) -> None:
+    def test_confirmed_counterexample_resolves_only_explicitly_named_validation_obligation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore(
                 "patch-counterexample-debt-reconciliation-test",
@@ -105,7 +111,15 @@ class Phase2PatchDebtTest(unittest.TestCase):
                                 "validation_result": "confirmed",
                                 "confirmed": True,
                             },
-                        }
+                        },
+                        {
+                            "op": "resolve_debt",
+                            "debt_id": "validate-candidate-k-two",
+                            "resolution_evidence_artifact_ids": ["legacy-confirmation-k-two"],
+                            "resolution_evidence": {
+                                "explanation": "The independent computation confirms this exact candidate."
+                            },
+                        },
                     ],
                     "rationale": "simulate a legacy confirmation without a candidate id",
                 },
@@ -172,7 +186,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
             self.assertTrue(newer.accepted, newer.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 rows = dict(
                     conn.execute(
                         "SELECT debt_id, status FROM debts WHERE debt_id IN (?, ?, ?)",
@@ -185,7 +199,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
                 )
 
         self.assertEqual(rows["validate-candidate-k-two"], "resolved")
-        self.assertEqual(rows["duplicate-validation-debt"], "resolved")
+        self.assertEqual(rows["duplicate-validation-debt"], "active")
         self.assertEqual(rows["validate-newer-candidate"], "active")
 
     def test_interrogative_root_cannot_be_marked_refuted(self) -> None:
@@ -276,7 +290,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
             self.assertTrue(outcome.accepted, outcome.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute("SELECT source_artifact_ids_json FROM debts WHERE debt_id = 'debt-source-card-mixed'").fetchone()
 
@@ -360,7 +374,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
             self.assertTrue(outcome.accepted, outcome.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute("SELECT severity FROM debts WHERE debt_id = 'debt-high-severity'").fetchone()
 
@@ -401,7 +415,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             artifact_dir.mkdir(parents=True, exist_ok=True)
             (artifact_dir / "stored-note.txt").write_text("abc", encoding="utf-8")
 
-            prior = apply_patch(
+            prior = apply_system_patch(
                 store,
                 {
                     "schema_version": SCHEMA_VERSION,
@@ -433,7 +447,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
             self.assertTrue(prior.accepted, prior.errors)
 
-            current = apply_patch(
+            current = apply_system_patch(
                 store,
                 {
                     "schema_version": SCHEMA_VERSION,
@@ -560,13 +574,13 @@ class Phase2PatchDebtTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("patch-console-verifier-launch-health-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("prove the root theorem")
-            recorded = apply_patch(
+            recorded = apply_system_patch(
                 store,
                 {
                     "schema_version": SCHEMA_VERSION,
                     "problem_id": store.problem_id,
                     "base_revision": 0,
-                    "actor_role": "strict_informal_verifier",
+                    "actor_role": "scheduler",
                     "target_id": "root",
                     "operations": [
                         {
@@ -622,7 +636,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT artifact_type, path, metadata_json FROM artifacts WHERE artifact_id = ?",
                     ("alias-proof-dossier",),
@@ -663,7 +677,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT artifact_type, path, metadata_json FROM artifacts WHERE artifact_id = ?",
                     ("nested-proof-dossier",),
@@ -701,7 +715,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT artifact_type, path, producer_role FROM artifacts WHERE artifact_id = ?",
                     ("bare-advisor-report",),
@@ -737,7 +751,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT artifact_id, artifact_type, path FROM artifacts WHERE producer_role = ?",
                     ("phd_advisor",),
@@ -780,7 +794,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT kind, statement, parent_ids_json, tags_json FROM claims WHERE claim_id = ?",
                     ("nested-local-lemma",),
@@ -843,7 +857,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
             self.assertTrue(outcome.accepted, outcome.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 route = conn.execute("SELECT 1 FROM routes WHERE route_id = 'route-auto-lemma-failed-proof'").fetchone()
                 inference_route = conn.execute(
                     "SELECT route_id FROM inferences WHERE inference_id = 'inf-failed-proof'"
@@ -851,7 +865,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             self.assertIsNone(route)
             self.assertEqual(inference_route, "route-root")
 
-    def test_obstruction_evidence_auto_routes_obstruction_claim(self) -> None:
+    def test_obstruction_evidence_does_not_create_an_undeclared_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("patch-obstruction-auto-route-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("prove the root theorem")
@@ -904,16 +918,15 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
             self.assertTrue(outcome.accepted, outcome.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 route = conn.execute(
                     "SELECT conclusion_claim_id, strategy FROM routes WHERE route_id = 'route-auto-obs-root'"
                 ).fetchone()
                 inference_route = conn.execute(
                     "SELECT route_id FROM inferences WHERE inference_id = 'inf-obs-root'"
                 ).fetchone()[0]
-            self.assertEqual(route[0], "obs-root")
-            self.assertEqual(route[1], "auto_assembled_from_dossier")
-            self.assertEqual(inference_route, "route-auto-obs-root")
+            self.assertIsNone(route)
+            self.assertEqual(inference_route, "route-root")
 
     def test_nested_add_route_operation_is_normalized(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -971,7 +984,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT label, strategy, relation_to_parent FROM routes WHERE route_id = ?",
                     ("nested-route",),
@@ -1041,7 +1054,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 route = conn.execute(
                     "SELECT conclusion_claim_id, strategy FROM routes WHERE route_id = ?",
                     ("route-alias-target",),
@@ -1101,7 +1114,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 route = conn.execute(
                     "SELECT conclusion_claim_id, strategy, relation_to_parent, status FROM routes WHERE route_id = ?",
                     ("route-generated-alias-target",),
@@ -1147,7 +1160,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT metadata_json FROM artifacts WHERE artifact_id = ?",
                     ("structured-source-notes",),
@@ -1183,7 +1196,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT artifact_type, path, metadata_json FROM artifacts WHERE artifact_id = ?",
                     ("flat-alias-counterexample",),
@@ -1225,7 +1238,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute("SELECT obligation FROM debts WHERE debt_id = ?", ("nested-root-gap",)).fetchone()
             self.assertEqual(row[0], "Nested debt content must be recorded.")
 
@@ -1268,7 +1281,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute("SELECT owner_type, owner_id FROM debts WHERE debt_id = ?", ("route-gap",)).fetchone()
             self.assertEqual(("route", "route-later"), tuple(row))
 
@@ -1328,7 +1341,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT explanation, validation_status FROM inferences WHERE inference_id = ?",
                     ("nested-root-inference",),
@@ -1370,7 +1383,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT exact_statement FROM retrieval_cards WHERE card_id = ?",
                     ("retrieval-no-useful-result",),
@@ -1410,7 +1423,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT exact_statement FROM retrieval_cards WHERE card_id = ?",
                     ("retrieval-card-from-artifact-id",),
@@ -1494,7 +1507,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT normalized_query, exact_statement, applicability_json FROM retrieval_cards WHERE card_id = ?",
                     ("retrieval-nested-card",),
@@ -1530,7 +1543,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT artifact_type, path FROM artifacts WHERE artifact_id = ?",
                     ("operation-alias-dossier",),
@@ -1567,7 +1580,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT artifact_type, path FROM artifacts WHERE artifact_id = ?",
                     ("operation-name-alias-report",),
@@ -1604,7 +1617,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute("SELECT path, content_summary FROM artifacts WHERE artifact_id = 'structured-diagnostic'").fetchone()
             self.assertTrue(row["path"])
@@ -1647,7 +1660,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute("SELECT applicability_json FROM retrieval_cards WHERE card_id = 'card-prose-applicability'").fetchone()
             applicability = json.loads(row["applicability_json"])
@@ -1773,7 +1786,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
             self.assertTrue(second.accepted, second.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 rows = list(conn.execute("SELECT debt_id, repeated_count, severity, status FROM debts"))
 
@@ -1819,7 +1832,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
             self.assertTrue(researcher_repair.accepted, researcher_repair.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute("SELECT status, resolution_evidence_json FROM debts WHERE debt_id = 'debt-gap'").fetchone()
 
@@ -1838,9 +1851,25 @@ class Phase2PatchDebtTest(unittest.TestCase):
                     "target_id": "root",
                     "operations": [
                         {
+                            "op": "attach_artifact",
+                            "artifact_id": "verification-report",
+                            "artifact_type": "verification_report",
+                            "content": "The submitted repair closes the exact proof obligation.",
+                            "metadata": {
+                                "verdict": "informally_verified",
+                                "verification_report": {
+                                    "checked_items": ["the exact repaired proof gap"],
+                                    "critical_errors": [],
+                                    "gaps": [],
+                                    "blocking_gap": False,
+                                },
+                            },
+                        },
+                        {
                             "op": "resolve_debt",
                             "debt_id": "debt-gap",
-                            "resolution_evidence": {"artifact_id": "verification-report"},
+                            "resolution_evidence_artifact_ids": ["verification-report"],
+                            "resolution_evidence": {"explanation": "The exact repair was checked."},
                         }
                     ],
                     "rationale": "verifier accepts the repair",
@@ -1848,7 +1877,7 @@ class Phase2PatchDebtTest(unittest.TestCase):
             )
             self.assertTrue(verifier_close.accepted, verifier_close.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute("SELECT status FROM debts WHERE debt_id = 'debt-gap'").fetchone()
 
@@ -2009,7 +2038,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
 
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     "SELECT source_identifiers_json, source_version, source_location, content_hash FROM retrieval_cards WHERE card_id = 'structured-source-card'"
@@ -2101,7 +2130,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(verified.accepted, verified.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 root = conn.execute("SELECT validation_status FROM claims WHERE claim_id = 'root'").fetchone()
                 inference = conn.execute("SELECT validation_status FROM inferences WHERE inference_id = 'inf-root'").fetchone()
@@ -2171,7 +2200,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(update.accepted, update.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 inference = conn.execute(
                     "SELECT explanation, validation_status, evidence_artifact_ids_json FROM inferences WHERE inference_id = 'inf-root'"
@@ -2307,7 +2336,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(integrated.accepted, integrated.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 root = conn.execute("SELECT lifecycle_status FROM claims WHERE claim_id = 'root'").fetchone()
                 route = conn.execute("SELECT status FROM routes WHERE route_id = 'route-root'").fetchone()
@@ -2522,7 +2551,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(verified.accepted, verified.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 root = conn.execute("SELECT validation_status FROM claims WHERE claim_id = 'root'").fetchone()
                 inference = conn.execute("SELECT validation_status FROM inferences WHERE inference_id = 'inf-root'").fetchone()
@@ -2535,7 +2564,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
     def test_pass_report_can_certify_claim(self) -> None:
         self._assert_zero_gap_verdict_can_certify_claim("pass")
 
-    def test_exact_external_citation_certifies_root_and_resolves_root_debt(self) -> None:
+    def test_exact_external_citation_certifies_root_without_implicitly_resolving_an_obligation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("citation-cert-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("There exists a weakly quasi-complete Noetherian local ring that is not quasi-complete.")
@@ -2616,7 +2645,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(cert_outcome.accepted, cert_outcome.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 root = conn.execute("SELECT validation_status, evidence_artifact_ids_json FROM claims WHERE claim_id = 'root'").fetchone()
                 route = conn.execute("SELECT * FROM routes WHERE conclusion_claim_id = 'root'").fetchone()
@@ -2630,7 +2659,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             self.assertEqual(route["relation_to_parent"], "sufficient")
             self.assertIsNotNone(inference)
             self.assertEqual(inference["validation_status"], "informally_verified")
-            self.assertEqual(debt["status"], "resolved")
+            self.assertEqual(debt["status"], "active")
             metadata = json.loads(artifact["metadata_json"])
             self.assertEqual(metadata["certification_type"], "external_citation")
             self.assertEqual(metadata["retrieval_card_id"], "retrieval-direct-theorem")
@@ -2638,7 +2667,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             self.assertEqual(library_entry["certification_type"], "external_citation")
             self.assertIn("weakly quasi-complete", library_entry["statement"])
 
-    def test_structured_external_citation_resolves_route_premise_debt(self) -> None:
+    def test_structured_external_citation_does_not_implicitly_resolve_a_route_premise_obligation(self) -> None:
         theorem = "There exists a weakly quasi-complete Noetherian local ring that is not quasi-complete."
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("structured-citation-cert-test", generation_root=Path(tmpdir) / "generation")
@@ -2766,13 +2795,13 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(cert_outcome.accepted, cert_outcome.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 debt = conn.execute("SELECT status, resolution_evidence_json FROM debts WHERE debt_id = 'debt-construction'").fetchone()
                 artifact = conn.execute("SELECT path FROM artifacts WHERE artifact_type = 'verification_report'").fetchone()
 
-            self.assertEqual(debt["status"], "resolved")
-            self.assertIn("retrieval-structured-source", debt["resolution_evidence_json"])
+            self.assertEqual(debt["status"], "active")
+            self.assertNotIn("retrieval-structured-source", debt["resolution_evidence_json"])
             report_text = Path(artifact["path"]).read_text(encoding="utf-8")
             self.assertIn("David Jensen", report_text)
             self.assertIn("Completions of UFDs", report_text)
@@ -2844,7 +2873,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(cert_outcome.accepted, cert_outcome.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 route = conn.execute("SELECT route_id FROM routes WHERE conclusion_claim_id = 'root'").fetchone()
             self.assertIsNotNone(route)
@@ -2890,14 +2919,14 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(integrated.accepted, integrated.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 root = conn.execute("SELECT lifecycle_status FROM claims WHERE claim_id = 'root'").fetchone()
                 route_row = conn.execute("SELECT status FROM routes WHERE route_id = ?", (route["route_id"],)).fetchone()
             self.assertEqual(root["lifecycle_status"], "integrated")
             self.assertEqual(route_row["status"], "integrated")
 
-    def test_clean_verification_resolves_older_claim_and_inference_debts(self) -> None:
+    def test_clean_verification_resolves_only_explicitly_named_claim_and_inference_obligations(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("integration-downstream-debt-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("Target theorem.")
@@ -3002,6 +3031,22 @@ class Phase2ExternalCitationTest(unittest.TestCase):
                             "evidence_artifact_ids": ["verif-side-bridge"],
                         },
                         {
+                            "op": "resolve_debt",
+                            "debt_id": "debt-before-side-bridge-verification",
+                            "resolution_evidence_artifact_ids": ["verif-side-bridge"],
+                            "resolution_evidence": {
+                                "explanation": "The report checks the exact claim-level gap."
+                            },
+                        },
+                        {
+                            "op": "resolve_debt",
+                            "debt_id": "inference-debt-before-side-bridge-verification",
+                            "resolution_evidence_artifact_ids": ["verif-side-bridge"],
+                            "resolution_evidence": {
+                                "explanation": "The report checks the exact inference-level gap."
+                            },
+                        },
+                        {
                             "op": "propose_status_transition",
                             "target_type": "inference",
                             "target_id": "inf-side-bridge",
@@ -3050,7 +3095,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(integrated.accepted, integrated.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 claim = conn.execute("SELECT lifecycle_status FROM claims WHERE claim_id = 'side-bridge'").fetchone()
                 route = conn.execute("SELECT status FROM routes WHERE route_id = 'route-side-bridge'").fetchone()
@@ -3070,9 +3115,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
         self.assertEqual(claim["lifecycle_status"], "integrated")
         self.assertEqual(route["status"], "integrated")
         self.assertEqual([row["status"] for row in debts], ["resolved", "resolved"])
-        self.assertTrue(
-            all("superseded_by_later_clean_verification" in row["resolution_evidence_json"] for row in debts)
-        )
+        self.assertTrue(all("closed_by_explicit_verification" in row["resolution_evidence_json"] for row in debts))
 
     def test_rejects_new_active_sufficient_route_to_integrated_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3350,7 +3393,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(integrated.accepted, integrated.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 root = conn.execute("SELECT lifecycle_status FROM claims WHERE claim_id = 'root'").fetchone()
                 route_row = conn.execute("SELECT status FROM routes WHERE route_id = 'route-root'").fetchone()
@@ -3441,7 +3484,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(verified.accepted, verified.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 claim = conn.execute("SELECT validation_status, evidence_artifact_ids_json FROM claims WHERE claim_id = 'lemma-frattini'").fetchone()
                 inference = conn.execute("SELECT validation_status, evidence_artifact_ids_json FROM inferences WHERE inference_id = 'inf-frattini'").fetchone()
@@ -3519,7 +3562,7 @@ class Phase2ExternalCitationTest(unittest.TestCase):
             )
             self.assertTrue(cert_outcome.accepted, cert_outcome.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 route = conn.execute("SELECT route_id FROM routes WHERE conclusion_claim_id = 'root'").fetchone()
             self.assertIsNotNone(route)
@@ -3733,47 +3776,50 @@ Proof: K_M=-2hTheta.
             )
             self.assertTrue(outcome.accepted, outcome.errors)
 
-            with store.connect() as conn:
-                proof_path = store.state_dir / "artifacts" / "side-proof.txt"
-                proof_path.parent.mkdir(parents=True, exist_ok=True)
-                proof_path.write_text("Proof body for the side lemma.", encoding="utf-8")
-                conn.execute(
-                    """
-                    INSERT INTO artifacts(
-                        artifact_id, artifact_type, path, sha256, producer_role, run_id,
-                        state_revision, content_summary, metadata_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        "side-proof-artifact",
-                        "verification_report",
-                        str(proof_path),
-                        "sha",
-                        "strict_informal_verifier",
-                        "",
-                        1,
-                        "side lemma verification",
-                        "{}",
-                        "2026-01-01T00:00:00+00:00",
-                    ),
-                )
-                conn.execute(
-                    """
-                    UPDATE claims
-                    SET validation_status = 'informally_verified',
-                        evidence_artifact_ids_json = ?
-                    WHERE claim_id = 'lem-side'
-                    """,
-                    (json.dumps(["side-proof-artifact"]),),
-                )
-                conn.commit()
+            verification = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": 1,
+                    "actor_role": "strict_informal_verifier",
+                    "target_id": "lem-side",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "side-proof-artifact",
+                            "artifact_type": "verification_report",
+                            "content": "Proof body for the side lemma.",
+                            "metadata": {
+                                "verdict": "informally_verified",
+                                "verification_report": {
+                                    "checked_items": ["the complete side-lemma proof"],
+                                    "critical_errors": [],
+                                    "gaps": [],
+                                    "blocking_gap": False,
+                                },
+                            },
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "claim",
+                            "target_id": "lem-side",
+                            "status_type": "validation",
+                            "new_status": "informally_verified",
+                            "evidence_artifact_ids": ["side-proof-artifact"],
+                        },
+                    ],
+                    "rationale": "strictly verify the side lemma",
+                },
+            )
+            self.assertTrue(verification.accepted, verification.errors)
 
             outcome = apply_patch(
                 store,
                 {
                     "schema_version": SCHEMA_VERSION,
                     "problem_id": store.problem_id,
-                    "base_revision": 1,
+                    "base_revision": 2,
                     "actor_role": "writer",
                     "target_id": "root",
                     "operations": [
@@ -3794,7 +3840,7 @@ Proof: K_M=-2hTheta.
             )
             self.assertTrue(outcome.accepted, outcome.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 artifact = conn.execute(
                     "SELECT path FROM artifacts WHERE artifact_id = 'partial-receipt-test'"
@@ -3804,9 +3850,9 @@ Proof: K_M=-2hTheta.
             self.assertIn("## Verified Side Lemmas", text)
             self.assertIn("`lem-side` validation=informally_verified", text)
             self.assertIn("Proof body for the side lemma.", text)
-            self.assertIn("## Claim Status Ledger", text)
+            self.assertIn("## Claim Status Summary", text)
             self.assertIn("`root` validation=untested", text)
-            self.assertGreater(text.rfind("## References"), text.rfind("## Claim Status Ledger"))
+            self.assertGreater(text.rfind("## References"), text.rfind("## Claim Status Summary"))
             self.assertTrue(Path(artifact["path"]).with_suffix(".tex").exists())
             if shutil.which("pdflatex"):
                 self.assertTrue(Path(artifact["path"]).with_suffix(".pdf").exists())
@@ -3981,7 +4027,7 @@ Proof: K_M=-2hTheta.
             )
             self.assertTrue(outcome.accepted, outcome.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 artifact = conn.execute(
                     "SELECT path FROM artifacts WHERE artifact_id = 'writer-report-test'"
@@ -4045,7 +4091,7 @@ class Phase2VerifierPatchAliasTest(unittest.TestCase):
             self._seed_route_with_inference(store)
             outcome = apply_patch(store, self._verifier_patch(store, gaps_section="[]"))
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 claim = conn.execute("SELECT validation_status FROM claims WHERE claim_id='lemma-x'").fetchone()
                 inf = conn.execute("SELECT validation_status FROM inferences WHERE inference_id='inf-x'").fetchone()
@@ -4105,7 +4151,7 @@ class Phase2VerifierPatchAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 claim = conn.execute("SELECT validation_status FROM claims WHERE claim_id='lemma-x'").fetchone()
                 inf = conn.execute("SELECT validation_status FROM inferences WHERE inference_id='inf-x'").fetchone()
@@ -4146,7 +4192,7 @@ class Phase2VerifierPatchAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 claim = conn.execute("SELECT validation_status FROM claims WHERE claim_id=?", ("lemma-x",)).fetchone()
                 inf = conn.execute("SELECT validation_status FROM inferences WHERE inference_id=?", ("inf-x",)).fetchone()
@@ -4214,7 +4260,7 @@ class Phase2VerifierPatchAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 claim = conn.execute("SELECT validation_status FROM claims WHERE claim_id=?", ("lemma-x",)).fetchone()
                 inf = conn.execute("SELECT validation_status FROM inferences WHERE inference_id=?", ("inf-x",)).fetchone()
@@ -4231,7 +4277,7 @@ class Phase2VerifierPatchAliasTest(unittest.TestCase):
             self.assertEqual(resolution["resolution_note"], "Strict verifier proved the negation.")
             self.assertEqual(resolution["resolution_evidence_artifact_ids"], ["vr-refute-x"])
             report = build_markdown_report(store)
-            self.assertIn("## Refuted Proof Debts", report)
+            self.assertIn("## Refuted Proof Obligations", report)
             self.assertIn("`debt-lemma-x`", report)
 
     def test_non_verifier_cannot_refute_a_debt(self) -> None:
@@ -4322,7 +4368,7 @@ class Phase2VerifierPatchAliasTest(unittest.TestCase):
                 ),
             )
             self.assertTrue(duplicate.accepted, duplicate.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 status = conn.execute(
                     "SELECT status FROM debts WHERE debt_id = ?", ("debt-false-bridge",)
                 ).fetchone()[0]
@@ -4378,7 +4424,7 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 cards = conn.execute("SELECT card_id FROM retrieval_cards ORDER BY card_id").fetchall()
                 artifact_count = conn.execute("SELECT COUNT(*) FROM artifacts WHERE artifact_type='cache_retrieval_card'").fetchone()[0]
             self.assertEqual([row[0] for row in cards], ["retrieval-card-a", "retrieval-card-b"])
@@ -4429,7 +4475,7 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 route = conn.execute("SELECT status, label, strategy, relation_to_parent, failure_fingerprint, evidence_artifact_ids_json FROM routes WHERE route_id=?", ("route-root",)).fetchone()
             self.assertEqual(route["status"], "blocked")
@@ -4459,7 +4505,7 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute("SELECT owner_type, owner_id, obligation FROM debts WHERE debt_id='d1'").fetchone()
             self.assertEqual(row[0], "claim")
             self.assertEqual(row[1], "root")
@@ -4513,7 +4559,7 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT owner_type, owner_id, obligation, source_artifact_ids_json, suggested_next_target, status FROM debts WHERE debt_id='debt-bridge'"
                 ).fetchone()
@@ -4572,7 +4618,7 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(updated.accepted, updated.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute("SELECT severity, status FROM debts WHERE debt_id='debt-status'").fetchone()
             self.assertEqual(tuple(row), ("minor", "resolved"))
 
@@ -4616,7 +4662,7 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT owner_type, owner_id, status, obligation, suggested_next_target FROM debts WHERE debt_id='debt_route_claim_order_ideal_bridge'"
                 ).fetchone()
@@ -4651,7 +4697,7 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 row = conn.execute("SELECT owner_type, owner_id, obligation FROM debts WHERE debt_id='debt-root-bridge'").fetchone()
             self.assertEqual(tuple(row), ("claim", "root", "Root still needs a bridge lemma."))
 
@@ -4675,7 +4721,7 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 self.assertIsNotNone(conn.execute("SELECT 1 FROM debts WHERE debt_id='d2'").fetchone())
 
     def test_attach_artifact_nested_artifact_object(self) -> None:
@@ -4697,50 +4743,27 @@ class Phase2PatchShapeAliasTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 self.assertIsNotNone(conn.execute("SELECT 1 FROM artifacts WHERE artifact_id='a-nested'").fetchone())
 
 
 class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
-    def test_add_claim_rejects_near_restatement_of_integrated_claim(self) -> None:
+    def test_add_claim_allows_a_semantically_similar_but_nonidentical_statement(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("integrated-claim-duplicate-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("root")
-            outcome = apply_patch(
+            certify_and_integrate_claim(
                 store,
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "problem_id": store.problem_id,
-                    "base_revision": 0,
-                    "actor_role": "researcher",
-                    "target_id": "root",
-                    "operations": [
-                        {
-                            "op": "add_claim",
-                            "claim_id": "closed-psl2-branch",
-                            "kind": "lemma",
-                            "statement": (
-                                "Let ell>=5 be an odd prime, S=PSL_2(ell), and let Gamma be S when ell=3 mod 4 "
-                                "and PGL_2(ell) when ell=1 mod 4. Let |Omega|>1 and let K satisfy "
-                                "S^Omega <= K <= Gamma wr P with P transitive on Omega. Then no pair x,y in K "
-                                "of orders 2 and ell invariably generates K."
-                            ),
-                            "parent_ids": ["root"],
-                            "root_impact": 0.9,
-                        }
-                    ],
-                    "rationale": "seed closed branch",
-                },
+                claim_id="closed-psl2-branch",
+                route_id="route-closed-psl2-branch",
+                inference_id="inf-closed-psl2-branch",
+                statement=(
+                    "Let ell>=5 be an odd prime, S=PSL_2(ell), and let Gamma be S when ell=3 mod 4 "
+                    "and PGL_2(ell) when ell=1 mod 4. Let |Omega|>1 and let K satisfy "
+                    "S^Omega <= K <= Gamma wr P with P transitive on Omega. Then no pair x,y in K "
+                    "of orders 2 and ell invariably generates K."
+                ),
             )
-            self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
-                conn.execute(
-                    """
-                    UPDATE claims
-                    SET validation_status='informally_verified', lifecycle_status='integrated'
-                    WHERE claim_id='closed-psl2-branch'
-                    """
-                )
 
             duplicate = apply_patch(
                 store,
@@ -4769,45 +4792,22 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
                 },
             )
 
-            self.assertFalse(duplicate.accepted)
-            self.assertIn("duplicate claim", " ".join(duplicate.errors))
-            self.assertIn("closed-psl2-branch", " ".join(duplicate.errors))
+            self.assertTrue(duplicate.accepted, duplicate.errors)
 
-    def test_add_claim_rejects_concise_symbolic_restatement(self) -> None:
+    def test_add_claim_allows_a_concise_nonidentical_symbolic_statement(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("concise-symbolic-duplicate-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("root")
-            seed = apply_patch(
+            certify_and_integrate_claim(
                 store,
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "problem_id": store.problem_id,
-                    "base_revision": 0,
-                    "actor_role": "researcher",
-                    "target_id": "root",
-                    "operations": [
-                        {
-                            "op": "add_claim",
-                            "claim_id": "central-vector-theorem",
-                            "kind": "theorem",
-                            "statement": (
-                                "Let X be an admissible object with parameters n>=4 and q>2. Let A(X) be "
-                                "its canonical faithful action on Omega(X). In that action X is properly "
-                                "contained in E(X), and E(X) is contained in the third closure C_3(X). "
-                                "Consequently X is not 3-rigid."
-                            ),
-                            "parent_ids": ["root"],
-                        }
-                    ],
-                    "rationale": "seed integrated symbolic theorem",
-                },
+                claim_id="central-vector-theorem",
+                statement=(
+                    "Let X be an admissible object with parameters n>=4 and q>2. Let A(X) be "
+                    "its canonical faithful action on Omega(X). In that action X is properly "
+                    "contained in E(X), and E(X) is contained in the third closure C_3(X). "
+                    "Consequently X is not 3-rigid."
+                ),
             )
-            self.assertTrue(seed.accepted, seed.errors)
-            with sqlite3.connect(store.db_path) as conn:
-                conn.execute(
-                    "UPDATE claims SET validation_status='informally_verified', lifecycle_status='integrated' "
-                    "WHERE claim_id='central-vector-theorem'"
-                )
 
             duplicate = apply_patch(
                 store,
@@ -4835,9 +4835,7 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
                 },
             )
 
-            self.assertFalse(duplicate.accepted)
-            self.assertIn("duplicate claim", " ".join(duplicate.errors))
-            self.assertIn("central-vector-theorem", " ".join(duplicate.errors))
+            self.assertTrue(duplicate.accepted, duplicate.errors)
 
     def test_distinct_parallel_integration_transition_is_rebase_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4969,64 +4967,18 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("integrated-claim-extension-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("root")
-            outcome = apply_patch(
+            certify_and_integrate_claim(
                 store,
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "problem_id": store.problem_id,
-                    "base_revision": 0,
-                    "actor_role": "researcher",
-                    "target_id": "root",
-                    "operations": [
-                        {
-                            "op": "add_claim",
-                            "claim_id": "closed-inner-c1",
-                            "kind": "lemma",
-                            "statement": (
-                                "Fix distinct primes p and q and put L=lcm(1,2,...,2max(p,q)). For all sufficiently large "
-                                "natural dimensions n, if S=PSp(V) or PSU(V) and S<=Gamma<=Inndiag(S), then the C1 "
-                                "stabilizer in Gamma of a nondegenerate L-subspace is proper, maps onto Gamma/S, and "
-                                "meets every S-conjugacy class of elements of orders p and q."
-                            ),
-                            "parent_ids": ["root"],
-                            "root_impact": 0.8,
-                        },
-                        {
-                            "op": "add_route",
-                            "route_id": "route-closed-inner-c1",
-                            "conclusion_claim_id": "closed-inner-c1",
-                            "relation_to_parent": "sufficient",
-                            "strategy": "seed route",
-                        },
-                        {
-                            "op": "attach_artifact",
-                            "artifact_id": "dossier-closed-inner-c1",
-                            "artifact_type": "proof_dossier",
-                            "metadata": {"claim_id": "closed-inner-c1", "route_id": "route-closed-inner-c1"},
-                            "content": "Seed proof dossier.",
-                        },
-                        {
-                            "op": "add_inference",
-                            "inference_id": "inf-closed-inner-c1",
-                            "route_id": "route-closed-inner-c1",
-                            "conclusion_claim_id": "closed-inner-c1",
-                            "evidence_artifact_ids": ["dossier-closed-inner-c1"],
-                            "explanation": "seed inference",
-                        },
-                    ],
-                    "rationale": "seed integrated inner C1 claim",
-                },
+                claim_id="closed-inner-c1",
+                route_id="route-closed-inner-c1",
+                inference_id="inf-closed-inner-c1",
+                statement=(
+                    "Fix distinct primes p and q and put L=lcm(1,2,...,2max(p,q)). For all sufficiently large "
+                    "natural dimensions n, if S=PSp(V) or PSU(V) and S<=Gamma<=Inndiag(S), then the C1 "
+                    "stabilizer in Gamma of a nondegenerate L-subspace is proper, maps onto Gamma/S, and "
+                    "meets every S-conjugacy class of elements of orders p and q."
+                ),
             )
-            self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
-                conn.execute(
-                    """
-                    UPDATE claims
-                    SET validation_status='informally_verified', lifecycle_status='integrated'
-                    WHERE claim_id='closed-inner-c1'
-                    """
-                )
-                conn.execute("UPDATE routes SET status='integrated' WHERE route_id='route-closed-inner-c1'")
 
             extension = apply_patch(
                 store,
@@ -5197,7 +5149,7 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
             )
             self.assertTrue(integrated.accepted, integrated.errors)
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 debt_row = conn.execute("SELECT status, resolution_evidence_json FROM debts WHERE debt_id = ?", ("debt-root-integration-citation",)).fetchone()
                 route_row = conn.execute("SELECT status FROM routes WHERE route_id = ?", ("route-root",)).fetchone()
@@ -5382,7 +5334,7 @@ class Phase2IntegratedDuplicateClaimTest(unittest.TestCase):
                 },
             )
             self.assertTrue(integrated.accepted, integrated.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 debt = conn.execute(
                     "SELECT status, resolution_evidence_json FROM debts WHERE debt_id = ?",
@@ -6060,14 +6012,14 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute("SELECT * FROM inferences WHERE inference_id='inf-a'").fetchone()
             self.assertIn("nested-evidence", json.loads(row["evidence_artifact_ids_json"]))
             self.assertIn("strengthened argument", row["explanation"])
 
     def test_stale_patch_wrapped_update_inference_payload_is_normalized(self) -> None:
-        from agents.generation.phase2.patches import apply_patch_with_stale_retry
+        from agents.generation.phase2.patches import apply_operator_patch_with_stale_retry as apply_patch_with_stale_retry
 
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("wrapped-update-inference-test", generation_root=Path(tmpdir) / "generation")
@@ -6104,14 +6056,14 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
                 },
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute("SELECT * FROM inferences WHERE inference_id='inf-a'").fetchone()
             self.assertIn("wrapped-evidence", json.loads(row["evidence_artifact_ids_json"]))
             self.assertIn("wrapped proof delta", row["explanation"])
 
     def test_concurrent_append_only_inference_updates_rebase_and_merge(self) -> None:
-        from agents.generation.phase2.patches import apply_patch_with_stale_retry
+        from agents.generation.phase2.patches import apply_operator_patch_with_stale_retry as apply_patch_with_stale_retry
 
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("stale-inference-append-test", generation_root=Path(tmpdir) / "generation")
@@ -6148,7 +6100,7 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
             }
             outcome = apply_patch_with_stale_retry(store, stale)
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute("SELECT * FROM inferences WHERE inference_id='inf-a'").fetchone()
             self.assertEqual(
@@ -6163,6 +6115,8 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
             store = ProofStateStore("simultaneous-patch-lock-test", generation_root=Path(tmpdir) / "generation")
             store.init_problem("root")
             begin_barrier = threading.Barrier(2)
+            begin_count = 0
+            begin_count_lock = threading.Lock()
             original_connect = store.connect
 
             class BarrierConnection:
@@ -6180,8 +6134,13 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
                     return getattr(self.raw, name)
 
                 def execute(self, sql, parameters=()):
+                    nonlocal begin_count
                     if str(sql).strip().upper() == "BEGIN IMMEDIATE":
-                        begin_barrier.wait(timeout=5)
+                        with begin_count_lock:
+                            begin_count += 1
+                            simultaneous_revision_check = begin_count <= 2
+                        if simultaneous_revision_check:
+                            begin_barrier.wait(timeout=5)
                     return self.raw.execute(sql, parameters)
 
             def synchronized_connect():
@@ -6228,11 +6187,11 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
             self.assertEqual(sum(outcome.accepted for outcome in outcomes), 1)
             self.assertEqual(sum("stale patch" in " ".join(outcome.errors) for outcome in outcomes), 1)
             self.assertEqual(store.get_revision(), 1)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM patches").fetchone()[0], 1)
 
     def test_concurrent_identical_verifier_transitions_rebase_and_merge(self) -> None:
-        from agents.generation.phase2.patches import apply_patch_with_stale_retry
+        from agents.generation.phase2.patches import apply_operator_patch_with_stale_retry as apply_patch_with_stale_retry
 
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("stale-verifier-transition-test", generation_root=Path(tmpdir) / "generation")
@@ -6323,7 +6282,7 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
             inference = next(row for row in state["inferences"] if row["inference_id"] == "inf-a")
             self.assertEqual(lemma["validation_status"], "informally_verified")
             self.assertEqual(inference["validation_status"], "informally_verified")
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 lemma_row = conn.execute(
                     "SELECT evidence_artifact_ids_json FROM claims WHERE claim_id='lemma-a'"
@@ -6349,7 +6308,7 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
             )
 
     def test_row_disjoint_additive_patch_is_rebased(self) -> None:
-        from agents.generation.phase2.patches import apply_patch_with_stale_retry
+        from agents.generation.phase2.patches import apply_operator_patch_with_stale_retry as apply_patch_with_stale_retry
 
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("stale-rebase-ok-test", generation_root=Path(tmpdir) / "generation")
@@ -6373,14 +6332,14 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
             }
             outcome = apply_patch_with_stale_retry(store, stale_patch)
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 self.assertIsNotNone(conn.execute("SELECT 1 FROM claims WHERE claim_id='lemma-b'").fetchone())
                 events = conn.execute("SELECT payload_json FROM events WHERE event_type='stale_rebase_applied'").fetchall()
             self.assertEqual(len(events), 1)
 
     def test_row_overlap_declines_rebase(self) -> None:
-        from agents.generation.phase2.patches import apply_patch_with_stale_retry
+        from agents.generation.phase2.patches import apply_operator_patch_with_stale_retry as apply_patch_with_stale_retry
 
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("stale-rebase-overlap-test", generation_root=Path(tmpdir) / "generation")
@@ -6419,7 +6378,7 @@ class Phase2StaleRebaseRetryTest(unittest.TestCase):
             self.assertTrue(any("stale patch" in e for e in outcome.errors))
 
     def test_row_disjoint_verifying_transition_is_rebased_and_revalidated(self) -> None:
-        from agents.generation.phase2.patches import apply_patch_with_stale_retry
+        from agents.generation.phase2.patches import apply_operator_patch_with_stale_retry as apply_patch_with_stale_retry
 
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ProofStateStore("stale-rebase-verify-test", generation_root=Path(tmpdir) / "generation")
@@ -6516,7 +6475,7 @@ class Phase2PatchRejectionEventTest(unittest.TestCase):
                 },
             )
             self.assertFalse(guard.accepted)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
                     "SELECT payload_json FROM events WHERE event_type='patch_rejected' ORDER BY event_id"

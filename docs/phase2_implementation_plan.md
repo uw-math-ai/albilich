@@ -1,5 +1,10 @@
 # Albilich v1 Implementation Plan
 
+> Historical implementation plan. It records the initial v1 design and is not
+> a description of the current schema or trust boundary. See
+> `phase2_architecture.md`, `soundness_remediation_blueprint.md`, and
+> `third_pass_systems_review.md` for the current system.
+
 ## Current Architecture Map
 
 This checkout documents the Albilich v0.5 line and the later Albilich v1 proof-state workflow.
@@ -36,7 +41,8 @@ The store includes:
 - `claims` for theorems, lemmas, definitions, obstructions, counterexample claims, and references;
 - `routes` for alternative proof/reduction strategies;
 - `inferences` plus `inference_premises` for hyperedges;
-- `debts` attached to claims/routes/inferences;
+- `debts` (legacy persisted name) attached to claims/proof approaches/inferences
+  and presented publicly as proof obligations;
 - `artifacts` with SHA-256 hashes and role provenance;
 - `runs` with mode, target, token usage, status, and context hash;
 - `patches` and `events` for append-only audit;
@@ -62,7 +68,7 @@ Implement models/enums, SQLite migrations, artifact hashing, patch validation/ap
 
 ### Phase B - Existing-System Adapters
 
-Implement verifier-report normalization, debt extraction and deduplication, PhD advisor certificate adapter, and memory evidence adapter.
+Implement verifier-report normalization, proof-obligation extraction and deduplication, PhD advisor certificate adapter, and memory evidence adapter.
 
 ### Phase C - Efficient Orchestration
 

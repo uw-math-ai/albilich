@@ -1,0 +1,39 @@
+name: phase2-soundness
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit-and-adversarial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install the runtime-attested Codex CLI
+        run: npm install --global @openai/codex@0.152.0
+      - name: Attest the real Codex executable boundary
+        run: python -m agents.generation.phase2.backend_contract codex --binary codex
+      - name: Compile
+        run: python -m compileall -q agents/generation/phase2
+      - name: Enforce append-only scheduler policy epochs
+        if: github.event_name == 'pull_request' || github.event.before != '0000000000000000000000000000000000000000'
+        env:
+          POLICY_EPOCH_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python -m agents.generation.phase2.policy_epoch_guard --base-ref "$POLICY_EPOCH_BASE"
+      - name: Phase 2 unit, migration, replay, and adversarial tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -v -s agents/generation/tests -p 'test_phase2*.py'
+      - name: Audit experiment archive labels and checksums
+        run: python -m agents.generation.phase2.experiment_audit
+      - name: Validate checked-in JSON files
+        run: python -m json.tool agents/generation/phase2/schemas/phase2_patch.schema.json >/dev/null

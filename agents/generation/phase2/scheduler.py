@@ -3,9 +3,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
+from .action_contract import (
+    EXECUTABLE_RUN_MODES,
+    scheduler_action_contract_errors,
+    scheduler_dispatch_action_errors,
+)
 from .audit import (
     PAPER_AUDIT_DOCUMENT_INTEGRATION_MARKER,
     PAPER_AUDIT_DOCUMENT_REVIEW_MARKER,
@@ -14,16 +21,54 @@ from .audit import (
     audit_subject_artifact,
     is_paper_audit_mode,
 )
+from .assurance import claim_assurance_summary
 from .branch_summary import (
     branch_cluster_claim_ids,
     branch_rotation_decision,
     build_branch_summary,
     build_branch_workbench,
 )
-from .budget import plan_action_budget, plan_step_budget
+from .budget import (
+    MIN_STEP_BUDGET,
+    normalize_resource_allocation_for_action,
+    plan_action_budget,
+    plan_step_budget,
+)
+from .bounded_io import read_bounded_text, read_text_tail
 from .completion_policy import evaluate_partial_stop
+from .decision_policy import (
+    ActionCandidate,
+    action_sha256,
+    bind_dispatched_action,
+    candidate_observations_in_trace as _candidate_observations_in_trace,
+    decision_candidate_deferral_counts_from_state,
+    decision_rejection_is_fairness_eligible,
+    decision_trace_errors,
+    select_action_candidate,
+    trace_single_mandatory_action,
+)
 from .fact_graph import build_fact_graph
 from .models import SCHEMA_VERSION, fingerprint_text, statement_is_interrogative_problem
+from .parallel_admission import (
+    MULTI_BRANCH_MAX_WORKERS,
+    MULTI_BRANCH_MIN_WORKERS,
+    PARALLEL_WAVE_ADMISSION_POLICY_VERSION,
+    PARALLEL_WAVE_DEFERRAL_LIMIT,
+    PARALLEL_WAVE_ROLE_DIVERSE_EXTRA_SLOTS,
+    normalize_parallel_branches,
+    parallel_action_identity,
+    parallel_admission_outcomes,
+    parallel_admission_order_key as _parallel_admission_order_key,
+    parallel_admission_priority_for as _parallel_admission_priority_for,
+    parallel_candidate_id,
+    parallel_candidate_deferral_counts as _parallel_candidate_deferral_counts,
+    parallel_candidate_deferral_counts_from_state,
+    parallel_candidate_set_sha256 as _parallel_candidate_set_sha256,
+    parallel_identity_conflict,
+    parallel_identity_conflict_reason as _parallel_identity_conflict_reason,
+    parallel_wave_id,
+    parallel_wave_admission_errors as _parallel_wave_admission_errors,
+)
 from .writing.linter import (
     REQUIRED_FIX_MARKER as WRITING_REQUIRED_FIX_MARKER,
     obligation_location as writing_obligation_location,
@@ -46,20 +91,23 @@ from .writing.paper_contract import (
 from .writing.publication import (
     PUBLICATION_REFEREE_LENS,
     latest_review_for_paper,
-    mark_route_error_escalated,
     pending_route_error_review,
 )
-from .debt_canonicalizer import central_debt_clusters, central_obstruction_for_debt
+from .debt_canonicalizer import central_debt_clusters
 from .graph_policy import (
     DebtCoverageIndex,
     FAR_FROM_ROOT_DISTANCE,
+    SCHEDULER_PLANNING_CACHE_KEY,
     _compact_text,
     active_frontier_pressure,
+    build_graph_policy_index,
     canonical_root_proof_skeleton,
     debt_covered_by_integrated_claim,
     decomposition_cooldown_active,
     decisive_theorem_test_signal,
     frontier_claim_ids,
+    get_debt_coverage_index,
+    is_decisive_theorem_test_obligation,
     maturity_rank,
     paused_route_ids,
     proof_trunk_maturity,
@@ -80,7 +128,7 @@ from .research_policy import (
     should_run_librarian,
     stamp_researcher_work_mode,
 )
-from .patches import apply_patch
+from .patches import apply_system_patch
 from .research_strategy import (
     REFERENCE_RECONSTRUCTION_INTENT,
     bottleneck_lease_state,
@@ -90,9 +138,22 @@ from .research_strategy import (
     threat_propagation_view,
 )
 from .research_strategy import enrich_action as enrich_research_strategy_action
-from .research_strategy import next_strategy_operation, score_action as score_research_strategy_action
+from .research_strategy import (
+    next_strategy_operation,
+    score_action as score_research_strategy_action,
+    strategy_operation_candidates,
+)
 from .research_intelligence import philosophy_signature, strategy_family
 from .role_capabilities import advisor_enabled
+from .scheduler_registry import (
+    PARALLEL_COMPANION_GENERATOR_IDS as _PARALLEL_COMPANION_GENERATOR_IDS,
+    PARALLEL_INTERNAL_GENERATOR_IDS as _PARALLEL_INTERNAL_GENERATOR_IDS,
+    bind_candidate_generator_registry,
+    generator_ids as _scope_generator_ids,
+    mark_candidate_generators_evaluated as _evaluate_parallel_candidate_generators,
+    mark_candidate_generators_skipped as _skip_parallel_candidate_generators,
+    new_parallel_generator_evaluation as _new_parallel_generator_evaluation,
+)
 from .hmt_sidecar import hmt_integrated_claim_interval, integrated_claim_count
 from .store import ProofStateStore
 from .verification import clean_verification_metadata
@@ -101,6 +162,85 @@ from . import steering
 ADVISOR_EARLY_ITERATION = 12
 ADVISOR_MANDATORY_ITERATION = 20
 ADVISOR_EVIDENCE_SYNTHESIS_BUDGET = 60_000
+SCHEDULER_DEFERRAL_LIMIT = 3
+SCHEDULER_SNAPSHOT_RETRY_LIMIT = 4
+POLICY_TIER_EXPLORATION = 100
+POLICY_TIER_RECOVERY = 200
+POLICY_TIER_VERIFICATION = 300
+POLICY_TIER_SAFETY = 400
+
+
+def _enable_scheduler_planning_cache(
+    state: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Opt a scheduler-owned immutable projection into derived-view reuse."""
+
+    if isinstance(state, dict):
+        # Always start a new cache when entering a planning operation.  This
+        # keeps reuse local even if a caller retained and later mutated an old
+        # projection in a diagnostic or test.
+        state[SCHEDULER_PLANNING_CACHE_KEY] = {}
+    return state
+
+
+@dataclass(frozen=True)
+class ActionPolicyRule:
+    name: str
+    tier: int
+    modes: frozenset[str] = frozenset()
+    flags: frozenset[str] = frozenset()
+
+
+ACTION_POLICY_RULES = (
+    ActionPolicyRule(
+        "safety",
+        POLICY_TIER_SAFETY,
+        modes=frozenset({"stop_solved", "stop_with_partial_results"}),
+        flags=frozenset(
+            {
+                "root_revision_required",
+                "dependency_threat_revalidation_required",
+                "counterexample_status_reconciliation_required",
+                "referee_route_error_research",
+            }
+        ),
+    ),
+    ActionPolicyRule(
+        "verification",
+        POLICY_TIER_VERIFICATION,
+        modes=frozenset({"integrate", "formalize", "validate_counterexample"}),
+        flags=frozenset(
+            {
+                "verify_ready_route_policy",
+                "counterexample_validation_required",
+                "assurance_review_required",
+            }
+        ),
+    ),
+    ActionPolicyRule(
+        "recovery",
+        POLICY_TIER_RECOVERY,
+        flags=frozenset(
+            {
+                "circling_stall",
+                "decompose_or_reroute",
+                "duplicate_work_guard",
+                "route_triage_required",
+                "frontier_pressure",
+                "stream_stall_recovery_required",
+                "no_content_guard",
+                "no_content_research_guard",
+                "strategy_advisor_required",
+            }
+        ),
+    ),
+)
+
+ACTION_POLICY_PRECEDENCE = (
+    ("safety", "verification"),
+    ("verification", "recovery"),
+    ("recovery", "exploration"),
+)
 # Anti-circling breaker: a strict, broad stall detector that escalates to the advisor
 # (decompose / re-route) and the human, instead of re-issuing the same research pass.
 CIRCLING_MIN_PASSES = 3
@@ -156,27 +296,28 @@ ADVISOR_EVIDENCE_SYNTHESIS_INTENTS = {
 }
 EXACT_THEOREM_SEARCH_INTENT = "exact_theorem_search"
 SUPPORT_LEMMA_PRECHECK_INTENT = "support_lemma_precheck"
-# Branch persistence (2026-07-09 TODO 1): nearby-lemma dispatch for a
+# Branch persistence: nearby-lemma dispatch for a
 # productive-but-blocked branch, plus its cooldown and the pass count that
 # marks the main target as "hammered without closing".
 NEARBY_LEMMA_INTENT = "branch_nearby_lemma"
 NEARBY_LEMMA_COOLDOWN_WINDOW = 3
 NEARBY_LEMMA_MIN_MAIN_TARGET_PASSES = 2
 NEARBY_LEMMA_RECENT_PASS_WINDOW = 4
-# multi_branch_research (2026-07-09 TODO 2): 2..5 simultaneous branch-scoped
+# multi_branch_research: 2..5 simultaneous branch-scoped
 # researcher workers per step window, planned through the existing
 # companion-session machinery with branch-packet templates.
 MULTI_BRANCH_RESEARCH_MODE_NAME = "multi_branch_research"
-MULTI_BRANCH_MIN_WORKERS = 2
-MULTI_BRANCH_MAX_WORKERS = 5
 # Three slots gives the default workflow room for a proof branch, an
 # adversarial branch, and one independent support/verifier handoff without the
 # stale-patch pressure of enabling the five-worker ceiling by default.
 DEFAULT_MULTI_BRANCH_WORKERS = 3
+# ``parallel_branches`` counts proof-search/adversarial workers.  A wave may
+# additionally contain at most two read-only or certification sidecars (for
+# example a librarian and a verifier), but total dispatch is still bounded.
 MULTI_BRANCH_WORKER_TEMPLATES = (
     "conceptual_invariant",
     "spine",
-    "villain_toy_model",
+    "adversarial_toy_model",
     "literature_adaptation",
     "alternative_route",
     "support_lemma",
@@ -230,6 +371,13 @@ VERIFIER_PRIMARY_EVIDENCE_ARTIFACT_TYPES = {
     "proof_blueprint",
     "proof_dossier",
     "research_notebook",
+    "verified_blueprint",
+}
+UNROUTED_PROOF_EVIDENCE_ARTIFACT_TYPES = {
+    "final_proof",
+    "partial_proof_report",
+    "proof_blueprint",
+    "proof_dossier",
     "verified_blueprint",
 }
 VERIFIER_SOURCE_EVIDENCE_ARTIFACT_TYPES = {
@@ -446,7 +594,9 @@ WRITING_GATE_BLOCKING_SEVERITIES = {"blocking", "major"}
 # blocker maps to the highest ("blocking"), major stays "major", and the
 # non-gating minor/nit both map to the lowest ("minor").
 WRITING_LINT_SEVERITY_TO_DEBT = {"blocker": "blocking", "major": "major", "minor": "minor", "nit": "minor"}
-WRITING_GATE_MAX_ARTIFACT_CHARS = 400_000
+WRITING_GATE_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
+# Compatibility name; the gate now validates the complete bounded document.
+WRITING_GATE_MAX_ARTIFACT_CHARS = WRITING_GATE_MAX_ARTIFACT_BYTES
 _WRITING_RULE_ID_RE = re.compile(r"^([A-Z]\d-[A-Z0-9]+(?:-[A-Z0-9]+)*-\d+):")
 _WRITING_LINE_RE = re.compile(r"\(line (\d+)\)")
 
@@ -465,6 +615,16 @@ def advisor_should_run(
     if iteration >= early_iteration and iterations_since_new_accepted_claim >= early_iteration:
         return {"run": True, "reason": f"no accepted progress for {iterations_since_new_accepted_claim} iterations"}
     return {"run": False, "reason": "advisor not due"}
+
+
+def _strict_verifier_budget(
+    problem: Mapping[str, Any], requested_tokens: Optional[int]
+) -> Dict[str, Any]:
+    """Plan a verifier budget with access to the protected verification reserve."""
+
+    budget = plan_step_budget(problem, "formalize", requested_tokens)
+    budget["policy"] = "strict_informal_verification"
+    return budget
 
 
 def _reallocate_advisor_action(action: Mapping[str, Any]) -> Dict[str, Any]:
@@ -489,6 +649,416 @@ def _reallocate_advisor_action(action: Mapping[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _candidate_deferral_counts(
+    state: Mapping[str, Any], candidate_ids: Sequence[str]
+) -> Dict[str, int]:
+    """Compute continuous deferrals for many candidates with one history parse."""
+
+    durable_counts = state.get("decision_candidate_deferrals")
+    if isinstance(durable_counts, Mapping):
+        return decision_candidate_deferral_counts_from_state(
+            durable_counts, candidate_ids
+        )
+    counts = {candidate_id: 0 for candidate_id in candidate_ids}
+    unresolved = set(counts)
+    for observations in _recent_candidate_observation_sequence(state):
+        if not unresolved:
+            break
+        for candidate_id in tuple(unresolved):
+            observation = observations.get(candidate_id)
+            if observation is None:
+                unresolved.remove(candidate_id)
+                continue
+            row, ancestors_selected = observation
+            if not row.get("admissible"):
+                unresolved.remove(candidate_id)
+                continue
+            disposition = str(row.get("disposition") or "")
+            if ancestors_selected and disposition == "selected":
+                unresolved.remove(candidate_id)
+                continue
+            if ancestors_selected and not decision_rejection_is_fairness_eligible(
+                disposition
+            ):
+                unresolved.remove(candidate_id)
+                continue
+            counts[candidate_id] += 1
+    return counts
+
+
+def _recent_candidate_observation_sequence(
+    state: Mapping[str, Any],
+) -> tuple[Dict[str, tuple[Mapping[str, Any], bool]], ...]:
+    """Parse bounded decision history once per immutable planning snapshot."""
+
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("recent_candidate_observation_sequence")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, tuple):
+        return cached
+    sequence: list[Dict[str, tuple[Mapping[str, Any], bool]]] = []
+    observations_by_trace_text: Dict[
+        str, Dict[str, tuple[Mapping[str, Any], bool]]
+    ] = {}
+    for run in state.get("recent_runs", []):
+        if run.get("decision_trace_history_included") is False:
+            break
+        raw_trace = (
+            run.get("decision_trace_json")
+            or run.get("decision_trace")
+            or {}
+        )
+        if isinstance(raw_trace, str):
+            prior_observations = observations_by_trace_text.get(raw_trace)
+            if prior_observations is not None:
+                sequence.append(prior_observations)
+                continue
+            try:
+                trace = json.loads(raw_trace)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                break
+        else:
+            trace = raw_trace
+        if not isinstance(trace, Mapping):
+            break
+        observations = _candidate_observations_in_trace(trace)
+        sequence.append(observations)
+        if isinstance(raw_trace, str):
+            observations_by_trace_text[raw_trace] = observations
+    result = tuple(sequence)
+    if isinstance(cache, dict):
+        cache["recent_candidate_observation_sequence"] = result
+    return result
+
+
+def _consecutive_candidate_deferrals(
+    state: Mapping[str, Any], candidate_id: str
+) -> int:
+    """Count consecutive admissible rejections, including nested policy strata."""
+
+    return _candidate_deferral_counts(state, [candidate_id])[candidate_id]
+
+
+def _generated_policy_deferrals(
+    state: Mapping[str, Any],
+    namespace: str,
+    generated: Sequence[tuple[str, Optional[Mapping[str, Any]]]],
+) -> Dict[str, int]:
+    candidate_ids = [
+        f"{namespace}:{policy_id}"
+        for policy_id, action in generated
+        if action is not None
+    ]
+    return _candidate_deferral_counts(state, candidate_ids)
+
+
+def _bind_generated_registry(
+    trace: Dict[str, Any],
+    *,
+    scope_id: str,
+    generated: Sequence[Sequence[Any]],
+) -> Dict[str, Any]:
+    """Bind a comparator that evaluated every declared applicability rule."""
+
+    active = [
+        str(row[0]).partition(":")[0]
+        for row in generated
+        if len(row) >= 2 and row[1] is not None
+    ]
+    return bind_candidate_generator_registry(
+        trace,
+        scope_id=scope_id,
+        active_generator_ids=active,
+        evaluated_generator_ids=_scope_generator_ids(scope_id),
+        skipped_generator_reasons={},
+    )
+
+
+_CANDIDATE_GENERATOR_FIELD = "_candidate_generator_id"
+
+
+def _tag_candidate_generator(
+    actions: Sequence[Mapping[str, Any]], generator_id: str
+) -> list[Dict[str, Any]]:
+    """Carry exact generator provenance to the one wave-admission boundary."""
+
+    return [
+        {**dict(action), _CANDIDATE_GENERATOR_FIELD: generator_id}
+        for action in actions
+    ]
+
+
+def _tag_single_candidate_generator(
+    action: Mapping[str, Any], generator_id: str
+) -> Dict[str, Any]:
+    return _tag_candidate_generator([action], generator_id)[0]
+
+
+def _base_action_policy_tier(action: Mapping[str, Any]) -> int:
+    """Classify base-planner output before comparing it with strategy policies.
+
+    These are lexicographic policy classes, not scalar utility bonuses. A due
+    exploratory action therefore cannot use its deferral allowance to displace
+    a proof-validation or state-repair action.
+    """
+
+    mode = str(action.get("mode") or "")
+    matching_tiers = [
+        rule.tier
+        for rule in ACTION_POLICY_RULES
+        if mode in rule.modes or any(action.get(flag) for flag in rule.flags)
+    ]
+    return max(matching_tiers, default=POLICY_TIER_EXPLORATION)
+
+
+def _action_policy_registry_errors() -> list[str]:
+    """Validate the declarative policy classes and their precedence edges."""
+
+    errors: list[str] = []
+    names = [rule.name for rule in ACTION_POLICY_RULES]
+    if len(names) != len(set(names)):
+        errors.append("action policy rule names must be unique")
+    tiers = {"exploration": POLICY_TIER_EXPLORATION}
+    tiers.update({rule.name: rule.tier for rule in ACTION_POLICY_RULES})
+    claimed_modes: Dict[str, str] = {}
+    claimed_flags: Dict[str, str] = {}
+    for rule in ACTION_POLICY_RULES:
+        if rule.tier <= POLICY_TIER_EXPLORATION:
+            errors.append(
+                f"action policy rule {rule.name} must exceed the exploration tier"
+            )
+        for mode in rule.modes:
+            prior = claimed_modes.setdefault(mode, rule.name)
+            if prior != rule.name:
+                errors.append(
+                    f"action mode {mode} is assigned to both {prior} and {rule.name}"
+                )
+        for flag in rule.flags:
+            prior = claimed_flags.setdefault(flag, rule.name)
+            if prior != rule.name:
+                errors.append(
+                    f"action flag {flag} is assigned to both {prior} and {rule.name}"
+                )
+    for higher, lower in ACTION_POLICY_PRECEDENCE:
+        if higher not in tiers or lower not in tiers:
+            errors.append(f"unknown policy class in precedence edge {higher}>{lower}")
+        elif tiers[higher] <= tiers[lower]:
+            errors.append(
+                f"policy precedence {higher}>{lower} disagrees with numeric tiers"
+            )
+    return errors
+
+
+_ACTION_POLICY_REGISTRY_ERRORS = tuple(_action_policy_registry_errors())
+if _ACTION_POLICY_REGISTRY_ERRORS:
+    raise RuntimeError(
+        "invalid scheduler action-policy registry: "
+        + "; ".join(_ACTION_POLICY_REGISTRY_ERRORS)
+    )
+
+
+def _base_action_is_mandatory_gate(
+    action: Mapping[str, Any],
+    *,
+    steering_alignment: Mapping[str, Any],
+) -> bool:
+    """Whether no strategy proposal may replace this state-machine action."""
+
+    mode = str(action.get("mode") or "")
+    return bool(
+        mode
+        in {
+            "stop_solved",
+            "stop_with_partial_results",
+            "await_human",
+            "integrate",
+            "formalize",
+            "validate_counterexample",
+            "review_writing",
+        }
+        or action.get("root_revision_required")
+        or action.get("dependency_threat_revalidation_required")
+        or action.get("counterexample_status_reconciliation_required")
+        or action.get("referee_route_error_research")
+        or action.get("final_output_required")
+        or action.get("post_integration_retrieval")
+        or action.get("paper_authoring")
+        or action.get("writing_revision")
+        or action.get("publication_writer")
+        or action.get("publication_referee")
+        or action.get("formalization_requested")
+        or action.get("paper_audit_verification_only")
+        or action.get("writing_revision_only")
+        or action.get("context_retrieval")
+        or action.get("assurance_review_required")
+        or (action.get("periodic_hmt") and not steering_alignment.get("required"))
+    )
+
+
+def _publish_selected_action_notifications(
+    store: ProofStateStore, action: Dict[str, Any]
+) -> list[str]:
+    """Publish optional UI notifications only after their action wins selection."""
+
+    request = action.get("human_blocker_request")
+    if not isinstance(request, Mapping):
+        return []
+    try:
+        blocker = steering.raise_authenticated_blocker(
+            store,
+            kind=str(request.get("kind") or "blocker"),
+            target_id=str(request.get("target_id") or "root"),
+            summary=str(request.get("summary") or ""),
+            detail=str(request.get("detail") or ""),
+            options=[str(item) for item in request.get("options", [])],
+            fingerprint=str(request.get("fingerprint") or "") or None,
+            revision=(
+                int(request["revision"])
+                if request.get("revision") is not None
+                else None
+            ),
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        action["human_blocker_notification_error"] = error
+        action["human_blocker_notification_required"] = bool(
+            request.get("required") or action.get("mode") == "await_human"
+        )
+        return [error]
+    action["human_blocker_id"] = str(blocker.get("id") or "")
+    return []
+
+
+def _reconcile_writing_gate_inputs(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Synchronize deterministic document findings before candidate generation."""
+
+    document: Optional[Mapping[str, Any]] = None
+    external_revision = is_writing_revision_state(state)
+    if external_revision:
+        document = latest_revision_document(state)
+    else:
+        root = _claim(state, "root") or {}
+        certificate = (
+            _final_proof_artifact(state, "root")
+            if str(root.get("lifecycle_status") or "") == "integrated"
+            else None
+        )
+        document = _final_paper_artifact(state) if certificate else None
+        if document is not None and _is_publication_workflow_document(document):
+            metadata = _json_object(document.get("metadata_json"))
+            if str(metadata.get("certificate_artifact_id") or "") != str(
+                (certificate or {}).get("artifact_id") or ""
+            ):
+                document = None
+    if document is None:
+        return None
+    artifact_id = str(document.get("artifact_id") or "")
+    content = _writing_artifact_content(document)
+    errors = _sync_writing_lint_debts(
+        store, artifact_id, content, include_paper_register=not external_revision
+    )
+    if not external_revision:
+        errors.extend(_sync_writing_compile_debt(store, artifact_id))
+    if errors:
+        problem = state.get("problem_state", {})
+        return _action(
+            "stop_with_partial_results",
+            "root",
+            "",
+            "could not reconcile deterministic writing-gate findings",
+            plan_step_budget(problem, "stop_with_partial_results", 0),
+            research_mode=research_mode,
+            errors=errors,
+            stop_reason_code="writing_gate_reconciliation_failed",
+            artifact_reviewed=artifact_id,
+        )
+    return None
+
+
+def _scheduler_snapshot_marker(
+    conn: sqlite3.Connection,
+    problem_id: str,
+) -> tuple[Any, ...]:
+    """Return the lightweight proof/configuration marker used during planning."""
+
+    row = conn.execute(
+        "SELECT current_revision, event_chain_length, event_chain_head, policy_event_head "
+        "FROM problem_state WHERE problem_id = ?",
+        (problem_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("problem state is not initialized")
+    return (
+        int(row["current_revision"] or 0),
+        int(row["event_chain_length"] or 0),
+        str(row["event_chain_head"] or ""),
+        str(row["policy_event_head"] or ""),
+    )
+
+
+def _problem_snapshot_marker(problem: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Project a loaded problem row to the scheduler consistency marker."""
+
+    return (
+        int(problem.get("current_revision") or 0),
+        int(problem.get("event_chain_length") or 0),
+        str(problem.get("event_chain_head") or ""),
+        str(problem.get("policy_event_head") or ""),
+    )
+
+
+def _integration_assurance_projection(
+    conn: sqlite3.Connection,
+    state: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Compute route assurance without one SQL query per standard claim.
+
+    The designation rows came from ``conn`` in the same read transaction.
+    Standard assurance has no further certificate-class condition, so its
+    authoritative result is immediate.  Only the exceptional heterogeneous
+    policy needs the more expensive binding scan.
+    """
+
+    levels = {
+        str(row.get("claim_id") or ""): str(
+            row.get("assurance_level") or "standard"
+        )
+        for row in state.get("claim_assurance", [])
+        if str(row.get("claim_id") or "")
+    }
+    projected: Dict[str, Dict[str, Any]] = {}
+    for candidate in candidates:
+        claim_id = str(candidate.get("conclusion_claim_id") or "")
+        route_id = str(candidate.get("route_id") or "")
+        level = levels.get(claim_id, "standard")
+        if level == "heterogeneous_review":
+            projected[route_id] = claim_assurance_summary(
+                conn,
+                claim_id=claim_id,
+                route_id=route_id,
+            )
+            continue
+        projected[route_id] = {
+            "claim_id": claim_id,
+            "route_id": route_id,
+            "assurance_level": level,
+            "satisfied": True,
+            "basis": "standard review policy",
+            "independence_classes": [],
+            "review_artifact_ids": [],
+        }
+    return projected
+
+
 def next_action(
     store: ProofStateStore,
     *,
@@ -498,40 +1068,197 @@ def next_action(
     allow_integration: bool = True,
     include_periodic_hmt: bool = True,
 ) -> Dict[str, Any]:
-    action = _plan_next_action(
-        store,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-        web_search=web_search,
-        allow_integration=allow_integration,
-        include_periodic_hmt=include_periodic_hmt,
-    )
-    steering_alignment = steering.approach_alignment_card(store.state_dir)
-    if (
-        action.get("paper_audit_verification_only")
-        or action.get("writing_revision_only")
-        or (action.get("periodic_hmt") and not steering_alignment.get("required"))
+    # One read transaction supplies invariant results, the proof-state
+    # projection, and authenticated steering. Deterministic derived-state
+    # reconciliation runs between snapshots, never inside candidate
+    # generation. A concurrent proof/configuration update still causes a
+    # bounded replan, so the dispatched action and comparison trace derive
+    # from one stable snapshot.
+    for _planning_attempt in range(SCHEDULER_SNAPSHOT_RETRY_LIMIT):
+        with store.connect() as planning_conn:
+            planning_conn.execute("BEGIN")
+            current_seal = store.current_state_seal(planning_conn)
+            invariant_errors = (
+                []
+                if current_seal["valid"]
+                else [
+                    "current proof-state seal is invalid: " + str(error)
+                    for error in current_seal["errors"]
+                ]
+            )
+            strategy_state = store.get_scheduler_state(conn=planning_conn)
+            projected_integration_candidates = (
+                _integration_candidates(
+                    strategy_state,
+                    distinct_claims=False,
+                )
+                if allow_integration and not invariant_errors
+                else []
+            )
+            projected_integration_candidate = (
+                projected_integration_candidates[0]
+                if projected_integration_candidates
+                else None
+            )
+            strategy_state["_integration_candidates"] = [
+                dict(candidate)
+                for candidate in projected_integration_candidates
+            ]
+            strategy_state["_integration_candidate"] = (
+                dict(projected_integration_candidate)
+                if projected_integration_candidate is not None
+                else None
+            )
+            strategy_state["_integration_assurance_by_route"] = (
+                _integration_assurance_projection(
+                    planning_conn,
+                    strategy_state,
+                    projected_integration_candidates,
+                )
+            )
+            strategy_state["_integration_assurance"] = (
+                strategy_state["_integration_assurance_by_route"].get(
+                    str(projected_integration_candidate["route_id"])
+                )
+                if projected_integration_candidate is not None
+                else None
+            )
+            steering_alignment = (
+                {}
+                if invariant_errors
+                else steering.authenticated_approach_alignment_card(
+                    store, conn=planning_conn
+                )
+            )
+            snapshot_marker = _scheduler_snapshot_marker(
+                planning_conn, store.problem_id
+            )
+            # End the read snapshot before the explicit reconciliation phase.
+            # This same connection can then read the latest marker without
+            # paying another connection setup.
+            planning_conn.rollback()
+            if not invariant_errors:
+                reconciliation_failure = _reconcile_publication_route_error(
+                    store,
+                    strategy_state,
+                    research_mode=normalize_research_mode(research_mode),
+                )
+                if reconciliation_failure is not None:
+                    return trace_single_mandatory_action(
+                        reconciliation_failure,
+                        domain="state_reconciliation",
+                        reason=str(reconciliation_failure.get("reason") or ""),
+                    )
+                if (
+                    _scheduler_snapshot_marker(planning_conn, store.problem_id)
+                    != snapshot_marker
+                ):
+                    continue
+                reconciliation_failure = _reconcile_writing_gate_inputs(
+                    store,
+                    strategy_state,
+                    research_mode=normalize_research_mode(research_mode),
+                )
+                if reconciliation_failure is not None:
+                    return trace_single_mandatory_action(
+                        reconciliation_failure,
+                        domain="state_reconciliation",
+                        reason=str(reconciliation_failure.get("reason") or ""),
+                    )
+                if (
+                    _scheduler_snapshot_marker(planning_conn, store.problem_id)
+                    != snapshot_marker
+                ):
+                    continue
+            action = _plan_next_action(
+                store,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                web_search=web_search,
+                allow_integration=allow_integration,
+                include_periodic_hmt=include_periodic_hmt,
+                _scheduler_state=strategy_state,
+                _invariant_errors_override=invariant_errors,
+            )
+            stable_snapshot = (
+                _scheduler_snapshot_marker(planning_conn, store.problem_id)
+                == snapshot_marker
+            )
+        if stable_snapshot:
+            break
+    else:
+        unstable = _action(
+            "stop_with_partial_results",
+            "root",
+            "",
+            "proof state or configuration changed during every bounded scheduler planning attempt",
+            plan_step_budget(
+                strategy_state.get("problem_state", {}),
+                "stop_with_partial_results",
+                0,
+            ),
+            research_mode=normalize_research_mode(research_mode),
+            stop_reason_code="unstable_scheduler_snapshot",
+            scheduler_snapshot_retry_limit=SCHEDULER_SNAPSHOT_RETRY_LIMIT,
+        )
+        return trace_single_mandatory_action(
+            unstable,
+            domain="state_consistency",
+            reason=str(unstable["reason"]),
+        )
+    base_policy_trace = action.pop("_base_policy_trace", None)
+    # A child comparison's commitment lives inside base_policy_trace. The
+    # enclosing comparator binds that complete trace under its own candidate.
+    action.pop("base_policy_trace_sha256", None)
+    if _base_action_is_mandatory_gate(
+        action, steering_alignment=steering_alignment
     ):
-        return action
+        gate_reason = str(action.get("reason") or "pre-comparison mandatory scheduler constraint")
+        _publish_selected_action_notifications(store, action)
+        return trace_single_mandatory_action(
+            action,
+            domain="safety_or_maintenance",
+            reason=gate_reason,
+            base_policy_trace=(
+                base_policy_trace
+                if isinstance(base_policy_trace, Mapping)
+                else None
+            ),
+        )
     # The research-strategy layer is a deterministic view over persisted proof
     # state. It may preempt ordinary mature-run rotation for a due compression,
     # global PhD-advisor synthesis, a sufficiency-prechecked bridge/conjecture,
     # or a strictly authorized invention pass. Verification/integration/writing
     # actions are protected inside next_strategy_operation.
-    strategy_state = store.get_scheduler_state()
-    strategy_signal = next_strategy_operation(
+    strategy_signals = strategy_operation_candidates(
         strategy_state,
         action,
         steering_alignment=steering_alignment,
     )
-    if strategy_signal:
+    base_assessment = score_research_strategy_action(strategy_state, action)
+    candidates = [
+        ActionCandidate(
+            # Keep the stable identifier for stored deferral histories from
+            # policy version 6; the branch is no longer sequential internally.
+            candidate_id="base:sequential_planner",
+            domain="base_policy_planner",
+            action=action,
+            ordinal_priority=float(base_assessment["scheduler_priority"]),
+            policy_tier=_base_action_policy_tier(action),
+            consecutive_deferrals=_consecutive_candidate_deferrals(
+                strategy_state, "base:sequential_planner"
+            ),
+            deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+        )
+    ]
+    for precedence, strategy_signal in enumerate(strategy_signals):
         candidate = _research_strategy_operation_action(
             strategy_state,
             strategy_signal,
             requested_tokens=requested_tokens,
             research_mode=normalize_research_mode(research_mode),
         )
-        force_operations = {
+        preemptive_operations = {
             "approach_portfolio_brainstorming",
             "approach_portfolio_refresh",
             "proof_compression",
@@ -540,12 +1267,88 @@ def next_action(
             "definition_invention",
             "reference_solution_reconstruction",
         }
-        if (
-            str(strategy_signal.get("operation") or "") in force_operations
-            or score_research_strategy_action(strategy_state, candidate)["expected_value_score"]
-            > score_research_strategy_action(strategy_state, action)["expected_value_score"]
-        ):
-            action = candidate
+        recovery_operations = {
+            "approach_portfolio_brainstorming",
+            "approach_portfolio_refresh",
+            "conceptual_invariant_discovery",
+            "advisor_global_synthesis",
+        }
+        candidate_assessment = score_research_strategy_action(strategy_state, candidate)
+        operation = str(strategy_signal.get("operation") or "operation")
+        qualifier = (
+            "bridge"
+            if strategy_signal.get("selected_bridge")
+            else "conjecture"
+            if strategy_signal.get("selected_conjecture")
+            else "approach"
+            if strategy_signal.get("selected_approach")
+            else "default"
+        )
+        # Creative and synthesis operations are high-priority policies, not
+        # hard constraints. Reserve mandatory status for authenticated
+        # exclusive alignment and a human-supplied reference that explicitly
+        # requires reconstruction before independent search resumes.
+        mandatory = bool(candidate.get("exclusive_wave_required")) or operation == (
+            "reference_solution_reconstruction"
+        )
+        preemptive = operation in preemptive_operations
+        candidate_id = f"research_strategy:{operation}:{qualifier}"
+        candidates.append(
+            ActionCandidate(
+                candidate_id=candidate_id,
+                domain="research_strategy",
+                action=candidate,
+                ordinal_priority=(
+                    1_000_000.0 - float(precedence)
+                    if preemptive
+                    else float(candidate_assessment["scheduler_priority"])
+                ),
+                policy_tier=(
+                    POLICY_TIER_SAFETY
+                    if mandatory
+                    else POLICY_TIER_RECOVERY
+                    if operation in recovery_operations
+                    else POLICY_TIER_EXPLORATION + 50
+                    if preemptive
+                    else POLICY_TIER_EXPLORATION
+                ),
+                mandatory_constraint=mandatory,
+                consecutive_deferrals=_consecutive_candidate_deferrals(
+                    strategy_state, candidate_id
+                ),
+                deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+            )
+        )
+    action, decision_trace = select_action_candidate(
+        candidates,
+        candidate_set_complete=True,
+        candidate_set_scope=(
+            "all admissible top-level research-strategy operations plus the selected action "
+            "from the base planner's complete open-problem stratum comparison"
+        ),
+        nested_policy_traces=(
+            {"base:sequential_planner": base_policy_trace}
+            if isinstance(base_policy_trace, Mapping)
+            else None
+        ),
+        # The final bound trace is validated once below. Revalidating this
+        # complete nested tree at every wrapper makes dense traces quadratic
+        # in policy depth without adding an independent check.
+        _nested_policy_traces_already_validated=True,
+    )
+    bind_candidate_generator_registry(
+        decision_trace,
+        scope_id="top_level",
+        active_generator_ids=[
+            "base_planner",
+            *[
+                str(signal.get("_candidate_generator_id") or "")
+                for signal in strategy_signals
+            ],
+        ],
+        evaluated_generator_ids=_scope_generator_ids("top_level"),
+        skipped_generator_reasons={},
+    )
     action = enrich_research_strategy_action(strategy_state, action)
     action = _reallocate_advisor_action(action)
     if action_expects_researcher_session(action) or action_expects_villain_session(action):
@@ -554,6 +1357,14 @@ def next_action(
             action,
             research_mode=research_mode,
             web_search=web_search,
+        )
+    _publish_selected_action_notifications(store, action)
+    action["decision_trace"] = bind_dispatched_action(action, decision_trace)
+    trace_errors = decision_trace_errors(action["decision_trace"])
+    if trace_errors:
+        raise RuntimeError(
+            "invalid host-generated scheduler decision trace: "
+            + "; ".join(trace_errors)
         )
     return action
 
@@ -577,7 +1388,14 @@ def _research_strategy_operation_action(
     extra = {
         key: value
         for key, value in signal.items()
-        if key not in {"mode", "target_id", "route_id", "reason"}
+        if key
+        not in {
+            "_candidate_generator_id",
+            "mode",
+            "target_id",
+            "route_id",
+            "reason",
+        }
     }
     if signal.get("experiment_workflow_required"):
         extra["cas_check_recommended"] = True
@@ -632,7 +1450,7 @@ def _paper_audit_verification_only_action(
             "root",
             "",
             "paper audit: strict verifier reviews the submitted statements and proofs directly; no proof repair or alternative argument",
-            plan_step_budget(problem, "prove", requested_tokens),
+            _strict_verifier_budget(problem, requested_tokens),
             research_mode=research_mode,
             paper_audit_verification_only=True,
             paper_audit_document_review_required=True,
@@ -760,29 +1578,22 @@ def _periodic_hmt_action(
 
     prior: list[Dict[str, Any]] = []
     try:
-        with store.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT state_revision, metadata_json
-                FROM artifacts
-                WHERE artifact_type = ?
-                ORDER BY state_revision ASC, created_at ASC
-                """,
-                (HUMAN_READABLE_TEXT_ARTIFACT_TYPE,),
-            ).fetchall()
-        for row in rows:
-            metadata = _json_object(row["metadata_json"])
+        for row in state.get("hmt_artifacts", []):
+            metadata = _json_object(row.get("metadata_json"))
             prior.append(
                 {
                     "source_revision": int(
-                        metadata.get("source_revision") or row["state_revision"] or 0
+                        metadata.get("source_revision")
+                        or row.get("state_revision")
+                        or 0
                     ),
                     "source_integrated_claim_count": metadata.get(
                         "source_integrated_claim_count"
                     ),
                 }
             )
-    except Exception:
+    except (TypeError, ValueError):
+        # Optional cadence metadata must not suppress mathematical work.
         return None
 
     recorded_counts = [
@@ -817,6 +1628,2809 @@ def _periodic_hmt_action(
     )
 
 
+_CONTEXT_REQUEST_ID_COLUMNS = (
+    "requested_claim_id",
+    "requested_route_id",
+    "requested_inference_id",
+    "requested_proof_obligation_id",
+    "requested_artifact_id",
+    "requested_retrieval_card_id",
+    "requested_theorem_library_entry_id",
+)
+
+
+def _pending_context_request_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    """Materialize each pending requester/session group in canonical order."""
+
+    pending = [
+        row
+        for row in state.get("context_requests", [])
+        if str(row.get("status") or "") == "pending"
+    ]
+    if not pending:
+        return []
+    pending.sort(
+        key=lambda row: (
+            str(row.get("requested_at") or ""),
+            str(row.get("request_id") or ""),
+        )
+    )
+    grouped_rows: Dict[tuple[str, str, str, str], list[Mapping[str, Any]]] = {}
+    for row in pending:
+        group_key = (
+            str(row.get("requester_role") or "researcher"),
+            str(row.get("request_mode") or "prove"),
+            str(row.get("original_target_id") or "root"),
+            str(row.get("original_route_id") or ""),
+        )
+        grouped_rows.setdefault(group_key, []).append(row)
+
+    actions: list[Dict[str, Any]] = []
+    for group_key, rows in grouped_rows.items():
+        selected_rows: list[tuple[Mapping[str, Any], str]] = []
+        for row in rows:
+            entity_id = next(
+                (
+                    str(row.get(column) or "")
+                    for column in _CONTEXT_REQUEST_ID_COLUMNS
+                    if str(row.get(column) or "")
+                ),
+                "",
+            )
+            if entity_id:
+                selected_rows.append((row, entity_id))
+            if len(selected_rows) >= 4:
+                break
+        if not selected_rows:
+            continue
+        requester_role, mode, target_id, route_id = group_key
+        actions.append(
+            _action(
+                mode,
+                target_id,
+                route_id,
+                "deliver explicitly requested proof-state objects in a complete local packet",
+                plan_step_budget(problem, mode, requested_tokens),
+                research_mode=research_mode,
+                context_retrieval=True,
+                force_cold_start=True,
+                requested_actor_role=requester_role,
+                requested_context_entity_ids=[
+                    entity_id for _, entity_id in selected_rows
+                ],
+                requested_context_entities=[
+                    {
+                        "entity_id": entity_id,
+                        "entity_type": str(
+                            row.get("requested_entity_type") or ""
+                        ),
+                    }
+                    for row, entity_id in selected_rows
+                ],
+                context_request_ids=[
+                    str(row.get("request_id") or "")
+                    for row, _ in selected_rows
+                ],
+                search_intent="context_entity_retrieval",
+            )
+        )
+    return actions
+
+
+def _pending_context_request_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Dict[str, Any] | None:
+    """Compatibility wrapper returning the oldest requester group."""
+
+    actions = _pending_context_request_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _context_request_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _pending_context_request_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    generated = [
+        (str(action.get("context_request_ids", [""])[0]), action)
+        for action in actions
+    ]
+    if not generated:
+        return None
+    deferrals = _generated_policy_deferrals(state, "base_context", generated)
+    candidates = [
+        ActionCandidate(
+            candidate_id=f"base_context:{request_id}",
+            domain="explicit_context_retrieval",
+            action=action,
+            ordinal_priority=float(len(generated) - precedence),
+            policy_tier=POLICY_TIER_SAFETY,
+            consecutive_deferrals=deferrals[f"base_context:{request_id}"],
+            deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+        )
+        for precedence, (request_id, action) in enumerate(generated)
+    ]
+    selected, trace = select_action_candidate(
+        candidates,
+        candidate_set_complete=True,
+        candidate_set_scope="all pending requester/session context groups",
+    )
+    selected["_base_policy_trace"] = trace
+    return selected
+
+
+def _requested_formalization_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    """Materialize every due explicit formal check in canonical priority order."""
+
+    claims = {
+        str(row.get("claim_id") or ""): row
+        for row in state.get("claims", [])
+        if str(row.get("claim_id") or "")
+    }
+    recent_formal_runs: dict[str, str] = {}
+    for run in state.get("recent_runs", []):
+        if str(run.get("mode") or "") != "formalize":
+            continue
+        target_id = str(run.get("target_id") or "")
+        recent_formal_runs[target_id] = max(
+            recent_formal_runs.get(target_id, ""),
+            str(run.get("created_at") or ""),
+        )
+    candidates = []
+    for obligation in state.get("debts", []):
+        if (
+            str(obligation.get("status") or "") != "active"
+            or str(obligation.get("debt_type") or "") != "formalization_gap"
+            or str(obligation.get("owner_type") or "") != "claim"
+        ):
+            continue
+        claim_id = str(obligation.get("owner_id") or "")
+        claim = claims.get(claim_id)
+        if not claim or str(claim.get("validation_status") or "") not in {
+            "informally_verified",
+            "formally_verified",
+        }:
+            continue
+        # A failed attempt is not retried unchanged forever. Updating the
+        # formalization obligation after the run makes it eligible again.
+        recent_at = recent_formal_runs.get(claim_id, "")
+        if recent_at and recent_at >= str(obligation.get("last_seen") or ""):
+            continue
+        candidates.append(obligation)
+    if not candidates:
+        return []
+    candidates.sort(
+        key=lambda row: (
+            0 if str(row.get("severity") or "") == "blocking" else 1,
+            str(row.get("last_seen") or ""),
+            str(row.get("debt_id") or ""),
+        )
+    )
+    actions: list[Dict[str, Any]] = []
+    for obligation in candidates:
+        claim_id = str(obligation.get("owner_id") or "")
+        route_ids = sorted(
+            str(route.get("route_id") or "")
+            for route in state.get("routes", [])
+            if str(route.get("conclusion_claim_id") or "") == claim_id
+            and str(route.get("status") or "") == "active"
+        )
+        actions.append(
+            _action(
+                "formalize",
+                claim_id,
+                route_ids[0] if route_ids else "",
+                "perform the explicitly requested formal verification of an informally checked claim",
+                plan_step_budget(problem, "formalize", requested_tokens),
+                research_mode=research_mode,
+                formalization_requested=True,
+                formalization_target_type="claim",
+                formalization_proof_obligation_id=str(
+                    obligation.get("debt_id") or ""
+                ),
+                search_intent="requested_formal_verification",
+            )
+        )
+    return actions
+
+
+def _requested_formalization_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Dict[str, Any] | None:
+    """Compatibility wrapper returning the highest-priority formal check."""
+
+    actions = _requested_formalization_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _formalization_request_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _requested_formalization_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    generated = [
+        (str(action.get("formalization_proof_obligation_id") or ""), action)
+        for action in actions
+    ]
+    if not generated:
+        return None
+    deferrals = _generated_policy_deferrals(
+        state, "base_formalization", generated
+    )
+    candidates = [
+        ActionCandidate(
+            candidate_id=f"base_formalization:{obligation_id}",
+            domain="explicit_formalization",
+            action=action,
+            ordinal_priority=float(len(generated) - precedence),
+            policy_tier=POLICY_TIER_VERIFICATION,
+            consecutive_deferrals=deferrals[
+                f"base_formalization:{obligation_id}"
+            ],
+            deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+        )
+        for precedence, (obligation_id, action) in enumerate(generated)
+    ]
+    selected, trace = select_action_candidate(
+        candidates,
+        candidate_set_complete=True,
+        candidate_set_scope="all due explicit formalization obligations",
+    )
+    selected["_base_policy_trace"] = trace
+    return selected
+
+
+def _verification_handoff_action(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+) -> Optional[Dict[str, Any]]:
+    """Compare every registered verification/handoff policy that is active.
+
+    This replaces an ordered early-return chain. Every pending route,
+    counterexample, status reconciliation, and route-assembly alternative is
+    materialized. Advisor actions represent the one current directive; older
+    directives are superseded rather than concurrent alternatives.
+    """
+
+    generated: list[tuple[str, Dict[str, Any] | None]] = [
+        (
+            "advisor_strict_verification",
+            _advisor_requested_strict_verifier_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        *[
+            (
+                f"fresh_proof_evidence:{str(action.get('route_id') or '')}",
+                action,
+            )
+            for action in _proof_evidence_handoff_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            )
+        ],
+        *[
+            (
+                f"verifier_loop_classification:{str(action.get('route_id') or '')}",
+                action,
+            )
+            for action in _verifier_loop_classification_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            )
+        ],
+        *[
+            (
+                f"support_theorem_precheck:{str(action.get('route_id') or '')}",
+                action,
+            )
+            for action in _support_lemma_precheck_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                web_search=web_search,
+                parallel_companion=False,
+            )
+        ],
+        *[
+            (
+                f"verifier_ready_route:{str(action.get('route_id') or '')}",
+                action,
+            )
+            for action in _verifier_candidate_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                parallel_companion=False,
+                distinct_claims=False,
+                limit=None,
+            )
+        ],
+        *[
+            (
+                "counterexample_validation:"
+                f"{str(action.get('candidate_counterexample_artifact_id') or '')}",
+                action,
+            )
+            for action in _counterexample_validation_actions(
+                store,
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            )
+        ],
+        *[
+            (
+                f"dependency_threat_revalidation:{str(action.get('route_id') or '')}",
+                action,
+            )
+            for action in _threat_revalidation_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            )
+        ],
+        (
+            "advisor_counterexample_validation",
+            _advisor_requested_validation_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        (
+            "advisor_adversarial_review",
+            _advisor_requested_villain_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        *[
+            (
+                f"unrouted_proof_assembly:{str(action.get('target_id') or '')}",
+                action,
+            )
+            for action in _unrouted_proof_claim_actions(
+                store,
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            )
+        ],
+    ]
+    deferral_counts = _generated_policy_deferrals(
+        state, "base_verification", generated
+    )
+    candidates: list[ActionCandidate] = []
+    policy_count = len(generated)
+    for precedence, (policy_id, candidate_action) in enumerate(generated):
+        if candidate_action is None:
+            continue
+        if policy_id.startswith("verifier_ready_route:"):
+            candidate_action["reason"] = (
+                "verifier-ready proof route should be checked before citation, "
+                "retrieval, counterexample, or decomposition work"
+            )
+            candidate_action["search_intent"] = (
+                candidate_action.get("search_intent") or "verify_ready_route"
+            )
+            candidate_action["verify_ready_route_policy"] = True
+        candidates.append(
+            ActionCandidate(
+                candidate_id=f"base_verification:{policy_id}",
+                domain="verification_and_evidence_handoff",
+                action=candidate_action,
+                ordinal_priority=float(policy_count - precedence),
+                policy_tier=POLICY_TIER_VERIFICATION,
+                consecutive_deferrals=deferral_counts[
+                    f"base_verification:{policy_id}"
+                ],
+                deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+            )
+        )
+    if not candidates:
+        return None
+    selected, trace = select_action_candidate(
+        candidates,
+        candidate_set_complete=True,
+        candidate_set_scope=(
+            "all active verification and evidence-handoff policy generators, "
+            "every verifier-ready route (including routes for the same claim), "
+            "every pending counterexample or status reconciliation, every "
+            "threatened route, every support-theorem precheck, every repeated "
+            "verifier loop, every unrouted proof claim, and the current advisor "
+            "directive"
+        ),
+    )
+    _bind_generated_registry(trace, scope_id="verification", generated=generated)
+    selected["_base_policy_trace"] = trace
+    return selected
+
+
+def _source_adaptation_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    actions: list[Dict[str, Any]] = []
+    for source_digest in _pending_source_handoff_digests(state):
+        mode = "reduce"
+        budget_action = {
+            "target_id": source_digest["target_id"],
+            "source_adaptation_digest_required": True,
+            "source_artifact_id": source_digest["artifact_id"],
+            "search_intent": "source_adaptation_digest",
+        }
+        actions.append(
+            _action(
+                mode,
+                source_digest["target_id"],
+                source_digest.get("route_id", ""),
+                "incorporate a checked literature handoff into the local proof draft",
+                plan_action_budget(problem, mode, budget_action, requested_tokens),
+                research_mode=research_mode,
+                source_adaptation_digest_required=True,
+                source_artifact_id=source_digest["artifact_id"],
+                source_artifact_type=source_digest["artifact_type"],
+                search_request_id=source_digest.get("search_request_id", ""),
+                needs_proof_dossier=True,
+                search_intent="source_adaptation_digest",
+            )
+        )
+    return actions
+
+
+def _source_adaptation_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _source_adaptation_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _external_citation_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    citation_candidates = _external_citation_candidates(state, target_id="root")
+    if not citation_candidates:
+        return []
+    mode = "prove"
+    actions: list[Dict[str, Any]] = []
+    durable_triage = _citation_triage_status_by_card(state)
+    for citation_candidate in citation_candidates:
+        triage_required = (
+            citation_candidate["card_id"] not in durable_triage
+            and not _recent_object_action_seen(
+                state,
+                intent="citation_triage",
+                candidate_prefix="base_evidence:external_citation_check:",
+                subject_id=citation_candidate["card_id"],
+                window=4,
+                target_id="root",
+            )
+        )
+        if triage_required:
+            budget_action = {
+                "target_id": "root",
+                "citation_triage_required": True,
+                "retrieval_card_id": citation_candidate["card_id"],
+                "search_intent": "citation_triage",
+            }
+            actions.append(
+                _action(
+                    mode,
+                    "root",
+                    "",
+                    "quick verifier triage for an exact external citation candidate",
+                    plan_action_budget(problem, mode, budget_action, requested_tokens),
+                    research_mode=research_mode,
+                    citation_triage_required=True,
+                    citation_verification_standard="reasonable_citation_triage",
+                    retrieval_card_id=citation_candidate["card_id"],
+                    citation_relation=citation_candidate["relation"],
+                    search_intent="citation_triage",
+                )
+            )
+            continue
+        budget_action = {
+            "target_id": "root",
+            "citation_certification_required": True,
+            "retrieval_card_id": citation_candidate["card_id"],
+            "search_intent": "citation_certification",
+        }
+        actions.append(
+            _action(
+                mode,
+                "root",
+                "",
+                "exact external citation candidate can certify the root theorem",
+                plan_action_budget(problem, mode, budget_action, requested_tokens),
+                research_mode=research_mode,
+                citation_certification_required=True,
+                citation_verification_standard="reasonable_citation_with_local_deduction",
+                retrieval_card_id=citation_candidate["card_id"],
+                citation_relation=citation_candidate["relation"],
+                search_intent="citation_certification",
+            )
+        )
+    return actions
+
+
+def _external_citation_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _external_citation_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _definition_audit_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    mode = "audit_definitions"
+    return [
+        _action(
+            mode,
+            "root",
+            "",
+            definition_audit["reason"],
+            plan_step_budget(problem, mode, requested_tokens),
+            research_mode=research_mode,
+            definition_audit_required=True,
+            retrieval_card_id=definition_audit["card_id"],
+            definition_audit_reason=definition_audit["reason"],
+            search_intent="definition_audit",
+        )
+        for definition_audit in _definition_audit_candidates(
+            state, target_id="root"
+        )
+    ]
+
+
+def _definition_audit_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _definition_audit_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _evidence_assimilation_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+    parent_implication_ready: bool,
+) -> Optional[Dict[str, Any]]:
+    """Compare every eligible source, proof-draft, and diagnostic action."""
+
+    exact_searches = (
+        []
+        if parent_implication_ready
+        else _verifier_blocked_citation_actions(
+            state,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+            web_search=web_search,
+        )
+    )
+    source_adaptations = (
+        []
+        if parent_implication_ready
+        else _source_adaptation_actions(
+            state,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+        )
+    )
+    proof_conversions = (
+        []
+        if parent_implication_ready
+        else _proof_candidate_route_conversion_actions(
+            state,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+        )
+    )
+    proof_extractions = [
+        action
+        for action in proof_conversions
+        if action.get("proved_lemma_claim_extraction_required")
+    ]
+    proof_route_conversions = [
+        action
+        for action in proof_conversions
+        if not action.get("proved_lemma_claim_extraction_required")
+    ]
+    external_citations = _external_citation_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    definition_audits = _definition_audit_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+
+    def identified(
+        policy_id: str,
+        actions: Sequence[Mapping[str, Any]],
+        identity_field: str,
+    ) -> list[tuple[str, Dict[str, Any]]]:
+        return [
+            (
+                f"{policy_id}:{str(action.get(identity_field) or action_sha256(action)[:16])}",
+                dict(action),
+            )
+            for action in actions
+        ]
+
+    generated: list[tuple[str, Dict[str, Any] | None]] = []
+    generated.extend(
+        identified("exact_support_theorem_search", exact_searches, "debt_id")
+    )
+    generated.extend(
+        identified("source_adaptation", source_adaptations, "source_artifact_id")
+    )
+    generated.extend(
+        identified(
+            "proved_lemma_extraction",
+            proof_extractions,
+            "proof_candidate_artifact_id",
+        )
+    )
+    generated.extend(
+        [
+        (
+            "executive_bottleneck_review",
+            None
+            if parent_implication_ready
+            else _executive_advisor_bottleneck_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        (
+            "near_solution_proof_spine",
+            None
+            if parent_implication_ready
+            else _near_solution_spine_synthesis_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        ]
+    )
+    generated.extend(
+        identified(
+            "proof_draft_route_conversion",
+            proof_route_conversions,
+            "proof_candidate_artifact_id",
+        )
+    )
+    generated.extend(
+        [
+        (
+            "stream_stall_recovery",
+            None
+            if parent_implication_ready
+            else _stream_stall_recovery_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        ]
+    )
+    generated.extend(
+        identified("external_citation_check", external_citations, "retrieval_card_id")
+    )
+    generated.extend(
+        identified("definition_audit", definition_audits, "retrieval_card_id")
+    )
+    deferral_counts = _generated_policy_deferrals(state, "base_evidence", generated)
+    candidates = [
+        ActionCandidate(
+            candidate_id=f"base_evidence:{policy_id}",
+            domain="evidence_assimilation",
+            action=candidate_action,
+            ordinal_priority=float(len(generated) - precedence),
+            policy_tier=POLICY_TIER_RECOVERY,
+            consecutive_deferrals=deferral_counts[f"base_evidence:{policy_id}"],
+            deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+        )
+        for precedence, (policy_id, candidate_action) in enumerate(generated)
+        if candidate_action is not None
+    ]
+    if not candidates:
+        return None
+    selected, trace = select_action_candidate(
+        candidates,
+        candidate_set_complete=True,
+        candidate_set_scope=(
+            "every eligible exact citation obligation, checked source handoff, "
+            "proof artifact awaiting claim or route conversion, root-target external "
+            "citation card, and root-target definition-audit card, together with the canonical current "
+            "output of each state-level executive, near-solution, and stream-recovery policy"
+        ),
+    )
+    _bind_generated_registry(trace, scope_id="evidence", generated=generated)
+    selected["_base_policy_trace"] = trace
+    return selected
+
+
+def _recovery_synthesis_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    parent_implication_ready: bool,
+) -> Optional[Dict[str, Any]]:
+    """Compare active recovery, persistence, and synthesis policies."""
+
+    bottleneck_locks = _bottleneck_lock_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    primary_bottleneck_lock = bottleneck_locks[0] if bottleneck_locks else None
+    advisor_followup = _advisor_followup_research_action(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    if not (
+        advisor_followup
+        and not parent_implication_ready
+        and _advisor_followup_can_preempt_bottleneck(
+            advisor_followup, primary_bottleneck_lock
+        )
+    ):
+        advisor_followup = None
+
+    scheduled_bottlenecks: list[Dict[str, Any]] = []
+    if not parent_implication_ready:
+        for bottleneck_lock in bottleneck_locks:
+            lease = bottleneck_lease_state(state, bottleneck_lock)
+            bottleneck_lock["bottleneck_lease"] = lease
+            if not lease.get("escape_required"):
+                scheduled_bottlenecks.append(bottleneck_lock)
+
+    generated: list[tuple[str, Dict[str, Any] | None]] = [
+        ("advisor_followup", advisor_followup),
+        (
+            "productive_branch_persistence",
+            None
+            if parent_implication_ready
+            else _branch_persistence_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        (
+            "duplicate_work_guard",
+            _duplicate_work_suppression_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        (
+            "retrieve_reduce_circuit_breaker",
+            _retrieve_reduce_loop_advisor_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        (
+            "no_content_guard",
+            _no_content_research_guard_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        *[
+            (
+                "bottleneck_lock:"
+                + str(action.get("proof_obligation_id") or action.get("debt_id") or action_sha256(action)[:16]),
+                action,
+            )
+            for action in scheduled_bottlenecks
+        ],
+        (
+            "proof_architecture",
+            _proof_architecture_pressure_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        (
+            "creative_proof_attack",
+            _creative_proof_attack_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        (
+            "parallel_wave_synthesis",
+            _parallel_wave_synthesis_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        (
+            "global_synthesis",
+            _global_synthesis_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        (
+            "no_result_synthesis",
+            _no_result_search_synthesis_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+    ]
+    deferral_counts = _generated_policy_deferrals(state, "base_recovery", generated)
+    candidates = [
+        ActionCandidate(
+            candidate_id=f"base_recovery:{policy_id}",
+            domain="recovery_and_synthesis",
+            action=candidate_action,
+            ordinal_priority=float(len(generated) - precedence),
+            policy_tier=POLICY_TIER_RECOVERY,
+            consecutive_deferrals=deferral_counts[f"base_recovery:{policy_id}"],
+            deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+        )
+        for precedence, (policy_id, candidate_action) in enumerate(generated)
+        if candidate_action is not None
+    ]
+    if not candidates:
+        return None
+    selected, trace = select_action_candidate(
+        candidates,
+        candidate_set_complete=True,
+        candidate_set_scope=(
+            "every eligible bottleneck proof obligation and the canonical current "
+            "output of each recent-history circuit-breaker, branch-persistence, "
+            "proof-architecture, creative-attack, and synthesis policy; central "
+            "obstruction workbenches are owned by the obligation-routing stratum"
+        ),
+    )
+    _bind_generated_registry(trace, scope_id="recovery", generated=generated)
+    selected["_base_policy_trace"] = trace
+    return selected
+
+
+def _requested_literature_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+) -> list[Dict[str, Any]]:
+    mode = "retrieve"
+    return [
+        _action(
+            mode,
+            request["target_id"],
+            request.get("route_id", ""),
+            "researcher requested targeted literature or theorem search",
+            plan_step_budget(problem, mode, requested_tokens),
+            research_mode=research_mode,
+            retrieval_required=True,
+            search_request_id=request["search_request_id"],
+            search_request_artifact_id=request["artifact_id"],
+            requested_query=request.get("query", ""),
+            local_theorem_search_allowed=True,
+            search_permission="live" if web_search == "live" else "local",
+            search_intent="researcher_search_request",
+            librarian_level=request.get("librarian_level", "reader"),
+        )
+        for request in _pending_literature_search_requests(state)
+    ]
+
+
+def _requested_literature_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+) -> Optional[Dict[str, Any]]:
+    actions = _requested_literature_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+        web_search=web_search,
+    )
+    return actions[0] if actions else None
+
+
+def _source_synthesis_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    source_synthesis = _source_synthesis_candidate(state, target_id="root")
+    if not source_synthesis:
+        return None
+    mode = "synthesize_sources"
+    return _action(
+        mode,
+        "root",
+        "",
+        source_synthesis["reason"],
+        plan_step_budget(problem, mode, requested_tokens),
+        research_mode=research_mode,
+        source_synthesis_required=True,
+        source_synthesis_reason=source_synthesis["reason"],
+        search_intent="source_synthesis",
+    )
+
+
+def _failed_decomposition_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    mode = "regulate_decomposition"
+    return [
+        _action(
+            mode,
+            failed_plan["target_id"],
+            failed_plan.get("route_id", ""),
+            "regulate failed decomposition before proposing another generation",
+            plan_step_budget(problem, mode, requested_tokens),
+            research_mode=research_mode,
+            decomposition_regulator_required=True,
+            failed_decomposition_artifact_id=failed_plan["artifact_id"],
+            decomposition_plan_id=failed_plan.get("decomposition_plan_id", ""),
+            decomposition_plan_artifact_id=failed_plan.get(
+                "decomposition_plan_artifact_id", ""
+            ),
+            search_intent="decomposition_regulator",
+        )
+        for failed_plan in _pending_key_failure_analyses(state)
+    ]
+
+
+def _failed_decomposition_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _failed_decomposition_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _blocked_decomposition_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    mode = "regulate_decomposition"
+    return [
+        _action(
+            mode,
+            blocked_plan["target_id"],
+            blocked_plan.get("route_id", ""),
+            blocked_plan["reason"],
+            plan_step_budget(problem, mode, requested_tokens),
+            research_mode=research_mode,
+            decomposition_regulator_required=True,
+            decomposition_plan_id=blocked_plan.get("decomposition_plan_id", ""),
+            decomposition_plan_artifact_id=blocked_plan.get("artifact_id", ""),
+            blocked_branch_ids=blocked_plan.get("blocked_branch_ids", []),
+            search_intent="decomposition_regulator",
+        )
+        for blocked_plan in _blocked_decomposition_plan_candidates(state)
+    ]
+
+
+def _blocked_decomposition_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _blocked_decomposition_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _obligation_routing_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+    active_trunk_pressure: Mapping[str, Any],
+    frontier_pressure: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Compare every eligible source request, obstruction, and obligation."""
+
+    # Exact citation obligations are owned by the complete evidence stratum,
+    # which supplies exact-query contracts and object-keyed cooldown. Emitting
+    # them again here would create a second identity that bypasses both.
+    blocking_obligations = [
+        obligation
+        for obligation in _blocking_debt_candidates(state)
+        if not _is_exact_citation_debt(obligation)
+    ]
+    obligation_actions = [
+        (
+            str(obligation.get("debt_id") or action_sha256(obligation)[:16]),
+            _blocking_debt_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                frontier_pressure=frontier_pressure,
+                blocking_debt=obligation,
+            ),
+        )
+        for obligation in blocking_obligations
+    ]
+    for obligation_id, obligation_action in obligation_actions:
+        if obligation_action:
+            obligation_action.setdefault("debt_id", obligation_id)
+            obligation_action.setdefault("proof_obligation_id", obligation_id)
+            obligation_action["reason"] = (
+                "active blocking proof obligation should be addressed after newer "
+                "obstruction signals are converted"
+            )
+    source_obligation_ids = {
+        str(obligation.get("debt_id") or action_sha256(obligation)[:16])
+        for obligation in blocking_obligations
+        if _is_source_like_debt(obligation)
+    }
+    source_obligation_actions = [
+        (obligation_id, action)
+        for obligation_id, action in obligation_actions
+        if obligation_id in source_obligation_ids
+    ]
+    mathematical_obligation_actions = [
+        (obligation_id, action)
+        for obligation_id, action in obligation_actions
+        if obligation_id not in source_obligation_ids
+    ]
+    for _obligation_id, obligation_action in source_obligation_actions:
+        if obligation_action and obligation_action.get("mode") == "retrieve":
+            obligation_action["reason"] = (
+                "source-like blocking proof obligation should be answered before "
+                "obstruction conversion or more approach checking"
+            )
+
+    # Preserve the substantive ordering computed by
+    # ``_blocking_debt_candidates``.  In particular, a newly exposed
+    # mathematical gap must not be hidden merely because an older source-like
+    # obligation is also present.  A central obstruction is likewise a proof
+    # construction problem, even when its original wording mentions a source;
+    # another search request cannot resolve it.  Ordinary researcher search
+    # requests still precede generic mathematical repair when neither of these
+    # two stronger signals is present.
+    first_source_index = next(
+        (
+            index
+            for index, obligation in enumerate(blocking_obligations)
+            if str(obligation.get("debt_id") or action_sha256(obligation)[:16])
+            in source_obligation_ids
+        ),
+        None,
+    )
+    preemptive_obligation_ids = {
+        obligation_id
+        for index, (obligation_id, action) in enumerate(obligation_actions)
+        if action
+        and (
+            bool(action.get("bridge_lemma_workbench_required"))
+            or (
+                first_source_index is not None
+                and index < first_source_index
+                and obligation_id not in source_obligation_ids
+            )
+        )
+    }
+    preemptive_obligation_actions = [
+        (obligation_id, action)
+        for obligation_id, action in obligation_actions
+        if obligation_id in preemptive_obligation_ids
+    ]
+    source_obligation_actions = [
+        (obligation_id, action)
+        for obligation_id, action in source_obligation_actions
+        if obligation_id not in preemptive_obligation_ids
+    ]
+    mathematical_obligation_actions = [
+        (obligation_id, action)
+        for obligation_id, action in mathematical_obligation_actions
+        if obligation_id not in preemptive_obligation_ids
+    ]
+
+    obstruction_actions = _obstruction_route_conversion_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    matching_obstructions: list[Dict[str, Any]] = []
+    other_obstructions: list[Dict[str, Any]] = []
+    obstruction_match_index = _blocking_obstruction_match_index(
+        state, blocking_obligations
+    )
+    for action in obstruction_actions:
+        if not blocking_obligations or _obstruction_matches_blocking_index(
+            action, obstruction_match_index
+        ):
+            matching_obstructions.append(action)
+        else:
+            other_obstructions.append(action)
+
+    def identified(
+        policy_id: str,
+        actions: Sequence[Mapping[str, Any]],
+        identity_field: str,
+    ) -> list[tuple[str, Dict[str, Any]]]:
+        return [
+            (
+                f"{policy_id}:{str(action.get(identity_field) or action_sha256(action)[:16])}",
+                dict(action),
+            )
+            for action in actions
+        ]
+
+    generated: list[tuple[str, Dict[str, Any] | None]] = []
+    generated.extend(
+        (
+            f"blocking_obligation:{obligation_id}",
+            obligation_action,
+        )
+        for obligation_id, obligation_action in preemptive_obligation_actions
+    )
+    generated.extend(
+        identified(
+            "requested_literature_search",
+            _requested_literature_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                web_search=web_search,
+            ),
+            "search_request_artifact_id",
+        )
+    )
+    generated.extend([
+        (
+            "source_synthesis",
+            _source_synthesis_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+    ])
+    generated.extend(
+        (
+            f"blocking_obligation:{obligation_id}",
+            obligation_action,
+        )
+        for obligation_id, obligation_action in source_obligation_actions
+    )
+    generated.extend(
+        identified(
+            "route_decision",
+            _route_decision_triage_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            "route_decision_artifact_id",
+        )
+    )
+    generated.append(
+        (
+            "paused_route_replacement",
+            _route_pause_replacement_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        )
+    )
+    generated.extend(
+        identified(
+            "obstruction_conversion",
+            matching_obstructions,
+            "obstruction_cluster_id",
+        )
+    )
+    generated.extend(
+        (
+            f"blocking_obligation:{obligation_id}",
+            obligation_action,
+        )
+        for obligation_id, obligation_action in mathematical_obligation_actions
+    )
+    generated.extend(
+        identified(
+            "obstruction_conversion",
+            other_obstructions,
+            "obstruction_cluster_id",
+        )
+    )
+    if not active_trunk_pressure.get("over_trunk_cap"):
+        generated.extend(
+            identified(
+                "route_proof_quota",
+                _route_proof_construction_quota_actions(
+                    state,
+                    problem=problem,
+                    requested_tokens=requested_tokens,
+                    research_mode=research_mode,
+                ),
+                "route_id",
+            )
+        )
+    generated.extend(
+        identified(
+            "failed_decomposition_regulation",
+            _failed_decomposition_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            "failed_decomposition_artifact_id",
+        )
+    )
+    generated.extend(
+        identified(
+            "blocked_decomposition_regulation",
+            _blocked_decomposition_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            "decomposition_plan_artifact_id",
+        )
+    )
+    deferral_counts = _generated_policy_deferrals(state, "base_obligation", generated)
+    candidates = [
+        ActionCandidate(
+            candidate_id=f"base_obligation:{policy_id}",
+            domain="obligation_and_route_management",
+            action=candidate_action,
+            ordinal_priority=float(len(generated) - precedence),
+            policy_tier=POLICY_TIER_RECOVERY,
+            consecutive_deferrals=deferral_counts[f"base_obligation:{policy_id}"],
+            deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+        )
+        for precedence, (policy_id, candidate_action) in enumerate(generated)
+        if candidate_action is not None
+    ]
+    if not candidates:
+        return None
+    selected, trace = select_action_candidate(
+        candidates,
+        candidate_set_complete=True,
+        candidate_set_scope=(
+            "every pending literature request, route-decision artifact, obstruction "
+            "cluster, schedulable non-citation blocking proof obligation, route lacking inference "
+            "evidence, and failed or blocked decomposition plan, together with the "
+            "canonical source-synthesis and all-root-route replacement policies; exact "
+            "citation obligations are owned by the evidence-assimilation stratum"
+        ),
+    )
+    _bind_generated_registry(trace, scope_id="obligation", generated=generated)
+    selected["_base_policy_trace"] = trace
+    return selected
+
+
+def _decomposition_step_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    return [
+        _decomposition_step_action_for_step(
+            step,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+        )
+        for step in _decomposition_plan_ready_steps(state, include_parent=True)
+    ]
+
+
+def _decomposition_step_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _decomposition_step_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _decomposition_step_action_for_step(
+    step: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Dict[str, Any]:
+    mode = step["mode"]
+    proof_construction = bool(step.get("proof_construction_required"))
+    budget_action = {
+        "target_id": step["target_id"],
+        "route_id": step.get("route_id", ""),
+        "proof_construction_required": proof_construction,
+        "search_intent": (
+            ROUTE_PROOF_CONSTRUCTION_INTENT
+            if proof_construction
+            else "decomposition_plan_work"
+        ),
+    }
+    return _action(
+        mode,
+        step["target_id"],
+        step.get("route_id", ""),
+        step["reason"],
+        plan_action_budget(problem, mode, budget_action, requested_tokens),
+        research_mode=research_mode,
+        decomposition_step_required=True,
+        decomposition_plan_id=step["decomposition_plan_id"],
+        decomposition_plan_artifact_id=step["artifact_id"],
+        decomposition_parent_id=step.get("parent_id", ""),
+        decomposition_dependencies=step.get("dependencies", []),
+        decomposition_parallel_group=step.get("parallel_group", ""),
+        decomposition_rank_policy=step.get("rank_policy", ""),
+        parent_implication_required=bool(step.get("parent_implication_required")),
+        direct_solve_required=bool(step.get("direct_solve_required")),
+        proof_construction_required=proof_construction,
+        citation_allowed_in_proof=bool(step.get("citation_allowed_in_proof")),
+        # Compatibility field for existing session contracts; public language
+        # uses the standard term "proof draft".
+        needs_proof_dossier=bool(step.get("needs_proof_dossier", mode == "reduce")),
+        search_intent=budget_action["search_intent"],
+    )
+
+
+def _route_triage_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    active_trunk_pressure: Mapping[str, Any],
+) -> list[Dict[str, Any]]:
+    candidates = _route_triage_candidates(
+        state, active_trunk_pressure=active_trunk_pressure
+    )
+    mode = "triage_routes"
+    return [
+        _action(
+            mode,
+            "root",
+            route_triage.get("route_id", ""),
+            route_triage["reason"],
+            plan_step_budget(problem, mode, requested_tokens),
+            research_mode=research_mode,
+            route_triage_required=True,
+            route_triage_id=route_triage["route_triage_id"],
+            route_triage_reason=route_triage["reason"],
+            active_trunk_pressure=active_trunk_pressure,
+            search_intent="route_triage",
+        )
+        for route_triage in candidates
+    ]
+
+
+def _route_triage_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    active_trunk_pressure: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    actions = _route_triage_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+        active_trunk_pressure=active_trunk_pressure,
+    )
+    return actions[0] if actions else None
+
+
+def _recursive_drift_stop_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    drift = _recursive_meta_drift(state)
+    if not drift:
+        return None
+    stop_guard = evaluate_partial_stop(
+        state,
+        verifier_ready_routes=verifier_ready_route_summaries(state),
+        proposed_reason=drift["reason"],
+    )
+    if not stop_guard.get("allow"):
+        return None
+    mode = "stop_with_partial_results"
+    return _action(
+        mode,
+        "root",
+        "",
+        drift["reason"],
+        plan_step_budget(problem, mode, requested_tokens),
+        research_mode=research_mode,
+        terminal_classification="scope_drift_partial",
+        decomposition_drift=drift,
+        stop_reason_code=str(stop_guard.get("stop_reason_code") or ""),
+        completion_policy=str(stop_guard.get("policy") or ""),
+        partial_stop_guard=stop_guard,
+    )
+
+
+def _research_librarian_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+) -> Optional[Dict[str, Any]]:
+    decision = should_run_librarian(
+        state,
+        research_mode=research_mode,
+        web_search=web_search,
+        target_id="root",
+    )
+    if not decision.get("run"):
+        return None
+    mode = "retrieve"
+    return _action(
+        mode,
+        str(decision.get("target_id") or "root"),
+        "",
+        str(decision.get("reason") or "research-mode literature scan"),
+        plan_step_budget(problem, mode, requested_tokens),
+        research_mode=research_mode,
+        retrieval_required=True,
+        search_permission=decision.get("search_permission", "live"),
+        search_intent=decision.get("search_intent", "literature_scoping"),
+        librarian_level=decision.get("librarian_level", "scout"),
+    )
+
+
+def _root_alignment_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    mode = "integrate"
+    return [
+        _action(
+            mode,
+            root_audit["conclusion_claim_id"],
+            root_audit["route_id"],
+            "periodic root-alignment audit for the current proof route",
+            plan_step_budget(problem, mode, requested_tokens),
+            research_mode=research_mode,
+            root_alignment_audit=True,
+            search_intent="root_alignment_audit",
+        )
+        for root_audit in _root_alignment_audit_candidates(state)
+    ]
+
+
+def _root_alignment_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _root_alignment_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _proof_compression_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    mode = "write"
+    return [
+        _action(
+            mode,
+            compression["conclusion_claim_id"],
+            compression["route_id"],
+            "compress verified progress into a shorter proof outline",
+            plan_step_budget(problem, mode, requested_tokens),
+            research_mode=research_mode,
+            proof_compression_required=True,
+            search_intent="proof_compression",
+        )
+        for compression in _proof_compression_candidates(state)
+    ]
+
+
+def _proof_compression_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _proof_compression_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _next_unverified_claim_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    return [
+        _next_unverified_claim_action_for_claim(
+            state,
+            claim,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+        )
+        for claim in _next_unverified_claims(state)
+    ]
+
+
+def _next_unverified_claim_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _next_unverified_claim_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _next_unverified_claim_action_for_claim(
+    state: Mapping[str, Any],
+    claim: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Dict[str, Any]:
+    mode, route_id = _work_mode_for_claim(state, claim["claim_id"])
+    direct_solve = mode == "prove" and not route_id
+    proof_construction = bool(route_id and mode == "reduce")
+    search_intent = (
+        "direct_solve"
+        if direct_solve
+        else ROUTE_PROOF_CONSTRUCTION_INTENT
+        if proof_construction
+        else ""
+    )
+    return _action(
+        mode,
+        claim["claim_id"],
+        route_id,
+        "highest-impact active unverified claim",
+        plan_action_budget(
+            problem,
+            mode,
+            {
+                "target_id": claim["claim_id"],
+                "route_id": route_id,
+                "proof_construction_required": proof_construction,
+                "search_intent": search_intent,
+            },
+            requested_tokens,
+        ),
+        research_mode=research_mode,
+        direct_solve_required=direct_solve,
+        proof_construction_required=proof_construction,
+        citation_allowed_in_proof=proof_construction,
+        research_diagnostic_required=False if direct_solve else (mode == "reduce"),
+        # Compatibility field retained for existing session contracts.
+        needs_proof_dossier=direct_solve or (mode == "reduce"),
+        search_intent=search_intent,
+    )
+
+
+def _residual_work_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+    active_trunk_pressure: Mapping[str, Any],
+    frontier_pressure: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Compare every active residual-work policy, excluding the true fallback."""
+
+    def identified(
+        policy_id: str,
+        actions: Sequence[Mapping[str, Any]],
+        identity,
+    ) -> list[tuple[str, Dict[str, Any]]]:
+        return [
+            (f"{policy_id}:{identity(action)}", dict(action))
+            for action in actions
+        ]
+
+    generated: list[tuple[str, Dict[str, Any] | None]] = []
+    generated.extend(
+        identified(
+            "decomposition_step",
+            _decomposition_step_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            lambda action: (
+                str(
+                    action.get("decomposition_plan_artifact_id")
+                    or action.get("decomposition_plan_id")
+                    or "plan"
+                )
+                + ":"
+                + str(action.get("target_id") or "root")
+            ),
+        )
+    )
+    generated.extend(
+        identified(
+            "route_triage",
+            _route_triage_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                active_trunk_pressure=active_trunk_pressure,
+            ),
+            lambda action: str(
+                action.get("route_triage_id")
+                or action.get("route_id")
+                or "active-trunk-cap"
+            ),
+        )
+    )
+    generated.extend([
+        (
+            "recursive_drift_stop",
+            _recursive_drift_stop_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+        ),
+        (
+            "research_librarian",
+            _research_librarian_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                web_search=web_search,
+            ),
+        ),
+    ])
+    generated.extend(
+        identified(
+            "root_alignment",
+            _root_alignment_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            lambda action: str(action.get("route_id") or action_sha256(action)[:16]),
+        )
+    )
+    generated.extend(
+        identified(
+            "proof_compression",
+            _proof_compression_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            lambda action: str(action.get("route_id") or action_sha256(action)[:16]),
+        )
+    )
+    generated.extend([
+        (
+            "frontier_pressure",
+            _frontier_pressure_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                frontier_pressure=frontier_pressure,
+            ),
+        ),
+    ])
+    generated.extend(
+        identified(
+            "unverified_claim",
+            _next_unverified_claim_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            lambda action: str(action.get("target_id") or action_sha256(action)[:16]),
+        )
+    )
+    deferral_counts = _generated_policy_deferrals(state, "base_residual", generated)
+    candidates = [
+        ActionCandidate(
+            candidate_id=f"base_residual:{policy_id}",
+            domain="residual_mathematical_work",
+            action=candidate_action,
+            ordinal_priority=float(len(generated) - precedence),
+            policy_tier=_base_action_policy_tier(candidate_action),
+            consecutive_deferrals=deferral_counts[f"base_residual:{policy_id}"],
+            deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+        )
+        for precedence, (policy_id, candidate_action) in enumerate(generated)
+        if candidate_action is not None
+    ]
+    if candidates:
+        selected, trace = select_action_candidate(
+            candidates,
+            candidate_set_complete=True,
+            candidate_set_scope=(
+                "every ready decomposition step, stalled-route triage, due root-alignment "
+                "audit, due proof-compression route, and active unverified claim, together "
+                "with the canonical current partial-stop, literature, and frontier-pressure "
+                "policies; routes lacking inference are owned by obligation routing"
+            ),
+        )
+        _bind_generated_registry(trace, scope_id="residual", generated=generated)
+        selected["_base_policy_trace"] = trace
+        return selected
+
+    fallback = _residual_fallback_action(
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    selected, trace = select_action_candidate(
+        [
+            ActionCandidate(
+                candidate_id="base_residual:fallback",
+                domain="residual_mathematical_work",
+                action=fallback,
+                ordinal_priority=0.0,
+                policy_tier=POLICY_TIER_EXPLORATION,
+            )
+        ],
+        candidate_set_complete=True,
+        candidate_set_scope=(
+            "the canonical retrieval-or-reduction fallback after every structured "
+            "residual-work generator returned no candidate"
+        ),
+    )
+    bind_candidate_generator_registry(
+        trace,
+        scope_id="residual",
+        active_generator_ids=["fallback_retrieval"],
+        evaluated_generator_ids=_scope_generator_ids("residual"),
+        skipped_generator_reasons={},
+    )
+    selected["_base_policy_trace"] = trace
+    return selected
+
+
+def _residual_fallback_action(
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Dict[str, Any]:
+    mode = "retrieve"
+    return _action(
+        mode,
+        "root",
+        "",
+        "no active proof route is selected; retrieve relevant results or propose a reduction",
+        plan_step_budget(problem, mode, requested_tokens),
+        research_mode=research_mode,
+    )
+
+
+def _precondition_gate_action(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Compare every currently required front-door scheduler precondition.
+
+    These actions were formerly selected by five implicit early returns.  The
+    stratum preserves their safety/verification precedence, exposes every
+    pending context group and formalization obligation, and gives persistent
+    peers a bounded opportunity instead of relying on source-code order.
+    """
+
+    generated: list[tuple[str, str, Dict[str, Any], float, int]] = []
+    context_actions = _pending_context_request_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    for precedence, action in enumerate(context_actions):
+        request_ids = [
+            str(item)
+            for item in action.get("context_request_ids", [])
+            if str(item)
+        ]
+        request_id = request_ids[0] if request_ids else f"group-{precedence:03d}"
+        generated.append(
+            (
+                f"base_context:{request_id}",
+                "explicit_context_retrieval",
+                action,
+                5_000.0 - float(precedence),
+                POLICY_TIER_SAFETY,
+            )
+        )
+
+    if is_writing_revision_state(state):
+        generated.append(
+            (
+                "base_precondition:external_writing_revision",
+                "external_writing_revision",
+                _external_writing_revision_action(
+                    store,
+                    state,
+                    problem=problem,
+                    requested_tokens=requested_tokens,
+                    research_mode=research_mode,
+                ),
+                4_000.0,
+                POLICY_TIER_SAFETY,
+            )
+        )
+
+    paper_audit = _paper_audit_verification_only_action(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    if paper_audit:
+        generated.append(
+            (
+                "base_precondition:paper_audit",
+                "paper_audit",
+                paper_audit,
+                3_000.0,
+                POLICY_TIER_SAFETY,
+            )
+        )
+
+    publication_repair = _publication_route_error_research_action(
+        store,
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    if publication_repair:
+        generated.append(
+            (
+                "base_precondition:publication_route_repair",
+                "publication_route_repair",
+                publication_repair,
+                2_000.0,
+                POLICY_TIER_SAFETY,
+            )
+        )
+
+    formalization_actions = _requested_formalization_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    for precedence, action in enumerate(formalization_actions):
+        obligation_id = str(
+            action.get("formalization_proof_obligation_id") or ""
+        ) or f"obligation-{precedence:03d}"
+        generated.append(
+            (
+                f"base_formalization:{obligation_id}",
+                "explicit_formalization",
+                action,
+                1_000.0 - float(precedence),
+                POLICY_TIER_VERIFICATION,
+            )
+        )
+
+    if not generated:
+        return None
+    candidate_ids = [candidate_id for candidate_id, *_ in generated]
+    deferrals = _candidate_deferral_counts(state, candidate_ids)
+    candidates = [
+        ActionCandidate(
+            candidate_id=candidate_id,
+            domain=domain,
+            action=action,
+            ordinal_priority=priority,
+            policy_tier=policy_tier,
+            mandatory_constraint=True,
+            admissibility_reason=(
+                "the scheduler must discharge this state precondition before ordinary proof search"
+            ),
+            consecutive_deferrals=deferrals[candidate_id],
+            deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+        )
+        for candidate_id, domain, action, priority, policy_tier in generated
+    ]
+    selected, trace = select_action_candidate(
+        candidates,
+        candidate_set_complete=True,
+        candidate_set_scope=(
+            "all pending explicit-context groups, external writing work, paper-audit work, "
+            "publication route repair, and requested formalization obligations"
+        ),
+    )
+    active_generators = []
+    for candidate_id, *_ in generated:
+        if candidate_id.startswith("base_context:"):
+            active_generators.append("context_request")
+        elif candidate_id.startswith("base_formalization:"):
+            active_generators.append("formalization")
+        else:
+            active_generators.append(
+                candidate_id.removeprefix("base_precondition:")
+            )
+    bind_candidate_generator_registry(
+        trace,
+        scope_id="precondition",
+        active_generator_ids=active_generators,
+        evaluated_generator_ids=_scope_generator_ids("precondition"),
+        skipped_generator_reasons={},
+    )
+    selected["_base_policy_trace"] = trace
+    return selected
+
+
+def _integration_gate_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    allow_integration: bool,
+) -> Optional[Dict[str, Any]]:
+    if allow_integration and not any(
+        key in state
+        for key in ("_integration_candidates", "_integration_candidate")
+    ):
+        raise RuntimeError(
+            "scheduler projection is missing its snapshot-bound integration candidates"
+        )
+    projected = (
+        state.get("_integration_candidates") if allow_integration else []
+    )
+    integration_candidates = (
+        [candidate for candidate in projected if isinstance(candidate, Mapping)]
+        if isinstance(projected, list)
+        else []
+    )
+    if not integration_candidates and allow_integration:
+        legacy_candidate = state.get("_integration_candidate")
+        if isinstance(legacy_candidate, Mapping):
+            integration_candidates = [legacy_candidate]
+    if not integration_candidates:
+        return None
+
+    # The authoritative certificate verifier ran inside the same read
+    # transaction that produced this scheduler projection.
+    assurance_by_route = state.get("_integration_assurance_by_route")
+    assurance_by_route = (
+        assurance_by_route if isinstance(assurance_by_route, Mapping) else {}
+    )
+    legacy_assurance = state.get("_integration_assurance")
+    generated: list[tuple[str, Dict[str, Any]]] = []
+    for integration_candidate in integration_candidates:
+        route_id = str(integration_candidate["route_id"])
+        claim_id = str(integration_candidate["conclusion_claim_id"])
+        assurance = assurance_by_route.get(route_id)
+        if not isinstance(assurance, Mapping) and len(integration_candidates) == 1:
+            assurance = legacy_assurance
+        if not isinstance(assurance, Mapping):
+            raise RuntimeError(
+                "scheduler projection is missing snapshot-bound integration assurance "
+                f"for route {route_id}"
+            )
+        generated.append(
+            (
+                f"{claim_id}:{route_id}",
+                _integration_action_for_candidate(
+                    integration_candidate,
+                    assurance=assurance,
+                    problem=problem,
+                    requested_tokens=requested_tokens,
+                    research_mode=research_mode,
+                ),
+            )
+        )
+    deferrals = _generated_policy_deferrals(
+        state,
+        "base_integration",
+        generated,
+    )
+    candidates = [
+        ActionCandidate(
+            candidate_id=f"base_integration:{candidate_id}",
+            domain="verified_route_integration",
+            action=action,
+            ordinal_priority=float(len(generated) - precedence),
+            policy_tier=POLICY_TIER_VERIFICATION,
+            consecutive_deferrals=deferrals[f"base_integration:{candidate_id}"],
+            deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+        )
+        for precedence, (candidate_id, action) in enumerate(generated)
+    ]
+    selected, trace = select_action_candidate(
+        candidates,
+        candidate_set_complete=True,
+        candidate_set_scope=(
+            "every verified sufficient route with a complete terminal inference, "
+            "including alternative routes to the same conclusion, with authoritative "
+            "snapshot-bound assurance for each route"
+        ),
+    )
+    bind_candidate_generator_registry(
+        trace,
+        scope_id="integration",
+        active_generator_ids=["verified_route"] * len(generated),
+        evaluated_generator_ids=_scope_generator_ids("integration"),
+        skipped_generator_reasons={},
+    )
+    selected["_base_policy_trace"] = trace
+    return selected
+
+
+def _integration_action_for_candidate(
+    integration_candidate: Mapping[str, Any],
+    *,
+    assurance: Mapping[str, Any],
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Dict[str, Any]:
+    """Build one exact route-bound integration or assurance-review action."""
+
+    claim_id = str(integration_candidate["conclusion_claim_id"])
+    route_id = str(integration_candidate["route_id"])
+    if not assurance.get("satisfied", True):
+        mode = "prove"
+        return _action(
+            mode,
+            claim_id,
+            route_id,
+            "enhanced assurance requires an independent second review before integration",
+            _strict_verifier_budget(problem, requested_tokens),
+            research_mode=research_mode,
+            assurance_review_required=True,
+            assurance_level="heterogeneous_review",
+            observed_reviewer_independence_classes=list(
+                assurance.get("independence_classes") or []
+            ),
+            required_review=(
+                "use a model family not listed in observed_reviewer_independence_classes, "
+                "or obtain a human/formal checkpoint"
+            ),
+            prior_assurance_review_artifact_ids=list(
+                assurance.get("review_artifact_ids") or []
+            ),
+            force_cold_start=True,
+            search_intent="heterogeneous_assurance_review",
+        )
+    mode = "integrate"
+    return _action(
+        mode,
+        claim_id,
+        route_id,
+        "verified sufficient route can be integrated",
+        plan_step_budget(problem, mode, requested_tokens),
+        research_mode=research_mode,
+        integration_terminal_inference_ids=integration_candidate.get(
+            "integration_terminal_inference_ids", []
+        ),
+    )
+
+
+def _open_problem_action(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+    allow_integration: bool,
+    include_periodic_hmt: bool,
+) -> Dict[str, Any]:
+    """Compare every top-level policy stratum for a still-open theorem."""
+
+    parent_implication_ready = bool(
+        (parent_step := _active_decomposition_plan_step(state))
+        and parent_step.get("parent_implication_required")
+    )
+    active_trunk_pressure = _active_main_trunk_pressure(state)
+    frontier_pressure = active_frontier_pressure(state)
+
+    generated: list[tuple[str, Dict[str, Any] | None, int, bool]] = [
+        (
+            "refuted_root_revision",
+            _refuted_root_revision_action(
+                store,
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            POLICY_TIER_SAFETY,
+            True,
+        ),
+        (
+            "verified_route_integration",
+            _integration_gate_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                allow_integration=allow_integration,
+            ),
+            POLICY_TIER_VERIFICATION,
+            True,
+        ),
+        (
+            "post_integration_proof_spine",
+            None
+            if parent_implication_ready
+            else _post_integration_proof_spine_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            POLICY_TIER_RECOVERY,
+            False,
+        ),
+        (
+            "periodic_mathematical_text",
+            None
+            if parent_implication_ready or not include_periodic_hmt
+            else _periodic_hmt_action(
+                store,
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            POLICY_TIER_EXPLORATION,
+            False,
+        ),
+        (
+            "verification_handoff",
+            None
+            if parent_implication_ready
+            else _verification_handoff_action(
+                store,
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                web_search=web_search,
+            ),
+            POLICY_TIER_VERIFICATION,
+            False,
+        ),
+        (
+            "root_refinement",
+            None
+            if parent_implication_ready
+            else _root_refinement_action(
+                store,
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            POLICY_TIER_RECOVERY,
+            False,
+        ),
+        (
+            "evidence_assimilation",
+            _evidence_assimilation_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                web_search=web_search,
+                parent_implication_ready=parent_implication_ready,
+            ),
+            POLICY_TIER_RECOVERY,
+            False,
+        ),
+        (
+            "researcher_circling_redirect",
+            _circling_redirect_action(
+                store,
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                researcher_only=True,
+            ),
+            POLICY_TIER_RECOVERY,
+            False,
+        ),
+        (
+            "recovery_synthesis",
+            _recovery_synthesis_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                parent_implication_ready=parent_implication_ready,
+            ),
+            POLICY_TIER_RECOVERY,
+            False,
+        ),
+        (
+            "obligation_routing",
+            _obligation_routing_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                web_search=web_search,
+                active_trunk_pressure=active_trunk_pressure,
+                frontier_pressure=frontier_pressure,
+            ),
+            POLICY_TIER_RECOVERY,
+            False,
+        ),
+        (
+            "general_circling_redirect",
+            _circling_redirect_action(
+                store,
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+            ),
+            POLICY_TIER_RECOVERY,
+            False,
+        ),
+        (
+            "residual_mathematical_work",
+            _residual_work_action(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                web_search=web_search,
+                active_trunk_pressure=active_trunk_pressure,
+                frontier_pressure=frontier_pressure,
+            ),
+            POLICY_TIER_EXPLORATION,
+            False,
+        ),
+    ]
+    nested_traces: dict[str, Mapping[str, Any]] = {}
+    prepared: list[tuple[str, Dict[str, Any] | None, int, bool]] = []
+    for policy_id, action, minimum_tier, mandatory in generated:
+        if action is None:
+            prepared.append((policy_id, None, minimum_tier, mandatory))
+            continue
+        comparison_action = dict(action)
+        nested = comparison_action.pop("_base_policy_trace", None)
+        if isinstance(nested, Mapping):
+            nested_traces[f"base_open_problem:{policy_id}"] = nested
+        prepared.append(
+            (policy_id, comparison_action, minimum_tier, mandatory)
+        )
+
+    deferrals = _generated_policy_deferrals(
+        state,
+        "base_open_problem",
+        [(policy_id, action) for policy_id, action, _, _ in prepared],
+    )
+    scope = (
+        "every top-level policy stratum for an open theorem, with each object-valued "
+        "child stratum committed through its nested complete comparison trace"
+    )
+
+    def open_candidates() -> list[ActionCandidate]:
+        candidates: list[ActionCandidate] = []
+        for precedence, (
+            policy_id,
+            action,
+            minimum_tier,
+            mandatory,
+        ) in enumerate(prepared):
+            if action is None:
+                continue
+            comparison_action = dict(action)
+            effective_tier = (
+                minimum_tier
+                if policy_id == "root_refinement"
+                else max(minimum_tier, _base_action_policy_tier(action))
+            )
+            candidates.append(
+                ActionCandidate(
+                    candidate_id=f"base_open_problem:{policy_id}",
+                    domain="open_problem",
+                    action=comparison_action,
+                    ordinal_priority=float(len(prepared) - precedence),
+                    policy_tier=effective_tier,
+                    mandatory_constraint=mandatory,
+                    consecutive_deferrals=deferrals[
+                        f"base_open_problem:{policy_id}"
+                    ],
+                    deferral_limit=SCHEDULER_DEFERRAL_LIMIT,
+                )
+            )
+        return candidates
+
+    selected, trace = select_action_candidate(
+        open_candidates(),
+        candidate_set_complete=True,
+        candidate_set_scope=scope,
+        nested_policy_traces=nested_traces,
+        # All child traces are produced by this planning operation and the
+        # complete enclosing trace is validated once before dispatch.
+        _nested_policy_traces_already_validated=True,
+    )
+    _bind_generated_registry(trace, scope_id="open_problem", generated=prepared)
+    selected.pop("base_policy_trace_sha256", None)
+    selected["_base_policy_trace"] = trace
+    return selected
+
+
+def _final_proof_writing_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Dict[str, Any]:
+    mode = "write"
+    return _action(
+        mode,
+        "root",
+        _integrated_route_for_claim(state, "root"),
+        "root is integrated; write final proof artifact",
+        plan_step_budget(problem, mode, requested_tokens),
+        research_mode=research_mode,
+        final_output_required=True,
+        terminal_classification="solved_but_not_written",
+    )
+
+
+def _post_integration_literature_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+) -> Optional[Dict[str, Any]]:
+    citation_decision = should_run_librarian(
+        state,
+        research_mode=research_mode,
+        web_search=web_search,
+        target_id="root",
+        phase="post_integration",
+    )
+    if not citation_decision.get("run"):
+        return None
+    mode = "retrieve"
+    return _action(
+        mode,
+        str(citation_decision.get("target_id") or "root"),
+        "",
+        str(citation_decision.get("reason") or "citation-pass literature scan"),
+        plan_step_budget(problem, mode, requested_tokens),
+        research_mode=research_mode,
+        retrieval_required=True,
+        post_integration_retrieval=True,
+        search_permission=citation_decision.get("search_permission", "live"),
+        search_intent=citation_decision.get("search_intent", "citation_pass"),
+    )
+
+
+def _solved_root_terminal_action(
+    state: Mapping[str, Any],
+    final_artifact: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    research_mode: str,
+) -> Dict[str, Any]:
+    paper_artifact = _final_paper_artifact(state)
+    return _action(
+        "stop_solved",
+        "root",
+        _integrated_route_for_claim(state, "root"),
+        (
+            "root is integrated and the standalone LaTeX final paper passed deterministic delivery checks"
+            if paper_artifact
+            else "root is integrated and the audit-mode final proof artifact exists"
+        ),
+        plan_step_budget(problem, "stop_solved", 0),
+        research_mode=research_mode,
+        terminal_classification="solved_final",
+        final_artifact_id=final_artifact.get("artifact_id", ""),
+        final_paper_artifact_id=(paper_artifact or {}).get("artifact_id", ""),
+        certificate_artifact_id=final_artifact.get("artifact_id", ""),
+    )
+
+
+def _solved_root_action(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+) -> Dict[str, Any]:
+    """Select one explicit phase of the integrated-root delivery process."""
+
+    final_artifact = _final_proof_artifact(state, "root")
+    if not final_artifact:
+        generated = [
+            (
+                "final_proof_writing",
+                _final_proof_writing_action(
+                    state,
+                    problem=problem,
+                    requested_tokens=requested_tokens,
+                    research_mode=research_mode,
+                ),
+            )
+        ]
+        selected, trace = select_action_candidate(
+            [
+                ActionCandidate(
+                    candidate_id="base_solved_root:final_proof_writing",
+                    domain="solved_root_delivery",
+                    action=generated[0][1],
+                    ordinal_priority=4.0,
+                    policy_tier=POLICY_TIER_SAFETY,
+                    mandatory_constraint=True,
+                )
+            ],
+            candidate_set_complete=True,
+            candidate_set_scope=(
+                "the required final-proof writing phase before post-integration "
+                "literature or document delivery can begin"
+            ),
+        )
+        _bind_generated_registry(trace, scope_id="solved_root", generated=generated)
+        selected["_base_policy_trace"] = trace
+        return selected
+
+    completion_policy = str(
+        problem.get("completion_policy") or "full_proof_first"
+    )
+    post_solve_work_requested = (
+        completion_policy == "publication_ready"
+        or research_mode == "citation_pass"
+    )
+    literature = (
+        _post_integration_literature_action(
+            state,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+            web_search=web_search,
+        )
+        if post_solve_work_requested
+        else None
+    )
+    writing = _writing_gate_action(
+        store,
+        state,
+        final_artifact=final_artifact,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+        editorial_review_required=(
+            post_solve_work_requested
+            or _is_publication_workflow_document(
+                _final_paper_artifact(state) or {}
+            )
+        ),
+    )
+    terminal = _solved_root_terminal_action(
+        state,
+        final_artifact,
+        problem=problem,
+        research_mode=research_mode,
+    )
+    generated = [
+        ("post_integration_literature", literature),
+        ("document_delivery", writing),
+        ("terminal_completion", terminal),
+    ]
+    candidates: list[ActionCandidate] = []
+    if literature is not None:
+        candidates.append(
+            ActionCandidate(
+                candidate_id="base_solved_root:post_integration_literature",
+                domain="solved_root_delivery",
+                action=literature,
+                ordinal_priority=3.0,
+                policy_tier=POLICY_TIER_SAFETY,
+                mandatory_constraint=True,
+                admissibility_reason=(
+                    "required source work precedes document delivery"
+                ),
+            )
+        )
+    if writing is not None:
+        candidates.append(
+            ActionCandidate(
+                candidate_id="base_solved_root:document_delivery",
+                domain="solved_root_delivery",
+                action=writing,
+                ordinal_priority=2.0,
+                policy_tier=POLICY_TIER_VERIFICATION,
+                admissible=literature is None,
+                mandatory_constraint=True,
+                admissibility_reason=(
+                    "post-integration source work must finish first"
+                    if literature is not None
+                    else "document delivery is the current solved-root phase"
+                ),
+            )
+        )
+    candidates.append(
+        ActionCandidate(
+            candidate_id="base_solved_root:terminal_completion",
+            domain="solved_root_delivery",
+            action=terminal,
+            ordinal_priority=1.0,
+            policy_tier=POLICY_TIER_SAFETY,
+            admissible=literature is None and writing is None,
+            mandatory_constraint=True,
+            admissibility_reason=(
+                "all post-integration and document-delivery requirements are complete"
+                if literature is None and writing is None
+                else "terminal completion requires all earlier solved-root phases"
+            ),
+        )
+    )
+    selected, trace = select_action_candidate(
+        candidates,
+        candidate_set_complete=True,
+        candidate_set_scope=(
+            "every solved-root action whose input artifact exists, with explicit "
+            "phase admissibility for literature, document delivery, and terminal completion"
+        ),
+    )
+    _bind_generated_registry(trace, scope_id="solved_root", generated=generated)
+    selected["_base_policy_trace"] = trace
+    return selected
+
+
 def _plan_next_action(
     store: ProofStateStore,
     *,
@@ -825,11 +4439,21 @@ def _plan_next_action(
     web_search: str | None = DEFAULT_WEB_SEARCH,
     allow_integration: bool = True,
     include_periodic_hmt: bool = True,
+    _scheduler_state: Optional[Mapping[str, Any]] = None,
+    _invariant_errors_override: Optional[list[str]] = None,
 ) -> Dict[str, Any]:
     research_mode = normalize_research_mode(research_mode)
-    state = store.get_scheduler_state()
+    state = _enable_scheduler_planning_cache(
+        _scheduler_state
+        if _scheduler_state is not None
+        else store.get_scheduler_state()
+    )
     problem = state["problem_state"]
-    invariant_errors = _invariant_errors(store)
+    invariant_errors = (
+        list(_invariant_errors_override)
+        if _invariant_errors_override is not None
+        else _invariant_errors(store)
+    )
     if invariant_errors:
         mode = "stop_with_partial_results"
         budget = plan_step_budget(problem, mode, requested_tokens)
@@ -845,886 +4469,36 @@ def _plan_next_action(
             completion_policy=str(problem.get("completion_policy") or "full_proof_first"),
         )
 
-    if is_writing_revision_state(state):
-        return _external_writing_revision_action(
-            store,
-            state,
-            problem=problem,
-            requested_tokens=requested_tokens,
-            research_mode=research_mode,
-        )
-
-    paper_audit_terminal = _paper_audit_verification_only_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if paper_audit_terminal:
-        return paper_audit_terminal
-
-    referee_route_error = _publication_route_error_research_action(
+    precondition = _precondition_gate_action(
         store,
         state,
         problem=problem,
         requested_tokens=requested_tokens,
         research_mode=research_mode,
     )
-    if referee_route_error:
-        return referee_route_error
+    if precondition:
+        return precondition
 
     root = _claim(state, "root")
     if root and root["lifecycle_status"] == "integrated":
-        final_artifact = _final_proof_artifact(state, "root")
-        if not final_artifact:
-            mode = "write"
-            route_id = _integrated_route_for_claim(state, "root")
-            return _action(
-                mode,
-                "root",
-                route_id,
-                "root is integrated; write final proof artifact",
-                plan_step_budget(problem, mode, requested_tokens),
-                research_mode=research_mode,
-                final_output_required=True,
-                terminal_classification="solved_but_not_written",
-            )
-        completion_policy = str(problem.get("completion_policy") or "full_proof_first")
-        post_solve_work_requested = completion_policy == "publication_ready" or research_mode == "citation_pass"
-        if post_solve_work_requested:
-            citation_decision = should_run_librarian(
-                state,
-                research_mode=research_mode,
-                web_search=web_search,
-                target_id="root",
-                phase="post_integration",
-            )
-            if citation_decision.get("run"):
-                mode = "retrieve"
-                return _action(
-                    mode,
-                    str(citation_decision.get("target_id") or "root"),
-                    "",
-                    str(citation_decision.get("reason") or "citation-pass literature scan"),
-                    plan_step_budget(problem, mode, requested_tokens),
-                    research_mode=research_mode,
-                    retrieval_required=True,
-                    search_permission=citation_decision.get("search_permission", "live"),
-                    search_intent=citation_decision.get("search_intent", "citation_pass"),
-                )
-        writing_gate = _writing_gate_action(
-            store,
-            state,
-            final_artifact=final_artifact,
-            problem=problem,
-            requested_tokens=requested_tokens,
-            research_mode=research_mode,
-            editorial_review_required=(
-                post_solve_work_requested
-                or _is_publication_workflow_document(_final_paper_artifact(state) or {})
-            ),
-        )
-        if writing_gate:
-            return writing_gate
-        paper_artifact = _final_paper_artifact(state)
-        return _action(
-            "stop_solved",
-            "root",
-            _integrated_route_for_claim(state, "root"),
-            (
-                "root is integrated and the standalone LaTeX final paper passed deterministic delivery checks"
-                if paper_artifact
-                else "root is integrated and the audit-mode final proof artifact exists"
-            ),
-            plan_step_budget(problem, "stop_solved", 0),
-            research_mode=research_mode,
-            terminal_classification="solved_final",
-            final_artifact_id=final_artifact.get("artifact_id", ""),
-            final_paper_artifact_id=(paper_artifact or {}).get("artifact_id", ""),
-            certificate_artifact_id=final_artifact.get("artifact_id", ""),
-        )
-
-    # Highest priority after a solved/integrated root: if the root has been refuted by a
-    # confirmed counterexample, stop trying to prove it — revise the goal and surface it.
-    refuted_root_guard = _refuted_root_revision_action(
-        store, state, problem=problem, requested_tokens=requested_tokens, research_mode=research_mode,
-    )
-    if refuted_root_guard:
-        return refuted_root_guard
-
-    integration_candidate = _integration_candidate(state) if allow_integration else None
-    if integration_candidate:
-        mode = "integrate"
-        return _action(
-            mode,
-            integration_candidate["conclusion_claim_id"],
-            integration_candidate["route_id"],
-            "verified sufficient route can be integrated",
-            plan_step_budget(problem, mode, requested_tokens),
-            research_mode=research_mode,
-            integration_terminal_inference_ids=integration_candidate.get(
-                "integration_terminal_inference_ids", []
-            ),
-        )
-
-    parent_implication_ready = bool(
-        (parent_step := _active_decomposition_plan_step(state))
-        and parent_step.get("parent_implication_required")
-    )
-    post_integration_spine = _post_integration_proof_spine_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if post_integration_spine and not parent_implication_ready:
-        return post_integration_spine
-
-    if include_periodic_hmt:
-        periodic_hmt = _periodic_hmt_action(
+        return _solved_root_action(
             store,
             state,
             problem=problem,
             requested_tokens=requested_tokens,
             research_mode=research_mode,
-        )
-        if periodic_hmt and not parent_implication_ready:
-            return periodic_hmt
-
-    advisor_verification = _advisor_requested_strict_verifier_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if advisor_verification and not parent_implication_ready:
-        return advisor_verification
-
-    proof_evidence_handoff = _proof_evidence_handoff_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if proof_evidence_handoff and not parent_implication_ready:
-        return proof_evidence_handoff
-
-    # Break a repeated gap-verification loop before another generic verifier
-    # dispatch or proof-candidate conversion can return.  This guard used to
-    # sit below both early-return paths, making it unreachable precisely while
-    # a route was being rechecked over and over.
-    verifier_loop_classification = _verifier_loop_classification_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if verifier_loop_classification and not parent_implication_ready:
-        return verifier_loop_classification
-
-    support_precheck = _support_lemma_precheck_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-        web_search=web_search,
-        parallel_companion=False,
-    )
-    if support_precheck and not parent_implication_ready:
-        return support_precheck
-
-    verifier_candidate = _verifier_candidate_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-        parallel_companion=False,
-    )
-    if verifier_candidate and not parent_implication_ready:
-        verifier_candidate["reason"] = (
-            "verifier-ready proof route should be checked before citation, "
-            "retrieval, counterexample, or decomposition work"
-        )
-        verifier_candidate["search_intent"] = verifier_candidate.get("search_intent") or "verify_ready_route"
-        verifier_candidate["verify_ready_route_policy"] = True
-        return verifier_candidate
-
-    # The villain's job is to disprove the root: when it has flagged a candidate
-    # counterexample, validate it promptly (root-threats first) instead of letting it
-    # sit uncertified while we keep proving. Confirmation routes to _refuted_root_revision.
-    counterexample_guard = _counterexample_validation_action(
-        store, state, problem=problem, requested_tokens=requested_tokens, research_mode=research_mode,
-    )
-    if counterexample_guard and not parent_implication_ready:
-        return counterexample_guard
-
-    threat_revalidation = _threat_revalidation_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if threat_revalidation and not parent_implication_ready:
-        return threat_revalidation
-
-    advisor_validation = _advisor_requested_validation_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if advisor_validation and not parent_implication_ready:
-        return advisor_validation
-
-    advisor_villain = _advisor_requested_villain_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if advisor_villain and not parent_implication_ready:
-        return advisor_villain
-
-    # No hanging proven-but-unrouted claims: if a claim already has a proof dossier but
-    # no route concludes it, assemble the route now (make it verifier-ready) before doing
-    # any new proving — otherwise the proof sits in limbo and the verifier never runs.
-    unrouted_proof_guard = _unrouted_proof_claim_action(
-        store, state, problem=problem, requested_tokens=requested_tokens, research_mode=research_mode,
-    )
-    if unrouted_proof_guard and not parent_implication_ready:
-        return unrouted_proof_guard
-
-    # The open cases against the root are really claims that refine it: when obstructions
-    # (definitional mismatch / over-broad scope / a counterexample family) pile up on the
-    # root, auto-refine it — schedule the agent to draft a corrected, scope-restricted
-    # restatement instead of endlessly trying to prove the over-broad version.
-    root_refinement_guard = _root_refinement_action(
-        store, state, problem=problem, requested_tokens=requested_tokens, research_mode=research_mode,
-    )
-    if root_refinement_guard and not parent_implication_ready:
-        return root_refinement_guard
-
-    # A near-complete proof blocked on a named theorem/source should search for
-    # that exact interface before another advisor/spine/reduction pass.  This
-    # used to run below the near-solution synthesis branch, so mature runs could
-    # repeatedly rewrite the root proof while the same citation debt remained
-    # untouched.
-    exact_theorem_search = _verifier_blocked_citation_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-        web_search=web_search,
-    )
-    if exact_theorem_search and not parent_implication_ready:
-        return exact_theorem_search
-
-    # A checked source handoff must reach the proof worker before an older
-    # advisor/bottleneck directive launches another mathematical pass.  The
-    # librarian often answers the exact search requested immediately above;
-    # leaving source digestion near the bottom of the scheduler allowed an
-    # executive-advisor lock to mask that fresh packet indefinitely.
-    source_digest = _pending_source_handoff_digest(state)
-    if source_digest and not parent_implication_ready:
-        mode = "reduce"
-        budget_action = {
-            "target_id": source_digest["target_id"],
-            "source_adaptation_digest_required": True,
-            "search_intent": "source_adaptation_digest",
-        }
-        return _action(
-            mode,
-            source_digest["target_id"],
-            source_digest.get("route_id", ""),
-            "digest new literature handoff into a local proof dossier",
-            plan_action_budget(problem, mode, budget_action, requested_tokens),
-            research_mode=research_mode,
-            source_adaptation_digest_required=True,
-            source_artifact_id=source_digest["artifact_id"],
-            source_artifact_type=source_digest["artifact_type"],
-            search_request_id=source_digest.get("search_request_id", ""),
-            needs_proof_dossier=True,
-            search_intent="source_adaptation_digest",
+            web_search=web_search,
         )
 
-    proof_candidate_conversion = _proof_candidate_route_conversion_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if (
-        proof_candidate_conversion
-        and proof_candidate_conversion.get("proved_lemma_claim_extraction_required")
-        and not parent_implication_ready
-    ):
-        return proof_candidate_conversion
-
-    executive_advisor_lock = _executive_advisor_bottleneck_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if executive_advisor_lock and not parent_implication_ready:
-        return executive_advisor_lock
-
-    near_solution_spine = _near_solution_spine_synthesis_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if near_solution_spine and not parent_implication_ready:
-        return near_solution_spine
-
-    if proof_candidate_conversion and not parent_implication_ready:
-        return proof_candidate_conversion
-
-    stream_stall_recovery = _stream_stall_recovery_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if stream_stall_recovery and not parent_implication_ready:
-        return stream_stall_recovery
-
-    citation_candidate = _external_citation_candidate(state, target_id="root")
-    if citation_candidate:
-        mode = "prove"
-        if not _recent_intent_seen(state, "citation_triage", window=4):
-            budget_action = {
-                "target_id": "root",
-                "citation_triage_required": True,
-                "search_intent": "citation_triage",
-            }
-            return _action(
-                mode,
-                "root",
-                "",
-                "quick verifier triage for an exact external citation candidate",
-                plan_action_budget(problem, mode, budget_action, requested_tokens),
-                research_mode=research_mode,
-                citation_triage_required=True,
-                citation_verification_standard="reasonable_citation_triage",
-                retrieval_card_id=citation_candidate["card_id"],
-                citation_relation=citation_candidate["relation"],
-                search_intent="citation_triage",
-            )
-        budget_action = {
-            "target_id": "root",
-            "citation_certification_required": True,
-            "search_intent": "citation_certification",
-        }
-        return _action(
-            mode,
-            "root",
-            "",
-            "exact external citation candidate can certify the root theorem",
-            plan_action_budget(problem, mode, budget_action, requested_tokens),
-            research_mode=research_mode,
-            citation_certification_required=True,
-            citation_verification_standard="reasonable_citation_with_local_deduction",
-            retrieval_card_id=citation_candidate["card_id"],
-            citation_relation=citation_candidate["relation"],
-            search_intent="citation_certification",
-        )
-
-    definition_audit = _definition_audit_candidate(state, target_id="root")
-    if definition_audit:
-        mode = "audit_definitions"
-        return _action(
-            mode,
-            "root",
-            "",
-            definition_audit["reason"],
-            plan_step_budget(problem, mode, requested_tokens),
-            research_mode=research_mode,
-            definition_audit_required=True,
-            retrieval_card_id=definition_audit["card_id"],
-            definition_audit_reason=definition_audit["reason"],
-            search_intent="definition_audit",
-        )
-
-    # This guard must run before bottleneck lock.  Otherwise a repeated
-    # researcher-only loop returns another researcher action and the existing
-    # advisor redirect below is unreachable indefinitely.
-    circling_guard = _circling_redirect_action(
+    return _open_problem_action(
         store,
         state,
         problem=problem,
         requested_tokens=requested_tokens,
         research_mode=research_mode,
-        researcher_only=True,
-    )
-    if circling_guard:
-        return circling_guard
-
-    bottleneck_lock = _bottleneck_lock_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-
-    advisor_followup = _advisor_followup_research_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if (
-        advisor_followup
-        and not parent_implication_ready
-        and _advisor_followup_can_preempt_bottleneck(advisor_followup, bottleneck_lock)
-    ):
-        return advisor_followup
-
-    # Branch persistence (TODO 1.2): a productive-but-blocked branch gets a
-    # nearby-lemma pass BEFORE the duplicate-work/circling machinery can
-    # rotate away from it. Rotation still happens on repeated same-failure
-    # fingerprints, no useful delta for BRANCH_STALE_PASS_LIMIT passes, or an
-    # advisor pause_or_merge adjudication (branch_rotation_decision).
-    branch_persistence = _branch_persistence_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if branch_persistence and not parent_implication_ready:
-        return branch_persistence
-
-    duplicate_guard = _duplicate_work_suppression_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if duplicate_guard:
-        return duplicate_guard
-
-    retrieve_reduce_guard = _retrieve_reduce_loop_advisor_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if retrieve_reduce_guard:
-        return retrieve_reduce_guard
-
-    no_content_guard = _no_content_research_guard_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if no_content_guard:
-        return no_content_guard
-
-    early_blocking_debt = _first_blocking_debt(state)
-    if early_blocking_debt and _is_source_like_debt(early_blocking_debt):
-        debt_action = _blocking_debt_action(
-            state,
-            problem=problem,
-            requested_tokens=requested_tokens,
-            research_mode=research_mode,
-            frontier_pressure=active_frontier_pressure(state),
-            blocking_debt=early_blocking_debt,
-        )
-        if debt_action:
-            debt_action["reason"] = "source-like blocking debt should be answered before obstruction conversion or more route checking"
-            return debt_action
-
-    if bottleneck_lock and not parent_implication_ready:
-        lease = bottleneck_lease_state(state, bottleneck_lock)
-        bottleneck_lock["bottleneck_lease"] = lease
-        if not lease.get("escape_required"):
-            return bottleneck_lock
-
-    architecture_pressure = _proof_architecture_pressure_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if architecture_pressure:
-        return architecture_pressure
-
-    creative_attack = _creative_proof_attack_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if creative_attack:
-        return creative_attack
-
-    parallel_synthesis = _parallel_wave_synthesis_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if parallel_synthesis:
-        return parallel_synthesis
-
-    global_synthesis = _global_synthesis_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if global_synthesis:
-        return global_synthesis
-
-    no_result_synthesis = _no_result_search_synthesis_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if no_result_synthesis:
-        return no_result_synthesis
-
-    central_workbench = _central_obstruction_workbench_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if central_workbench:
-        return central_workbench
-
-    search_request = _pending_literature_search_request(state)
-    if search_request:
-        mode = "retrieve"
-        return _action(
-            mode,
-            search_request["target_id"],
-            search_request.get("route_id", ""),
-            "researcher requested targeted literature/theorem search",
-            plan_step_budget(problem, mode, requested_tokens),
-            research_mode=research_mode,
-            retrieval_required=True,
-            search_request_id=search_request["search_request_id"],
-            search_request_artifact_id=search_request["artifact_id"],
-            requested_query=search_request.get("query", ""),
-            local_theorem_search_allowed=True,
-            search_permission="live" if web_search == "live" else "local",
-            search_intent="researcher_search_request",
-            librarian_level=search_request.get("librarian_level", "reader"),
-        )
-
-    active_trunk_pressure = _active_main_trunk_pressure(state)
-    source_synthesis = _source_synthesis_candidate(state, target_id="root")
-    if source_synthesis:
-        mode = "synthesize_sources"
-        return _action(
-            mode,
-            "root",
-            "",
-            source_synthesis["reason"],
-            plan_step_budget(problem, mode, requested_tokens),
-            research_mode=research_mode,
-            source_synthesis_required=True,
-            source_synthesis_reason=source_synthesis["reason"],
-            search_intent="source_synthesis",
-        )
-
-    route_decision_triage = _route_decision_triage_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if route_decision_triage:
-        return route_decision_triage
-
-    route_pause_replacement = _route_pause_replacement_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if route_pause_replacement:
-        return route_pause_replacement
-
-    frontier_pressure = active_frontier_pressure(state)
-    blocking_debt = _first_blocking_debt(state)
-
-    obstruction_conversion = _obstruction_route_conversion_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if obstruction_conversion and (
-        not blocking_debt or _obstruction_conversion_matches_blocking_debt(state, obstruction_conversion, blocking_debt)
-    ):
-        return obstruction_conversion
-
-    if blocking_debt:
-        debt_action = _blocking_debt_action(
-            state,
-            problem=problem,
-            requested_tokens=requested_tokens,
-            research_mode=research_mode,
-            frontier_pressure=frontier_pressure,
-            blocking_debt=blocking_debt,
-        )
-        if debt_action:
-            debt_action["reason"] = "active blocking proof debt should be repaired after newer obstruction signals are converted"
-            return debt_action
-
-    if obstruction_conversion:
-        return obstruction_conversion
-
-    verifier_candidate = _verifier_candidate_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-        parallel_companion=False,
-    )
-    if verifier_candidate and not active_trunk_pressure.get("over_trunk_cap") and not parent_implication_ready:
-        verifier_candidate["reason"] = "verifier-ready proof route should be checked before more research or decomposition"
-        return verifier_candidate
-
-    if not active_trunk_pressure.get("over_trunk_cap"):
-        proof_quota = _route_proof_construction_quota_action(
-            state,
-            problem=problem,
-            requested_tokens=requested_tokens,
-            research_mode=research_mode,
-        )
-        if proof_quota:
-            return proof_quota
-
-    failed_plan = _pending_key_failure_analysis(state)
-    if failed_plan:
-        mode = "regulate_decomposition"
-        return _action(
-            mode,
-            failed_plan["target_id"],
-            failed_plan.get("route_id", ""),
-            "regulate failed decomposition before proposing another generation",
-            plan_step_budget(problem, mode, requested_tokens),
-            research_mode=research_mode,
-            decomposition_regulator_required=True,
-            failed_decomposition_artifact_id=failed_plan["artifact_id"],
-            decomposition_plan_id=failed_plan.get("decomposition_plan_id", ""),
-            decomposition_plan_artifact_id=failed_plan.get("decomposition_plan_artifact_id", ""),
-            search_intent="decomposition_regulator",
-        )
-
-    blocked_plan = _blocked_decomposition_plan_candidate(state)
-    if blocked_plan:
-        mode = "regulate_decomposition"
-        return _action(
-            mode,
-            blocked_plan["target_id"],
-            blocked_plan.get("route_id", ""),
-            blocked_plan["reason"],
-            plan_step_budget(problem, mode, requested_tokens),
-            research_mode=research_mode,
-            decomposition_regulator_required=True,
-            decomposition_plan_id=blocked_plan.get("decomposition_plan_id", ""),
-            decomposition_plan_artifact_id=blocked_plan.get("artifact_id", ""),
-            blocked_branch_ids=blocked_plan.get("blocked_branch_ids", []),
-            search_intent="decomposition_regulator",
-        )
-
-    circling_guard = _circling_redirect_action(
-        store,
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    if circling_guard:
-        return circling_guard
-
-    decomposition_step = _active_decomposition_plan_step(state)
-    if decomposition_step:
-        mode = decomposition_step["mode"]
-        budget_action = {
-            "target_id": decomposition_step["target_id"],
-            "route_id": decomposition_step.get("route_id", ""),
-            "proof_construction_required": bool(decomposition_step.get("proof_construction_required")),
-            "search_intent": ROUTE_PROOF_CONSTRUCTION_INTENT if decomposition_step.get("proof_construction_required") else "decomposition_plan_work",
-        }
-        return _action(
-            mode,
-            decomposition_step["target_id"],
-            decomposition_step.get("route_id", ""),
-            decomposition_step["reason"],
-            plan_action_budget(problem, mode, budget_action, requested_tokens),
-            research_mode=research_mode,
-            decomposition_step_required=True,
-            decomposition_plan_id=decomposition_step["decomposition_plan_id"],
-            decomposition_plan_artifact_id=decomposition_step["artifact_id"],
-            decomposition_parent_id=decomposition_step.get("parent_id", ""),
-            decomposition_dependencies=decomposition_step.get("dependencies", []),
-            decomposition_parallel_group=decomposition_step.get("parallel_group", ""),
-            decomposition_rank_policy=decomposition_step.get("rank_policy", ""),
-            parent_implication_required=bool(decomposition_step.get("parent_implication_required")),
-            direct_solve_required=bool(decomposition_step.get("direct_solve_required")),
-            proof_construction_required=bool(decomposition_step.get("proof_construction_required")),
-            citation_allowed_in_proof=bool(decomposition_step.get("citation_allowed_in_proof")),
-            needs_proof_dossier=bool(decomposition_step.get("needs_proof_dossier", mode == "reduce")),
-            search_intent=budget_action["search_intent"],
-        )
-
-    route_triage = _route_triage_candidate(state, active_trunk_pressure=active_trunk_pressure)
-    if route_triage:
-        mode = "triage_routes"
-        return _action(
-            mode,
-            "root",
-            route_triage.get("route_id", ""),
-            route_triage["reason"],
-            plan_step_budget(problem, mode, requested_tokens),
-            research_mode=research_mode,
-            route_triage_required=True,
-            route_triage_reason=route_triage["reason"],
-            active_trunk_pressure=active_trunk_pressure,
-            search_intent="route_triage",
-        )
-
-    decomposition_drift = _recursive_meta_drift(state)
-    if decomposition_drift:
-        # Anti-premature-partial guard (TODO 7): under full_proof_first the
-        # stop is blocked while genuine progress signals remain (active
-        # plausible route, verifier-ready route, actionable narrowed blocker,
-        # productive branch, untried high-score route) unless the budget is
-        # exhausted or an operator stop / explicit advisor transition allows
-        # it. When blocked, the planner falls through and keeps working.
-        stop_guard = evaluate_partial_stop(
-            state,
-            verifier_ready_routes=verifier_ready_route_summaries(state),
-            proposed_reason=decomposition_drift["reason"],
-        )
-        if stop_guard.get("allow"):
-            mode = "stop_with_partial_results"
-            budget = plan_step_budget(problem, mode, requested_tokens)
-            return _action(
-                mode,
-                "root",
-                "",
-                decomposition_drift["reason"],
-                budget,
-                research_mode=research_mode,
-                terminal_classification="scope_drift_partial",
-                decomposition_drift=decomposition_drift,
-                stop_reason_code=str(stop_guard.get("stop_reason_code") or ""),
-                completion_policy=str(stop_guard.get("policy") or ""),
-                partial_stop_guard=stop_guard,
-            )
-
-    research_decision = should_run_librarian(state, research_mode=research_mode, web_search=web_search, target_id="root")
-    if research_decision.get("run"):
-        mode = "retrieve"
-        return _action(
-            mode,
-            str(research_decision.get("target_id") or "root"),
-            "",
-            str(research_decision.get("reason") or "research-mode literature scan"),
-            plan_step_budget(problem, mode, requested_tokens),
-            research_mode=research_mode,
-            retrieval_required=True,
-            search_permission=research_decision.get("search_permission", "live"),
-            search_intent=research_decision.get("search_intent", "literature_scoping"),
-            librarian_level=research_decision.get("librarian_level", "scout"),
-        )
-
-    root_audit = _root_alignment_audit_candidate(state)
-    if root_audit:
-        mode = "integrate"
-        return _action(
-            mode,
-            root_audit["conclusion_claim_id"],
-            root_audit["route_id"],
-            "periodic root-alignment audit for the current proof route",
-            plan_step_budget(problem, mode, requested_tokens),
-            research_mode=research_mode,
-            root_alignment_audit=True,
-            search_intent="root_alignment_audit",
-        )
-
-    compression = _proof_compression_candidate(state)
-    if compression:
-        mode = "write"
-        return _action(
-            mode,
-            compression["conclusion_claim_id"],
-            compression["route_id"],
-            "compress verified progress into a shorter route outline",
-            plan_step_budget(problem, mode, requested_tokens),
-            research_mode=research_mode,
-            proof_compression_required=True,
-            search_intent="proof_compression",
-        )
-
-    pressure_action = _frontier_pressure_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-        frontier_pressure=frontier_pressure,
-    )
-    if pressure_action:
-        return pressure_action
-
-    route_without_inference = _route_without_inference(state)
-    if route_without_inference:
-        return _route_proof_construction_action(
-            state,
-            route_without_inference,
-            problem=problem,
-            requested_tokens=requested_tokens,
-            research_mode=research_mode,
-            reason="active route lacks inference evidence; researcher should try to prove the route before reducing further",
-        )
-
-    untested_claim = _next_unverified_claim(state)
-    if untested_claim:
-        mode, route_id = _work_mode_for_claim(state, untested_claim["claim_id"])
-        direct_solve = mode == "prove" and not route_id
-        proof_construction = bool(route_id and mode == "reduce")
-        return _action(
-            mode,
-            untested_claim["claim_id"],
-            route_id,
-            "highest-impact active unverified claim",
-            plan_action_budget(
-                problem,
-                mode,
-                {
-                    "target_id": untested_claim["claim_id"],
-                    "route_id": route_id,
-                    "proof_construction_required": proof_construction,
-                    "search_intent": ROUTE_PROOF_CONSTRUCTION_INTENT if proof_construction else ("direct_solve" if direct_solve else ""),
-                },
-                requested_tokens,
-            ),
-            research_mode=research_mode,
-            direct_solve_required=direct_solve,
-            proof_construction_required=proof_construction,
-            citation_allowed_in_proof=proof_construction,
-            research_diagnostic_required=False if direct_solve else (mode == "reduce"),
-            needs_proof_dossier=direct_solve or (mode == "reduce"),
-            search_intent="direct_solve" if direct_solve else (ROUTE_PROOF_CONSTRUCTION_INTENT if proof_construction else ""),
-        )
-
-    mode = "retrieve"
-    return _action(
-        mode,
-        "root",
-        "",
-        "no active route selected; retrieve references or propose reduction",
-        plan_step_budget(problem, mode, requested_tokens),
-        research_mode=research_mode,
+        web_search=web_search,
+        allow_integration=allow_integration,
+        include_periodic_hmt=include_periodic_hmt,
     )
 
 
@@ -1735,28 +4509,75 @@ def parallel_companion_actions(
     requested_tokens: Optional[int] = None,
     research_mode: str | None = DEFAULT_RESEARCH_MODE,
     web_search: str | None = DEFAULT_WEB_SEARCH,
+    parallel_branches: int | None = None,
+    _defer_admission: bool = False,
+    _scheduler_state: Mapping[str, Any] | None = None,
+    _generator_evaluation: Dict[str, Any] | None = None,
+    _parallel_policy_version: int = PARALLEL_WAVE_ADMISSION_POLICY_VERSION,
 ) -> list[Dict[str, Any]]:
+    generator_evaluation = (
+        _generator_evaluation
+        if _generator_evaluation is not None
+        else _new_parallel_generator_evaluation()
+    )
     if primary_action.get("paper_audit_verification_only") or primary_action.get("exclusive_wave_required"):
+        _skip_parallel_candidate_generators(
+            generator_evaluation,
+            _PARALLEL_COMPANION_GENERATOR_IDS,
+            "primary_phase_exclusion",
+        )
         return []
+    # Companion generation and admission must use one coherent store snapshot.
+    # The workflow's audit-head check remains the optimistic guard between this
+    # read and dispatch, but direct callers no longer receive a wave assembled
+    # from two independently loaded scheduler states.
+    state = _enable_scheduler_planning_cache(
+        _scheduler_state
+        if _scheduler_state is not None
+        else store.get_scheduler_state()
+    )
+    if parallel_branches is not None:
+        state = dict(state)
+        state["problem_state"] = {
+            **state["problem_state"],
+            "parallel_branches": normalize_parallel_branches(
+                parallel_branches
+            ),
+        }
     companions = _plan_parallel_companion_actions(
         store,
         primary_action,
         requested_tokens=requested_tokens,
         research_mode=research_mode,
         web_search=web_search,
+        _scheduler_state=state,
+        _generator_evaluation=generator_evaluation,
     )
-    state = store.get_scheduler_state()
+    _evaluate_parallel_candidate_generators(
+        generator_evaluation,
+        {
+            "independent_integration",
+            "background_planner",
+            "verifier_capacity",
+        },
+    )
+    if any(
+        not isinstance(action.get(_CANDIDATE_GENERATOR_FIELD), str)
+        or not str(action.get(_CANDIDATE_GENERATOR_FIELD) or "")
+        for action in companions
+    ):
+        raise RuntimeError(
+            "parallel companion planner produced an unclassified candidate"
+        )
     wave = [primary_action, *companions]
     primary_mode = str(primary_action.get("mode") or "")
     if primary_mode == "integrate" and str(primary_action.get("target_id") or "") != "root":
         # Several independent routes can become integration-ready in one strict
         # verifier wave.  Integration used to serialize them: the primary
         # integration admitted only unrelated background work, leaving the
-        # other verified claim stranded until a later scheduler round.  Fill
-        # the available companion slots with distinct non-root integrations
-        # first, then use any remaining slot for background mathematics.
-        configured_parallelism = int(state["problem_state"].get("parallel_branches") or 0)
-        companion_capacity = max(1, configured_parallelism - 1)
+        # other verified claim stranded until a later scheduler round.  Emit
+        # every distinct non-root integration and the background alternative;
+        # the single admission transition records all capacity rejections.
         occupied_route_ids = {
             str(action.get("route_id") or "")
             for action in [primary_action, *companions]
@@ -1770,53 +4591,72 @@ def parallel_companion_actions(
                 if str(action.get("target_id") or "")
             },
         }
-        remaining_slots = max(0, companion_capacity - len(companions))
         for candidate in _integration_candidates(
             state,
             exclude_route_ids=occupied_route_ids,
             exclude_claim_ids=occupied_claim_ids,
-            limit=remaining_slots,
         ):
-            companions.append(
-                _action(
-                    "integrate",
-                    str(candidate["conclusion_claim_id"]),
-                    str(candidate["route_id"]),
-                    "parallel integration of another independently verified sufficient route",
-                    plan_step_budget(state["problem_state"], "integrate", requested_tokens),
-                    research_mode=normalize_research_mode(research_mode),
-                    search_intent="parallel_verified_route_integration",
-                    parallel_companion=True,
-                    integration_parallel_safe=True,
-                    integration_terminal_inference_ids=candidate.get(
-                        "integration_terminal_inference_ids", []
-                    ),
+            companions.extend(
+                _tag_candidate_generator(
+                    [
+                        _action(
+                            "integrate",
+                            str(candidate["conclusion_claim_id"]),
+                            str(candidate["route_id"]),
+                            "parallel integration of another independently verified sufficient route",
+                            plan_step_budget(
+                                state["problem_state"],
+                                "integrate",
+                                requested_tokens,
+                            ),
+                            research_mode=normalize_research_mode(research_mode),
+                            search_intent="parallel_verified_route_integration",
+                            parallel_companion=True,
+                            integration_parallel_safe=True,
+                            integration_terminal_inference_ids=candidate.get(
+                                "integration_terminal_inference_ids", []
+                            ),
+                        )
+                    ],
+                    "independent_integration",
                 )
             )
 
-        if len(companions) < companion_capacity:
-            background = next_action(
-                store,
-                requested_tokens=requested_tokens,
-                research_mode=research_mode,
-                web_search=web_search,
-                allow_integration=False,
+        background = next_action(
+            store,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+            web_search=web_search,
+            allow_integration=False,
+        )
+        current_marker = ()
+        with store.connect() as marker_conn:
+            current_marker = _scheduler_snapshot_marker(
+                marker_conn, store.problem_id
             )
-            background_mode = str(background.get("mode") or "")
-            same_target = str(background.get("target_id") or "") == str(primary_action.get("target_id") or "")
-            same_route = bool(background.get("route_id")) and str(background.get("route_id")) == str(primary_action.get("route_id") or "")
-            if (
-                background_mode not in {
-                    "stop_with_partial_results", "stop_solved", "integrate", "write", "review_writing"
-                }
-                and not _is_verifier_action(background)
-                and not same_target
-                and not same_route
-            ):
-                background = dict(background)
-                background["parallel_companion"] = True
-                background["integration_parallel_safe"] = True
-                companions.append(background)
+        state_marker = _problem_snapshot_marker(state["problem_state"])
+        if current_marker != state_marker:
+            # The recursive base-plan query can perform explicit
+            # reconciliation.  If it advanced proof/configuration state,
+            # discard the entire companion wave; the primary itself now
+            # needs replanning from the new snapshot.
+            return []
+        background_mode = str(background.get("mode") or "")
+        same_target = str(background.get("target_id") or "") == str(primary_action.get("target_id") or "")
+        same_route = bool(background.get("route_id")) and str(background.get("route_id")) == str(primary_action.get("route_id") or "")
+        if (
+            background_mode not in {
+                "stop_with_partial_results", "stop_solved", "integrate", "write", "review_writing"
+            }
+            and not _is_verifier_action(background)
+            and not same_target
+            and not same_route
+        ):
+            background = dict(background)
+            background["parallel_companion"] = True
+            background["integration_parallel_safe"] = True
+            background[_CANDIDATE_GENERATOR_FIELD] = "background_planner"
+            companions.append(background)
         wave = [primary_action, *companions]
     # Integration is proof-state certification, not proof construction.  It is
     # safe to overlap an unrelated researcher/advisor/villain/librarian wave,
@@ -1836,26 +4676,28 @@ def parallel_companion_actions(
             state,
             exclude_route_ids=occupied_route_ids,
             exclude_claim_ids=occupied_claim_ids,
-            limit=1,
         )
-        if integration_candidates:
-            candidate = integration_candidates[0]
-            companions.insert(
-                0,
-                _action(
-                    "integrate",
-                    str(candidate["conclusion_claim_id"]),
-                    str(candidate["route_id"]),
-                    "parallel integration of an independently verified sufficient route",
-                    plan_step_budget(state["problem_state"], "integrate", requested_tokens),
-                    research_mode=normalize_research_mode(research_mode),
-                    search_intent="parallel_verified_route_integration",
-                    parallel_companion=True,
-                    integration_parallel_safe=True,
-                    integration_terminal_inference_ids=candidate.get(
-                        "integration_terminal_inference_ids", []
-                    ),
-                ),
+        for candidate in reversed(integration_candidates):
+            companions[0:0] = _tag_candidate_generator(
+                [
+                    _action(
+                        "integrate",
+                        str(candidate["conclusion_claim_id"]),
+                        str(candidate["route_id"]),
+                        "parallel integration of an independently verified sufficient route",
+                        plan_step_budget(
+                            state["problem_state"], "integrate", requested_tokens
+                        ),
+                        research_mode=normalize_research_mode(research_mode),
+                        search_intent="parallel_verified_route_integration",
+                        parallel_companion=True,
+                        integration_parallel_safe=True,
+                        integration_terminal_inference_ids=candidate.get(
+                            "integration_terminal_inference_ids", []
+                        ),
+                    )
+                ],
+                "independent_integration",
             )
     # Once the normal planner has admitted one strict verifier (so citation
     # prechecks and other gates have passed), fill the remaining verifier slots
@@ -1868,10 +4710,8 @@ def parallel_companion_actions(
         if _is_verifier_action(action)
     ]
     if existing_verifier_actions:
-        verifier_capacity = max(1, int(state["problem_state"].get("parallel_branches") or 0))
-        remaining_verifier_slots = max(0, verifier_capacity - len(existing_verifier_actions))
-        if remaining_verifier_slots:
-            companions.extend(
+        companions.extend(
+            _tag_candidate_generator(
                 _verifier_candidate_actions(
                     state,
                     problem=state["problem_state"],
@@ -1882,27 +4722,804 @@ def parallel_companion_actions(
                         str(action.get("route_id") or "")
                         for action in existing_verifier_actions
                     },
-                    limit=remaining_verifier_slots,
-                )
+                    exclude_claim_ids={
+                        str(action.get("target_id") or "")
+                        for action in existing_verifier_actions
+                    },
+                ),
+                "verifier_capacity",
             )
-    if companions:
-        companions = [
-            enrich_research_strategy_action(state, _reallocate_advisor_action(companion))
-            for companion in companions
-        ]
-        researcher_companion_index = 0
-        for companion in companions:
-            if action_expects_researcher_session(companion) or action_expects_villain_session(companion):
-                if action_expects_researcher_session(companion) and not action_expects_villain_session(companion):
-                    companion["parallel_companion_index"] = researcher_companion_index
-                    researcher_companion_index += 1
-                stamp_researcher_work_mode(
-                    state,
-                    companion,
-                    research_mode=research_mode,
-                    web_search=web_search,
-                )
+        )
+    if _defer_admission:
+        # The workflow adds multi-branch candidates after this generator.  It
+        # must admit the union exactly once so the final trace contains every
+        # materialized alternative and one persisted resource allocation.
+        return [dict(action) for action in companions]
+    _skip_parallel_candidate_generators(
+        generator_evaluation,
+        {"multi_branch"},
+        "not_part_of_direct_companion_call",
+    )
+    companions, _wave_admission = _admit_and_finalize_parallel_companions(
+        store,
+        primary_action,
+        companions,
+        research_mode=research_mode,
+        web_search=web_search,
+        parallel_branches=parallel_branches,
+        _scheduler_state=state,
+        _generator_evaluation=generator_evaluation,
+        _parallel_policy_version=_parallel_policy_version,
+    )
     return companions
+
+
+def _admit_and_finalize_parallel_companions(
+    store: ProofStateStore,
+    primary_action: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    research_mode: str | None = DEFAULT_RESEARCH_MODE,
+    web_search: str | None = DEFAULT_WEB_SEARCH,
+    parallel_branches: int | None = None,
+    _scheduler_state: Mapping[str, Any] | None = None,
+    _generator_evaluation: Dict[str, Any] | None = None,
+    _parallel_policy_version: int = PARALLEL_WAVE_ADMISSION_POLICY_VERSION,
+) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    """Admit and finalize one complete materialized companion wave."""
+
+    state = (
+        dict(_scheduler_state)
+        if _scheduler_state is not None
+        else _enable_scheduler_planning_cache(store.get_scheduler_state())
+    )
+    if parallel_branches is not None:
+        state = dict(state)
+        state["problem_state"] = {
+            **state["problem_state"],
+            "parallel_branches": normalize_parallel_branches(
+                parallel_branches
+            ),
+        }
+    problem_state = state.get("problem_state")
+    if not isinstance(problem_state, Mapping):
+        raise RuntimeError("parallel admission requires a complete scheduler snapshot")
+    for digest_field in ("proof_state_hash", "run_provenance_hash"):
+        digest = problem_state.get(digest_field)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise RuntimeError(
+                "parallel admission requires an authenticated scheduler snapshot: "
+                f"invalid {digest_field}"
+            )
+    if type(problem_state.get("current_revision")) is not int or int(
+        problem_state.get("current_revision") or 0
+    ) < 0:
+        raise RuntimeError(
+            "parallel admission requires an authenticated scheduler snapshot: "
+            "invalid current_revision"
+        )
+    # Apply role ablations before admission.  Otherwise an advisor reallocated
+    # to proof search would consume the advisory quota in the trace and could
+    # silently exceed the mathematical-worker capacity after admission.
+    materialized = []
+    for action in candidates:
+        companion = enrich_research_strategy_action(
+            state, _reallocate_advisor_action(action)
+        )
+        if action_expects_researcher_session(
+            companion
+        ) or action_expects_villain_session(companion):
+            stamp_researcher_work_mode(
+                state,
+                companion,
+                research_mode=research_mode,
+                web_search=web_search,
+            )
+        materialized.append(companion)
+    admitted, wave_admission = _admit_parallel_companion_candidates(
+        primary_action,
+        materialized,
+        problem=problem_state,
+        recent_runs=state.get("recent_runs", []),
+        durable_deferral_counts=state.get("parallel_candidate_deferrals"),
+        _generator_evaluation=_generator_evaluation,
+        _parallel_policy_version=_parallel_policy_version,
+    )
+    researcher_companion_index = 0
+    for companion in admitted:
+        if action_expects_researcher_session(
+            companion
+        ) or action_expects_villain_session(companion):
+            if action_expects_researcher_session(
+                companion
+            ) and not action_expects_villain_session(companion):
+                companion["parallel_companion_index"] = (
+                    researcher_companion_index
+                )
+                researcher_companion_index += 1
+        companion["parallel_wave_admission"] = dict(wave_admission)
+    admitted = [
+        _bind_parallel_wave_decision(companion, wave_admission)
+        for companion in admitted
+    ]
+    return admitted, wave_admission
+
+
+def _parallel_action_class(action: Mapping[str, Any]) -> str:
+    """Return the resource/conflict class used for wave admission."""
+
+    mode = str(action.get("mode") or "")
+    if mode == "integrate":
+        return "integration"
+    if _is_verifier_action(action):
+        return "verification"
+    if mode in {"retrieve", "synthesize_sources", "audit_definitions"}:
+        return "literature"
+    if mode in {"triage_routes", "regulate_decomposition"}:
+        return "advisory"
+    if mode == "refute":
+        return "adversarial"
+    return "research"
+
+
+def _parallel_action_identity(action: Mapping[str, Any]) -> tuple[str, ...]:
+    return parallel_action_identity(
+        action,
+        action_class=_parallel_action_class(action),
+    )
+
+
+def _parallel_admission_priority(action: Mapping[str, Any]) -> int:
+    """Explicit resource-admission priority, independent of generator order."""
+
+    action_class = _parallel_action_class(action)
+    return _parallel_admission_priority_for(
+        action_class,
+        str(action.get("search_intent") or ""),
+    )
+
+
+
+
+def _parallel_conflict_reason(
+    candidate: Mapping[str, Any],
+    admitted: Sequence[Mapping[str, Any]],
+) -> str:
+    """Explain an unsafe or redundant overlap, or return the empty string."""
+    return _parallel_identity_conflict_reason(
+        _parallel_action_identity(candidate),
+        [_parallel_action_identity(existing) for existing in admitted],
+    )
+
+
+def _scheduled_parallel_leader_action(
+    primary_action: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Materialize the scheduled-primary row for the leader comparison."""
+
+    primary = dict(primary_action)
+    primary.pop("decision_trace", None)
+    return primary
+
+
+def _parallel_leader_candidate_actions(
+    primary_action: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Return same-tier actions whose ownership conflict is serializable."""
+
+    primary_identity = _parallel_action_identity(primary_action)
+    primary_tier = _base_action_policy_tier(primary_action)
+    eligible: list[Dict[str, Any]] = []
+    seen: set[tuple[str, ...]] = set()
+    for raw_candidate in candidates:
+        candidate = _reallocate_advisor_action(raw_candidate)
+        candidate.pop(_CANDIDATE_GENERATOR_FIELD, None)
+        for field in (
+            "decision_trace",
+            "integration_parallel_safe",
+            "parallel_companion",
+            "parallel_companion_index",
+            "parallel_wave_admission",
+            "parallel_wave_candidate_id",
+            "parallel_wave_input_action_sha256",
+        ):
+            candidate.pop(field, None)
+        if scheduler_action_contract_errors(
+            candidate, require_target=True, executable=True
+        ):
+            # A malformed generator row must not displace a valid primary and
+            # then fail at the authoritative dispatch boundary.
+            continue
+        budget = candidate.get("budget")
+        if isinstance(budget, Mapping) and budget.get("allowed") is False:
+            continue
+        identity = _parallel_action_identity(candidate)
+        _reason, serializable = parallel_identity_conflict(
+            identity, [primary_identity]
+        )
+        if (
+            not serializable
+            or _base_action_policy_tier(candidate) != primary_tier
+            or identity in seen
+        ):
+            continue
+        seen.add(identity)
+        eligible.append(candidate)
+    eligible.sort(key=_parallel_action_identity)
+    return eligible
+
+
+def _select_parallel_wave_leader(
+    state: Mapping[str, Any],
+    primary_action: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> tuple[Dict[str, Any], bool]:
+    """Promote an overdue serial conflict, preserving policy-tier safety.
+
+    The caller must regenerate the complete companion set when ``True`` is
+    returned. A promoted row was generated under the old leader and is not by
+    itself evidence that any of its old companions remain admissible.
+    """
+
+    parallel_counts = state.get("parallel_candidate_deferrals")
+    parallel_counts = parallel_counts if isinstance(parallel_counts, Mapping) else {}
+    decision_counts = state.get("decision_candidate_deferrals")
+    decision_counts = decision_counts if isinstance(decision_counts, Mapping) else {}
+    if not any(
+        type(value) is int and value >= PARALLEL_WAVE_DEFERRAL_LIMIT
+        for value in parallel_counts.values()
+    ) and not any(
+        isinstance(candidate_id, str)
+        and candidate_id.startswith("parallel_leader:")
+        for candidate_id in decision_counts
+    ):
+        return dict(primary_action), False
+
+    raw_primary_trace = primary_action.get("decision_trace")
+    if not isinstance(raw_primary_trace, Mapping):
+        return dict(primary_action), False
+    trace_errors = decision_trace_errors(raw_primary_trace)
+    if trace_errors:
+        raise RuntimeError(
+            "parallel leader comparison received an invalid primary trace: "
+            + "; ".join(trace_errors)
+        )
+    selected_primary_id = str(
+        raw_primary_trace.get("selected_candidate_id") or ""
+    )
+    selected_primary_rows = [
+        row
+        for row in raw_primary_trace.get("candidates", [])
+        if isinstance(row, Mapping)
+        and str(row.get("candidate_id") or "") == selected_primary_id
+    ]
+    if (
+        len(selected_primary_rows) != 1
+        or selected_primary_rows[0].get("mandatory_constraint") is True
+    ):
+        return dict(primary_action), False
+
+    eligible = _parallel_leader_candidate_actions(primary_action, candidates)
+    if not eligible:
+        return dict(primary_action), False
+    primary = _scheduled_parallel_leader_action(primary_action)
+    primary_id = (
+        "parallel_leader:scheduled:"
+        + parallel_candidate_id(_parallel_action_identity(primary)).split(":", 1)[1]
+    )
+    eligible_rows: list[tuple[str, str, Dict[str, Any], int]] = []
+    for candidate in eligible:
+        parallel_id = parallel_candidate_id(_parallel_action_identity(candidate))
+        leader_id = "parallel_leader:serialized:" + parallel_id.split(":", 1)[1]
+        raw_parallel_count = parallel_counts.get(parallel_id, 0)
+        raw_decision_count = decision_counts.get(leader_id, 0)
+        if (
+            type(raw_parallel_count) is not int
+            or raw_parallel_count < 0
+            or type(raw_decision_count) is not int
+            or raw_decision_count < 0
+        ):
+            raise ValueError(
+                "parallel leader deferral state must contain nonnegative integers"
+            )
+        eligible_rows.append(
+            (parallel_id, leader_id, candidate, raw_parallel_count)
+        )
+    raw_primary_decision_count = decision_counts.get(primary_id, 0)
+    if type(raw_primary_decision_count) is not int or raw_primary_decision_count < 0:
+        raise ValueError(
+            "parallel leader deferral state must contain nonnegative integers"
+        )
+    leader_history_active = primary_id in decision_counts or any(
+        leader_id in decision_counts
+        for _parallel_id, leader_id, _candidate, _count in eligible_rows
+    )
+    overdue_parallel_rows = [
+        row
+        for row in eligible_rows
+        if row[3] >= PARALLEL_WAVE_DEFERRAL_LIMIT
+    ]
+    if not leader_history_active and not overdue_parallel_rows:
+        return dict(primary_action), False
+
+    bootstrap_selected_id = ""
+    if not leader_history_active:
+        bootstrap_selected_id = max(
+            overdue_parallel_rows,
+            key=lambda row: (
+                row[3],
+                _parallel_admission_priority(row[2]),
+                row[1],
+            ),
+        )[1]
+    policy_tier = _base_action_policy_tier(primary)
+    comparison_candidates = [
+        ActionCandidate(
+            candidate_id=primary_id,
+            domain="parallel_leader",
+            action=primary,
+            ordinal_priority=1.0,
+            policy_tier=policy_tier,
+            consecutive_deferrals=raw_primary_decision_count,
+            deferral_limit=PARALLEL_WAVE_DEFERRAL_LIMIT,
+        )
+    ]
+    for _parallel_id, leader_id, candidate, _parallel_count in eligible_rows:
+        comparison_candidates.append(
+            ActionCandidate(
+                candidate_id=leader_id,
+                domain="parallel_leader",
+                action=candidate,
+                ordinal_priority=(
+                    2.0 if leader_id == bootstrap_selected_id else 0.0
+                ),
+                policy_tier=policy_tier,
+                consecutive_deferrals=int(decision_counts.get(leader_id, 0)),
+                deferral_limit=PARALLEL_WAVE_DEFERRAL_LIMIT,
+            )
+        )
+    selected, leader_trace = select_action_candidate(
+        comparison_candidates,
+        candidate_set_complete=True,
+        candidate_set_scope=(
+            "the scheduled nonmandatory primary and every materialized same-tier "
+            "candidate blocked only by serializable ownership"
+        ),
+        nested_policy_traces={primary_id: raw_primary_trace},
+    )
+    bind_candidate_generator_registry(
+        leader_trace,
+        scope_id="parallel_leader",
+        active_generator_ids=[
+            "scheduled_primary",
+            *(["serialized_candidate"] * len(eligible_rows)),
+        ],
+        evaluated_generator_ids=_scope_generator_ids("parallel_leader"),
+        skipped_generator_reasons={},
+        candidate_generator_assignments=[
+            ["scheduled_primary"],
+            *([["serialized_candidate"]] * len(eligible_rows)),
+        ],
+    )
+    selected["decision_trace"] = bind_dispatched_action(selected, leader_trace)
+    return selected, str(leader_trace["selected_candidate_id"]) != primary_id
+
+
+def _admit_parallel_companion_candidates(
+    primary_action: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    problem: Mapping[str, Any],
+    recent_runs: Sequence[Mapping[str, Any]] = (),
+    durable_deferral_counts: Mapping[str, Any] | None = None,
+    _generator_evaluation: Dict[str, Any] | None = None,
+    _parallel_policy_version: int = PARALLEL_WAVE_ADMISSION_POLICY_VERSION,
+) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    """Admit a bounded, conflict-free companion set with an audit trace.
+
+    Admission order is derived from an explicit resource priority and a stable
+    semantic candidate identifier, never from generator traversal. Every
+    distinct materialized action remains in the trace even when capacity
+    rejects it.
+    """
+
+    explicit_generator_evaluation = _generator_evaluation is not None
+    generator_evaluation = (
+        _generator_evaluation
+        if _generator_evaluation is not None
+        else _new_parallel_generator_evaluation()
+    )
+    generator_ids: list[str] = []
+    caller_supplied_present = False
+    normalized_candidates: list[Dict[str, Any]] = []
+    for candidate in candidates:
+        normalized = dict(candidate)
+        generator_id = normalized.pop(_CANDIDATE_GENERATOR_FIELD, None)
+        if not isinstance(generator_id, str) or not generator_id:
+            caller_supplied_present = True
+        generator_ids.append(
+            generator_id
+            if isinstance(generator_id, str) and generator_id
+            else "caller_supplied"
+        )
+        normalized_candidates.append(normalized)
+    _evaluate_parallel_candidate_generators(generator_evaluation, generator_ids)
+    if not caller_supplied_present:
+        _skip_parallel_candidate_generators(
+            generator_evaluation,
+            {"caller_supplied"},
+            "no_caller_supplied_candidates",
+        )
+    candidates = normalized_candidates
+
+    distinct_candidates: list[Mapping[str, Any]] = []
+    seen_identities: Dict[tuple[str, ...], str] = {}
+    generator_ids_by_identity: Dict[tuple[str, ...], set[str]] = {}
+    for candidate, generator_id in zip(candidates, generator_ids):
+        identity = _parallel_action_identity(candidate)
+        action_digest = action_sha256(candidate)
+        prior_digest = seen_identities.get(identity)
+        if prior_digest == action_digest:
+            generator_ids_by_identity[identity].add(generator_id)
+            continue
+        if prior_digest is not None:
+            raise ValueError(
+                "parallel candidate generators produced conflicting actions "
+                "for one semantic identity"
+            )
+        seen_identities[identity] = action_digest
+        generator_ids_by_identity[identity] = {generator_id}
+        distinct_candidates.append(candidate)
+    candidates = distinct_candidates
+
+    configured_workers = normalize_parallel_branches(
+        problem.get("parallel_branches")
+    )
+    proof_search_capacity = configured_workers or 2
+    total_capacity = max(
+        3,
+        configured_workers + PARALLEL_WAVE_ROLE_DIVERSE_EXTRA_SLOTS,
+    )
+    class_capacities = {
+        "research_or_adversarial": proof_search_capacity,
+        "verification": configured_workers or 1,
+        "integration": configured_workers or 2,
+        "literature": 1,
+        "advisory": 1,
+    }
+    selected: list[Dict[str, Any]] = []
+
+    aggregate_budget_enforced = (
+        "remaining_token_budget" in problem
+        and "reserved_verification_budget" in problem
+    )
+
+    def requested_tokens(action: Mapping[str, Any]) -> int:
+        budget = action.get("budget")
+        if not isinstance(budget, Mapping):
+            return 0
+        try:
+            value = int(budget.get("requested_tokens") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, value)
+
+    def budget_allows_dispatch(action: Mapping[str, Any]) -> bool:
+        budget = action.get("budget")
+        return not isinstance(budget, Mapping) or budget.get("allowed") is not False
+
+    primary_requested_tokens = requested_tokens(primary_action)
+
+    primary_identity = _parallel_action_identity(primary_action)
+    descriptors = [
+        {
+            "candidate_id": "parallel:primary",
+            "admission_priority": 1_000_000,
+            "action_class": primary_identity[0],
+            "mode": primary_identity[1],
+            "target_id": primary_identity[2],
+            "route_id": primary_identity[3],
+            "search_intent": primary_identity[4],
+            "semantic_identity": list(primary_identity),
+            "consecutive_deferrals": 0,
+            "deferral_limit": 0,
+            "budget_allowed": budget_allows_dispatch(primary_action),
+            "requested_tokens": primary_requested_tokens,
+            "comparison_action_sha256": action_sha256(primary_action),
+        }
+    ]
+    candidate_descriptors: list[tuple[Dict[str, Any], Mapping[str, Any]]] = []
+    for candidate in candidates:
+        identity = _parallel_action_identity(candidate)
+        candidate_id = parallel_candidate_id(
+            identity, policy_version=_parallel_policy_version
+        )
+        candidate_descriptors.append(
+            (
+                {
+                    "candidate_id": candidate_id,
+                    "admission_priority": _parallel_admission_priority(candidate),
+                    "action_class": identity[0],
+                    "mode": identity[1],
+                    "target_id": identity[2],
+                    "route_id": identity[3],
+                    "search_intent": identity[4],
+                    "semantic_identity": list(identity),
+                    "consecutive_deferrals": 0,
+                    "deferral_limit": PARALLEL_WAVE_DEFERRAL_LIMIT,
+                    "budget_allowed": budget_allows_dispatch(candidate),
+                    "requested_tokens": requested_tokens(candidate),
+                    "comparison_action_sha256": action_sha256(candidate),
+                },
+                candidate,
+            )
+        )
+    # Policy v7 expands identity to the complete stable action payload. Older
+    # counters cannot be assigned to one newly distinguished task without
+    # guessing, so the semantic-identity epoch deliberately resets them.
+    legacy_candidate_aliases: Dict[str, tuple[str, ...]] = {}
+    candidate_ids = [
+        descriptor["candidate_id"] for descriptor, _ in candidate_descriptors
+    ]
+    if durable_deferral_counts is None:
+        deferral_counts = _parallel_candidate_deferral_counts(
+            recent_runs,
+            candidate_ids,
+            candidate_aliases=legacy_candidate_aliases,
+        )
+    else:
+        deferral_counts = parallel_candidate_deferral_counts_from_state(
+            durable_deferral_counts,
+            candidate_ids,
+            candidate_aliases=legacy_candidate_aliases,
+        )
+    for descriptor, _candidate in candidate_descriptors:
+        descriptor["consecutive_deferrals"] = deferral_counts[
+            descriptor["candidate_id"]
+        ]
+    candidate_descriptors.sort(
+        key=lambda item: _parallel_admission_order_key(item[0])
+    )
+    descriptors.extend(descriptor for descriptor, _ in candidate_descriptors)
+    candidate_set_sha256 = _parallel_candidate_set_sha256(
+        descriptors, policy_version=_parallel_policy_version
+    )
+    admission_search: Dict[str, Any] = {}
+    outcomes, remaining_total_tokens = parallel_admission_outcomes(
+        descriptors,
+        total_capacity=total_capacity,
+        class_capacities=class_capacities,
+        aggregate_budget_enforced=aggregate_budget_enforced,
+        initial_remaining_token_budget=max(
+            0, int(problem.get("remaining_token_budget") or 0)
+        ),
+        initial_reserved_verification_budget=max(
+            0, int(problem.get("reserved_verification_budget") or 0)
+        ),
+        search_metadata_out=admission_search,
+        policy_version=_parallel_policy_version,
+    )
+    rows: list[Dict[str, Any]] = []
+    candidate_by_id = {
+        descriptor["candidate_id"]: candidate
+        for descriptor, candidate in candidate_descriptors
+    }
+    for descriptor in descriptors:
+        candidate_id = str(descriptor["candidate_id"])
+        outcome = outcomes[candidate_id]
+        disposition = outcome.disposition
+        reason = outcome.reason
+        grant = outcome.admitted_tokens
+        rows.append(
+            {
+                **descriptor,
+                "disposition": disposition,
+                "reason": reason,
+                "outcome_code": outcome.outcome_code,
+                "admitted_tokens": grant,
+            }
+        )
+        if disposition != "selected":
+            continue
+        candidate = candidate_by_id[candidate_id]
+        original_request = requested_tokens(candidate)
+        action = dict(candidate)
+        if grant != original_request:
+            budget = dict(action.get("budget") or {})
+            budget["wave_requested_tokens_before_admission"] = original_request
+            budget["requested_tokens"] = grant
+            budget["wave_budget_adjusted"] = True
+            action["budget"] = budget
+        action["parallel_wave_candidate_id"] = candidate_id
+        selected.append(action)
+    state_revision = int(problem.get("current_revision") or 0)
+    proof_state_hash = str(problem.get("proof_state_hash") or "")
+    run_provenance_hash = str(problem.get("run_provenance_hash") or "")
+    initial_remaining_token_budget = (
+        max(0, int(problem.get("remaining_token_budget") or 0))
+        if aggregate_budget_enforced
+        else None
+    )
+    initial_reserved_verification_budget = (
+        max(0, int(problem.get("reserved_verification_budget") or 0))
+        if aggregate_budget_enforced
+        else None
+    )
+    candidate_set_scope = (
+        "every distinct companion action admissible under the primary action's "
+        "phase constraints; ownership, role capacity, and aggregate token limits "
+        "are applied here and every rejection remains in this trace"
+    )
+    trace = {
+        "policy_version": _parallel_policy_version,
+        # Bound after the candidate-generator manifest is available.  Policy
+        # v5 makes evaluation/phase-exclusion provenance part of wave identity.
+        "wave_id": "",
+        "state_revision": state_revision,
+        "proof_state_hash": proof_state_hash,
+        "run_provenance_hash": run_provenance_hash,
+        "candidate_set_sha256": candidate_set_sha256,
+        "candidate_set_complete": True,
+        "candidate_set_scope": candidate_set_scope,
+        "configured_proof_search_workers": configured_workers,
+        "total_wave_capacity": total_capacity,
+        "class_capacities": class_capacities,
+        "aggregate_budget_enforced": aggregate_budget_enforced,
+        "initial_remaining_token_budget": initial_remaining_token_budget,
+        "initial_reserved_verification_budget": (
+            initial_reserved_verification_budget
+        ),
+        "admitted_token_budget": sum(
+            int(row.get("admitted_tokens") or 0) for row in rows
+        ),
+        "remaining_uncommitted_token_budget": (
+            remaining_total_tokens if aggregate_budget_enforced else None
+        ),
+        "selected_candidate_ids": [
+            row["candidate_id"]
+            for row in rows
+            if row["disposition"] in {"fixed_primary", "selected"}
+        ],
+        "candidates": rows,
+    }
+    if _parallel_policy_version >= 9:
+        trace["admission_search"] = dict(admission_search)
+    declared_parallel_generators = set(_scope_generator_ids("parallel_wave"))
+    unresolved_generators = (
+        declared_parallel_generators
+        - set(generator_evaluation.get("evaluated", set()))
+        - set(generator_evaluation.get("skipped", {}))
+    )
+    if explicit_generator_evaluation and unresolved_generators:
+        raise RuntimeError(
+            "parallel candidate-generator evaluation is incomplete: "
+            + ", ".join(sorted(unresolved_generators))
+        )
+    if unresolved_generators:
+        _skip_parallel_candidate_generators(
+            generator_evaluation,
+            unresolved_generators,
+            "not_invoked_by_direct_admission",
+        )
+    bind_candidate_generator_registry(
+        trace,
+        scope_id="parallel_wave",
+        active_generator_ids=[],
+        evaluated_generator_ids=sorted(generator_evaluation["evaluated"]),
+        skipped_generator_reasons=generator_evaluation["skipped"],
+        candidate_generator_assignments=[
+            sorted(
+                generator_ids_by_identity[
+                    tuple(str(item) for item in row["semantic_identity"])
+                ]
+            )
+            for row in rows[1:]
+        ],
+    )
+    trace["wave_id"] = parallel_wave_id(
+        candidate_set_sha256=candidate_set_sha256,
+        candidate_set_scope=candidate_set_scope,
+        state_revision=state_revision,
+        proof_state_hash=proof_state_hash,
+        run_provenance_hash=run_provenance_hash,
+        configured_proof_search_workers=configured_workers,
+        total_wave_capacity=total_capacity,
+        class_capacities=class_capacities,
+        aggregate_budget_enforced=aggregate_budget_enforced,
+        initial_remaining_token_budget=initial_remaining_token_budget,
+        initial_reserved_verification_budget=(
+            initial_reserved_verification_budget
+        ),
+        candidate_generator_manifest_sha256=trace[
+            "candidate_generator_manifest_sha256"
+        ],
+        admission_search=trace.get("admission_search"),
+        policy_version=_parallel_policy_version,
+    )
+    trace_errors = _parallel_wave_admission_errors(trace)
+    if trace_errors:
+        raise RuntimeError(
+            "invalid host-generated parallel wave trace: "
+            + "; ".join(trace_errors)
+        )
+    return selected, trace
+
+
+def _bind_parallel_wave_decision(
+    action: Mapping[str, Any],
+    wave_admission: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Persistable decision provenance for one admitted companion action."""
+
+    candidate_id = str(action.get("parallel_wave_candidate_id") or "")
+    if not candidate_id:
+        raise ValueError("admitted companion is missing its wave candidate identifier")
+    matching_rows = [
+        row
+        for row in wave_admission.get("candidates", [])
+        if isinstance(row, Mapping) and row.get("candidate_id") == candidate_id
+    ]
+    if len(matching_rows) != 1 or matching_rows[0].get("disposition") != "selected":
+        raise ValueError(
+            "admitted companion is not uniquely selected in its parallel wave"
+        )
+    comparison_action = dict(action)
+    comparison_action.pop("decision_trace", None)
+    _, trace = select_action_candidate(
+        [
+            ActionCandidate(
+                candidate_id=candidate_id,
+                domain="parallel_wave",
+                action=comparison_action,
+                ordinal_priority=0.0,
+                mandatory_constraint=True,
+            )
+        ],
+        candidate_set_complete=True,
+        candidate_set_scope=(
+            "the dispatched companion; the embedded parallel_wave_admission records "
+            "the complete materialized wave comparison"
+        ),
+    )
+    trace["parallel_wave_admission"] = dict(wave_admission)
+    trace["parallel_wave_candidate_id"] = candidate_id
+    trace["parallel_wave_input_action_sha256"] = str(
+        matching_rows[0].get("comparison_action_sha256") or ""
+    )
+    comparison_action["decision_trace"] = bind_dispatched_action(
+        comparison_action, trace
+    )
+    return comparison_action
+
+
+def _bind_primary_parallel_wave_decision(
+    action: Mapping[str, Any],
+    wave_admission: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Bind the complete wave record to the already selected primary action."""
+
+    result = dict(action)
+    raw_trace = result.get("decision_trace")
+    if not isinstance(raw_trace, Mapping):
+        raise ValueError("primary action is missing its scheduler decision trace")
+    result["parallel_wave_admission"] = dict(wave_admission)
+    trace = dict(raw_trace)
+    trace["parallel_wave_admission"] = dict(wave_admission)
+    trace["parallel_wave_candidate_id"] = "parallel:primary"
+    trace["parallel_wave_input_action_sha256"] = action_sha256(action)
+    result["decision_trace"] = bind_dispatched_action(result, trace)
+    trace_errors = decision_trace_errors(result["decision_trace"])
+    if trace_errors:
+        raise RuntimeError(
+            "invalid primary parallel-wave decision trace: "
+            + "; ".join(trace_errors)
+        )
+    return result
 
 
 def _plan_parallel_companion_actions(
@@ -1912,62 +5529,95 @@ def _plan_parallel_companion_actions(
     requested_tokens: Optional[int] = None,
     research_mode: str | None = DEFAULT_RESEARCH_MODE,
     web_search: str | None = DEFAULT_WEB_SEARCH,
+    _scheduler_state: Mapping[str, Any] | None = None,
+    _generator_evaluation: Dict[str, Any] | None = None,
 ) -> list[Dict[str, Any]]:
     """Plan safe companion actions for literature/research/verifier overlap."""
+    generator_evaluation = (
+        _generator_evaluation
+        if _generator_evaluation is not None
+        else _new_parallel_generator_evaluation()
+    )
     if primary_action.get("paper_audit_verification_only"):
+        _skip_parallel_candidate_generators(
+            generator_evaluation,
+            _PARALLEL_INTERNAL_GENERATOR_IDS,
+            "primary_phase_exclusion",
+        )
         return []
     mode = str(primary_action.get("mode") or "")
     if mode in {"stop_with_partial_results", "stop_solved", "integrate", "write", "review_writing"}:
+        _skip_parallel_candidate_generators(
+            generator_evaluation,
+            _PARALLEL_INTERNAL_GENERATOR_IDS,
+            "primary_phase_exclusion",
+        )
         return []
+    _evaluate_parallel_candidate_generators(
+        generator_evaluation, _PARALLEL_INTERNAL_GENERATOR_IDS
+    )
     research_mode = normalize_research_mode(research_mode)
-    state = store.get_scheduler_state()
+    state = (
+        dict(_scheduler_state)
+        if _scheduler_state is not None
+        else store.get_scheduler_state()
+    )
+    state = _enable_scheduler_planning_cache(state)
     problem = state["problem_state"]
+
+    def counterexample_for(
+        action: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        candidate = _counterexample_companion_action(
+            action,
+            state,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+        )
+        return (
+            _tag_single_candidate_generator(candidate, "counterexample_search")
+            if candidate
+            else None
+        )
 
     if _is_verifier_action(primary_action):
         # A verifier-ready wave may contain several independent routes.  Do not
         # serialize those packets behind the first route: use the configured
         # branch parallelism for distinct strict-verifier checks, while still
         # avoiding unrelated literature/research companions here.
-        verifier_slots = max(0, int(problem.get("parallel_branches") or 0) - 1)
-        if not verifier_slots:
-            return []
-        return _verifier_candidate_actions(
-            state,
-            problem=problem,
-            requested_tokens=requested_tokens,
-            research_mode=research_mode,
-            parallel_companion=True,
-            exclude_route_ids={str(primary_action.get("route_id") or "")},
-            limit=verifier_slots,
+        return _tag_candidate_generator(
+            _verifier_candidate_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                parallel_companion=True,
+                exclude_route_ids={str(primary_action.get("route_id") or "")},
+                exclude_claim_ids={str(primary_action.get("target_id") or "")},
+            ),
+            "peer_verification",
         )
     if primary_action.get("closure_pipeline_required"):
         # Near closure, empty capacity is not permission to launch more proof
         # exploration or another advisor summary.  Only overlap a genuinely
         # verifier-ready, distinct route; integration overlap is added by the
         # caller under its existing ownership guards.
-        verifier = _verifier_candidate_action(
+        verifiers = _verifier_candidate_actions(
             state,
             problem=problem,
             requested_tokens=requested_tokens,
             research_mode=research_mode,
             parallel_companion=True,
         )
-        if not verifier:
-            return []
-        same_target = str(verifier.get("target_id") or "") == str(primary_action.get("target_id") or "")
-        same_route = bool(verifier.get("route_id")) and str(verifier.get("route_id")) == str(primary_action.get("route_id") or "")
-        return [] if (same_target or same_route) else [verifier]
+        # Keep conflicts in the materialized set. Admission will reject same-
+        # target/route certification and preserve the reason in the wave trace.
+        return _tag_candidate_generator(verifiers, "peer_verification")
     if primary_action.get("long_mathematical_session_required"):
         # Long discovery sessions need coherence.  Use at most one genuinely
         # orthogonal companion rather than filling every branch slot with
         # nearby lemmas in the same formalism.
-        adversary = _counterexample_companion_action(
-            primary_action,
-            state,
-            problem=problem,
-            requested_tokens=requested_tokens,
-            research_mode=research_mode,
-        )
+        adversary = counterexample_for(primary_action)
         if adversary:
             adversary["counterexample_probe_required"] = True
             adversary["research_philosophy"] = "adversarial_probe"
@@ -1979,75 +5629,113 @@ def _plan_parallel_companion_actions(
             research_mode=research_mode,
             parallel_companion=True,
         )
-        return [verifier] if verifier else []
-    support_precheck = _support_lemma_precheck_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-        web_search=web_search,
-        parallel_companion=True,
-    )
-    advisor = _advisor_evidence_synthesis_action(
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-        primary_action=primary_action,
-        parallel_companion=True,
-    )
-    verifier = None
-    if not support_precheck:
-        verifier = _verifier_candidate_action(
+        return (
+            [
+                _tag_single_candidate_generator(
+                    verifier, "long_session_verification"
+                )
+            ]
+            if verifier
+            else []
+        )
+    def support_precheck_candidates() -> list[Dict[str, Any]]:
+        return _tag_candidate_generator(
+            _support_lemma_precheck_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                web_search=web_search,
+                parallel_companion=True,
+            ),
+            "support_theorem_precheck",
+        )
+
+    def peer_verifier_candidates() -> list[Dict[str, Any]]:
+        return _tag_candidate_generator(
+            _verifier_candidate_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                parallel_companion=True,
+            ),
+            "peer_verification",
+        )
+
+    def advisor_candidate() -> Optional[Dict[str, Any]]:
+        candidate = _advisor_evidence_synthesis_action(
             state,
             problem=problem,
             requested_tokens=requested_tokens,
             research_mode=research_mode,
+            primary_action=primary_action,
             parallel_companion=True,
+        )
+        return (
+            _tag_single_candidate_generator(candidate, "advisor_synthesis")
+            if candidate
+            else None
         )
 
     if primary_action.get("bottleneck_lock_required"):
         companions: list[Dict[str, Any]] = []
-        exact_search = _verifier_blocked_citation_action(
-            state,
-            problem=problem,
-            requested_tokens=requested_tokens,
-            research_mode=research_mode,
-            web_search=web_search,
-            parallel_companion=True,
+        exact_searches = _tag_candidate_generator(
+            _verifier_blocked_citation_actions(
+                state,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                web_search=web_search,
+                parallel_companion=True,
+            ),
+            "exact_support_theorem_search",
         )
-        if exact_search:
-            companions.append(exact_search)
-        elif support_precheck:
-            companions.append(support_precheck)
-        elif verifier:
-            companions.append(verifier)
-        counterexample = _counterexample_companion_action(
+        if exact_searches:
+            companions.extend(exact_searches)
+        else:
+            support_prechecks = support_precheck_candidates()
+            companions.extend(
+                support_prechecks
+                if support_prechecks
+                else peer_verifier_candidates()
+            )
+        counterexample = counterexample_for(primary_action)
+        if counterexample:
+            companions.append(counterexample)
+        advisor = advisor_candidate()
+        if advisor:
+            companions.append(advisor)
+        return companions
+
+    support_prechecks = support_precheck_candidates()
+    verifiers = [] if support_prechecks else peer_verifier_candidates()
+    verification_candidates = support_prechecks or verifiers
+    advisor = advisor_candidate()
+
+    decomposition_companions = _tag_candidate_generator(
+        _parallel_decomposition_companion_actions(
             primary_action,
             state,
             problem=problem,
             requested_tokens=requested_tokens,
             research_mode=research_mode,
-        )
-        if counterexample:
-            companions.append(counterexample)
-        if advisor:
-            companions.append(advisor)
-        return companions
-
-    decomposition_companions = _parallel_decomposition_companion_actions(
-        primary_action,
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
+        ),
+        "parallel_decomposition",
     )
     if decomposition_companions:
-        return ([verifier] if verifier else []) + decomposition_companions
+        return [
+            *verification_candidates,
+            *decomposition_companions,
+            *([advisor] if advisor else []),
+        ]
 
     if mode == "retrieve":
-        if verifier:
-            return [verifier]
+        if verification_candidates:
+            return [
+                *verification_candidates,
+                *([advisor] if advisor else []),
+            ]
         researcher = _researcher_candidate_action(
             primary_action,
             state,
@@ -2056,7 +5744,8 @@ def _plan_parallel_companion_actions(
             research_mode=research_mode,
         )
         if not researcher:
-            return []
+            return [advisor] if advisor else []
+        researcher = _tag_single_candidate_generator(researcher, "researcher")
         # On a new hard problem the literature scout may start immediately,
         # but the parallel mathematician first maps genuinely different proof
         # mechanisms.  This makes brainstorming an initial research section
@@ -2074,14 +5763,9 @@ def _plan_parallel_companion_actions(
             )
             researcher["parallel_companion"] = True
             researcher = enrich_research_strategy_action(state, researcher)
+            researcher[_CANDIDATE_GENERATOR_FIELD] = "research_strategy"
         companions = [researcher]
-        counterexample = _counterexample_companion_action(
-            researcher,
-            state,
-            problem=problem,
-            requested_tokens=requested_tokens,
-            research_mode=research_mode,
-        )
+        counterexample = counterexample_for(researcher)
         if counterexample:
             companions.append(counterexample)
         if advisor:
@@ -2090,10 +5774,7 @@ def _plan_parallel_companion_actions(
 
     if primary_action.get("proof_construction_required"):
         companions: list[Dict[str, Any]] = []
-        if support_precheck and mode != "retrieve":
-            companions.append(support_precheck)
-        elif verifier:
-            companions.append(verifier)
+        companions.extend(verification_candidates)
         decision = should_run_librarian(
             state,
             research_mode=research_mode,
@@ -2102,41 +5783,42 @@ def _plan_parallel_companion_actions(
         )
         if decision.get("run"):
             companions.append(
-                _action(
-                    "retrieve",
-                    str(decision.get("target_id") or primary_action.get("target_id") or "root"),
-                    "",
-                    "parallel literature scan while researcher constructs the proof route",
-                    plan_step_budget(problem, "retrieve", requested_tokens),
-                    research_mode=research_mode,
-                    retrieval_required=True,
-                    search_permission=decision.get("search_permission", "live"),
-                    search_intent=decision.get("search_intent", "literature_scoping"),
-                    librarian_level=decision.get("librarian_level", "scout"),
-                    parallel_companion=True,
+                _tag_single_candidate_generator(
+                    _action(
+                        "retrieve",
+                        str(
+                            decision.get("target_id")
+                            or primary_action.get("target_id")
+                            or "root"
+                        ),
+                        "",
+                        "parallel literature scan while researcher constructs the proof route",
+                        plan_step_budget(problem, "retrieve", requested_tokens),
+                        research_mode=research_mode,
+                        retrieval_required=True,
+                        search_permission=decision.get(
+                            "search_permission", "live"
+                        ),
+                        search_intent=decision.get(
+                            "search_intent", "literature_scoping"
+                        ),
+                        librarian_level=decision.get(
+                            "librarian_level", "scout"
+                        ),
+                        parallel_companion=True,
+                    ),
+                    "literature_scan",
                 )
             )
-        counterexample = _counterexample_companion_action(
-            primary_action,
-            state,
-            problem=problem,
-            requested_tokens=requested_tokens,
-            research_mode=research_mode,
-        )
+        counterexample = counterexample_for(primary_action)
         if counterexample:
             companions.append(counterexample)
         if advisor:
             companions.append(advisor)
         return companions
 
-    counterexample = _counterexample_companion_action(
-        primary_action,
-        state,
-        problem=problem,
-        requested_tokens=requested_tokens,
-        research_mode=research_mode,
-    )
-    companions = [verifier] if verifier else []
+    counterexample = counterexample_for(primary_action)
+    companions = list(verification_candidates)
     if counterexample:
         companions.append(counterexample)
     if advisor:
@@ -2155,21 +5837,35 @@ def route_verifier_readiness(state: Mapping[str, Any], route_id: str) -> Dict[st
 
 def verifier_ready_route_summaries(state: Mapping[str, Any]) -> list[Dict[str, Any]]:
     """Summarize routes that the scheduler considers ready for strict verification."""
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("verifier_ready_route_summaries")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, tuple):
+        return [dict(row) for row in cached]
     paused = paused_route_ids(state)
+    readiness_index = _build_route_readiness_index(state)
     summaries: list[Dict[str, Any]] = []
     for route in state.get("routes", []):
         route_id = str(route.get("route_id") or "")
         if not route_id or str(route.get("status") or "") != "active":
             continue
+        if not readiness_index.inferences_by_route.get(route_id):
+            continue
         target_id = str(route.get("conclusion_claim_id") or "")
-        claim = _claim(state, target_id)
+        claim = readiness_index.claims_by_id.get(target_id)
         if route_id in paused and not _terminal_verification_revives_stale_route(
             state,
             route=route,
             claim=claim,
+            readiness_index=readiness_index,
         ):
             continue
-        readiness = _route_readiness_scorecard(state, route_id)
+        readiness = _route_readiness_scorecard(
+            state, route_id, readiness_index=readiness_index
+        )
         if not readiness.get("verifier_ready"):
             continue
         summaries.append(
@@ -2183,13 +5879,175 @@ def verifier_ready_route_summaries(state: Mapping[str, Any]) -> list[Dict[str, A
             }
         )
     summaries.sort(key=lambda row: (str(row["target_id"]) != "root", -int(row["score"]), str(row["route_id"])))
+    if isinstance(cache, dict):
+        cache["verifier_ready_route_summaries"] = tuple(
+            dict(row) for row in summaries
+        )
     return summaries
 
 
-def _route_readiness_scorecard(state: Mapping[str, Any], route_id: str) -> Dict[str, Any]:
-    route = _route(state, route_id)
+@dataclass(frozen=True)
+class RouteReadinessIndex:
+    routes_by_id: Mapping[str, Mapping[str, Any]]
+    claims_by_id: Mapping[str, Mapping[str, Any]]
+    inferences_by_route: Mapping[str, tuple[Mapping[str, Any], ...]]
+    evidence_artifact_ids_by_route: Mapping[str, tuple[str, ...]]
+    evidence_artifact_ids_by_route_and_inference: Mapping[
+        tuple[str, str], tuple[str, ...]
+    ]
+    research_artifacts_by_id: Mapping[str, Mapping[str, Any]]
+    evidence_artifacts_by_id: Mapping[str, Mapping[str, Any]]
+    blocking_debts_by_owner: Mapping[
+        str, tuple[tuple[int, Mapping[str, Any]], ...]
+    ]
+    blocking_debts_by_suggested_target: Mapping[
+        str, tuple[tuple[int, Mapping[str, Any]], ...]
+    ]
+    root_distances: Mapping[str, int]
+
+
+def _build_route_readiness_index(
+    state: Mapping[str, Any],
+) -> RouteReadinessIndex:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("route_readiness_index")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, RouteReadinessIndex):
+        return cached
+    inferences_by_route: Dict[str, list[Mapping[str, Any]]] = {}
+    evidence_by_route: Dict[str, list[str]] = {}
+    evidence_seen_by_route: Dict[str, set[str]] = {}
+    evidence_by_route_and_inference: Dict[tuple[str, str], tuple[str, ...]] = {}
+
+    def add_route_evidence(route_id: str, raw_ids: Any) -> tuple[str, ...]:
+        row_ids: list[str] = []
+        route_ids = evidence_by_route.setdefault(route_id, [])
+        route_seen = evidence_seen_by_route.setdefault(route_id, set())
+        row_seen: set[str] = set()
+        for raw_id in _json_list(raw_ids):
+            artifact_id = str(raw_id or "").strip()
+            if not artifact_id:
+                continue
+            if artifact_id not in row_seen:
+                row_ids.append(artifact_id)
+                row_seen.add(artifact_id)
+            if artifact_id not in route_seen:
+                route_ids.append(artifact_id)
+                route_seen.add(artifact_id)
+        return tuple(row_ids)
+
+    routes_by_id = {
+        str(route.get("route_id") or ""): route
+        for route in state.get("routes", [])
+        if str(route.get("route_id") or "")
+    }
+    for route_id, route in routes_by_id.items():
+        add_route_evidence(route_id, route.get("evidence_artifact_ids_json"))
+    for inference in state.get("inferences", []):
+        route_id = str(inference.get("route_id") or "")
+        inferences_by_route.setdefault(route_id, []).append(inference)
+        inference_id = str(inference.get("inference_id") or "")
+        inference_evidence = add_route_evidence(
+            route_id, inference.get("evidence_artifact_ids_json")
+        )
+        if inference_id:
+            evidence_by_route_and_inference[(route_id, inference_id)] = (
+                inference_evidence
+            )
+    blocking_by_owner: Dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
+    blocking_by_suggested: Dict[
+        str, list[tuple[int, Mapping[str, Any]]]
+    ] = {}
+    for position, obligation in enumerate(state.get("debts", [])):
+        if (
+            str(obligation.get("status") or "") != "active"
+            or str(obligation.get("severity") or "") != "blocking"
+        ):
+            continue
+        owner_id = str(obligation.get("owner_id") or "")
+        if owner_id:
+            blocking_by_owner.setdefault(owner_id, []).append(
+                (position, obligation)
+            )
+        suggested = str(obligation.get("suggested_next_target") or "")
+        if suggested:
+            blocking_by_suggested.setdefault(suggested, []).append(
+                (position, obligation)
+            )
+    graph_index = build_graph_policy_index(state)
+    research_artifacts_by_id = {
+        str(artifact.get("artifact_id") or ""): artifact
+        for artifact in state.get("research_artifacts", [])
+        if str(artifact.get("artifact_id") or "")
+    }
+    evidence_artifacts = (
+        state.get("research_artifacts") or state.get("artifacts") or []
+    )
+    index = RouteReadinessIndex(
+        routes_by_id=routes_by_id,
+        claims_by_id=graph_index.claims_by_id,
+        inferences_by_route={
+            route_id: tuple(rows)
+            for route_id, rows in inferences_by_route.items()
+        },
+        evidence_artifact_ids_by_route={
+            route_id: tuple(artifact_ids)
+            for route_id, artifact_ids in evidence_by_route.items()
+        },
+        evidence_artifact_ids_by_route_and_inference=(
+            evidence_by_route_and_inference
+        ),
+        research_artifacts_by_id=research_artifacts_by_id,
+        evidence_artifacts_by_id={
+            str(artifact.get("artifact_id") or ""): artifact
+            for artifact in evidence_artifacts
+            if str(artifact.get("artifact_id") or "")
+        },
+        blocking_debts_by_owner={
+            owner_id: tuple(rows) for owner_id, rows in blocking_by_owner.items()
+        },
+        blocking_debts_by_suggested_target={
+            target_id: tuple(rows)
+            for target_id, rows in blocking_by_suggested.items()
+        },
+        root_distances=graph_index.root_distances,
+    )
+    if isinstance(cache, dict):
+        cache["route_readiness_index"] = index
+    return index
+
+
+def _copy_route_readiness_scorecard(
+    scorecard: Mapping[str, Any],
+) -> Dict[str, Any]:
+    copied = dict(scorecard)
+    copied["ready_checks"] = list(scorecard.get("ready_checks") or [])
+    copied["missing_checks"] = list(scorecard.get("missing_checks") or [])
+    return copied
+
+
+def _route_readiness_scorecard(
+    state: Mapping[str, Any],
+    route_id: str,
+    *,
+    readiness_index: RouteReadinessIndex | None = None,
+) -> Dict[str, Any]:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    scorecard_cache: dict[str, Dict[str, Any]] | None = None
+    if isinstance(cache, dict):
+        cached_scorecards = cache.setdefault("route_readiness_scorecards", {})
+        if isinstance(cached_scorecards, dict):
+            scorecard_cache = cached_scorecards
+            cached_scorecard = scorecard_cache.get(route_id)
+            if isinstance(cached_scorecard, dict):
+                return _copy_route_readiness_scorecard(cached_scorecard)
+    index = readiness_index or _build_route_readiness_index(state)
+    route = index.routes_by_id.get(route_id)
     if not route:
-        return {
+        result = {
             "route_id": route_id,
             "score": 0,
             "level": "missing",
@@ -2197,15 +6055,29 @@ def _route_readiness_scorecard(state: Mapping[str, Any], route_id: str) -> Dict[
             "ready_checks": [],
             "missing_checks": ["route is absent"],
         }
+        if scorecard_cache is not None:
+            scorecard_cache[route_id] = _copy_route_readiness_scorecard(result)
+        return result
     conclusion_id = str(route.get("conclusion_claim_id") or "")
-    claim_by_id = {str(row.get("claim_id") or ""): row for row in state.get("claims", [])}
+    claim_by_id = index.claims_by_id
     conclusion_claim = claim_by_id.get(conclusion_id)
-    inferences = [row for row in state.get("inferences", []) if row.get("route_id") == route_id]
+    inferences = list(index.inferences_by_route.get(route_id, ()))
     conclusion_status = str((conclusion_claim or {}).get("validation_status") or "")
-    terminal_inference_needs_verification = _verified_claim_needs_terminal_inference_verification(
-        state,
-        route=route,
-        claim=conclusion_claim,
+    terminal_statuses = [
+        str(inference.get("validation_status") or "")
+        for inference in inferences
+        if str(inference.get("conclusion_claim_id") or "") == conclusion_id
+    ]
+    terminal_inference_needs_verification = (
+        conclusion_status in {"informally_verified", "formally_verified"}
+        and any(
+            status in {"untested", "plausible", "challenged"}
+            for status in terminal_statuses
+        )
+        and not any(
+            status in {"informally_verified", "formally_verified"}
+            for status in terminal_statuses
+        )
     )
     conclusion_verifiable = bool(
         conclusion_claim
@@ -2231,15 +6103,21 @@ def _route_readiness_scorecard(state: Mapping[str, Any], route_id: str) -> Dict[
         premise_ids.update(inference_premises)
         inference_premise_sets.append(inference_premises)
     route_blocker_owner_ids = route_or_claim_owner_ids | inference_ids | premise_ids
+    indexed_blockers: Dict[int, Mapping[str, Any]] = {}
+    for owner_id in route_blocker_owner_ids:
+        for position, obligation in index.blocking_debts_by_owner.get(
+            owner_id, ()
+        ):
+            indexed_blockers[position] = obligation
+    for premise_id in premise_ids:
+        for position, obligation in index.blocking_debts_by_suggested_target.get(
+            premise_id, ()
+        ):
+            indexed_blockers[position] = obligation
     blockers = [
-        row for row in state.get("debts", [])
-        if row.get("status") == "active"
-        and row.get("severity") == "blocking"
-        and (
-            str(row.get("owner_id") or "") in route_blocker_owner_ids
-            or str(row.get("suggested_next_target") or "") in premise_ids
-        )
-        and _debt_blocks_route_verification(
+        row
+        for _, row in sorted(indexed_blockers.items())
+        if _debt_blocks_route_verification(
             row,
             conclusion_id=conclusion_id,
             route_id=route_id,
@@ -2284,7 +6162,7 @@ def _route_readiness_scorecard(state: Mapping[str, Any], route_id: str) -> Dict[
     else:
         score += 1
         ready_checks.append("no_active_blocking_debt")
-    if conclusion_id == "root" or root_distance_for_claim_id(state, conclusion_id) <= 2:
+    if conclusion_id == "root" or int(index.root_distances.get(conclusion_id, 99)) <= 2:
         score += 1
         ready_checks.append("root_local")
     else:
@@ -2316,7 +6194,7 @@ def _route_readiness_scorecard(state: Mapping[str, Any], route_id: str) -> Dict[
         level = "candidate_needs_artifact_or_premise"
     else:
         level = "needs_researcher_inference"
-    return {
+    result = {
         "route_id": route_id,
         "conclusion_claim_id": conclusion_id,
         "score": score,
@@ -2328,6 +6206,9 @@ def _route_readiness_scorecard(state: Mapping[str, Any], route_id: str) -> Dict[
         "ready_checks": ready_checks,
         "missing_checks": missing_checks,
     }
+    if scorecard_cache is not None:
+        scorecard_cache[route_id] = _copy_route_readiness_scorecard(result)
+    return result
 
 
 def _debt_blocks_route_verification(
@@ -2421,24 +6302,21 @@ def _verifier_candidate_action(
     return actions[0] if actions else None
 
 
-def _proof_evidence_handoff_action(
+def _proof_evidence_handoff_actions(
     state: Mapping[str, Any],
     *,
     problem: Mapping[str, Any],
     requested_tokens: Optional[int],
     research_mode: str,
-) -> Optional[Dict[str, Any]]:
+) -> list[Dict[str, Any]]:
     """Send fresh proof-grade route evidence directly to the strict verifier.
 
     This also covers repaired evidence on an already integrated route.  The
     integrated verdict is not silently revoked, but fresh mathematical content
-    cannot sit in a researcher dossier without a verifier-owned recheck.
+    cannot sit in a researcher proof draft without a verifier-owned recheck.
     """
-    artifacts = {
-        str(row.get("artifact_id") or ""): row
-        for row in state.get("research_artifacts", [])
-        if str(row.get("artifact_id") or "")
-    }
+    readiness_index = _build_route_readiness_index(state)
+    artifacts = readiness_index.research_artifacts_by_id
     current_revision = int(state.get("problem_state", {}).get("current_revision") or 0)
     candidates: list[tuple[int, int, str, str, str, list[str]]] = []
     for route in state.get("routes", []):
@@ -2446,10 +6324,12 @@ def _proof_evidence_handoff_action(
         if not route_id or str(route.get("status") or "") not in {"active", "blocked", "integrated"}:
             continue
         target_id = str(route.get("conclusion_claim_id") or "")
-        claim = _claim(state, target_id)
+        claim = readiness_index.claims_by_id.get(target_id)
         if not claim or str(claim.get("lifecycle_status") or "") in {"superseded", "abandoned"}:
             continue
-        evidence_ids = _route_evidence_artifact_ids(state, route_id)
+        evidence_ids = _route_evidence_artifact_ids(
+            state, route_id, readiness_index=readiness_index
+        )
         proof_ids = [
             artifact_id
             for artifact_id in evidence_ids
@@ -2462,17 +6342,21 @@ def _proof_evidence_handoff_action(
         ]
         if not proof_ids:
             continue
-        evidence_revision = _route_evidence_state_revision(state, proof_ids)
+        evidence_revision = _route_evidence_state_revision(
+            state, proof_ids, readiness_index=readiness_index
+        )
         if evidence_revision < max(0, current_revision - 24):
             continue
         if _strict_verifier_recently_checked_route(state, route_id, evidence_revision):
             continue
         route_status = str(route.get("status") or "")
-        if route_status == "active" and not _route_readiness_scorecard(state, route_id).get("verifier_ready"):
+        if route_status == "active" and not _route_readiness_scorecard(
+            state, route_id, readiness_index=readiness_index
+        ).get("verifier_ready"):
             continue
         candidates.append(
             (
-                root_distance_for_claim_id(state, target_id),
+                int(readiness_index.root_distances.get(target_id, 99)),
                 -evidence_revision,
                 route_id,
                 target_id,
@@ -2481,28 +6365,100 @@ def _proof_evidence_handoff_action(
             )
         )
     if not candidates:
-        return None
+        return []
     candidates.sort()
-    _, neg_revision, route_id, target_id, route_status, proof_ids = candidates[0]
-    evidence_revision = -neg_revision
-    return _action(
-        "prove",
-        target_id,
-        route_id,
-        "fresh proof-grade researcher evidence requires an automatic strict-verifier handoff",
-        plan_step_budget(problem, "prove", requested_tokens),
+    return [
+        _action(
+            "prove",
+            target_id,
+            route_id,
+            "fresh proof-grade researcher evidence requires an automatic strict-verifier handoff",
+            _strict_verifier_budget(problem, requested_tokens),
+            research_mode=research_mode,
+            verify_ready_route_policy=True,
+            automatic_researcher_verifier_handoff=True,
+            revalidating_integrated_route=(route_status == "integrated"),
+            prior_route_status=route_status,
+            strict_verifier_scope="fresh_route_evidence_revalidation",
+            verifier_evidence_artifact_ids=proof_ids,
+            verifier_evidence_state_revision=-neg_revision,
+            strict_verifier_no_fresh_evidence=True,
+            strict_verifier_no_cas=True,
+            search_intent=VERIFY_READY_ROUTE_INTENT,
+        )
+        for (
+            _,
+            neg_revision,
+            route_id,
+            target_id,
+            route_status,
+            proof_ids,
+        ) in candidates
+    ]
+
+
+def _proof_evidence_handoff_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _proof_evidence_handoff_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
         research_mode=research_mode,
-        verify_ready_route_policy=True,
-        automatic_researcher_verifier_handoff=True,
-        revalidating_integrated_route=(route_status == "integrated"),
-        prior_route_status=route_status,
-        strict_verifier_scope="fresh_route_evidence_revalidation",
-        verifier_evidence_artifact_ids=proof_ids,
-        verifier_evidence_state_revision=evidence_revision,
-        strict_verifier_no_fresh_evidence=True,
-        strict_verifier_no_cas=True,
-        search_intent=VERIFY_READY_ROUTE_INTENT,
     )
+    return actions[0] if actions else None
+
+
+def _threat_revalidation_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    threat = threat_propagation_view(state)
+    pending = list(threat.get("pending_revalidation_routes") or [])
+    if not pending:
+        return []
+    readiness_index = _build_route_readiness_index(state)
+    actions: list[Dict[str, Any]] = []
+    for candidate in pending:
+        route_id = str(candidate.get("route_id") or "")
+        target_id = str(candidate.get("target_id") or "root")
+        evidence_ids = _route_evidence_artifact_ids(
+            state, route_id, readiness_index=readiness_index
+        )
+        for artifact_id in threat.get("source_artifact_ids") or []:
+            artifact_id = str(artifact_id or "")
+            if artifact_id and artifact_id not in evidence_ids:
+                evidence_ids.append(artifact_id)
+        actions.append(
+            _action(
+                "prove",
+                target_id,
+                route_id,
+                "fresh mathematical counterevidence threatens a certified dependency; strict revalidation is required before downstream reuse",
+                _strict_verifier_budget(problem, requested_tokens),
+                research_mode=research_mode,
+                dependency_threat_revalidation_required=True,
+                threat_propagation=threat,
+                certification_state="threatened_pending_revalidation",
+                prior_certification_not_silently_revoked=True,
+                strict_verifier_scope="threatened_dependency_revalidation",
+                verifier_evidence_artifact_ids=evidence_ids,
+                verifier_evidence_state_revision=int(
+                    candidate.get("threat_revision") or 0
+                ),
+                strict_verifier_no_fresh_evidence=True,
+                strict_verifier_no_cas=True,
+                search_intent="threatened_dependency_revalidation",
+            )
+        )
+    return actions
 
 
 def _threat_revalidation_action(
@@ -2512,36 +6468,13 @@ def _threat_revalidation_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    threat = threat_propagation_view(state)
-    pending = list(threat.get("pending_revalidation_routes") or [])
-    if not pending:
-        return None
-    candidate = pending[0]
-    route_id = str(candidate.get("route_id") or "")
-    target_id = str(candidate.get("target_id") or "root")
-    evidence_ids = _route_evidence_artifact_ids(state, route_id)
-    for artifact_id in threat.get("source_artifact_ids") or []:
-        artifact_id = str(artifact_id or "")
-        if artifact_id and artifact_id not in evidence_ids:
-            evidence_ids.append(artifact_id)
-    return _action(
-        "prove",
-        target_id,
-        route_id,
-        "fresh mathematical counterevidence threatens a certified dependency; strict revalidation is required before downstream reuse",
-        plan_step_budget(problem, "prove", requested_tokens),
+    actions = _threat_revalidation_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
         research_mode=research_mode,
-        dependency_threat_revalidation_required=True,
-        threat_propagation=threat,
-        certification_state="threatened_pending_revalidation",
-        prior_certification_not_silently_revoked=True,
-        strict_verifier_scope="threatened_dependency_revalidation",
-        verifier_evidence_artifact_ids=evidence_ids,
-        verifier_evidence_state_revision=int(candidate.get("threat_revision") or 0),
-        strict_verifier_no_fresh_evidence=True,
-        strict_verifier_no_cas=True,
-        search_intent="threatened_dependency_revalidation",
     )
+    return actions[0] if actions else None
 
 
 def _verifier_candidate_actions(
@@ -2552,17 +6485,35 @@ def _verifier_candidate_actions(
     research_mode: str,
     parallel_companion: bool = True,
     exclude_route_ids: set[str] | None = None,
+    exclude_claim_ids: set[str] | None = None,
+    distinct_claims: bool = True,
     limit: int | None = None,
 ) -> list[Dict[str, Any]]:
-    """Build strict-verifier actions for distinct ready routes."""
+    """Build strict-verifier actions with distinct route and claim ownership."""
     excluded = {str(route_id) for route_id in (exclude_route_ids or set()) if str(route_id)}
-    candidates = [
-        candidate
-        for candidate in _verifier_ready_route_candidates(state)
-        if str(candidate["route_id"]) not in excluded
-    ]
-    if limit is not None:
-        candidates = candidates[: max(0, int(limit))]
+    excluded_claims = {
+        str(claim_id)
+        for claim_id in (exclude_claim_ids or set())
+        if str(claim_id)
+    }
+    claimed = set(excluded_claims)
+    if limit is not None and int(limit) <= 0:
+        return []
+    candidates: list[Mapping[str, Any]] = []
+    for candidate in _verifier_ready_route_candidates(state):
+        route_id = str(candidate["route_id"])
+        target_id = str(candidate["target_id"])
+        if (
+            route_id in excluded
+            or target_id in excluded_claims
+            or (distinct_claims and target_id in claimed)
+        ):
+            continue
+        candidates.append(candidate)
+        if distinct_claims:
+            claimed.add(target_id)
+        if limit is not None and len(candidates) >= max(0, int(limit)):
+            break
     extra = {"parallel_companion": True} if parallel_companion else {}
     return [
         _action(
@@ -2570,7 +6521,7 @@ def _verifier_candidate_actions(
             str(candidate["target_id"]),
             str(candidate["route_id"]),
             "strict verifier check for an existing verifier-ready proof route",
-            plan_step_budget(problem, "prove", requested_tokens),
+            _strict_verifier_budget(problem, requested_tokens),
             research_mode=research_mode,
             route_readiness=candidate["route_readiness"],
             verify_ready_route_policy=True,
@@ -2587,7 +6538,27 @@ def _verifier_candidate_actions(
 
 
 def _verifier_ready_route_candidates(state: Mapping[str, Any]) -> list[Dict[str, Any]]:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("verifier_ready_route_candidates")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, tuple):
+        return [
+            {
+                **dict(row),
+                "route_readiness": _copy_route_readiness_scorecard(
+                    row.get("route_readiness") or {}
+                ),
+                "evidence_artifact_ids": list(
+                    row.get("evidence_artifact_ids") or []
+                ),
+            }
+            for row in cached
+        ]
     paused = paused_route_ids(state)
+    readiness_index = _build_route_readiness_index(state)
     candidates: list[Dict[str, Any]] = []
     for route in state.get("routes", []):
         route_id = str(route.get("route_id") or "")
@@ -2595,14 +6566,20 @@ def _verifier_ready_route_candidates(state: Mapping[str, Any]) -> list[Dict[str,
             continue
         if str(route.get("status") or "") != "active":
             continue
+        # An existing terminal inference is a necessary verifier-readiness
+        # condition. Reject route skeletons before any route-local scorecard
+        # work; this keeps a wide exploratory graph linear.
+        if not readiness_index.inferences_by_route.get(route_id):
+            continue
         target_id = str(route.get("conclusion_claim_id") or "")
-        claim = _claim(state, target_id)
+        claim = readiness_index.claims_by_id.get(target_id)
         if not claim or str(claim.get("lifecycle_status") or "") != "active":
             continue
         if route_id in paused and not _terminal_verification_revives_stale_route(
             state,
             route=route,
             claim=claim,
+            readiness_index=readiness_index,
         ):
             continue
         claim_status = str(claim.get("validation_status") or "")
@@ -2615,14 +6592,21 @@ def _verifier_ready_route_candidates(state: Mapping[str, Any]) -> list[Dict[str,
                 state,
                 route=route,
                 claim=claim,
+                readiness_index=readiness_index,
             )
         ):
             continue
-        readiness = _route_readiness_scorecard(state, route_id)
+        readiness = _route_readiness_scorecard(
+            state, route_id, readiness_index=readiness_index
+        )
         if not readiness.get("verifier_ready"):
             continue
-        evidence_ids = _route_evidence_artifact_ids(state, route_id)
-        evidence_revision = _route_evidence_state_revision(state, evidence_ids)
+        evidence_ids = _route_evidence_artifact_ids(
+            state, route_id, readiness_index=readiness_index
+        )
+        evidence_revision = _route_evidence_state_revision(
+            state, evidence_ids, readiness_index=readiness_index
+        )
         if _strict_verifier_recently_checked_route(state, route_id, evidence_revision):
             continue
         candidates.append(
@@ -2641,7 +6625,7 @@ def _verifier_ready_route_candidates(state: Mapping[str, Any]) -> list[Dict[str,
         target_id = str(item["target_id"])
         readiness = item["route_readiness"]
         return (
-            root_distance_for_claim_id(state, target_id),
+            int(readiness_index.root_distances.get(target_id, 99)),
             int(target_id != "root"),
             -float(claim.get("root_impact", 0.0) or 0.0),
             -int(readiness.get("score", 0) or 0),
@@ -2650,6 +6634,19 @@ def _verifier_ready_route_candidates(state: Mapping[str, Any]) -> list[Dict[str,
         )
 
     candidates.sort(key=priority)
+    if isinstance(cache, dict):
+        cache["verifier_ready_route_candidates"] = tuple(
+            {
+                **dict(row),
+                "route_readiness": _copy_route_readiness_scorecard(
+                    row.get("route_readiness") or {}
+                ),
+                "evidence_artifact_ids": tuple(
+                    row.get("evidence_artifact_ids") or []
+                ),
+            }
+            for row in candidates
+        )
     return candidates
 
 
@@ -2658,6 +6655,7 @@ def _terminal_verification_revives_stale_route(
     *,
     route: Mapping[str, Any],
     claim: Mapping[str, Any] | None,
+    readiness_index: RouteReadinessIndex | None = None,
 ) -> bool:
     """Let strict verification finish a paused route's already-proved side lemma.
 
@@ -2670,6 +6668,7 @@ def _terminal_verification_revives_stale_route(
         state,
         route=route,
         claim=claim,
+        readiness_index=readiness_index,
     ):
         return False
     route_id = str(route.get("route_id") or "")
@@ -2683,6 +6682,7 @@ def _verified_claim_needs_terminal_inference_verification(
     *,
     route: Mapping[str, Any],
     claim: Mapping[str, Any] | None,
+    readiness_index: RouteReadinessIndex | None = None,
 ) -> bool:
     """Return whether a verified claim still lacks a certified terminal edge."""
     if not claim or str(claim.get("validation_status") or "") not in {
@@ -2692,11 +6692,13 @@ def _verified_claim_needs_terminal_inference_verification(
         return False
     route_id = str(route.get("route_id") or "")
     target_id = str(route.get("conclusion_claim_id") or "")
+    inferences = (
+        readiness_index or _build_route_readiness_index(state)
+    ).inferences_by_route.get(route_id, ())
     terminal_statuses = [
         str(inference.get("validation_status") or "")
-        for inference in state.get("inferences", [])
-        if str(inference.get("route_id") or "") == route_id
-        and str(inference.get("conclusion_claim_id") or "") == target_id
+        for inference in inferences
+        if str(inference.get("conclusion_claim_id") or "") == target_id
     ]
     return (
         any(status in {"untested", "plausible", "challenged"} for status in terminal_statuses)
@@ -2709,39 +6711,27 @@ def _route_evidence_artifact_ids(
     route_id: str,
     *,
     focus_inference_id: str = "",
+    readiness_index: RouteReadinessIndex | None = None,
 ) -> list[str]:
-    route = _route(state, route_id)
-    evidence_ids: list[str] = []
-    focus_evidence_ids: set[str] = set()
-
-    def add_many(raw_ids: Any) -> None:
-        for raw in _json_list(raw_ids):
-            artifact_id = str(raw or "").strip()
-            if artifact_id and artifact_id not in evidence_ids:
-                evidence_ids.append(artifact_id)
-
-    if route:
-        add_many(route.get("evidence_artifact_ids_json"))
-    for inference in state.get("inferences", []):
-        if str(inference.get("route_id") or "") == route_id:
-            inference_evidence_ids = _json_list(inference.get("evidence_artifact_ids_json"))
-            add_many(inference_evidence_ids)
-            if str(inference.get("inference_id") or "") == focus_inference_id:
-                focus_evidence_ids.update(str(raw_id) for raw_id in inference_evidence_ids if str(raw_id))
-
-    artifacts = state.get("research_artifacts") or state.get("artifacts") or []
-    artifact_by_id = {
-        str(artifact.get("artifact_id") or ""): artifact
-        for artifact in artifacts
-        if str(artifact.get("artifact_id") or "")
+    index = readiness_index or _build_route_readiness_index(state)
+    evidence_ids = list(
+        index.evidence_artifact_ids_by_route.get(route_id, ())
+    )
+    focus_evidence_ids = set(
+        index.evidence_artifact_ids_by_route_and_inference.get(
+            (route_id, focus_inference_id), ()
+        )
+    )
+    original_order = {
+        artifact_id: position
+        for position, artifact_id in enumerate(evidence_ids)
     }
-    original_order = {artifact_id: index for index, artifact_id in enumerate(evidence_ids)}
 
     def evidence_priority(artifact_id: str) -> tuple[int, int, int, int]:
         # Context fitting may retain only the first proof artifact.  Keep the
         # advisor's exact inference evidence first, then prefer the newest
         # proof-grade dossier over historical plans and session summaries.
-        artifact = artifact_by_id.get(artifact_id, {})
+        artifact = index.evidence_artifacts_by_id.get(artifact_id, {})
         artifact_type = str(artifact.get("artifact_type") or "")
         if artifact_type in VERIFIER_PRIMARY_EVIDENCE_ARTIFACT_TYPES:
             type_rank = 0
@@ -2763,20 +6753,30 @@ def _route_evidence_artifact_ids(
     return sorted(evidence_ids, key=evidence_priority)
 
 
-def _route_evidence_state_revision(state: Mapping[str, Any], evidence_ids: list[str]) -> int:
-    artifact_revisions = {
-        str(artifact.get("artifact_id") or ""): _revision_number(artifact.get("state_revision"))
-        for artifact in state.get("research_artifacts", [])
+def _route_evidence_state_revision(
+    state: Mapping[str, Any],
+    evidence_ids: list[str],
+    *,
+    readiness_index: RouteReadinessIndex | None = None,
+) -> int:
+    artifacts_by_id = (
+        readiness_index or _build_route_readiness_index(state)
+    ).research_artifacts_by_id
+    revisions = [
+        _revision_number(artifacts_by_id[artifact_id].get("state_revision"))
+        for artifact_id in evidence_ids
+        if artifact_id in artifacts_by_id
         # A verifier's own report is a verdict on the proof packet, not fresh
         # mathematical route evidence.  Counting it here makes every failed
         # check invalidate the "recently checked" watermark and immediately
         # schedules the same route again.
-        if not (
-            str(artifact.get("artifact_type") or "") == "verification_report"
-            and str(artifact.get("producer_role") or "") == "strict_informal_verifier"
+        and not (
+            str(artifacts_by_id[artifact_id].get("artifact_type") or "")
+            == "verification_report"
+            and str(artifacts_by_id[artifact_id].get("producer_role") or "")
+            == "strict_informal_verifier"
         )
-    }
-    revisions = [artifact_revisions[artifact_id] for artifact_id in evidence_ids if artifact_id in artifact_revisions]
+    ]
     if revisions:
         return max(revisions)
     return 0
@@ -2837,6 +6837,78 @@ def _post_integration_proof_spine_action(
     )
 
 
+def _support_lemma_precheck_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+    parallel_companion: bool = False,
+) -> list[Dict[str, Any]]:
+    candidates = _verifier_ready_route_candidates(state)
+    if not candidates:
+        return []
+    readiness_index = _build_route_readiness_index(state)
+    already_sourced_labels = {
+        label
+        for label, terms, _query in SUPPORT_LEMMA_THEOREM_TERMS
+        if _support_term_already_sourced(state, terms)
+    }
+    actions: list[Dict[str, Any]] = []
+    for candidate in candidates:
+        route_id = str(candidate["route_id"])
+        if _recent_support_precheck_for_route(state, route_id):
+            continue
+        support = _route_named_support_gap(
+            state,
+            candidate,
+            readiness_index=readiness_index,
+            already_sourced_labels=already_sourced_labels,
+        )
+        if not support:
+            continue
+        target_id = str(candidate["target_id"])
+        query = _support_theorem_query(state, candidate, support)
+        actions.append(
+            _action(
+                "retrieve",
+                target_id,
+                route_id,
+                "verifier-ready route cites a named support theorem without a visible source card; retrieve the exact theorem before strict verification",
+                plan_action_budget(
+                    problem,
+                    "retrieve",
+                    {
+                        "target_id": target_id,
+                        "route_id": route_id,
+                        "support_lemma_precheck_required": True,
+                        "search_intent": SUPPORT_LEMMA_PRECHECK_INTENT,
+                    },
+                    requested_tokens,
+                ),
+                research_mode=research_mode,
+                retrieval_required=True,
+                support_lemma_precheck_required=True,
+                exact_theorem_search_required=True,
+                support_lemma_label=support["label"],
+                support_lemma_query=support["query"],
+                requested_query=query,
+                missing_theorem=support["query"],
+                local_theorem_search_allowed=True,
+                search_permission=(
+                    "live"
+                    if str(web_search or DEFAULT_WEB_SEARCH) == "live"
+                    else "local"
+                ),
+                search_intent=SUPPORT_LEMMA_PRECHECK_INTENT,
+                librarian_level="research_librarian",
+                parallel_companion=parallel_companion,
+            )
+        )
+    return actions
+
+
 def _support_lemma_precheck_action(
     state: Mapping[str, Any],
     *,
@@ -2846,50 +6918,18 @@ def _support_lemma_precheck_action(
     web_search: str | None,
     parallel_companion: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    candidates = _verifier_ready_route_candidates(state)
-    for candidate in candidates:
-        route_id = str(candidate["route_id"])
-        if _recent_support_precheck_for_route(state, route_id):
-            continue
-        support = _route_named_support_gap(state, candidate)
-        if not support:
-            continue
-        target_id = str(candidate["target_id"])
-        query = _support_theorem_query(state, candidate, support)
-        return _action(
-            "retrieve",
-            target_id,
-            route_id,
-            "verifier-ready route cites a named support theorem without a visible source card; retrieve the exact theorem before strict verification",
-            plan_action_budget(
-                problem,
-                "retrieve",
-                {
-                    "target_id": target_id,
-                    "route_id": route_id,
-                    "support_lemma_precheck_required": True,
-                    "search_intent": SUPPORT_LEMMA_PRECHECK_INTENT,
-                },
-                requested_tokens,
-            ),
-            research_mode=research_mode,
-            retrieval_required=True,
-            support_lemma_precheck_required=True,
-            exact_theorem_search_required=True,
-            support_lemma_label=support["label"],
-            support_lemma_query=support["query"],
-            requested_query=query,
-            missing_theorem=support["query"],
-            local_theorem_search_allowed=True,
-            search_permission="live" if str(web_search or DEFAULT_WEB_SEARCH) == "live" else "local",
-            search_intent=SUPPORT_LEMMA_PRECHECK_INTENT,
-            librarian_level="research_librarian",
-            parallel_companion=parallel_companion,
-        )
-    return None
+    actions = _support_lemma_precheck_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+        web_search=web_search,
+        parallel_companion=parallel_companion,
+    )
+    return actions[0] if actions else None
 
 
-def _verifier_blocked_citation_action(
+def _verifier_blocked_citation_actions(
     state: Mapping[str, Any],
     *,
     problem: Mapping[str, Any],
@@ -2897,8 +6937,8 @@ def _verifier_blocked_citation_action(
     research_mode: str,
     web_search: str | None,
     parallel_companion: bool = False,
-) -> Optional[Dict[str, Any]]:
-    debt_coverage_index = DebtCoverageIndex(state)
+) -> list[Dict[str, Any]]:
+    debt_coverage_index = get_debt_coverage_index(state)
     debts = [
         row for row in state.get("debts", [])
         if row.get("status") == "active"
@@ -2911,7 +6951,7 @@ def _verifier_blocked_citation_action(
         )
     ]
     if not debts:
-        return None
+        return []
 
     def priority(row: Mapping[str, Any]) -> tuple[int, int, int, str]:
         target_id = _claim_target_for_debt(state, row) or str(row.get("owner_id") or "root")
@@ -2923,15 +6963,21 @@ def _verifier_blocked_citation_action(
         )
 
     debts.sort(key=priority)
+    closure_signal = _near_solution_spine_signal(state)
+    actions: list[Dict[str, Any]] = []
     for debt in debts:
         target_id = _claim_target_for_debt(state, debt) or str(debt.get("owner_id") or "root")
         if not _claim(state, target_id):
             target_id = "root"
         route_id = _route_for_debt(state, debt, target_id, allow_paused=True)
-        if _recent_exact_search_for_debt_target(state, target_id=target_id, route_id=route_id):
+        if _recent_exact_search_for_obligation(
+            state,
+            obligation_id=str(debt.get("debt_id") or ""),
+            target_id=target_id,
+            route_id=route_id,
+        ):
             continue
         query = _exact_citation_query(debt)
-        closure_signal = _near_solution_spine_signal(state)
         closure_fields: Dict[str, Any] = {}
         if closure_signal:
             closure_fields = {
@@ -2940,38 +6986,60 @@ def _verifier_blocked_citation_action(
                 "canonical_proof_artifact_id": str(closure_signal.get("canonical_proof_artifact_id") or ""),
                 "source_certification_packet_required": True,
             }
-        return _action(
-            "retrieve",
-            target_id,
-            route_id,
-            "strict verifier found a citation/local-theorem debt; run an exact theorem search before more proof repair",
-            plan_action_budget(
-                problem,
+        actions.append(
+            _action(
                 "retrieve",
-                {
-                    "target_id": target_id,
-                    "route_id": route_id,
-                    "debt_id": str(debt.get("debt_id") or ""),
-                    "exact_theorem_search_required": True,
-                    "search_intent": EXACT_THEOREM_SEARCH_INTENT,
-                },
-                requested_tokens,
-            ),
-            research_mode=research_mode,
-            retrieval_required=True,
-            exact_theorem_search_required=True,
-            verifier_blocked_citation_search=True,
-            debt_id=str(debt.get("debt_id") or ""),
-            requested_query=query,
-            missing_theorem=query,
-            local_theorem_search_allowed=True,
-            search_permission="live" if str(web_search or DEFAULT_WEB_SEARCH) == "live" else "local",
-            search_intent=EXACT_THEOREM_SEARCH_INTENT,
-            librarian_level="research_librarian",
-            parallel_companion=parallel_companion,
-            **closure_fields,
+                target_id,
+                route_id,
+                "strict verifier found a citation or local-theorem obligation; run an exact theorem search before more proof repair",
+                plan_action_budget(
+                    problem,
+                    "retrieve",
+                    {
+                        "target_id": target_id,
+                        "route_id": route_id,
+                        "debt_id": str(debt.get("debt_id") or ""),
+                        "exact_theorem_search_required": True,
+                        "search_intent": EXACT_THEOREM_SEARCH_INTENT,
+                    },
+                    requested_tokens,
+                ),
+                research_mode=research_mode,
+                retrieval_required=True,
+                exact_theorem_search_required=True,
+                verifier_blocked_citation_search=True,
+                debt_id=str(debt.get("debt_id") or ""),
+                requested_query=query,
+                missing_theorem=query,
+                local_theorem_search_allowed=True,
+                search_permission="live" if str(web_search or DEFAULT_WEB_SEARCH) == "live" else "local",
+                search_intent=EXACT_THEOREM_SEARCH_INTENT,
+                librarian_level="research_librarian",
+                parallel_companion=parallel_companion,
+                **closure_fields,
+            )
         )
-    return None
+    return actions
+
+
+def _verifier_blocked_citation_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+    web_search: str | None,
+    parallel_companion: bool = False,
+) -> Optional[Dict[str, Any]]:
+    actions = _verifier_blocked_citation_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+        web_search=web_search,
+        parallel_companion=parallel_companion,
+    )
+    return actions[0] if actions else None
 
 
 def _is_exact_citation_debt(debt: Mapping[str, Any]) -> bool:
@@ -2999,15 +7067,115 @@ def _exact_citation_query(debt: Mapping[str, Any]) -> str:
     )
 
 
-def _recent_exact_search_for_debt_target(state: Mapping[str, Any], *, target_id: str, route_id: str) -> bool:
-    for row in list(state.get("recent_runs", []))[:8]:
-        if str(row.get("search_intent") or "") != EXACT_THEOREM_SEARCH_INTENT:
+def _recent_exact_search_for_obligation(
+    state: Mapping[str, Any],
+    *,
+    obligation_id: str,
+    target_id: str,
+    route_id: str,
+) -> bool:
+    return _recent_object_action_seen(
+        state,
+        intent=EXACT_THEOREM_SEARCH_INTENT,
+        candidate_prefix="base_evidence:exact_support_theorem_search:",
+        subject_id=obligation_id,
+        window=8,
+        target_id=target_id,
+        route_id=route_id,
+    )
+
+
+def _recent_object_action_seen(
+    state: Mapping[str, Any],
+    *,
+    intent: str,
+    candidate_prefix: str,
+    subject_id: str,
+    window: int,
+    target_id: str = "",
+    route_id: str = "",
+    legacy_global: bool = False,
+) -> bool:
+    """Recognize a completed action by exact object identity when trace permits.
+
+    Object-keyed candidate identifiers prevent one queue item from consuming
+    its unselected peers. Older traces did not expose that identity, so their
+    cooldown remains conservatively target/route scoped (or global when the
+    legacy policy itself was global).
+    """
+
+    candidate_id = f"{candidate_prefix}{subject_id}"
+    observation_sequence = _recent_candidate_observation_sequence(state)
+    prefix_presence = _candidate_prefix_presence(
+        state, candidate_prefix, observation_sequence
+    )
+    failed_statuses = {
+        "failed",
+        "timeout",
+        "no_patch",
+        "cancelled",
+        "patch_rejected",
+    }
+    for index, row in enumerate(list(state.get("recent_runs", []))[:window]):
+        if str(row.get("search_intent") or "") != intent:
             continue
+        if str(row.get("status") or "") in failed_statuses:
+            continue
+        observations = (
+            observation_sequence[index]
+            if index < len(observation_sequence)
+            else {}
+        )
+        subject_identified = (
+            prefix_presence[index] if index < len(prefix_presence) else False
+        )
+        if subject_identified:
+            observation = observations.get(candidate_id)
+            if observation is None:
+                continue
+            candidate_row, ancestors_selected = observation
+            if (
+                ancestors_selected
+                and str(candidate_row.get("disposition") or "") == "selected"
+            ):
+                return True
+            continue
+        if row.get("decision_trace_history_included") is False:
+            # The online byte bound deliberately omitted this trace. Absence
+            # of subject identity is not evidence that every object sharing a
+            # target was processed; prefer a possible retry to false progress.
+            continue
+        if legacy_global:
+            return True
         if str(row.get("target_id") or "") == target_id:
             return True
         if route_id and str(row.get("route_id") or "") == route_id:
             return True
     return False
+
+
+def _candidate_prefix_presence(
+    state: Mapping[str, Any],
+    candidate_prefix: str,
+    observation_sequence: Sequence[Mapping[str, Any]],
+) -> tuple[bool, ...]:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    prefix_cache = (
+        cache.setdefault("candidate_prefix_presence", {})
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(prefix_cache, dict):
+        cached = prefix_cache.get(candidate_prefix)
+        if isinstance(cached, tuple):
+            return cached
+    result = tuple(
+        any(candidate_id.startswith(candidate_prefix) for candidate_id in observations)
+        for observations in observation_sequence
+    )
+    if isinstance(prefix_cache, dict):
+        prefix_cache[candidate_prefix] = result
+    return result
 
 
 def _recent_support_precheck_for_route(state: Mapping[str, Any], route_id: str) -> bool:
@@ -3019,40 +7187,59 @@ def _recent_support_precheck_for_route(state: Mapping[str, Any], route_id: str) 
     return False
 
 
-def _route_named_support_gap(state: Mapping[str, Any], candidate: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+def _route_named_support_gap(
+    state: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    readiness_index: RouteReadinessIndex | None = None,
+    already_sourced_labels: set[str] | None = None,
+) -> Optional[Dict[str, Any]]:
     route_id = str(candidate["route_id"])
     evidence_ids = list(candidate.get("evidence_artifact_ids") or [])
-    text = _route_support_text(state, route_id, evidence_ids)
+    text = _route_support_text(
+        state,
+        route_id,
+        evidence_ids,
+        readiness_index=readiness_index,
+    )
     if not text:
         return None
     for label, terms, query in SUPPORT_LEMMA_THEOREM_TERMS:
         if not any(term in text for term in terms):
             continue
-        if _support_term_already_sourced(state, terms):
+        if (
+            label in already_sourced_labels
+            if already_sourced_labels is not None
+            else _support_term_already_sourced(state, terms)
+        ):
             continue
         return {"label": label, "terms": list(terms), "query": query}
     return None
 
 
-def _route_support_text(state: Mapping[str, Any], route_id: str, evidence_ids: list[str]) -> str:
-    route = _route(state, route_id)
+def _route_support_text(
+    state: Mapping[str, Any],
+    route_id: str,
+    evidence_ids: list[str],
+    *,
+    readiness_index: RouteReadinessIndex | None = None,
+) -> str:
+    index = readiness_index or _build_route_readiness_index(state)
+    route = index.routes_by_id.get(route_id)
     pieces: list[str] = []
     if route:
         pieces.extend(
             str(route.get(key) or "")
             for key in ("route_id", "label", "strategy", "relation_to_parent", "failure_fingerprint")
         )
-    for inference in state.get("inferences", []):
-        if str(inference.get("route_id") or "") != route_id:
-            continue
+    for inference in index.inferences_by_route.get(route_id, ()):
         pieces.extend(
             str(inference.get(key) or "")
             for key in ("inference_id", "conclusion_claim_id", "explanation")
         )
         evidence_ids.extend(str(item or "") for item in _json_list(inference.get("evidence_artifact_ids_json")))
-    artifact_index = _artifact_index(state)
     for artifact_id in dict.fromkeys(evidence_ids):
-        artifact = artifact_index.get(str(artifact_id or ""))
+        artifact = index.evidence_artifacts_by_id.get(str(artifact_id or ""))
         if not artifact:
             continue
         metadata = _json_object(artifact.get("metadata_json"))
@@ -3089,13 +7276,123 @@ def _support_theorem_query(
 ) -> str:
     route_id = str(candidate["route_id"])
     target_id = str(candidate["target_id"])
-    claim = _claim(state, target_id)
+    claim = candidate.get("claim") or _claim(state, target_id)
     statement = _compact_text(str((claim or {}).get("statement") or target_id), 500)
     return (
         f"Support-lemma precheck for verifier-ready route {route_id} proving {target_id}: "
         f"find the exact cited theorem for {support['query']}. Target statement: {statement}. "
         "Return a retrieval card or source handoff only if the source gives a locatable theorem and its hypotheses can be checked."
     )
+
+
+def _verifier_loop_classification_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    # Most routes have no recent strict-verifier activity.  Index the bounded
+    # run window once and reject those routes before computing route evidence,
+    # proof obligations, or the complete route scoreboard.  The old ordering
+    # performed that graph-wide work once for every active route.
+    recent_verifier_runs_by_route: dict[str, list[Mapping[str, Any]]] = {}
+    classified_route_ids: set[str] = set()
+    for row in list(state.get("recent_runs", []))[:STRICT_VERIFIER_RECENT_WINDOW]:
+        route_id = str(row.get("route_id") or "")
+        if (
+            str(row.get("search_intent") or "")
+            == VERIFIER_LOOP_CLASSIFICATION_INTENT
+            and route_id
+        ):
+            classified_route_ids.add(route_id)
+        if (
+            str(row.get("actor_role") or "")
+            == "strict_informal_verifier"
+            and str(row.get("mode") or "") == "prove"
+            and str(row.get("status") or "")
+            not in {
+                "failed",
+                "timeout",
+                "no_patch",
+                "cancelled",
+                "patch_rejected",
+            }
+            and route_id
+        ):
+            recent_verifier_runs_by_route.setdefault(route_id, []).append(row)
+
+    actions: list[Dict[str, Any]] = []
+    readiness_index: RouteReadinessIndex | None = None
+    for route in state.get("routes", []):
+        route_id = str(route.get("route_id") or "")
+        if not route_id or str(route.get("status") or "") != "active":
+            continue
+        target_id = str(route.get("conclusion_claim_id") or "root")
+        if route_id in classified_route_ids:
+            continue
+        verifier_runs = recent_verifier_runs_by_route.get(route_id, [])
+        if len(verifier_runs) < 2:
+            continue
+        debt_ids = _active_route_gap_debt_ids(state, route_id, target_id)
+        if not debt_ids:
+            continue
+        if readiness_index is None:
+            readiness_index = _build_route_readiness_index(state)
+        route_evidence_ids = _route_evidence_artifact_ids(
+            state, route_id, readiness_index=readiness_index
+        )
+        evidence_revision = _route_evidence_state_revision(
+            state,
+            route_evidence_ids,
+            readiness_index=readiness_index,
+        )
+        verifier_runs = [
+            row
+            for row in verifier_runs
+            if _revision_number(row.get("state_revision")) >= evidence_revision
+        ]
+        if len(verifier_runs) < 2:
+            continue
+        budget_action = {
+            "target_id": target_id,
+            "route_id": route_id,
+            "verifier_loop_classification_required": True,
+            "search_intent": VERIFIER_LOOP_CLASSIFICATION_INTENT,
+        }
+        actions.append(
+            _action(
+                "triage_routes",
+                target_id,
+                route_id,
+                "same route has repeated strict-verifier gap reports; PhD advisor must classify the loop before another repair pass",
+                plan_action_budget(
+                    problem,
+                    "triage_routes",
+                    budget_action,
+                    requested_tokens,
+                ),
+                research_mode=research_mode,
+                route_triage_required=True,
+                verifier_loop_classification_required=True,
+                verifier_loop_route_id=route_id,
+                verifier_loop_claim_id=target_id,
+                verifier_gap_debt_ids=debt_ids,
+                recent_verifier_run_ids=[
+                    str(row.get("run_id") or "")
+                    for row in verifier_runs[:4]
+                ],
+                verifier_loop_classification_options=[
+                    "local_repair_or_typo",
+                    "missing_theorem",
+                    "bad_strategy",
+                    "abandon_or_pause_route",
+                ],
+                advisor_evidence_synthesis_required=True,
+                search_intent=VERIFIER_LOOP_CLASSIFICATION_INTENT,
+            )
+        )
+    return actions
 
 
 def _verifier_loop_classification_action(
@@ -3105,84 +7402,13 @@ def _verifier_loop_classification_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    for route in state.get("routes", []):
-        route_id = str(route.get("route_id") or "")
-        if not route_id or str(route.get("status") or "") != "active":
-            continue
-        target_id = str(route.get("conclusion_claim_id") or "root")
-        if _recent_verifier_loop_classification_seen(state, route_id):
-            continue
-        debt_ids = _active_route_gap_debt_ids(state, route_id, target_id)
-        if not debt_ids:
-            continue
-        evidence_revision = _route_evidence_state_revision(state, _route_evidence_artifact_ids(state, route_id))
-        verifier_runs = _recent_strict_verifier_runs_for_route(
-            state,
-            route_id=route_id,
-            min_state_revision=evidence_revision,
-        )
-        if len(verifier_runs) < 2:
-            continue
-        budget_action = {
-            "target_id": target_id,
-            "route_id": route_id,
-            "verifier_loop_classification_required": True,
-            "search_intent": VERIFIER_LOOP_CLASSIFICATION_INTENT,
-        }
-        return _action(
-            "triage_routes",
-            target_id,
-            route_id,
-            "same route has repeated strict-verifier gap reports; PhD advisor must classify the loop before another repair pass",
-            plan_action_budget(problem, "triage_routes", budget_action, requested_tokens),
-            research_mode=research_mode,
-            route_triage_required=True,
-            verifier_loop_classification_required=True,
-            verifier_loop_route_id=route_id,
-            verifier_loop_claim_id=target_id,
-            verifier_gap_debt_ids=debt_ids,
-            recent_verifier_run_ids=[str(row.get("run_id") or "") for row in verifier_runs[:4]],
-            verifier_loop_classification_options=[
-                "local_repair_or_typo",
-                "missing_theorem",
-                "bad_strategy",
-                "abandon_or_pause_route",
-            ],
-            advisor_evidence_synthesis_required=True,
-            search_intent=VERIFIER_LOOP_CLASSIFICATION_INTENT,
-        )
-    return None
-
-
-def _recent_strict_verifier_runs_for_route(
-    state: Mapping[str, Any],
-    *,
-    route_id: str,
-    min_state_revision: int,
-) -> list[Mapping[str, Any]]:
-    runs: list[Mapping[str, Any]] = []
-    for row in list(state.get("recent_runs", []))[:STRICT_VERIFIER_RECENT_WINDOW]:
-        if str(row.get("actor_role") or "") != "strict_informal_verifier":
-            continue
-        if str(row.get("mode") or "") != "prove":
-            continue
-        if str(row.get("route_id") or "") != route_id:
-            continue
-        if str(row.get("status") or "") in {"failed", "timeout", "no_patch", "cancelled", "patch_rejected"}:
-            continue
-        if _revision_number(row.get("state_revision")) < min_state_revision:
-            continue
-        runs.append(row)
-    return runs
-
-
-def _recent_verifier_loop_classification_seen(state: Mapping[str, Any], route_id: str) -> bool:
-    for row in list(state.get("recent_runs", []))[:STRICT_VERIFIER_RECENT_WINDOW]:
-        if str(row.get("search_intent") or "") != VERIFIER_LOOP_CLASSIFICATION_INTENT:
-            continue
-        if str(row.get("route_id") or "") == route_id:
-            return True
-    return False
+    actions = _verifier_loop_classification_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
 
 
 def _active_route_gap_debt_ids(state: Mapping[str, Any], route_id: str, target_id: str) -> list[str]:
@@ -3191,6 +7417,10 @@ def _active_route_gap_debt_ids(state: Mapping[str, Any], route_id: str, target_i
         for row in state.get("inferences", [])
         if str(row.get("route_id") or "") == route_id
     }
+    # The active route depends only on the target, not on the obligation row.
+    # Computing it inside this loop rebuilt the complete route scoreboard for
+    # every active obligation and produced cubic behavior on wide proof graphs.
+    target_active_route_id = _active_route_for_claim(state, target_id)
     debt_ids: list[str] = []
     for debt in state.get("debts", []):
         if str(debt.get("status") or "") != "active":
@@ -3204,7 +7434,11 @@ def _active_route_gap_debt_ids(state: Mapping[str, Any], route_id: str, target_i
         route_scoped = (
             (owner_type == "route" and owner_id == route_id)
             or (owner_type == "inference" and owner_id in inference_ids)
-            or (owner_type == "claim" and owner_id == target_id and _active_route_for_claim(state, target_id) == route_id)
+            or (
+                owner_type == "claim"
+                and owner_id == target_id
+                and target_active_route_id == route_id
+            )
             or suggested in {route_id, target_id}
         )
         if route_scoped:
@@ -3299,7 +7533,7 @@ def _executive_advisor_bottleneck_action(
             "allowed_terminal_outputs": [
                 "verifier-ready route/inference",
                 "route-killing obstruction",
-                "one strictly narrower theorem-level debt",
+                "one strictly narrower theorem-level proof obligation",
             ],
             "forbidden_outputs": [
                 "route inventory",
@@ -3406,7 +7640,7 @@ def _near_solution_spine_synthesis_action(
         mode,
         "root",
         route_id,
-        "near-solution proof has entered closure mode; repair exactly the selected debt and update the canonical proof",
+        "near-solution proof has entered closure mode; address exactly the selected proof obligation and update the canonical proof",
         plan_action_budget(problem, mode, budget_action, requested_tokens),
         research_mode=research_mode,
         near_solution_spine_synthesis_required=True,
@@ -3442,10 +7676,15 @@ def _near_solution_spine_signal(state: Mapping[str, Any]) -> Optional[Dict[str, 
     root = _claim(state, "root")
     if root and str(root.get("lifecycle_status") or "") == "integrated":
         return None
+    policy_index = build_graph_policy_index(state)
     partial_credit = [
         claim for claim in state.get("claims", [])
         if str(claim.get("claim_id") or "") != "root"
-        and root_distance_for_claim_id(state, str(claim.get("claim_id") or "")) <= 3
+        and root_distance_for_claim_id(
+            state,
+            str(claim.get("claim_id") or ""),
+            policy_index=policy_index,
+        ) <= 3
         and float(claim.get("root_impact", 0.0) or 0.0) >= 0.35
         and (
             str(claim.get("validation_status") or "") in {"informally_verified", "formally_verified"}
@@ -3458,6 +7697,7 @@ def _near_solution_spine_signal(state: Mapping[str, Any]) -> Optional[Dict[str, 
         and root_distance_for_claim_id(
             state,
             _target_id_from_metadata(state, _json_object(artifact.get("metadata_json")), fallback="root"),
+            policy_index=policy_index,
         ) <= 3
     ]
     proof_artifacts.sort(
@@ -3475,7 +7715,11 @@ def _near_solution_spine_signal(state: Mapping[str, Any]) -> Optional[Dict[str, 
         and (
             str(debt.get("owner_id") or "") == "root"
             or str(debt.get("suggested_next_target") or "") == "root"
-            or root_distance_for_claim_id(state, _claim_target_for_debt(state, debt)) <= 3
+            or root_distance_for_claim_id(
+                state,
+                _claim_target_for_debt(state, debt),
+                policy_index=policy_index,
+            ) <= 3
         )
     ]
     if len({str(row.get("claim_id") or "") for row in partial_credit}) < NEAR_SOLUTION_MIN_PARTIAL_CREDIT:
@@ -3514,6 +7758,55 @@ def _near_solution_spine_signal(state: Mapping[str, Any]) -> Optional[Dict[str, 
     }
 
 
+def _proof_candidate_route_conversion_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    actions: list[Dict[str, Any]] = []
+    for candidate in _unrouted_proof_candidates(state):
+        target_id = str(candidate.get("target_id") or "root")
+        route_id = str(candidate.get("route_id") or "")
+        artifact_id = str(candidate.get("artifact_id") or "")
+        claim_extraction_required = bool(
+            candidate.get("proved_lemma_claim_extraction_required")
+        )
+        mode = "reduce" if route_id else "prove"
+        budget_action = {
+            "target_id": target_id,
+            "route_id": route_id,
+            "proof_route_conversion_required": True,
+            "proof_candidate_artifact_id": artifact_id,
+            "proved_lemma_claim_extraction_required": claim_extraction_required,
+            "research_attack_stage": "synthesis",
+            "search_intent": PROOF_CANDIDATE_ROUTE_CONVERSION_INTENT,
+        }
+        actions.append(
+            _action(
+                mode,
+                target_id,
+                route_id,
+                "proof-like artifact needs immediate route and inference conversion before more research",
+                plan_action_budget(problem, mode, budget_action, requested_tokens),
+                research_mode=research_mode,
+                proof_route_conversion_required=True,
+                proof_candidate_artifact_id=artifact_id,
+                proof_candidate_summary=str(candidate.get("summary") or ""),
+                proved_lemma_claim_extraction_required=claim_extraction_required,
+                proved_lemma_candidate_statements=candidate.get("candidate_lemmas", []),
+                needs_proof_dossier=False,
+                research_synthesis_required=True,
+                proof_spine_mode_required=True,
+                route_conversion_attempt_required=True,
+                research_attack_stage="synthesis",
+                search_intent=PROOF_CANDIDATE_ROUTE_CONVERSION_INTENT,
+            )
+        )
+    return actions
+
+
 def _proof_candidate_route_conversion_action(
     state: Mapping[str, Any],
     *,
@@ -3521,42 +7814,13 @@ def _proof_candidate_route_conversion_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    candidate = _unrouted_proof_candidate(state)
-    if not candidate:
-        return None
-    target_id = str(candidate.get("target_id") or "root")
-    route_id = str(candidate.get("route_id") or "")
-    artifact_id = str(candidate.get("artifact_id") or "")
-    claim_extraction_required = bool(candidate.get("proved_lemma_claim_extraction_required"))
-    mode = "reduce" if route_id else "prove"
-    budget_action = {
-        "target_id": target_id,
-        "route_id": route_id,
-        "proof_route_conversion_required": True,
-        "proof_candidate_artifact_id": artifact_id,
-        "proved_lemma_claim_extraction_required": claim_extraction_required,
-        "research_attack_stage": "synthesis",
-        "search_intent": PROOF_CANDIDATE_ROUTE_CONVERSION_INTENT,
-    }
-    return _action(
-        mode,
-        target_id,
-        route_id,
-        "proof-like artifact needs immediate route/inference conversion before more research",
-        plan_action_budget(problem, mode, budget_action, requested_tokens),
+    actions = _proof_candidate_route_conversion_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
         research_mode=research_mode,
-        proof_route_conversion_required=True,
-        proof_candidate_artifact_id=artifact_id,
-        proof_candidate_summary=str(candidate.get("summary") or ""),
-        proved_lemma_claim_extraction_required=claim_extraction_required,
-        proved_lemma_candidate_statements=candidate.get("candidate_lemmas", []),
-        needs_proof_dossier=False,
-        research_synthesis_required=True,
-        proof_spine_mode_required=True,
-        route_conversion_attempt_required=True,
-        research_attack_stage="synthesis",
-        search_intent=PROOF_CANDIDATE_ROUTE_CONVERSION_INTENT,
     )
+    return actions[0] if actions else None
 
 
 def _advisor_followup_research_action(
@@ -3691,9 +7955,12 @@ def _advisor_followup_can_preempt_bottleneck(
     return any(debt_id and debt_id in advisor_text for debt_id in locked_ids)
 
 
-def _advisor_followup_report(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-    last_followup = _last_intent_run(state, ADVISOR_FOLLOWUP_RESEARCH_INTENT)
-    last_revision = _revision_number(last_followup.get("state_revision")) if last_followup else -1
+def _current_advisor_directive_report(
+    state: Mapping[str, Any],
+    *,
+    after_revision: int = -1,
+) -> Optional[Mapping[str, Any]]:
+    """Return the newest still-actionable advisor directive, across all roles."""
     candidates: list[tuple[int, str, Mapping[str, Any]]] = []
     for artifact in state.get("research_artifacts", []):
         if str(artifact.get("artifact_type") or "") != ADVISOR_REPORT_ARTIFACT_TYPE:
@@ -3701,7 +7968,7 @@ def _advisor_followup_report(state: Mapping[str, Any]) -> Optional[Mapping[str, 
         if str(artifact.get("producer_role") or "") != "phd_advisor":
             continue
         artifact_revision = _revision_number(artifact.get("state_revision"))
-        if artifact_revision <= last_revision:
+        if artifact_revision <= after_revision:
             continue
         metadata = _json_object(artifact.get("metadata_json"))
         if not (
@@ -3710,13 +7977,29 @@ def _advisor_followup_report(state: Mapping[str, Any]) -> Optional[Mapping[str, 
             or metadata.get("recommended_next_action")
             or metadata.get("remaining_gaps")
             or metadata.get("directed_researcher_mode")
+            or metadata.get("next_role")
+            or metadata.get("classification")
         ):
             continue
         candidates.append((artifact_revision, str(artifact.get("artifact_id") or ""), artifact))
     if not candidates:
         return None
     candidates.sort(key=lambda item: (-item[0], item[1]))
-    newest = candidates[0][2]
+    return candidates[0][2]
+
+
+def _advisor_followup_report(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    last_followup = _last_intent_run(state, ADVISOR_FOLLOWUP_RESEARCH_INTENT)
+    last_revision = (
+        _revision_number(last_followup.get("state_revision"))
+        if last_followup
+        else -1
+    )
+    newest = _current_advisor_directive_report(
+        state, after_revision=last_revision
+    )
+    if not newest:
+        return None
     newest_metadata = _json_object(newest.get("metadata_json"))
     if newest_metadata.get("proof_candidate") or newest_metadata.get("candidate_full_proof"):
         # Proof-shaped reports are consumed by the proof-candidate conversion
@@ -3867,7 +8150,7 @@ def _advisor_evidence_synthesis_signal(state: Mapping[str, Any]) -> Optional[Dic
         "graph_delta": graph_delta,
         "instruction": (
             "Use the original problem and the fresh durable evidence to propose the nearest full-proof shape, "
-            "remaining gaps, and immediate researcher/literature/villain follow-up. Do not verify or integrate."
+            "remaining gaps, and immediate researcher/literature/adversarial-review follow-up. Do not verify or integrate."
         ),
     }
 
@@ -3902,10 +8185,9 @@ def _new_graph_evidence_after(state: Mapping[str, Any], since_iso: str) -> Dict[
     return delta
 
 
-def _unrouted_proof_candidate(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    last_conversion = _last_intent_run(state, PROOF_CANDIDATE_ROUTE_CONVERSION_INTENT)
-    last_revision = _revision_number(last_conversion.get("state_revision")) if last_conversion else -1
+def _unrouted_proof_candidates(state: Mapping[str, Any]) -> list[Dict[str, Any]]:
     routed_artifact_ids = _routed_evidence_artifact_ids(state)
+    classified_artifact_ids = _classified_proof_candidate_artifact_ids(state)
     suppression_revision, suppressed_route_ids, suppressed_target_ids = _fresh_advisor_suppression(state)
     candidates: list[tuple[int, int, str, Dict[str, Any]]] = []
     for artifact in state.get("research_artifacts", []):
@@ -3922,17 +8204,27 @@ def _unrouted_proof_candidate(state: Mapping[str, Any]) -> Optional[Dict[str, An
         proved_lemma_delta = bool(proved_lemma_statements)
         if artifact_id in routed_artifact_ids and not proved_lemma_delta:
             continue
-        artifact_revision = _revision_number(artifact.get("state_revision"))
-        # A conversion run is only a coarse revision watermark: it does not
-        # identify which candidate artifact that run handled.  Keep explicit
-        # proved lemmas eligible until their evidence is actually routed, or a
-        # later conversion can accidentally hide an older unextracted lemma.
-        if artifact_revision <= last_revision and not proved_lemma_delta:
+        if artifact_id in classified_artifact_ids and not proved_lemma_delta:
             continue
+        artifact_revision = _revision_number(artifact.get("state_revision"))
         if not _artifact_is_proof_candidate(artifact):
             continue
         target_id = _target_id_from_metadata(state, metadata, fallback="root")
         route_id = _active_route_for_claim(state, target_id)
+        if not proved_lemma_delta and _recent_object_action_seen(
+            state,
+            intent=PROOF_CANDIDATE_ROUTE_CONVERSION_INTENT,
+            candidate_prefix=(
+                "base_evidence:proved_lemma_extraction:"
+                if proved_lemma_delta
+                else "base_evidence:proof_draft_route_conversion:"
+            ),
+            subject_id=artifact_id,
+            window=4,
+            target_id=target_id,
+            route_id=route_id,
+        ):
+            continue
         if (
             suppression_revision >= 0
             and artifact_revision <= suppression_revision
@@ -3959,32 +8251,56 @@ def _unrouted_proof_candidate(state: Mapping[str, Any]) -> Optional[Dict[str, An
                 },
             )
         )
-    if not candidates:
-        return None
     candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
-    return candidates[0][3]
+    return [item[3] for item in candidates]
+
+
+def _unrouted_proof_candidate(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    candidates = _unrouted_proof_candidates(state)
+    return candidates[0] if candidates else None
 
 
 def _artifact_evidenced_claim_count(state: Mapping[str, Any], artifact_id: str) -> int:
-    conclusion_claim_ids: set[str] = set()
+    return _artifact_evidenced_claim_counts(state).get(artifact_id, 0)
+
+
+def _artifact_evidenced_claim_counts(
+    state: Mapping[str, Any],
+) -> Mapping[str, int]:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("artifact_evidenced_claim_counts")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, dict):
+        return cached
+    conclusion_claim_ids_by_artifact: Dict[str, set[str]] = {}
+
+    def add(raw_artifact_ids: Any, conclusion_claim_id: str) -> None:
+        if not conclusion_claim_id or conclusion_claim_id == "root":
+            return
+        for raw_artifact_id in _json_list(raw_artifact_ids):
+            evidence_artifact_id = str(raw_artifact_id or "")
+            if evidence_artifact_id:
+                conclusion_claim_ids_by_artifact.setdefault(
+                    evidence_artifact_id, set()
+                ).add(conclusion_claim_id)
+
     for claim in state.get("claims", []):
         claim_id = str(claim.get("claim_id") or "")
-        evidence_ids = {
-            str(item) for item in _json_list(claim.get("evidence_artifact_ids_json")) if str(item)
-        }
-        if claim_id and claim_id != "root" and artifact_id in evidence_ids:
-            conclusion_claim_ids.add(claim_id)
+        add(claim.get("evidence_artifact_ids_json"), claim_id)
     for entity_kind in ("routes", "inferences"):
         for entity in state.get(entity_kind, []):
-            evidence_ids = {
-                str(item)
-                for item in _json_list(entity.get("evidence_artifact_ids_json"))
-                if str(item)
-            }
             conclusion_claim_id = str(entity.get("conclusion_claim_id") or "")
-            if conclusion_claim_id and conclusion_claim_id != "root" and artifact_id in evidence_ids:
-                conclusion_claim_ids.add(conclusion_claim_id)
-    return len(conclusion_claim_ids)
+            add(entity.get("evidence_artifact_ids_json"), conclusion_claim_id)
+    counts = {
+        evidence_artifact_id: len(claim_ids)
+        for evidence_artifact_id, claim_ids in conclusion_claim_ids_by_artifact.items()
+    }
+    if isinstance(cache, dict):
+        cache["artifact_evidenced_claim_counts"] = counts
+    return counts
 
 
 def _proof_candidate_subsumed_by_verified_claim(state: Mapping[str, Any], artifact: Mapping[str, Any]) -> bool:
@@ -4359,7 +8675,7 @@ def _counterexample_companion_action(
         "refute",
         target_id,
         route_id,
-        "parallel villain probe: test the full hypotheses against two competing structural conjectures while the main researcher works",
+        "parallel adversarial probe: test the full hypotheses against two competing structural conjectures while the main researcher works",
         plan_action_budget(problem, "refute", budget_action, requested_tokens),
         research_mode=research_mode,
         counterexample_search_required=True,
@@ -4377,7 +8693,7 @@ def _is_root_local_high_impact_claim(state: Mapping[str, Any], claim: Mapping[st
         return False
     try:
         root_impact = float(claim.get("root_impact", 0.0) or 0.0)
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         root_impact = 0.0
     return root_distance_for_claim_id(state, claim_id) <= 2 and root_impact >= COUNTEREXAMPLE_ROOT_LOCAL_IMPACT
 
@@ -4752,6 +9068,25 @@ def _decisive_theorem_test_payload(
     return payload
 
 
+def _bottleneck_lock_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    return [
+        _bottleneck_lock_action_for_signal(
+            state,
+            signal,
+            problem=problem,
+            requested_tokens=requested_tokens,
+            research_mode=research_mode,
+        )
+        for signal in _bottleneck_lock_signals(state)
+    ]
+
+
 def _bottleneck_lock_action(
     state: Mapping[str, Any],
     *,
@@ -4759,9 +9094,23 @@ def _bottleneck_lock_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    signal = _bottleneck_lock_signal(state)
-    if not signal:
-        return None
+    actions = _bottleneck_lock_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
+
+
+def _bottleneck_lock_action_for_signal(
+    state: Mapping[str, Any],
+    signal: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Dict[str, Any]:
 
     debt_id = str(signal.get("debt_id") or "")
     blocking_debt = next(
@@ -4823,6 +9172,7 @@ def _bottleneck_lock_action(
         plan_action_budget(problem, mode, budget_action, requested_tokens),
         research_mode=research_mode,
         debt_id=debt_id,
+        proof_obligation_id=debt_id,
         proof_repair_required=bool(route_id),
         proof_construction_required=bool(route_id),
         direct_solve_required=not bool(route_id),
@@ -4832,6 +9182,7 @@ def _bottleneck_lock_action(
         research_attack_stage="bottleneck_lock",
         search_intent=BOTTLENECK_LOCK_INTENT,
         bottleneck_lock_required=True,
+        bottleneck_candidate_id=f"base_recovery:bottleneck_lock:{debt_id}",
         bottleneck_lock_signal=signal,
         diagnostic_cooldown_active=True,
         diagnostic_artifact_ids=list(signal.get("diagnostic_artifact_ids") or []),
@@ -4858,7 +9209,7 @@ def _bottleneck_lock_action(
             "route inventory without proof attempt",
             "management-only research_notebook",
             "new decomposition without assembly argument",
-            "restatement of an already accepted theorem without attacking the newest child debt",
+            "restatement of an already accepted theorem without attacking the newest derived proof obligation",
         ],
         hard_theorem_attack_contract={
             "prove_budget_fraction": 0.70,
@@ -4870,18 +9221,23 @@ def _bottleneck_lock_action(
     )
 
 
-def _bottleneck_lock_signal(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+def _bottleneck_lock_signals(state: Mapping[str, Any]) -> list[Dict[str, Any]]:
     if verifier_ready_route_summaries(state):
-        return None
+        return []
     debts = _bottleneck_lock_debt_candidates(state)
     if not debts:
-        return None
+        return []
     diagnostics = _recent_bottleneck_diagnostic_artifacts(state)
     diagnostic_count = len(diagnostics)
     eligible: list[Mapping[str, Any]] = []
     for debt in debts:
         repeated = int(debt.get("repeated_count") or 0)
-        decisive = bool(decisive_theorem_test_signal(state, debt_id=str(debt.get("debt_id") or "")))
+        decisive = bool(
+            is_decisive_theorem_test_obligation(debt)
+            and decisive_theorem_test_signal(
+                state, debt_id=str(debt.get("debt_id") or "")
+            )
+        )
         if repeated >= BOTTLENECK_LOCK_REPEAT_THRESHOLD:
             eligible.append(debt)
             continue
@@ -4891,32 +9247,52 @@ def _bottleneck_lock_signal(state: Mapping[str, Any]) -> Optional[Dict[str, Any]
         if diagnostic_count >= BOTTLENECK_LOCK_MIN_DIAGNOSTIC_ARTIFACTS:
             eligible.append(debt)
     if not eligible:
-        return None
-    debt = eligible[0]
-    target_id = _claim_target_for_debt(state, debt) or "root"
-    if not _claim(state, target_id):
-        target_id = "root"
-    repeated_count = int(debt.get("repeated_count") or 0)
-    trigger = "repeated_debt" if repeated_count >= BOTTLENECK_LOCK_REPEAT_THRESHOLD else "diagnostic_cooldown"
-    return {
-        "policy": "bottleneck-lock",
-        "trigger": trigger,
-        "target_id": target_id,
-        "debt_id": str(debt.get("debt_id") or ""),
-        "owner_type": str(debt.get("owner_type") or ""),
-        "owner_id": str(debt.get("owner_id") or ""),
-        "suggested_next_target": str(debt.get("suggested_next_target") or ""),
-        "debt_type": str(debt.get("debt_type") or ""),
-        "repeated_count": repeated_count,
-        "obligation": _compact_text(str(debt.get("obligation") or ""), 900),
-        "diagnostic_artifact_ids": [str(row.get("artifact_id") or "") for row in diagnostics[:6]],
-        "diagnostic_count": diagnostic_count,
-        "required_output": {
-            "primary": "proof_dossier, proof_blueprint, route_obstruction, construction_failure, exact citation, or one narrower theorem-level debt",
-            "forbidden": "broad diagnostic, route inventory, or management-only notebook as the main output",
-            "sublemma_policy": "if the theorem is too large, extract one verifier-checkable sublemma with an assembly argument",
-        },
-    }
+        return []
+    signals: list[Dict[str, Any]] = []
+    for debt in eligible:
+        target_id = _claim_target_for_debt(state, debt) or "root"
+        if not _claim(state, target_id):
+            target_id = "root"
+        repeated_count = int(debt.get("repeated_count") or 0)
+        trigger = (
+            "repeated_debt"
+            if repeated_count >= BOTTLENECK_LOCK_REPEAT_THRESHOLD
+            else "diagnostic_cooldown"
+        )
+        signals.append(
+            {
+                "policy": "bottleneck-lock",
+                "trigger": trigger,
+                "target_id": target_id,
+                "debt_id": str(debt.get("debt_id") or ""),
+                "owner_type": str(debt.get("owner_type") or ""),
+                "owner_id": str(debt.get("owner_id") or ""),
+                "suggested_next_target": str(
+                    debt.get("suggested_next_target") or ""
+                ),
+                "debt_type": str(debt.get("debt_type") or ""),
+                "repeated_count": repeated_count,
+                "obligation": _compact_text(
+                    str(debt.get("obligation") or ""), 900
+                ),
+                "diagnostic_artifact_ids": [
+                    str(row.get("artifact_id") or "")
+                    for row in diagnostics[:6]
+                ],
+                "diagnostic_count": diagnostic_count,
+                "required_output": {
+                    "primary": "proof draft, proof outline, approach obstruction, construction failure, exact citation, or one narrower theorem-level proof obligation",
+                    "forbidden": "broad diagnostic, route inventory, or management-only notebook as the main output",
+                    "sublemma_policy": "if the theorem is too large, extract one verifier-checkable sublemma with an assembly argument",
+                },
+            }
+        )
+    return signals
+
+
+def _bottleneck_lock_signal(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    signals = _bottleneck_lock_signals(state)
+    return signals[0] if signals else None
 
 
 def bottleneck_frontier_summary(state: Mapping[str, Any]) -> Dict[str, Any]:
@@ -5039,7 +9415,7 @@ def proof_spine_summary(state: Mapping[str, Any]) -> Dict[str, Any]:
     else:
         next_workflow_rule = (
             "Prefer a short verifier-checkable lemma chain. Convert proof-like artifacts into routes/inferences; "
-            "if blocked, name exactly one next theorem-level debt."
+            "if blocked, name exactly one next theorem-level proof obligation."
         )
     return {
         "policy": "active-proof-spine",
@@ -5109,7 +9485,7 @@ def _recent_proof_spine_artifacts(state: Mapping[str, Any], *, limit: int) -> li
 def _bottleneck_lock_debt_candidates(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     debts: list[Mapping[str, Any]] = []
     artifact_index = _artifact_index(state)
-    debt_coverage_index = DebtCoverageIndex(state)
+    debt_coverage_index = get_debt_coverage_index(state)
     canonical_frontier = minimal_active_debt_frontier(state)
     alias_to_primary = {
         str(alias): str(primary)
@@ -5431,13 +9807,13 @@ def _proof_architecture_pressure_signal(state: Mapping[str, Any]) -> Optional[Di
             for row in scored_routes[:8]
         ],
         "route_status_semantics": {
-            "blocked": "explicit route.status=blocked; the route is intentionally paused pending a central obstruction or proof debt",
+            "blocked": "explicit route.status=blocked; the proof approach is intentionally paused pending a central obstruction or proof obligation",
             "stalled": "heuristic health label; the route is still active but repeated blockers or failed attempts make ordinary proof construction low-value",
         },
         "required_output": {
             "current_best_plan": "name exactly one proof architecture to pursue now",
             "route_contracts": "for each kept route, state hypotheses, proof obligation, evidence needed, acceptance criteria, and abandonment criteria",
-            "bottleneck_obligation": "reduce the proof to the smallest named lemma/debt that would unlock the plan",
+            "bottleneck_obligation": "reduce the proof to the smallest named lemma or proof obligation that would unlock the plan",
             "repair_attempt": "try to repair the best existing route before opening a new trunk",
             "speculative_proof_attempt": "write a clearly labeled possible proof skeleton and mark unproved steps",
         },
@@ -5508,16 +9884,26 @@ def _creative_proof_attack_signal(state: Mapping[str, Any]) -> Optional[Dict[str
     if root and str(root.get("lifecycle_status") or "") == "integrated":
         return None
 
+    policy_index = build_graph_policy_index(state)
+
     partial_claims = [
         row for row in state.get("claims", [])
         if str(row.get("claim_id") or "") != "root"
-        and root_distance_for_claim_id(state, str(row.get("claim_id") or "")) <= 3
+        and root_distance_for_claim_id(
+            state,
+            str(row.get("claim_id") or ""),
+            policy_index=policy_index,
+        ) <= 3
         and str(row.get("validation_status") or "") in {"informally_verified", "formally_verified"}
     ]
     integrated_claims = [
         row for row in state.get("claims", [])
         if str(row.get("claim_id") or "") != "root"
-        and root_distance_for_claim_id(state, str(row.get("claim_id") or "")) <= 3
+        and root_distance_for_claim_id(
+            state,
+            str(row.get("claim_id") or ""),
+            policy_index=policy_index,
+        ) <= 3
         and str(row.get("lifecycle_status") or "") == "integrated"
     ]
     partial_credit_ids = {
@@ -5535,8 +9921,16 @@ def _creative_proof_attack_signal(state: Mapping[str, Any]) -> Optional[Dict[str
         and (
             str(row.get("owner_id") or "") == "root"
             or str(row.get("suggested_next_target") or "") == "root"
-            or root_distance_for_claim_id(state, str(row.get("owner_id") or "")) <= 3
-            or root_distance_for_claim_id(state, str(row.get("suggested_next_target") or "")) <= 3
+            or root_distance_for_claim_id(
+                state,
+                str(row.get("owner_id") or ""),
+                policy_index=policy_index,
+            ) <= 3
+            or root_distance_for_claim_id(
+                state,
+                str(row.get("suggested_next_target") or ""),
+                policy_index=policy_index,
+            ) <= 3
         )
     ]
     repeated_debts = [row for row in active_blocking_debts if int(row.get("repeated_count") or 0) >= 2]
@@ -5574,7 +9968,7 @@ def _creative_proof_attack_signal(state: Mapping[str, Any]) -> Optional[Dict[str
             "draft one full proof attempt with explicit gaps",
             "invert the central obstruction: ask what construction or theorem would evade it",
             "generate speculative bridge theorems with exact hypotheses and failure modes",
-            "own one bottleneck for the whole pass instead of scattering into many local debts",
+            "own one bottleneck for the whole pass instead of scattering into many local proof obligations",
             "compare one analogy from a nearby mathematical method and translate only if it yields a concrete lemma",
             "autopsy the strongest failed route and state the single reason it failed",
         ],
@@ -5869,15 +10263,14 @@ def _extract_missing_theorem(metadata: Mapping[str, Any], fallback_text: str) ->
     return fallback_text[index : index + 300]
 
 
-def _route_decision_triage_action(
+def _route_decision_triage_actions(
     state: Mapping[str, Any],
     *,
     problem: Mapping[str, Any],
     requested_tokens: Optional[int],
     research_mode: str,
-) -> Optional[Dict[str, Any]]:
-    last_triage = _last_intent_run(state, "route_triage")
-    triage_revision = int(last_triage.get("state_revision", -1) or -1) if last_triage else -1
+) -> list[Dict[str, Any]]:
+    actions: list[Dict[str, Any]] = []
     for artifact in state.get("research_artifacts", []):
         if str(artifact.get("artifact_type") or "") not in {"proof_dossier", "research_diagnostic"}:
             continue
@@ -5893,27 +10286,61 @@ def _route_decision_triage_action(
             continue
         if not any(term in route_decision for term in ("abandon", "pause", "replace")):
             continue
-        artifact_revision = int(artifact.get("state_revision", -1) or -1)
-        if triage_revision >= artifact_revision >= 0:
-            continue
         route_id = str(metadata.get("route_id") or "")
         if not route_id or not _route(state, route_id):
             continue
-        return _action(
-            "triage_routes",
-            "root",
-            route_id,
-            "route-killing obstruction dossier needs advisor decision before more proof search",
-            plan_step_budget(problem, "triage_routes", requested_tokens),
-            research_mode=research_mode,
-            route_triage_required=True,
-            route_triage_reason="route-killing obstruction dossier requested route pause, replacement, or abandonment",
-            route_decision_artifact_id=str(artifact.get("artifact_id") or ""),
-            route_decision=str(metadata.get("route_decision") or ""),
-            route_decision_classification=str(metadata.get("classification") or metadata.get("obstruction_classification") or ""),
-            search_intent="route_triage",
+        artifact_id = str(artifact.get("artifact_id") or "")
+        if _route_decision_already_triaged(state, artifact):
+            continue
+        if _recent_object_action_seen(
+            state,
+            intent="route_triage",
+            candidate_prefix="base_obligation:route_decision:",
+            subject_id=artifact_id,
+            window=6,
+            target_id="root",
+            route_id=route_id,
+        ):
+            continue
+        actions.append(
+            _action(
+                "triage_routes",
+                "root",
+                route_id,
+                "route-killing obstruction proof draft needs an advisor decision before more proof search",
+                plan_step_budget(problem, "triage_routes", requested_tokens),
+                research_mode=research_mode,
+                route_triage_required=True,
+                route_triage_reason="route-killing obstruction requested route pause, replacement, or abandonment",
+                route_decision_artifact_id=artifact_id,
+                route_decision=str(metadata.get("route_decision") or ""),
+                route_decision_classification=str(metadata.get("classification") or metadata.get("obstruction_classification") or ""),
+                search_intent="route_triage",
+            )
         )
-    return None
+    actions.sort(
+        key=lambda action: (
+            str(action.get("route_id") or ""),
+            str(action.get("route_decision_artifact_id") or ""),
+        )
+    )
+    return actions
+
+
+def _route_decision_triage_action(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _route_decision_triage_actions(
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
 
 
 def _route_pause_replacement_action(
@@ -5973,6 +10400,95 @@ def _latest_route_pause_report(state: Mapping[str, Any]) -> Optional[Mapping[str
     return None
 
 
+def _obstruction_route_conversion_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    actions: list[Dict[str, Any]] = []
+    for cluster in _obstruction_route_conversion_clusters(state):
+        target_id = str(cluster.get("target_id") or "root")
+        route_id = str(cluster.get("route_id") or _active_route_for_claim(state, target_id) or "")
+        cluster_key = f"{target_id}:{route_id or 'unrouted'}"
+        cluster_id = _obstruction_cluster_id(cluster)
+        if _recent_object_action_seen(
+            state,
+            intent=OBSTRUCTION_ROUTE_CONVERSION_INTENT,
+            candidate_prefix="base_obligation:obstruction_conversion:",
+            subject_id=cluster_id,
+            window=6,
+            target_id=target_id,
+            route_id=route_id,
+        ):
+            continue
+        mode = "reduce" if route_id else "prove"
+        recent_timeout = _recent_researcher_timeout_for_intent(
+            state,
+            intent=OBSTRUCTION_ROUTE_CONVERSION_INTENT,
+            target_id=target_id,
+            route_id=route_id,
+        )
+        global_obstruction_architecture = target_id == "root" and bool(
+            len(cluster.get("claim_ids", []) or [])
+            + len(cluster.get("artifact_ids", []) or [])
+            + len(cluster.get("debt_ids", []) or [])
+        )
+        budget_action = {
+            "target_id": target_id,
+            "route_id": route_id,
+            "research_attack_stage": "synthesis",
+            "search_intent": OBSTRUCTION_ROUTE_CONVERSION_INTENT,
+        }
+        common = {
+            "research_mode": research_mode,
+            "obstruction_route_conversion_required": True,
+            "obstruction_cluster_id": cluster_id,
+            "obstruction_cluster_key": cluster_key,
+            "obstruction_cluster": cluster,
+            "obstruction_claim_ids": cluster.get("claim_ids", []),
+            "obstruction_artifact_ids": cluster.get("artifact_ids", []),
+            "obstruction_debt_ids": cluster.get("debt_ids", []),
+            "obstruction_proof_obligation_ids": cluster.get("debt_ids", []),
+            "global_obstruction_architecture_required": global_obstruction_architecture,
+            "search_intent": OBSTRUCTION_ROUTE_CONVERSION_INTENT,
+        }
+        if recent_timeout:
+            actions.append(
+                _action(
+                    "triage_routes",
+                    target_id,
+                    route_id,
+                    "researcher obstruction conversion hit a stream-stall timeout; the advisor should make the compact route decision before replaying research",
+                    plan_action_budget(problem, "triage_routes", budget_action, requested_tokens),
+                    route_triage_required=True,
+                    advisor_obstruction_conversion_required=True,
+                    recent_researcher_timeout_run_id=str(recent_timeout.get("run_id") or ""),
+                    advisor_evidence_synthesis_required=True,
+                    research_attack_stage="triage_after_researcher_timeout",
+                    **common,
+                )
+            )
+            continue
+        actions.append(
+            _action(
+                mode,
+                target_id,
+                route_id,
+                "convert a serious obstruction into a route decision before continuing proof search",
+                plan_action_budget(problem, mode, budget_action, requested_tokens),
+                research_synthesis_required=True,
+                proof_repair_required=bool(route_id),
+                direct_solve_required=not bool(route_id),
+                needs_proof_dossier=True,
+                research_attack_stage="synthesis",
+                **common,
+            )
+        )
+    return actions
+
+
 def _obstruction_route_conversion_action(
     state: Mapping[str, Any],
     *,
@@ -5980,70 +10496,37 @@ def _obstruction_route_conversion_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    cluster = _obstruction_route_conversion_cluster(state)
-    if not cluster:
-        return None
-    target_id = str(cluster.get("target_id") or "root")
-    route_id = str(cluster.get("route_id") or _active_route_for_claim(state, target_id) or "")
-    mode = "reduce" if route_id else "prove"
-    recent_timeout = _recent_researcher_timeout_for_intent(
+    actions = _obstruction_route_conversion_actions(
         state,
-        intent=OBSTRUCTION_ROUTE_CONVERSION_INTENT,
-        target_id=target_id,
-        route_id=route_id,
-    )
-    global_obstruction_architecture = target_id == "root" and (
-        len(cluster.get("claim_ids", []) or [])
-        + len(cluster.get("artifact_ids", []) or [])
-        + len(cluster.get("debt_ids", []) or [])
-    ) >= 1
-    budget_action = {
-        "target_id": target_id,
-        "route_id": route_id,
-        "research_attack_stage": "synthesis",
-        "search_intent": OBSTRUCTION_ROUTE_CONVERSION_INTENT,
-    }
-    if recent_timeout:
-        return _action(
-            "triage_routes",
-            target_id,
-            route_id,
-            "researcher obstruction conversion hit a stream-stall timeout; PhD advisor should make the compact route decision before replaying research",
-            plan_action_budget(problem, "triage_routes", budget_action, requested_tokens),
-            research_mode=research_mode,
-            route_triage_required=True,
-            obstruction_route_conversion_required=True,
-            advisor_obstruction_conversion_required=True,
-            obstruction_cluster=cluster,
-            obstruction_claim_ids=cluster.get("claim_ids", []),
-            obstruction_artifact_ids=cluster.get("artifact_ids", []),
-            obstruction_debt_ids=cluster.get("debt_ids", []),
-            recent_researcher_timeout_run_id=str(recent_timeout.get("run_id") or ""),
-            advisor_evidence_synthesis_required=True,
-            global_obstruction_architecture_required=global_obstruction_architecture,
-            research_attack_stage="triage_after_researcher_timeout",
-            search_intent=OBSTRUCTION_ROUTE_CONVERSION_INTENT,
-        )
-    return _action(
-        mode,
-        target_id,
-        route_id,
-        "convert a serious obstruction into a route decision before continuing proof search",
-        plan_action_budget(problem, mode, budget_action, requested_tokens),
+        problem=problem,
+        requested_tokens=requested_tokens,
         research_mode=research_mode,
-        research_synthesis_required=True,
-        obstruction_route_conversion_required=True,
-        obstruction_cluster=cluster,
-        obstruction_claim_ids=cluster.get("claim_ids", []),
-        obstruction_artifact_ids=cluster.get("artifact_ids", []),
-        obstruction_debt_ids=cluster.get("debt_ids", []),
-        proof_repair_required=bool(route_id),
-        direct_solve_required=not bool(route_id),
-        global_obstruction_architecture_required=global_obstruction_architecture,
-        needs_proof_dossier=True,
-        research_attack_stage="synthesis",
-        search_intent=OBSTRUCTION_ROUTE_CONVERSION_INTENT,
     )
+    return actions[0] if actions else None
+
+
+def _obstruction_cluster_id(cluster: Mapping[str, Any]) -> str:
+    """Content-versioned identity for one target/route obstruction cluster."""
+
+    target_id = str(cluster.get("target_id") or "root")
+    route_id = str(cluster.get("route_id") or "unrouted")
+    version = action_sha256(
+        {
+            "target_id": target_id,
+            "route_id": route_id,
+            "claim_ids": sorted(str(item) for item in cluster.get("claim_ids", [])),
+            "artifact_ids": sorted(
+                str(item) for item in cluster.get("artifact_ids", [])
+            ),
+            "obligation_ids": sorted(
+                str(item) for item in cluster.get("debt_ids", [])
+            ),
+            "newest_state_revision": _revision_number(
+                cluster.get("newest_state_revision")
+            ),
+        }
+    )[:16]
+    return f"{target_id}:{route_id or 'unrouted'}:{version}"
 
 
 def _obstruction_conversion_matches_blocking_debt(
@@ -6066,6 +10549,70 @@ def _obstruction_conversion_matches_blocking_debt(
     evidence_ids = {str(item) for item in action.get("obstruction_artifact_ids", []) if str(item)}
     evidence_ids.update(str(item) for item in action.get("obstruction_cluster", {}).get("evidence_artifact_ids", []) if str(item))
     return bool(source_ids and source_ids.intersection(evidence_ids))
+
+
+@dataclass(frozen=True)
+class BlockingObstructionMatchIndex:
+    target_ids: frozenset[str]
+    route_ids: frozenset[str]
+    obligation_ids: frozenset[str]
+    source_artifact_ids: frozenset[str]
+
+
+def _blocking_obstruction_match_index(
+    state: Mapping[str, Any], obligations: Sequence[Mapping[str, Any]]
+) -> BlockingObstructionMatchIndex:
+    target_ids: set[str] = set()
+    route_ids: set[str] = set()
+    obligation_ids: set[str] = set()
+    source_artifact_ids: set[str] = set()
+    for obligation in obligations:
+        target_id = str(_claim_target_for_debt(state, obligation) or "")
+        route_id = _route_for_debt(state, obligation, target_id)
+        if target_id:
+            target_ids.add(target_id)
+        if route_id:
+            route_ids.add(route_id)
+        obligation_id = str(obligation.get("debt_id") or "")
+        if obligation_id:
+            obligation_ids.add(obligation_id)
+        source_artifact_ids.update(
+            str(item)
+            for item in _json_list(obligation.get("source_artifact_ids_json"))
+            if str(item)
+        )
+    return BlockingObstructionMatchIndex(
+        target_ids=frozenset(target_ids),
+        route_ids=frozenset(route_ids),
+        obligation_ids=frozenset(obligation_ids),
+        source_artifact_ids=frozenset(source_artifact_ids),
+    )
+
+
+def _obstruction_matches_blocking_index(
+    action: Mapping[str, Any], index: BlockingObstructionMatchIndex
+) -> bool:
+    if str(action.get("route_id") or "") in index.route_ids:
+        return True
+    if str(action.get("target_id") or "") in index.target_ids:
+        return True
+    if index.obligation_ids.intersection(
+        str(item) for item in action.get("obstruction_debt_ids", []) if str(item)
+    ):
+        return True
+    evidence_ids = {
+        str(item)
+        for item in action.get("obstruction_artifact_ids", [])
+        if str(item)
+    }
+    cluster = action.get("obstruction_cluster")
+    if isinstance(cluster, Mapping):
+        evidence_ids.update(
+            str(item)
+            for item in cluster.get("evidence_artifact_ids", [])
+            if str(item)
+        )
+    return bool(index.source_artifact_ids.intersection(evidence_ids))
 
 
 def _recent_researcher_timeout_for_intent(
@@ -6159,10 +10706,10 @@ def _recent_researcher_stream_stall(
     return None
 
 
-def _obstruction_route_conversion_cluster(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+def _obstruction_route_conversion_clusters(state: Mapping[str, Any]) -> list[Dict[str, Any]]:
     signals = _unconverted_obstruction_signals(state)
     if not signals:
-        return None
+        return []
     grouped: dict[tuple[str, str], list[Dict[str, Any]]] = {}
     for signal in signals:
         target_id = str(signal.get("target_id") or "root")
@@ -6181,38 +10728,53 @@ def _obstruction_route_conversion_cluster(state: Mapping[str, Any]) -> Optional[
         )
         candidates.append((root_impact, newest_revision, len(group), target_id != "root", target_id, route_id, tie_key, group))
     candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4], item[5], item[6]))
-    root_impact, newest_revision, _count, _nonroot, target_id, route_id, _tie_key, group = candidates[0]
-    return {
-        "policy": "obstruction-to-route-conversion",
-        "target_id": target_id,
-        "route_id": route_id,
-        "count": len(group),
-        "max_root_impact": root_impact,
-        "newest_state_revision": newest_revision,
-        "signal_types": sorted({str(item.get("signal_type") or "") for item in group if item.get("signal_type")}),
-        "claim_ids": sorted({str(item.get("claim_id") or "") for item in group if item.get("claim_id")}),
-        "artifact_ids": sorted({str(item.get("artifact_id") or "") for item in group if item.get("artifact_id")}),
-        "debt_ids": sorted({str(item.get("debt_id") or "") for item in group if item.get("debt_id")}),
-        "evidence_artifact_ids": sorted(
-            {
-                str(evidence_id)
-                for item in group
-                for evidence_id in item.get("evidence_artifact_ids", [])
-                if str(evidence_id)
-            }
-        ),
-        "conversion_choices": [
-            "route_killing_obstruction",
-            "route_repair_signal",
-            "missing_hypothesis",
-            "generalized_construction_needed",
-            "candidate_counterexample_needs_validation",
-        ],
-    }
+    return [
+        {
+            "policy": "obstruction-to-route-conversion",
+            "target_id": target_id,
+            "route_id": route_id,
+            "count": len(group),
+            "max_root_impact": root_impact,
+            "newest_state_revision": newest_revision,
+            "signal_types": sorted({str(item.get("signal_type") or "") for item in group if item.get("signal_type")}),
+            "claim_ids": sorted({str(item.get("claim_id") or "") for item in group if item.get("claim_id")}),
+            "artifact_ids": sorted({str(item.get("artifact_id") or "") for item in group if item.get("artifact_id")}),
+            "debt_ids": sorted({str(item.get("debt_id") or "") for item in group if item.get("debt_id")}),
+            "evidence_artifact_ids": sorted(
+                {
+                    str(evidence_id)
+                    for item in group
+                    for evidence_id in item.get("evidence_artifact_ids", [])
+                    if str(evidence_id)
+                }
+            ),
+            "conversion_choices": [
+                "route_killing_obstruction",
+                "route_repair_signal",
+                "missing_hypothesis",
+                "generalized_construction_needed",
+                "candidate_counterexample_needs_validation",
+            ],
+        }
+        for (
+            root_impact,
+            newest_revision,
+            _count,
+            _nonroot,
+            target_id,
+            route_id,
+            _tie_key,
+            group,
+        ) in candidates
+    ]
+
+
+def _obstruction_route_conversion_cluster(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    clusters = _obstruction_route_conversion_clusters(state)
+    return clusters[0] if clusters else None
 
 
 def _unconverted_obstruction_signals(state: Mapping[str, Any]) -> list[Dict[str, Any]]:
-    last_conversion = _last_intent_run(state, OBSTRUCTION_ROUTE_CONVERSION_INTENT)
     artifact_by_id = {
         str(row.get("artifact_id") or ""): row
         for row in state.get("research_artifacts", [])
@@ -6228,7 +10790,7 @@ def _unconverted_obstruction_signals(state: Mapping[str, Any]) -> list[Dict[str,
         if str(claim.get("validation_status") or "") in {"informally_verified", "formally_verified", "refuted"}:
             continue
         signal = _obstruction_claim_signal(state, claim, artifact_by_id)
-        if signal and not _obstruction_signal_already_converted(signal, last_conversion):
+        if signal and not _obstruction_signal_already_converted(state, signal):
             signals.append(signal)
 
     for artifact in state.get("research_artifacts", []):
@@ -6237,12 +10799,12 @@ def _unconverted_obstruction_signals(state: Mapping[str, Any]) -> list[Dict[str,
         if not _artifact_is_obstruction_signal(artifact):
             continue
         signal = _obstruction_artifact_signal(state, artifact)
-        if signal and not _obstruction_signal_already_converted(signal, last_conversion):
+        if signal and not _obstruction_signal_already_converted(state, signal):
             signals.append(signal)
 
     for debt_row in state.get("debts", []):
         signal = _obstruction_debt_signal(state, debt_row, artifact_by_id)
-        if signal and not _obstruction_signal_already_converted(signal, last_conversion):
+        if signal and not _obstruction_signal_already_converted(state, signal):
             signals.append(signal)
 
     return signals
@@ -6335,6 +10897,33 @@ def _artifact_is_obstruction_signal(artifact: Mapping[str, Any]) -> bool:
     if artifact_type in ROUTE_OBSTRUCTION_ARTIFACT_TYPES:
         return True
     metadata = _json_object(artifact.get("metadata_json"))
+    if metadata.get("route_decision") and "route_killing_obstruction" in str(
+        metadata.get("classification")
+        or metadata.get("obstruction_classification")
+        or ""
+    ).lower():
+        # The obstruction has already been converted into a concrete routing
+        # recommendation; route-decision triage owns this object.
+        return False
+    if (
+        metadata.get("obstruction_cluster_id")
+        and any(
+            metadata.get(key)
+            for key in (
+                "obstruction_claim_ids",
+                "obstruction_artifact_ids",
+                "obstruction_debt_ids",
+                "obstruction_obligation_ids",
+                "obstruction_proof_obligation_ids",
+            )
+        )
+        and metadata.get("new_obstruction_signal") is not True
+    ):
+        # This is a durable response to a previously enumerated obstruction
+        # cluster, not fresh evidence. A genuinely new obstruction must be
+        # emitted explicitly (preferably as route_obstruction) or opt in with
+        # new_obstruction_signal=true.
+        return False
     status = str(metadata.get("status") or metadata.get("classification") or metadata.get("conclusion") or "").lower()
     text = " ".join(
         [
@@ -6453,16 +11042,148 @@ def _run_is_at_or_after(run: Mapping[str, Any], reference: Mapping[str, Any]) ->
     return bool(run_created_at and reference_created_at and run_created_at >= reference_created_at)
 
 
-def _obstruction_signal_already_converted(signal: Mapping[str, Any], last_conversion: Mapping[str, Any] | None) -> bool:
-    if not last_conversion:
+@dataclass(frozen=True)
+class RoutingCompletionIndex:
+    """Durable, revision-aware responses to routing work items."""
+
+    route_decision_revisions: Mapping[str, int]
+    obstruction_cluster_revisions: Mapping[str, int]
+    obstruction_claim_revisions: Mapping[str, int]
+    obstruction_artifact_revisions: Mapping[str, int]
+    obstruction_obligation_revisions: Mapping[str, int]
+
+
+def _routing_completion_index(state: Mapping[str, Any]) -> RoutingCompletionIndex:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("routing_completion_index")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, RoutingCompletionIndex):
+        return cached
+
+    route_decision_revisions: dict[str, int] = {}
+    obstruction_cluster_revisions: dict[str, int] = {}
+    obstruction_claim_revisions: dict[str, int] = {}
+    obstruction_artifact_revisions: dict[str, int] = {}
+    obstruction_obligation_revisions: dict[str, int] = {}
+
+    def record(index: dict[str, int], identifiers: Iterable[str], revision: int) -> None:
+        for identifier in identifiers:
+            identifier = str(identifier or "").strip()
+            if identifier:
+                index[identifier] = max(index.get(identifier, -1), revision)
+
+    for artifact in state.get("research_artifacts", []):
+        artifact_type = str(artifact.get("artifact_type") or "")
+        metadata = _json_object(artifact.get("metadata_json"))
+        revision = _revision_number(artifact.get("state_revision"))
+        if artifact_type in {"route_triage_report", "advisor_report"}:
+            record(
+                route_decision_revisions,
+                _metadata_strings(
+                    metadata,
+                    "route_decision_artifact_id",
+                    "route_decision_artifact_ids",
+                ),
+                revision,
+            )
+        if artifact_type not in {
+            "proof_dossier",
+            "proof_blueprint",
+            "research_notebook",
+            "research_diagnostic",
+            "route_triage_report",
+            "advisor_report",
+        }:
+            continue
+        record(
+            obstruction_cluster_revisions,
+            _metadata_strings(metadata, "obstruction_cluster_id"),
+            revision,
+        )
+        record(
+            obstruction_claim_revisions,
+            _metadata_strings(metadata, "obstruction_claim_ids"),
+            revision,
+        )
+        record(
+            obstruction_artifact_revisions,
+            _metadata_strings(metadata, "obstruction_artifact_ids"),
+            revision,
+        )
+        record(
+            obstruction_obligation_revisions,
+            _metadata_strings(
+                metadata,
+                "obstruction_debt_ids",
+                "obstruction_obligation_ids",
+                "obstruction_proof_obligation_ids",
+            ),
+            revision,
+        )
+
+    result = RoutingCompletionIndex(
+        route_decision_revisions=route_decision_revisions,
+        obstruction_cluster_revisions=obstruction_cluster_revisions,
+        obstruction_claim_revisions=obstruction_claim_revisions,
+        obstruction_artifact_revisions=obstruction_artifact_revisions,
+        obstruction_obligation_revisions=obstruction_obligation_revisions,
+    )
+    if isinstance(cache, dict):
+        cache["routing_completion_index"] = result
+    return result
+
+
+def _response_is_current(response_revision: int | None, source_revision: int) -> bool:
+    if response_revision is None:
         return False
-    signal_revision = int(signal.get("state_revision", -1) or -1)
-    conversion_revision = int(last_conversion.get("state_revision", -1) or -1)
-    if signal_revision >= 0 and conversion_revision >= signal_revision:
+    if source_revision < 0:
         return True
-    signal_time = str(signal.get("created_at") or "")
-    conversion_time = str(last_conversion.get("created_at") or "")
-    return bool(signal_time and conversion_time and conversion_time >= signal_time)
+    return response_revision >= source_revision
+
+
+def _route_decision_already_triaged(
+    state: Mapping[str, Any], artifact: Mapping[str, Any]
+) -> bool:
+    artifact_id = str(artifact.get("artifact_id") or "")
+    if not artifact_id:
+        return False
+    response_revision = _routing_completion_index(
+        state
+    ).route_decision_revisions.get(artifact_id)
+    return _response_is_current(
+        response_revision, _revision_number(artifact.get("state_revision"))
+    )
+
+
+def _obstruction_signal_already_converted(
+    state: Mapping[str, Any], signal: Mapping[str, Any]
+) -> bool:
+    index = _routing_completion_index(state)
+    target_id = str(signal.get("target_id") or "root")
+    route_id = str(signal.get("route_id") or "")
+    cluster_key = f"{target_id}:{route_id or 'unrouted'}"
+    revisions: list[int] = []
+    for field, revision_index in (
+        ("claim_id", index.obstruction_claim_revisions),
+        ("artifact_id", index.obstruction_artifact_revisions),
+        ("debt_id", index.obstruction_obligation_revisions),
+    ):
+        identifier = str(signal.get(field) or "")
+        if identifier in revision_index:
+            revisions.append(revision_index[identifier])
+    # Exact member identifiers are the authoritative completion binding. The
+    # legacy unversioned target/route key remains accepted for old responses;
+    # a current content-versioned cluster id is evaluated after grouping.
+    if cluster_key in index.obstruction_cluster_revisions:
+        revisions.append(index.obstruction_cluster_revisions[cluster_key])
+    if not revisions:
+        return False
+    return _response_is_current(
+        max(revisions), _revision_number(signal.get("state_revision"))
+    )
 
 
 def _route_proof_construction_action(
@@ -6524,6 +11245,34 @@ def _should_deep_research(state: Mapping[str, Any], target_id: str) -> bool:
     return root_distance_for_claim_id(state, target_id) <= 2 or float(claim.get("root_impact", 0.0) or 0.0) >= 0.75
 
 
+def _route_proof_construction_quota_actions(
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    actions: list[Dict[str, Any]] = []
+    for route in _routes_without_inference(state):
+        target_id = str(route.get("conclusion_claim_id") or "root")
+        route_id = str(route.get("route_id") or "")
+        if _recent_route_proof_attempt_seen(
+            state, target_id=target_id, route_id=route_id, window=5
+        ):
+            continue
+        actions.append(
+            _route_proof_construction_action(
+                state,
+                route,
+                problem=problem,
+                requested_tokens=requested_tokens,
+                research_mode=research_mode,
+                reason="proof-attempt quota: construct the active route proof before further reduction or decomposition",
+            )
+        )
+    return actions
+
+
 def _route_proof_construction_quota_action(
     state: Mapping[str, Any],
     *,
@@ -6531,21 +11280,13 @@ def _route_proof_construction_quota_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    route = _route_without_inference(state)
-    if not route:
-        return None
-    target_id = str(route.get("conclusion_claim_id") or "root")
-    route_id = str(route.get("route_id") or "")
-    if _recent_route_proof_attempt_seen(state, target_id=target_id, route_id=route_id, window=5):
-        return None
-    return _route_proof_construction_action(
+    actions = _route_proof_construction_quota_actions(
         state,
-        route,
         problem=problem,
         requested_tokens=requested_tokens,
         research_mode=research_mode,
-        reason="proof-attempt quota: construct the active route proof before further reduction or decomposition",
     )
+    return actions[0] if actions else None
 
 
 def _recent_route_proof_attempt_seen(state: Mapping[str, Any], *, target_id: str, route_id: str, window: int) -> bool:
@@ -6698,8 +11439,8 @@ def _circling_redirect_action(
     """Anti-circling breaker.
 
     When the researcher has repeated the same pass on a target with no new verified
-    result, (1) raise an async human blocker (the dashboard surfaces it; the human can
-    steer without halting the run) and (2) force the advisor to *redirect* — decompose a
+    result, (1) request an async human blocker if this action wins selection and (2)
+    force the advisor to *redirect* — decompose a
     tractable subgoal or abandon the route for a different construction — instead of the
     no-content guard's default of re-issuing another prove. If the advisor has already
     been handed the wheel ``CIRCLING_ADVISOR_MAX`` times without breaking the loop, stop
@@ -6715,31 +11456,6 @@ def _circling_redirect_action(
         return None
     target_id = stall["target_id"]
     route_id = stall["route_id"] or _active_route_for_claim(state, target_id) or ""
-
-    try:
-        steering.raise_blocker(
-            store.state_dir,
-            kind="stall",
-            target_id=target_id,
-            summary=(
-                f"{stall['count']} consecutive research passes on '{target_id}' with no new "
-                "verified result — the researcher appears stuck."
-            ),
-            detail=(
-                "Modes tried: " + ", ".join(dict.fromkeys(stall["modes"])) + ". "
-                "Pick a direction: decompose into a tractable subgoal, abandon this route for a "
-                "different construction, or type specific guidance."
-            ),
-            options=[
-                "decompose into a tractable subgoal",
-                "abandon route & try another construction",
-                "(type your own guidance)",
-            ],
-            fingerprint=f"stall:{target_id}",
-            revision=int(problem.get("current_revision") or 0),
-        )
-    except Exception:
-        pass
 
     if stall["advisor_passes"] >= CIRCLING_ADVISOR_MAX:
         return None
@@ -6759,17 +11475,37 @@ def _circling_redirect_action(
         role_starvation_recovery=researcher_only,
         researcher_only_streak=int(stall.get("count") or 0) if researcher_only else 0,
         search_intent=CIRCLING_INTENT,
+        human_blocker_request={
+            "kind": "stall",
+            "target_id": target_id,
+            "summary": (
+                f"{stall['count']} consecutive research passes on '{target_id}' with no new "
+                "verified result — the researcher appears stuck."
+            ),
+            "detail": (
+                "Modes tried: " + ", ".join(dict.fromkeys(stall["modes"])) + ". "
+                "Pick a direction: decompose into a tractable subgoal, abandon this route for a "
+                "different construction, or type specific guidance."
+            ),
+            "options": [
+                "decompose into a tractable subgoal",
+                "abandon route & try another construction",
+                "(type your own guidance)",
+            ],
+            "fingerprint": f"stall:{target_id}",
+            "revision": int(problem.get("current_revision") or 0),
+        },
     )
 
 
-def _counterexample_validation_action(
+def _counterexample_validation_actions(
     store: ProofStateStore,
     state: Mapping[str, Any],
     *,
     problem: Mapping[str, Any],
     requested_tokens: Optional[int],
     research_mode: str,
-) -> Optional[Dict[str, Any]]:
+) -> list[Dict[str, Any]]:
     """Force independent validation of a villain's candidate counterexample.
 
     The villain records a candidate_counterexample (marking the claim 'challenged'),
@@ -6780,6 +11516,40 @@ def _counterexample_validation_action(
     refuted-root guard then turns into a goal revision.
     """
     recent = list(state.get("recent_runs", []))[:8]
+    recently_validated_candidate_ids: set[str] = set()
+    legacy_validated_targets: set[str] = set()
+    observation_sequence = _recent_candidate_observation_sequence(state)
+    candidate_prefix = "base_verification:counterexample_validation:"
+    for run, observations in zip(recent, observation_sequence):
+        if (
+            str(run.get("mode") or "") != "validate_counterexample"
+            or str(run.get("status") or "")
+            in {
+                "failed",
+                "timeout",
+                "no_patch",
+                "cancelled",
+                "patch_rejected",
+            }
+        ):
+            continue
+        exact_ids = {
+            candidate_id.removeprefix(candidate_prefix)
+            for candidate_id, (row, ancestors_selected) in observations.items()
+            if candidate_id.startswith(candidate_prefix)
+            and ancestors_selected
+            and str(row.get("disposition") or "") == "selected"
+            and candidate_id.removeprefix(candidate_prefix)
+        }
+        if exact_ids:
+            recently_validated_candidate_ids.update(exact_ids)
+        else:
+            # v6 and observational runs did not identify the selected
+            # counterexample artifact. Preserve their bounded target-level
+            # cooldown without applying that ambiguity to v7 traces.
+            legacy_target = str(run.get("target_id") or "")
+            if legacy_target:
+                legacy_validated_targets.add(legacy_target)
     durably_confirmed_candidate_refs: set[str] = set()
     candidate_rows = [
         artifact
@@ -6815,7 +11585,7 @@ def _counterexample_validation_action(
                     confirmed_candidate_refs.add(ref_text)
                     durably_confirmed_candidate_refs.add(ref_text)
         if any(
-            candidate_id == ref or candidate_id in ref
+            _artifact_reference_matches_id(ref, candidate_id)
             for candidate_id in candidate_ids
             for ref in confirmed_candidate_refs
         ):
@@ -6869,28 +11639,35 @@ def _counterexample_validation_action(
         if target == "root" and statement_is_interrogative_problem(str(claim.get("statement") or "")):
             continue
         unreconciled_confirmations.append((target, confirmed))
-    if unreconciled_confirmations:
-        unreconciled_confirmations.sort(
-            key=lambda item: (
-                0 if item[0] == "root" else 1,
-                -_revision_number(item[1].get("state_revision")),
-            )
+    unreconciled_confirmations.sort(
+        key=lambda item: (
+            0 if item[0] == "root" else 1,
+            -_revision_number(item[1].get("state_revision")),
+            str(item[1].get("artifact_id") or ""),
         )
-        target, confirmed = unreconciled_confirmations[0]
+    )
+    actions: list[Dict[str, Any]] = []
+    seen_artifact_ids: set[str] = set()
+    for target, confirmed in unreconciled_confirmations:
         artifact_id = str(confirmed.get("artifact_id") or "")
-        return _action(
-            "validate_counterexample",
-            target,
-            "",
-            "a confirmed counterexample already exists, but the falsified declarative claim is still not marked refuted; reconcile the status using the existing confirmation",
-            plan_step_budget(problem, "validate_counterexample", requested_tokens),
-            research_mode=research_mode,
-            counterexample_validation_required=True,
-            counterexample_status_reconciliation_required=True,
-            candidate_counterexample_artifact_id=artifact_id,
-            confirmed_counterexample_artifact_id=artifact_id,
-            validation_evidence_artifact_ids=[artifact_id],
-            search_intent="counterexample_status_reconciliation",
+        if not artifact_id or artifact_id in seen_artifact_ids:
+            continue
+        seen_artifact_ids.add(artifact_id)
+        actions.append(
+            _action(
+                "validate_counterexample",
+                target,
+                "",
+                "a confirmed counterexample already exists, but the falsified declarative claim is still not marked refuted; reconcile the status using the existing confirmation",
+                plan_step_budget(problem, "validate_counterexample", requested_tokens),
+                research_mode=research_mode,
+                counterexample_validation_required=True,
+                counterexample_status_reconciliation_required=True,
+                candidate_counterexample_artifact_id=artifact_id,
+                confirmed_counterexample_artifact_id=artifact_id,
+                validation_evidence_artifact_ids=[artifact_id],
+                search_intent="counterexample_status_reconciliation",
+            )
         )
     pending: list = []
     for art in state.get("research_artifacts", []):
@@ -6898,7 +11675,7 @@ def _counterexample_validation_action(
             continue
         candidate_artifact_id = str(art.get("artifact_id") or "")
         if candidate_artifact_id and any(
-            candidate_artifact_id == ref or candidate_artifact_id in ref
+            _artifact_reference_matches_id(ref, candidate_artifact_id)
             for ref in durably_confirmed_candidate_refs
         ):
             continue
@@ -6909,50 +11686,105 @@ def _counterexample_validation_action(
         if str(claim.get("validation_status") or "") in {"refuted", "informally_verified", "formally_verified"}:
             continue
         artifact_revision = _revision_number(art.get("state_revision"))
-        if any(
+        if candidate_artifact_id in recently_validated_candidate_ids:
+            continue
+        if target in legacy_validated_targets and any(
             str(run.get("mode") or "") == "validate_counterexample"
             and str(run.get("target_id") or "") == target
-            and str(run.get("status") or "") == "completed"
-            and _revision_number(run.get("state_revision")) >= artifact_revision
+            and str(run.get("status") or "")
+            not in {
+                "failed",
+                "timeout",
+                "no_patch",
+                "cancelled",
+                "patch_rejected",
+            }
+            and _revision_number(run.get("state_revision"))
+            >= artifact_revision
             for run in recent
         ):
             continue
         pending.append((target, art))
-    if not pending:
-        return None
-    pending.sort(key=lambda item: 0 if item[0] == "root" else 1)  # root-threats first
-    target, art = pending[0]
-    is_root = target == "root"
-    root_claim = _claim(state, "root") if is_root else None
-    root_is_question = bool(
-        root_claim and statement_is_interrogative_problem(str(root_claim.get("statement") or ""))
-    )
-    return _action(
-        "validate_counterexample",
-        target,
-        "",
-        f"the villain flagged a candidate counterexample against '{target}'; validate it independently — "
-        + (
-            "construct/confirm the concrete instance as root-level partial evidence, or reject it with reasons."
-            if root_is_question
-            else "construct/confirm a concrete instance and propose refuted, or reject it with reasons."
+    pending.sort(
+        key=lambda item: (
+            0 if item[0] == "root" else 1,
+            -_revision_number(item[1].get("state_revision")),
+            str(item[1].get("artifact_id") or ""),
         )
-        + (
-            " It is root-level evidence for an interrogative problem: if confirmed, record the exact narrower conjecture it falsifies, "
-            "but keep the root question active."
-            if root_is_question
-            else " It targets the ROOT: if confirmed, the root must be revised, so resolve it before more proving."
-            if is_root
-            else ""
-        ),
-        plan_step_budget(problem, "validate_counterexample", requested_tokens),
-        research_mode=research_mode,
-        counterexample_validation_required=True,
-        candidate_counterexample_artifact_id=str(art.get("artifact_id") or ""),
-        allow_root_refutation=is_root and not root_is_question,
-        root_is_interrogative_problem=root_is_question,
-        search_intent="counterexample_validation",
     )
+    for target, art in pending:
+        artifact_id = str(art.get("artifact_id") or "")
+        if not artifact_id or artifact_id in seen_artifact_ids:
+            continue
+        seen_artifact_ids.add(artifact_id)
+        is_root = target == "root"
+        root_claim = _claim(state, "root") if is_root else None
+        root_is_question = bool(
+            root_claim
+            and statement_is_interrogative_problem(
+                str(root_claim.get("statement") or "")
+            )
+        )
+        actions.append(
+            _action(
+                "validate_counterexample",
+                target,
+                "",
+                f"the adversarial reviewer flagged a candidate counterexample against '{target}'; validate it independently — "
+                + (
+                    "construct/confirm the concrete instance as root-level partial evidence, or reject it with reasons."
+                    if root_is_question
+                    else "construct/confirm a concrete instance and propose refuted, or reject it with reasons."
+                )
+                + (
+                    " It is root-level evidence for an interrogative problem: if confirmed, record the exact narrower conjecture it falsifies, "
+                    "but keep the root question active."
+                    if root_is_question
+                    else " It targets the ROOT: if confirmed, the root must be revised, so resolve it before more proving."
+                    if is_root
+                    else ""
+                ),
+                plan_step_budget(
+                    problem, "validate_counterexample", requested_tokens
+                ),
+                research_mode=research_mode,
+                counterexample_validation_required=True,
+                candidate_counterexample_artifact_id=artifact_id,
+                allow_root_refutation=is_root and not root_is_question,
+                root_is_interrogative_problem=root_is_question,
+                search_intent="counterexample_validation",
+            )
+        )
+    return actions
+
+
+def _artifact_reference_matches_id(reference: str, artifact_id: str) -> bool:
+    """Match an artifact id exactly, including a path that names its file."""
+
+    if not reference or not artifact_id:
+        return False
+    if reference == artifact_id:
+        return True
+    basename = reference.replace("\\", "/").rsplit("/", 1)[-1]
+    return basename == artifact_id or basename.startswith(f"{artifact_id}.")
+
+
+def _counterexample_validation_action(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    actions = _counterexample_validation_actions(
+        store,
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
 
 
 def _advisor_requested_validation_action(
@@ -6969,7 +11801,7 @@ def _advisor_requested_validation_action(
     another prove/refute wave.  Route candidate-counterexample validation through
     the dedicated validator before executive proof work.
     """
-    report = _advisor_followup_report(state)
+    report = _current_advisor_directive_report(state)
     if not report:
         return None
     metadata = _json_object(report.get("metadata_json"))
@@ -6979,13 +11811,6 @@ def _advisor_requested_validation_action(
         return None
 
     report_revision = _revision_number(report.get("state_revision"))
-    if any(
-        str(run.get("mode") or "") == "validate_counterexample"
-        and _revision_number(run.get("state_revision")) >= report_revision
-        for run in state.get("recent_runs", [])
-    ):
-        return None
-
     target_id = _explicit_advisor_next_target_id(state, metadata) or _target_id_from_metadata(
         state, metadata, fallback="root"
     )
@@ -6993,6 +11818,21 @@ def _advisor_requested_validation_action(
         target_id = "root"
     target_claim = _claim(state, target_id)
     if target_claim and str(target_claim.get("validation_status") or "") == "refuted":
+        return None
+    if any(
+        str(run.get("mode") or "") == "validate_counterexample"
+        and str(run.get("target_id") or "") == target_id
+        and str(run.get("status") or "")
+        not in {
+            "failed",
+            "timeout",
+            "no_patch",
+            "cancelled",
+            "patch_rejected",
+        }
+        and _revision_number(run.get("state_revision")) >= report_revision
+        for run in state.get("recent_runs", [])
+    ):
         return None
     report_id = str(report.get("artifact_id") or "")
     advisor_debt_ids = set(_advisor_referenced_debt_ids(metadata))
@@ -7080,22 +11920,9 @@ def _advisor_requested_strict_verifier_action(
     name ``strict_informal_verifier`` was not a recognized scheduler handoff;
     the planner could therefore launch unrelated research instead.
     """
-    reports = [
-        artifact
-        for artifact in state.get("research_artifacts", [])
-        if str(artifact.get("artifact_type") or "") == ADVISOR_REPORT_ARTIFACT_TYPE
-        and str(artifact.get("producer_role") or "") == "phd_advisor"
-    ]
-    if not reports:
+    report = _current_advisor_directive_report(state)
+    if not report:
         return None
-    reports.sort(
-        key=lambda artifact: (
-            _revision_number(artifact.get("state_revision")),
-            str(artifact.get("artifact_id") or ""),
-        ),
-        reverse=True,
-    )
-    report = reports[0]
     metadata = _json_object(report.get("metadata_json"))
     next_role = str(metadata.get("next_role") or "").strip().lower()
     classification = str(metadata.get("classification") or "").strip().lower()
@@ -7159,7 +11986,7 @@ def _advisor_requested_strict_verifier_action(
         target_id,
         route_id,
         "PhD advisor explicitly assigned the next decisive route check to the strict informal verifier",
-        plan_step_budget(problem, "prove", requested_tokens),
+        _strict_verifier_budget(problem, requested_tokens),
         research_mode=research_mode,
         route_readiness=readiness,
         verify_ready_route_policy=True,
@@ -7196,42 +12023,33 @@ def _advisor_requested_villain_action(
     advisor report with ``next_role=villain`` could be converted into the
     executive lock's hard-coded researcher proof action.
     """
-    candidates: list[tuple[int, str, Mapping[str, Any], Mapping[str, Any]]] = []
-    for artifact in state.get("research_artifacts", []):
-        if str(artifact.get("artifact_type") or "") != ADVISOR_REPORT_ARTIFACT_TYPE:
-            continue
-        if str(artifact.get("producer_role") or "") != "phd_advisor":
-            continue
-        metadata = _json_object(artifact.get("metadata_json"))
-        if str(metadata.get("next_role") or "").strip().lower() != "villain":
-            continue
-        if _metadata_flag_false(metadata, "advisor_followup_required"):
-            continue
-        candidates.append(
-            (
-                _revision_number(artifact.get("state_revision")),
-                str(artifact.get("artifact_id") or ""),
-                artifact,
-                metadata,
-            )
-        )
-    if not candidates:
+    report = _current_advisor_directive_report(state)
+    if not report:
         return None
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    report_revision, report_id, _report, metadata = candidates[0]
-    if any(
-        str(run.get("actor_role") or "") == "villain"
-        and str(run.get("status") or "") == "completed"
-        and _revision_number(run.get("state_revision")) >= report_revision
-        for run in state.get("recent_runs", [])
-    ):
+    metadata = _json_object(report.get("metadata_json"))
+    if str(metadata.get("next_role") or "").strip().lower() not in {
+        "adversarial_reviewer",
+        "villain",
+    }:
         return None
-
+    if _metadata_flag_false(metadata, "advisor_followup_required"):
+        return None
+    report_revision = _revision_number(report.get("state_revision"))
+    report_id = str(report.get("artifact_id") or "")
     target_id = _explicit_advisor_next_target_id(state, metadata) or _target_id_from_metadata(
         state, metadata, fallback="root"
     )
     if not _claim(state, target_id):
         target_id = "root"
+    if any(
+        str(run.get("actor_role") or "")
+        in {"adversarial_reviewer", "villain"}
+        and str(run.get("target_id") or "") == target_id
+        and str(run.get("status") or "") == "completed"
+        and _revision_number(run.get("state_revision")) >= report_revision
+        for run in state.get("recent_runs", [])
+    ):
+        return None
     recommended = str(
         metadata.get("recommended_next_action")
         or metadata.get("next_decisive_task")
@@ -7248,7 +12066,7 @@ def _advisor_requested_villain_action(
         "refute",
         target_id,
         "",
-        "PhD advisor assigned the next decisive adversarial task to the villain",
+        "PhD advisor assigned the next decisive task to the adversarial reviewer",
         plan_action_budget(problem, "refute", budget_action, requested_tokens),
         research_mode=research_mode,
         advisor_followup_required=True,
@@ -7274,32 +12092,10 @@ def _refuted_root_revision_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    """When the root is refuted by a confirmed counterexample, stop proving it: raise a
-    human blocker and propose a scope-restricted restatement instead of stalling."""
+    """When the root is refuted, propose revision and request human notification."""
     root = _claim(state, "root")
     if not root or str(root.get("validation_status") or "") != "refuted":
         return None
-    try:
-        steering.raise_blocker(
-            store.state_dir,
-            kind="root_refuted",
-            target_id="root",
-            summary="The ROOT has been disproven by a confirmed counterexample — it needs revising.",
-            detail=(
-                "A confirmed counterexample refutes the root as stated. Decide how to restate it — e.g. "
-                "restrict the scope to the locus where it holds — or confirm abandoning this root. The "
-                "system is proposing a scope-restricted restatement; steer it if you want a specific scope."
-            ),
-            options=[
-                "restrict the root's scope (weaken)",
-                "restate the root (give a new statement)",
-                "abandon this root",
-            ],
-            fingerprint="root_refuted",
-            revision=int(problem.get("current_revision") or 0),
-        )
-    except Exception:
-        pass
     recent = list(state.get("recent_runs", []))[:6]
     if any(str(r.get("mode") or "") == "weaken" and str(r.get("target_id") or "") == "root" for r in recent):
         return None
@@ -7313,7 +12109,124 @@ def _refuted_root_revision_action(
         research_mode=research_mode,
         root_revision_required=True,
         search_intent="root_revision",
+        human_blocker_request={
+            "kind": "root_refuted",
+            "target_id": "root",
+            "summary": (
+                "The root statement has been disproved by a confirmed "
+                "counterexample and requires revision."
+            ),
+            "detail": (
+                "Decide whether to restrict its hypotheses, provide a replacement "
+                "statement, or abandon it."
+            ),
+            "options": [
+                "restrict the root's hypotheses",
+                "provide a replacement statement",
+                "abandon this root",
+            ],
+            "fingerprint": "root_refuted",
+            "revision": int(problem.get("current_revision") or 0),
+        },
     )
+
+
+def _unrouted_proof_claim_actions(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> list[Dict[str, Any]]:
+    """No hanging proven-but-unverified claims.
+
+    A claim that already has a proof-draft-backed inference but no active route
+    *concluding it* can never be verified — the verifier is only scheduled on a
+    verifier-ready route, so the proof sits in limbo (exactly what stranded g1/root/
+    chow-ring on the package lemma's route). Promote it: assemble a route concluding
+    the claim from its existing proof draft, so the verifier then picks it up.
+    """
+    recent = list(state.get("recent_runs", []))[:8]
+    recently_routed = {
+        str(r.get("target_id") or "")
+        for r in recent
+        if str(r.get("search_intent") or "") == "route_assembly"
+        and str(r.get("status") or "")
+        not in {
+            "failed",
+            "timeout",
+            "no_patch",
+            "cancelled",
+            "patch_rejected",
+        }
+    }
+    concluding_routes: Dict[str, list] = {}
+    for route in state.get("routes", []):
+        if str(route.get("status") or "") == "active":
+            concluding_routes.setdefault(str(route.get("conclusion_claim_id") or ""), []).append(route)
+    artifact_by_id = _artifact_index(state)
+    dossier_claims: set[str] = set()
+    for inf in state.get("inferences", []):
+        evidence_artifacts = [
+            artifact_by_id.get(str(artifact_id or ""))
+            for artifact_id in _json_list(
+                inf.get("evidence_artifact_ids_json")
+            )
+        ]
+        if any(
+            artifact
+            and str(artifact.get("artifact_type") or "")
+            in UNROUTED_PROOF_EVIDENCE_ARTIFACT_TYPES
+            for artifact in evidence_artifacts
+        ):
+            dossier_claims.add(str(inf.get("conclusion_claim_id") or ""))
+    policy_index = build_graph_policy_index(state)
+    eligible_claims: list[Mapping[str, Any]] = []
+    for claim in state.get("claims", []):
+        cid = str(claim.get("claim_id") or "")
+        if not cid or cid not in dossier_claims:
+            continue
+        if str(claim.get("lifecycle_status") or "") != "active":
+            continue
+        if str(claim.get("validation_status") or "") in {
+            "informally_verified",
+            "formally_verified",
+            "refuted",
+        }:
+            continue
+        if concluding_routes.get(cid) or cid in recently_routed:
+            continue
+        eligible_claims.append(claim)
+    eligible_claims.sort(
+        key=lambda claim: (
+            int(
+                policy_index.root_distances.get(
+                    str(claim.get("claim_id") or ""), 99
+                )
+            ),
+            -float(claim.get("root_impact", 0.0) or 0.0),
+            str(claim.get("claim_id") or ""),
+        )
+    )
+    actions: list[Dict[str, Any]] = []
+    for claim in eligible_claims:
+        cid = str(claim.get("claim_id") or "")
+        actions.append(
+            _action(
+                "triage_routes",
+                cid,
+                "",
+                f"claim '{cid}' already has a proof draft but no active route concludes it, so the verifier is "
+                "never scheduled. Assemble an active route concluding this claim from its "
+                "existing proof-draft-backed inference to make it verifier-ready — do not re-derive the proof.",
+                plan_step_budget(problem, "triage_routes", requested_tokens),
+                research_mode=research_mode,
+                route_assembly_required=True,
+                search_intent="route_assembly",
+            )
+        )
+    return actions
 
 
 def _unrouted_proof_claim_action(
@@ -7324,54 +12237,14 @@ def _unrouted_proof_claim_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    """No hanging proven-but-unverified claims.
-
-    A claim that already has a proof-dossier-backed inference but no active route
-    *concluding it* can never be verified — the verifier is only scheduled on a
-    verifier-ready route, so the proof sits in limbo (exactly what stranded g1/root/
-    chow-ring on the package lemma's route). Promote it: assemble a route concluding
-    the claim from its existing dossier, so the verifier then picks it up.
-    """
-    recent = list(state.get("recent_runs", []))[:8]
-    recently_routed = {
-        str(r.get("target_id") or "")
-        for r in recent
-        if str(r.get("mode") or "") in {"reduce", "triage_routes"}
-    }
-    concluding_routes: Dict[str, list] = {}
-    for route in state.get("routes", []):
-        if str(route.get("status") or "") == "active":
-            concluding_routes.setdefault(str(route.get("conclusion_claim_id") or ""), []).append(route)
-    dossier_claims: set = set()
-    for inf in state.get("inferences", []):
-        ev = _json_list(inf.get("evidence_artifact_ids_json"))
-        if any("dossier" in str(e) or "proof" in str(e) for e in ev):
-            dossier_claims.add(str(inf.get("conclusion_claim_id") or ""))
-    for claim in state.get("claims", []):
-        cid = str(claim.get("claim_id") or "")
-        if not cid or cid not in dossier_claims:
-            continue
-        if str(claim.get("lifecycle_status") or "") != "active":
-            continue
-        if str(claim.get("validation_status") or "") in {"informally_verified", "formally_verified", "refuted"}:
-            continue
-        if concluding_routes.get(cid):
-            continue  # already routed; the verifier / readiness guards handle it
-        if cid in recently_routed:
-            continue  # gave it a routing attempt recently
-        return _action(
-            "triage_routes",
-            cid,
-            "",
-            f"claim '{cid}' already has a proof dossier but no active route concludes it, so the verifier is "
-            "never scheduled and the proof hangs. Assemble an active route concluding this claim from its "
-            "existing dossier-backed inference to make it verifier-ready — do not re-derive the dossier.",
-            plan_step_budget(problem, "triage_routes", requested_tokens),
-            research_mode=research_mode,
-            route_assembly_required=True,
-            search_intent="route_assembly",
-        )
-    return None
+    actions = _unrouted_proof_claim_actions(
+        store,
+        state,
+        problem=problem,
+        requested_tokens=requested_tokens,
+        research_mode=research_mode,
+    )
+    return actions[0] if actions else None
 
 
 def _root_refinement_signals(state: Mapping[str, Any]) -> list:
@@ -7432,7 +12305,7 @@ def _root_refinement_action(
     definitionally mismatched, schedule the agent to draft a corrected, scope-restricted
     restatement (and promote the key obstruction to a verifiable claim), rather than
     leaving the open cases hanging or hammering the over-broad root. The agent does the
-    math; a human blocker surfaces it without halting the run."""
+    math; a blocker is published only if this action wins selection."""
     root = _claim(state, "root")
     if not root:
         return None
@@ -7444,28 +12317,6 @@ def _root_refinement_action(
     recent = list(state.get("recent_runs", []))[:8]
     if any(str(r.get("mode") or "") in {"weaken", "strengthen"} and str(r.get("target_id") or "") == "root" for r in recent):
         return None
-    try:
-        steering.raise_blocker(
-            store.state_dir,
-            kind="root_refinement",
-            target_id="root",
-            summary="The root has accumulated obstructions (definitional mismatch / over-broad scope / a counterexample family) — auto-refining it into a corrected, scope-restricted restatement.",
-            detail=(
-                "The system is drafting a restricted root that resolves these obstructions by adding the missing "
-                "hypotheses, restricting the scope, or replacing an over-broad formulation with the strongest "
-                "surviving statement. Steer the scope if you want a specific restriction; otherwise it proceeds "
-                "and the verifier/villain re-check it."
-            ),
-            options=[
-                "accept the auto-restricted root",
-                "specify the restriction scope",
-                "keep the broad root",
-            ],
-            fingerprint="root_refinement",
-            revision=int(problem.get("current_revision") or 0),
-        )
-    except Exception:
-        pass
     return _action(
         "weaken",
         "root",
@@ -7480,6 +12331,25 @@ def _root_refinement_action(
         root_revision_required=True,
         root_refinement_signals=signals,
         search_intent="root_refinement",
+        human_blocker_request={
+            "kind": "root_refinement",
+            "target_id": "root",
+            "summary": (
+                "The root has accumulated independent obstructions and may require "
+                "a corrected, hypothesis-restricted statement."
+            ),
+            "detail": (
+                "Add only hypotheses justified by the recorded obstructions while "
+                "preserving the strongest viable conclusion."
+            ),
+            "options": [
+                "accept a hypothesis-restricted root",
+                "specify the intended hypotheses",
+                "retain the current root",
+            ],
+            "fingerprint": "root_refinement",
+            "revision": int(problem.get("current_revision") or 0),
+        },
     )
 
 
@@ -7587,7 +12457,7 @@ def _run_has_contentful_artifact(run: Mapping[str, Any], artifact_by_id: Mapping
 
 
 # ---------------------------------------------------------------------------
-# Branch persistence + nearby-lemma dispatch (2026-07-09 TODO 1.2)
+# Branch persistence + nearby-lemma dispatch
 # ---------------------------------------------------------------------------
 
 
@@ -7615,7 +12485,7 @@ def _branch_persistence_action(
     requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    """Nearby-lemma dispatch for a productive-but-blocked branch (TODO 1.2).
+    """Nearby-lemma dispatch for a productive-but-blocked branch.
 
     When the current branch keeps producing verified mathematics but its main
     target stays blocked after repeated passes, keep exploiting the branch:
@@ -7687,19 +12557,8 @@ def _branch_persistence_action(
 
 
 # ---------------------------------------------------------------------------
-# multi_branch_research parallel mode (2026-07-09 TODO 2)
+# multi_branch_research parallel mode
 # ---------------------------------------------------------------------------
-
-
-def normalize_parallel_branches(value: Any) -> int:
-    """0 when the mode is off, else a worker count clamped to 2..5."""
-    try:
-        workers = int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-    if workers < MULTI_BRANCH_MIN_WORKERS:
-        return 0
-    return min(workers, MULTI_BRANCH_MAX_WORKERS)
 
 
 def multi_branch_research_actions(
@@ -7711,12 +12570,15 @@ def multi_branch_research_actions(
     requested_tokens: Optional[int] = None,
     research_mode: str | None = DEFAULT_RESEARCH_MODE,
     web_search: str | None = DEFAULT_WEB_SEARCH,
+    _defer_capacity: bool = False,
+    _scheduler_state: Mapping[str, Any] | None = None,
+    _generator_evaluation: Dict[str, Any] | None = None,
 ) -> list[Dict[str, Any]]:
-    """Plan up to N simultaneous branch-scoped worker actions (TODO 2).
+    """Plan up to N simultaneous branch-scoped worker actions.
 
     Extends the existing companion-session wave (primary + companions) with
     branch-packet template workers — spine, support_lemma,
-    literature_adaptation, villain_toy_model, alternative_route — until the
+    literature_adaptation, adversarial_toy_model, alternative_route — until the
     wave carries ``parallel_branches`` researcher/villain sessions. Each
     worker action is a normal companion (the store stays the coordination
     layer; no child-managed multi-agent memory) carrying ``branch_focus`` and
@@ -7725,6 +12587,14 @@ def multi_branch_research_actions(
     another active packet in the wave, and whose claim/debt ownership would
     overlap another packet.
     """
+    generator_evaluation = (
+        _generator_evaluation
+        if _generator_evaluation is not None
+        else _new_parallel_generator_evaluation()
+    )
+    _evaluate_parallel_candidate_generators(
+        generator_evaluation, {"multi_branch"}
+    )
     workers = normalize_parallel_branches(parallel_branches)
     if not workers:
         return []
@@ -7750,7 +12620,11 @@ def multi_branch_research_actions(
     if primary_mode == "integrate" and str(primary_action.get("target_id") or "") == "root":
         return []
     research_mode = normalize_research_mode(research_mode)
-    state = store.get_scheduler_state()
+    state = _enable_scheduler_planning_cache(
+        _scheduler_state
+        if _scheduler_state is not None
+        else store.get_scheduler_state()
+    )
     problem = state["problem_state"]
     root = _claim(state, "root")
     if root and str(root.get("lifecycle_status") or "") == "integrated":
@@ -7769,13 +12643,13 @@ def multi_branch_research_actions(
         family = strategy_family(action)
         if family:
             claimed_families.add(family)
-    if session_count >= workers:
+    if session_count >= workers and not _defer_capacity:
         return []
 
     anchors = _multi_branch_anchor_rows(state)
     planned: list[Dict[str, Any]] = []
     for template in MULTI_BRANCH_WORKER_TEMPLATES:
-        if session_count + len(planned) >= workers:
+        if not _defer_capacity and session_count + len(planned) >= workers:
             break
         action = _branch_worker_action(
             template,
@@ -7812,7 +12686,7 @@ def multi_branch_research_actions(
     for action in planned:
         if action_expects_researcher_session(action) or action_expects_villain_session(action):
             stamp_researcher_work_mode(state, action, research_mode=research_mode, web_search=web_search)
-    return planned
+    return _tag_candidate_generator(planned, "multi_branch")
 
 
 def _multi_branch_anchor_rows(state: Mapping[str, Any]) -> list[Dict[str, Any]]:
@@ -7889,7 +12763,7 @@ def _branch_packet_card(state: Mapping[str, Any], route_id: str, target_id: str,
         "debt_ids": sorted(debt_ids),
         "incoming_debt_ids": sorted(incoming_debt_ids),
     }
-    # Fact-graph pilot (2026-07-09 TODO 3, first use): the packet's
+    # Fact-graph policy: the packet's
     # verified-facts list comes from the read-only fact_graph view, so a
     # branch worker's settled proof input is exactly
     # facts_for_branch(verified_only=True) — candidate facts never appear.
@@ -8074,7 +12948,7 @@ def _branch_worker_action(
             requested_tokens=requested_tokens,
             research_mode=research_mode,
         )
-    if template == "villain_toy_model":
+    if template == "adversarial_toy_model":
         anchor = _first_unclaimed_anchor(state, anchors, claimed_ownership)
         if not anchor:
             return None
@@ -8084,23 +12958,23 @@ def _branch_worker_action(
             "target_id": target_id,
             "counterexample_search_required": True,
             "research_attack_stage": "counterexample",
-            "search_intent": f"{MULTI_BRANCH_INTENT_PREFIX}villain_toy_model",
+            "search_intent": f"{MULTI_BRANCH_INTENT_PREFIX}adversarial_toy_model",
         }
         return _action(
             "refute",
             target_id,
             route_id,
-            "multi-branch villain worker: hunt counterexamples, missing hypotheses, and small toy models "
+            "multi-branch adversarial worker: hunt counterexamples, missing hypotheses, and small toy models "
             "for this branch",
             plan_action_budget(problem, "refute", budget_action, requested_tokens),
             research_mode=research_mode,
             parallel_companion=True,
             branch_focus=route_id,
-            multi_branch_worker="villain_toy_model",
+            multi_branch_worker="adversarial_toy_model",
             multi_branch_mode=MULTI_BRANCH_RESEARCH_MODE_NAME,
-            branch_packet=_branch_packet_card(state, route_id, target_id, "villain_toy_model"),
+            branch_packet=_branch_packet_card(state, route_id, target_id, "adversarial_toy_model"),
             branch_worker_directive={
-                "worker": "villain_toy_model",
+                "worker": "adversarial_toy_model",
                 "instruction": (
                     "You own the adversarial lane of this branch packet: state two competing structural conjectures, test the target's full "
                     "hypotheses (not a weakened shadow), and build the smallest model whose possible outcomes change the proof decision. "
@@ -8111,7 +12985,7 @@ def _branch_worker_action(
             counterexample_probe_required=True,
             research_philosophy="adversarial_probe",
             research_attack_stage="counterexample",
-            search_intent=f"{MULTI_BRANCH_INTENT_PREFIX}villain_toy_model",
+            search_intent=f"{MULTI_BRANCH_INTENT_PREFIX}adversarial_toy_model",
         )
     if template == "alternative_route":
         anchor = _first_unclaimed_anchor(state, anchors, claimed_ownership)
@@ -8126,7 +13000,7 @@ def _branch_worker_action(
             directive=(
                 "You own the alternative-route lane: attack this branch with a substantially different "
                 "construction or reduction from the other active workers — do not rediscover a route another "
-                "packet already owns or a failed method in the negative-result ledger."
+                "packet already owns or a failed method in the negative-result archive."
             ),
             search_intent=f"{MULTI_BRANCH_INTENT_PREFIX}alternative_route",
             problem=problem,
@@ -8475,12 +13349,13 @@ def _invariant_errors(store: ProofStateStore) -> list[str]:
         return validate_conn(conn)
 
 
-def _pending_literature_search_request(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+def _pending_literature_search_requests(state: Mapping[str, Any]) -> list[Dict[str, Any]]:
     rows = [
         row for row in state.get("research_artifacts", [])
         if row.get("artifact_type") in SEARCH_REQUEST_ARTIFACT_TYPES
     ]
     rows.sort(key=lambda row: (int(row.get("state_revision", 0)), str(row.get("created_at") or "")), reverse=True)
+    requests: list[Dict[str, Any]] = []
     for row in rows:
         metadata = _json_object(row.get("metadata_json"))
         if str(metadata.get("status") or "").lower() in {"answered", "resolved", "discarded"}:
@@ -8502,85 +13377,172 @@ def _pending_literature_search_request(state: Mapping[str, Any]) -> Optional[Dic
             "proof_obligation",
             "acceptance_criteria",
         )
-        return {
-            "artifact_id": artifact_id,
-            "search_request_id": request_id,
-            "target_id": str(metadata.get("target_id") or "root"),
-            "route_id": str(metadata.get("route_id") or ""),
-            "query": query or str(row.get("content_summary") or ""),
-            "librarian_level": str(metadata.get("librarian_level") or "reader"),
-        }
-    return None
+        requests.append(
+            {
+                "artifact_id": artifact_id,
+                "search_request_id": request_id,
+                "target_id": str(metadata.get("target_id") or "root"),
+                "route_id": str(metadata.get("route_id") or ""),
+                "query": query or str(row.get("content_summary") or ""),
+                "librarian_level": str(metadata.get("librarian_level") or "reader"),
+            }
+        )
+    return requests
+
+
+def _pending_literature_search_request(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    requests = _pending_literature_search_requests(state)
+    return requests[0] if requests else None
 
 
 def _search_request_has_response(state: Mapping[str, Any], *, artifact_id: str, request_id: str) -> bool:
+    wanted = {identifier for identifier in (artifact_id, request_id) if identifier}
+    if not wanted:
+        return False
+    return bool(wanted.intersection(_search_request_response_keys(state)))
+
+
+def _search_request_response_keys(state: Mapping[str, Any]) -> set[str]:
+    """Index exact request identifiers referenced by source responses."""
+
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("search_request_response_keys")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, set):
+        return cached
+    keys: set[str] = set()
+
+    def collect(payload: Mapping[str, Any]) -> None:
+        for key in (
+            "search_request_id",
+            "request_id",
+            "source_request_artifact_id",
+            "literature_search_request_id",
+        ):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                keys.add(value)
+
     for card in state.get("retrieval_cards", []):
-        applicability = _json_object(card.get("applicability_json"))
-        if _matches_search_request(applicability, artifact_id=artifact_id, request_id=request_id):
-            return True
+        collect(_json_object(card.get("applicability_json")))
     for artifact in state.get("research_artifacts", []):
         if artifact.get("artifact_type") not in SOURCE_HANDOFF_ARTIFACT_TYPES:
             continue
-        metadata = _json_object(artifact.get("metadata_json"))
-        if _matches_search_request(metadata, artifact_id=artifact_id, request_id=request_id):
-            return True
-    return False
+        collect(_json_object(artifact.get("metadata_json")))
+    if isinstance(cache, dict):
+        cache["search_request_response_keys"] = keys
+    return keys
 
 
-def _pending_source_handoff_digest(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    last_research_revision = -1
-    for run in state.get("recent_runs", []):
-        if run.get("actor_role") == "researcher" or run.get("mode") in {"reduce", "weaken", "strengthen"}:
-            last_research_revision = max(last_research_revision, int(run.get("state_revision", -1)))
+def _pending_source_handoff_digests(state: Mapping[str, Any]) -> list[Dict[str, Any]]:
+    consumed_artifact_ids = _consumed_source_handoff_ids(state)
     rows = [
         row for row in state.get("research_artifacts", [])
         if row.get("artifact_type") in SOURCE_HANDOFF_ARTIFACT_TYPES
-        and int(row.get("state_revision", 0)) > last_research_revision
+        and str(row.get("artifact_id") or "") not in consumed_artifact_ids
     ]
     rows.sort(key=lambda row: (int(row.get("state_revision", 0)), str(row.get("created_at") or "")), reverse=True)
-    if not rows:
-        return None
-    row = rows[0]
-    metadata = _json_object(row.get("metadata_json"))
-    raw_target_id = str(metadata.get("target_id") or metadata.get("claim_id") or "root")
-    target_id = raw_target_id
-    route_id = str(metadata.get("route_id") or "")
-    if route_id and not _route(state, route_id):
-        route_id = ""
-    if not _claim(state, target_id):
-        target_route = _route(state, target_id)
-        if target_route:
-            route_id = route_id or str(target_route.get("route_id") or "")
-            target_id = str(target_route.get("conclusion_claim_id") or "root")
-        else:
-            target_inference = next(
-                (
-                    inference
-                    for inference in state.get("inferences", [])
-                    if str(inference.get("inference_id") or "") == target_id
-                ),
-                None,
-            )
-            if target_inference:
-                route_id = route_id or str(target_inference.get("route_id") or "")
-                target_id = str(target_inference.get("conclusion_claim_id") or "root")
-            else:
-                target_id = _target_id_from_metadata(state, metadata, fallback="root")
-    return {
-        "artifact_id": str(row.get("artifact_id") or ""),
-        "artifact_type": str(row.get("artifact_type") or ""),
-        "target_id": target_id,
-        "route_id": route_id,
-        "search_request_id": str(metadata.get("search_request_id") or metadata.get("request_id") or ""),
+    route_by_id = {
+        str(route.get("route_id") or ""): route
+        for route in state.get("routes", [])
+        if str(route.get("route_id") or "")
     }
+    claim_ids = {
+        str(claim.get("claim_id") or "")
+        for claim in state.get("claims", [])
+        if str(claim.get("claim_id") or "")
+    }
+    inference_by_id = {
+        str(inference.get("inference_id") or ""): inference
+        for inference in state.get("inferences", [])
+        if str(inference.get("inference_id") or "")
+    }
+    digests: list[Dict[str, Any]] = []
+    for row in rows:
+        metadata = _json_object(row.get("metadata_json"))
+        target_id = str(metadata.get("target_id") or metadata.get("claim_id") or "root")
+        route_id = str(metadata.get("route_id") or "")
+        if route_id and route_id not in route_by_id:
+            route_id = ""
+        if target_id not in claim_ids:
+            target_route = route_by_id.get(target_id)
+            if target_route:
+                route_id = route_id or str(target_route.get("route_id") or "")
+                target_id = str(target_route.get("conclusion_claim_id") or "root")
+            else:
+                target_inference = inference_by_id.get(target_id)
+                if target_inference:
+                    route_id = route_id or str(target_inference.get("route_id") or "")
+                    target_id = str(target_inference.get("conclusion_claim_id") or "root")
+                else:
+                    target_id = _target_id_from_metadata(state, metadata, fallback="root")
+        artifact_id = str(row.get("artifact_id") or "")
+        if _recent_object_action_seen(
+            state,
+            intent="source_adaptation_digest",
+            candidate_prefix="base_evidence:source_adaptation:",
+            subject_id=artifact_id,
+            window=4,
+            target_id=target_id,
+            route_id=route_id,
+        ):
+            continue
+        digests.append(
+            {
+                "artifact_id": artifact_id,
+                "artifact_type": str(row.get("artifact_type") or ""),
+                "target_id": target_id,
+                "route_id": route_id,
+                "search_request_id": str(
+                    metadata.get("search_request_id")
+                    or metadata.get("request_id")
+                    or ""
+                ),
+            }
+        )
+    return digests
 
 
-def _pending_key_failure_analysis(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+def _consumed_source_handoff_ids(state: Mapping[str, Any]) -> set[str]:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("consumed_source_handoff_ids")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, set):
+        return cached
+    consumed = _routed_evidence_artifact_ids(state)
+    reference_keys = (
+        "source_artifact_id",
+        "source_artifact_ids",
+        "evidence_artifact_id",
+        "evidence_artifact_ids",
+        "adapted_source_artifact_id",
+    )
+    for artifact in state.get("research_artifacts", []):
+        metadata = _json_object(artifact.get("metadata_json"))
+        consumed.update(_metadata_reference_ids(metadata, *reference_keys))
+    if isinstance(cache, dict):
+        cache["consumed_source_handoff_ids"] = consumed
+    return consumed
+
+
+def _pending_source_handoff_digest(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    digests = _pending_source_handoff_digests(state)
+    return digests[0] if digests else None
+
+
+def _pending_key_failure_analyses(state: Mapping[str, Any]) -> list[Dict[str, Any]]:
     rows = [
         row for row in state.get("research_artifacts", [])
         if row.get("artifact_type") == FAILED_DECOMPOSITION_ARTIFACT_TYPE
     ]
     rows.sort(key=lambda row: (int(row.get("state_revision", 0)), str(row.get("created_at") or "")), reverse=True)
+    analyses: list[Dict[str, Any]] = []
     for row in rows:
         metadata = _json_object(row.get("metadata_json"))
         if str(metadata.get("status") or "").lower() in {"analyzed", "resolved", "discarded"}:
@@ -8594,14 +13556,21 @@ def _pending_key_failure_analysis(state: Mapping[str, Any]) -> Optional[Dict[str
             failed_artifact_id=str(row.get("artifact_id") or ""),
         ):
             continue
-        return {
-            "artifact_id": str(row.get("artifact_id") or ""),
-            "target_id": str(metadata.get("parent_claim_id") or metadata.get("target_id") or "root"),
-            "route_id": str(metadata.get("route_id") or ""),
-            "decomposition_plan_id": plan_id,
-            "decomposition_plan_artifact_id": plan_artifact_id,
-        }
-    return None
+        analyses.append(
+            {
+                "artifact_id": str(row.get("artifact_id") or ""),
+                "target_id": str(metadata.get("parent_claim_id") or metadata.get("target_id") or "root"),
+                "route_id": str(metadata.get("route_id") or ""),
+                "decomposition_plan_id": plan_id,
+                "decomposition_plan_artifact_id": plan_artifact_id,
+            }
+        )
+    return analyses
+
+
+def _pending_key_failure_analysis(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    analyses = _pending_key_failure_analyses(state)
+    return analyses[0] if analyses else None
 
 
 def _active_decomposition_plan_step(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -8668,8 +13637,6 @@ def _parallel_decomposition_companion_actions(
             parallel_companion=True,
         )
         companions.append(action)
-        if len(companions) >= MAX_PARALLEL_DECOMPOSITION_COMPANIONS:
-            break
     return companions
 
 
@@ -8682,6 +13649,7 @@ def _decomposition_plan_ready_steps(
 ) -> list[Dict[str, Any]]:
     exclude_targets = exclude_targets or set()
     claims = {str(row.get("claim_id") or ""): row for row in state.get("claims", [])}
+    all_steps: list[Dict[str, Any]] = []
     for row, metadata, current_plan_id, artifact_id in _active_decomposition_plan_records(state):
         if plan_id and current_plan_id != plan_id and artifact_id != plan_id:
             continue
@@ -8725,7 +13693,8 @@ def _decomposition_plan_ready_steps(
             )
         ready.sort(key=lambda step: _decomposition_ready_step_priority(state, step))
         if ready:
-            return ready
+            all_steps.extend(ready)
+            continue
         if unresolved:
             continue
         parent_route_id = str(metadata.get("route_id") or _active_route_for_claim(state, parent_id) or "")
@@ -8741,7 +13710,7 @@ def _decomposition_plan_ready_steps(
             else:
                 mode = "prove"
             direct_solve = mode == "prove" and not parent_route_id
-            return [
+            all_steps.append(
                 {
                     "mode": mode,
                     "target_id": parent_id,
@@ -8756,8 +13725,8 @@ def _decomposition_plan_ready_steps(
                     "citation_allowed_in_proof": bool(parent_route_id and mode == "reduce"),
                     "needs_proof_dossier": direct_solve or (mode == "reduce"),
                 }
-            ]
-    return []
+            )
+    return all_steps
 
 
 def _decomposition_ready_step_priority(state: Mapping[str, Any], step: Mapping[str, Any]) -> tuple[int, int, int, int, float, int, str]:
@@ -8772,7 +13741,7 @@ def _decomposition_ready_step_priority(state: Mapping[str, Any], step: Mapping[s
         verifier_ready = bool(readiness.get("verifier_ready"))
     try:
         root_impact = float(claim.get("root_impact", 0.0) or 0.0)
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         root_impact = 0.0
     return (
         int(not verifier_ready),
@@ -8785,21 +13754,23 @@ def _decomposition_ready_step_priority(state: Mapping[str, Any], step: Mapping[s
     )
 
 
-def _blocked_decomposition_plan_candidate(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+def _blocked_decomposition_plan_candidates(state: Mapping[str, Any]) -> list[Dict[str, Any]]:
     claims = {str(row.get("claim_id") or ""): row for row in state.get("claims", [])}
+    candidates: list[Dict[str, Any]] = []
     for row, metadata, plan_id, artifact_id in _active_decomposition_plan_records(state):
         if _has_decomposition_regulator_response(state, plan_id=plan_id, plan_artifact_id=artifact_id):
             continue
         subgoal_ids = _metadata_strings(metadata, "subgoal_claim_ids", "subgoals", "claim_ids")
         if not subgoal_ids:
-            return {
+            candidates.append({
                 "target_id": str(metadata.get("parent_claim_id") or metadata.get("target_id") or "root"),
                 "route_id": str(metadata.get("route_id") or ""),
                 "reason": "decomposition plan has no explicit subgoals; advisor must regulate the plan",
                 "artifact_id": artifact_id,
                 "decomposition_plan_id": plan_id,
                 "blocked_branch_ids": [],
-            }
+            })
+            continue
         unresolved = [
             subgoal_id
             for subgoal_id in subgoal_ids
@@ -8812,15 +13783,20 @@ def _blocked_decomposition_plan_candidate(state: Mapping[str, Any]) -> Optional[
         ready = _decomposition_plan_ready_steps(state, plan_id=plan_id, include_parent=False)
         if ready:
             continue
-        return {
+        candidates.append({
             "target_id": str(metadata.get("parent_claim_id") or metadata.get("target_id") or "root"),
             "route_id": str(metadata.get("route_id") or ""),
             "reason": "decomposition plan has unresolved branches but no dependency-ready branch; advisor must regulate the plan",
             "artifact_id": artifact_id,
             "decomposition_plan_id": plan_id,
             "blocked_branch_ids": unresolved,
-        }
-    return None
+        })
+    return candidates
+
+
+def _blocked_decomposition_plan_candidate(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    candidates = _blocked_decomposition_plan_candidates(state)
+    return candidates[0] if candidates else None
 
 
 def _active_decomposition_plan_records(
@@ -8917,13 +13893,66 @@ def _has_decomposition_response(
     plan_artifact_id: str,
     failed_artifact_id: str = "",
 ) -> bool:
+    wanted = {
+        value for value in (plan_id, plan_artifact_id, failed_artifact_id) if value
+    }
+    if not wanted:
+        return False
+    response_index = _decomposition_response_revision_index(state).get(
+        artifact_type, {}
+    )
+    response_revisions = [
+        response_index[identifier]
+        for identifier in wanted
+        if identifier in response_index
+    ]
+    if not response_revisions:
+        return False
+    artifacts_by_id = _artifact_index(state)
+    source_revision = max(
+        (
+            _revision_number(artifacts_by_id[identifier].get("state_revision"))
+            for identifier in (plan_artifact_id, failed_artifact_id)
+            if identifier in artifacts_by_id
+        ),
+        default=-1,
+    )
+    return _response_is_current(max(response_revisions), source_revision)
+
+
+def _decomposition_response_revision_index(
+    state: Mapping[str, Any],
+) -> Mapping[str, Mapping[str, int]]:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("decomposition_response_revision_index")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, dict):
+        return cached
+    result: dict[str, dict[str, int]] = {}
+    response_types = {
+        FAILED_DECOMPOSITION_ARTIFACT_TYPE,
+        KEY_FAILURE_ARTIFACT_TYPE,
+        ADVISOR_REPORT_ARTIFACT_TYPE,
+    }
     for artifact in state.get("research_artifacts", []):
-        if artifact.get("artifact_type") != artifact_type:
+        artifact_type = str(artifact.get("artifact_type") or "")
+        if artifact_type not in response_types:
             continue
-        metadata = _json_object(artifact.get("metadata_json"))
-        if _matches_decomposition_reference(metadata, plan_id=plan_id, plan_artifact_id=plan_artifact_id, failed_artifact_id=failed_artifact_id):
-            return True
-    return False
+        revision = _revision_number(artifact.get("state_revision"))
+        references = _decomposition_reference_ids(
+            _json_object(artifact.get("metadata_json"))
+        )
+        by_reference = result.setdefault(artifact_type, {})
+        for reference in references:
+            by_reference[reference] = max(
+                by_reference.get(reference, -1), revision
+            )
+    if isinstance(cache, dict):
+        cache["decomposition_response_revision_index"] = result
+    return result
 
 
 def _has_decomposition_regulator_response(
@@ -8952,16 +13981,20 @@ def _matches_decomposition_reference(
     plan_artifact_id: str,
     failed_artifact_id: str = "",
 ) -> bool:
-    references = {
+    references = _decomposition_reference_ids(payload)
+    wanted = {value for value in {plan_id, plan_artifact_id, failed_artifact_id} if value}
+    return bool(wanted & references)
+
+
+def _decomposition_reference_ids(payload: Mapping[str, Any]) -> set[str]:
+    return {
         str(payload.get("decomposition_plan_id") or ""),
         str(payload.get("plan_id") or ""),
         str(payload.get("source_decomposition_plan_id") or ""),
         str(payload.get("decomposition_plan_artifact_id") or ""),
         str(payload.get("source_plan_artifact_id") or ""),
         str(payload.get("failed_decomposition_artifact_id") or ""),
-    }
-    wanted = {value for value in {plan_id, plan_artifact_id, failed_artifact_id} if value}
-    return bool(wanted & references)
+    } - {""}
 
 
 def _metadata_strings(metadata: Mapping[str, Any], *keys: str) -> list[str]:
@@ -8987,18 +14020,6 @@ def _metadata_strings(metadata: Mapping[str, Any], *keys: str) -> list[str]:
     return unique
 
 
-def _matches_search_request(payload: Mapping[str, Any], *, artifact_id: str, request_id: str) -> bool:
-    return any(
-        str(payload.get(key) or "") in {artifact_id, request_id}
-        for key in (
-            "search_request_id",
-            "request_id",
-            "source_request_artifact_id",
-            "literature_search_request_id",
-        )
-    )
-
-
 # NOTE: _json_object is defined once near the end of this module; an earlier
 # duplicate definition with subtly different coercion semantics was removed
 # because Python silently shadowed it module-wide anyway.
@@ -9018,12 +14039,6 @@ def _first_metadata_text(metadata: Mapping[str, Any], *keys: str) -> str:
 
 def _action(mode: str, target_id: str, route_id: str, reason: str, budget: Mapping[str, Any], **extra: Any) -> Dict[str, Any]:
     terminal_modes = {"stop_with_partial_results", "stop_solved"}
-    if not budget.get("allowed", False) and mode not in terminal_modes:
-        mode = "stop_with_partial_results"
-        reason = budget.get("reason", reason)
-        # Budget-forced stops are always allowed under every completion
-        # policy; record the explicit stop reason (TODO 7).
-        extra.setdefault("stop_reason_code", "exhausted_budget")
     action = {
         "mode": mode,
         "target_id": target_id,
@@ -9032,6 +14047,19 @@ def _action(mode: str, target_id: str, route_id: str, reason: str, budget: Mappi
         "budget": dict(budget),
     }
     action.update(extra)
+    action["budget"] = normalize_resource_allocation_for_action(
+        action, action["budget"]
+    )
+    if not action["budget"].get("allowed", False) and mode not in terminal_modes:
+        action["mode"] = "stop_with_partial_results"
+        action["reason"] = action["budget"].get("reason", reason)
+        # Budget-forced stops are always allowed under every completion
+        # policy; record the explicit stop reason.
+        action.setdefault("stop_reason_code", "exhausted_budget")
+    action.setdefault(
+        "scheduler_policy_id",
+        str(action.get("search_intent") or action.get("terminal_classification") or mode),
+    )
     if action.get("proof_construction_required") and action.get("mode") == "reduce":
         action.setdefault("display_mode", "researcher_prove")
     checkpoint_kind = _checkpointed_research_kind(action)
@@ -9051,6 +14079,13 @@ def _action(mode: str, target_id: str, route_id: str, reason: str, budget: Mappi
                 ],
             },
         )
+    if action["mode"] in EXECUTABLE_RUN_MODES:
+        contract_errors = scheduler_dispatch_action_errors(action)
+        if contract_errors:
+            raise ValueError(
+                "scheduler constructed an invalid executable action: "
+                + "; ".join(contract_errors)
+            )
     return action
 
 
@@ -9083,11 +14118,63 @@ def _checkpointed_research_kind(action: Mapping[str, Any]) -> str:
 
 
 def _claim(state: Mapping[str, Any], claim_id: str) -> Optional[Mapping[str, Any]]:
-    return next((row for row in state["claims"] if row["claim_id"] == claim_id), None)
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    if isinstance(cache, dict):
+        return build_graph_policy_index(state).claims_by_id.get(claim_id)
+    return next(
+        (
+            row
+            for row in state.get("claims", [])
+            if row.get("claim_id") == claim_id
+        ),
+        None,
+    )
 
 
 def _route(state: Mapping[str, Any], route_id: str) -> Optional[Mapping[str, Any]]:
-    return next((row for row in state["routes"] if row["route_id"] == route_id), None)
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    if isinstance(cache, dict):
+        routes_by_id = cache.get("routes_by_id")
+        if not isinstance(routes_by_id, dict):
+            routes_by_id = {
+                str(row.get("route_id") or ""): row
+                for row in state.get("routes", [])
+                if str(row.get("route_id") or "")
+            }
+            cache["routes_by_id"] = routes_by_id
+        return routes_by_id.get(route_id)
+    return next(
+        (
+            row
+            for row in state.get("routes", [])
+            if row.get("route_id") == route_id
+        ),
+        None,
+    )
+
+
+def _inference(
+    state: Mapping[str, Any], inference_id: str
+) -> Optional[Mapping[str, Any]]:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    if isinstance(cache, dict):
+        inferences_by_id = cache.get("inferences_by_id")
+        if not isinstance(inferences_by_id, dict):
+            inferences_by_id = {
+                str(row.get("inference_id") or ""): row
+                for row in state.get("inferences", [])
+                if str(row.get("inference_id") or "")
+            }
+            cache["inferences_by_id"] = inferences_by_id
+        return inferences_by_id.get(inference_id)
+    return next(
+        (
+            row
+            for row in state.get("inferences", [])
+            if str(row.get("inference_id") or "") == inference_id
+        ),
+        None,
+    )
 
 
 def _work_mode_for_claim(state: Mapping[str, Any], claim_id: str) -> tuple[str, str]:
@@ -9106,7 +14193,7 @@ def _claim_target_for_debt(state: Mapping[str, Any], debt: Mapping[str, Any]) ->
     route = _route(state, target_id)
     if route:
         return str(route["conclusion_claim_id"])
-    inference = next((row for row in state["inferences"] if row["inference_id"] == target_id), None)
+    inference = _inference(state, target_id)
     if inference:
         return str(inference["conclusion_claim_id"])
 
@@ -9117,7 +14204,7 @@ def _claim_target_for_debt(state: Mapping[str, Any], debt: Mapping[str, Any]) ->
 
     if debt.get("owner_type") == "inference":
         inference_id = str(debt.get("owner_id") or "")
-        inference = next((row for row in state["inferences"] if row["inference_id"] == inference_id), None)
+        inference = _inference(state, inference_id)
         if inference:
             return str(inference["conclusion_claim_id"])
 
@@ -9138,25 +14225,16 @@ def _debt_points_to_retired_graph(state: Mapping[str, Any], debt: Mapping[str, A
             or str(claim.get("validation_status") or "") == "refuted"
         ):
             return True
-        route = next(
-            (row for row in state.get("routes", []) if str(row.get("route_id") or "") == candidate),
-            None,
-        ) if candidate else None
+        route = _route(state, candidate) if candidate else None
         if route and str(route.get("status") or "") in retired:
             return True
 
     if owner_type == "inference":
-        inference = next(
-            (row for row in state.get("inferences", []) if str(row.get("inference_id") or "") == owner_id),
-            None,
-        )
+        inference = _inference(state, owner_id)
         if inference:
             conclusion = _claim(state, str(inference.get("conclusion_claim_id") or ""))
             inference_route_id = str(inference.get("route_id") or "")
-            route = next(
-                (row for row in state.get("routes", []) if str(row.get("route_id") or "") == inference_route_id),
-                None,
-            )
+            route = _route(state, inference_route_id)
             if conclusion and (
                 str(conclusion.get("lifecycle_status") or "") in retired
                 or str(conclusion.get("validation_status") or "") == "refuted"
@@ -9167,8 +14245,8 @@ def _debt_points_to_retired_graph(state: Mapping[str, Any], debt: Mapping[str, A
     return False
 
 
-def _first_blocking_debt(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-    debt_coverage_index = DebtCoverageIndex(state)
+def _blocking_debt_candidates(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    debt_coverage_index = get_debt_coverage_index(state)
     canonical_frontier = minimal_active_debt_frontier(state)
     alias_to_primary = {
         str(alias): str(primary)
@@ -9200,7 +14278,8 @@ def _first_blocking_debt(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]
         for row in state["claims"]
     }
     max_depth = _max_schedulable_reduction_depth(state)
-    frontier = frontier_claim_ids(state)
+    policy_index = build_graph_policy_index(state)
+    frontier = frontier_claim_ids(state, policy_index=policy_index)
 
     schedulable = [
         row for row in debts
@@ -9209,14 +14288,16 @@ def _first_blocking_debt(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]
     if schedulable:
         debts = schedulable
     elif debts:
-        return None
+        return []
 
     def priority(row: Mapping[str, Any]) -> tuple[int, int, int, int, int, int, int, str, str]:
         owner_id = str(row.get("owner_id") or "")
         owner_depth = claim_depth.get(owner_id, 0)
         target_id = str(row.get("suggested_next_target") or owner_id)
         target_depth = claim_depth.get(target_id, owner_depth)
-        root_distance = root_distance_for_claim_id(state, target_id)
+        root_distance = root_distance_for_claim_id(
+            state, target_id, policy_index=policy_index
+        )
         frontier_penalty = int(target_id not in frontier and owner_id not in frontier)
         far_penalty = int(root_distance > FAR_FROM_ROOT_DISTANCE)
         repeated_count = int(row.get("repeated_count", 0))
@@ -9244,15 +14325,20 @@ def _first_blocking_debt(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]
         )
 
     debts.sort(key=priority)
-    return debts[0] if debts else None
+    return debts
 
 
-def _next_unverified_claim(
+def _first_blocking_debt(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    candidates = _blocking_debt_candidates(state)
+    return candidates[0] if candidates else None
+
+
+def _next_unverified_claims(
     state: Mapping[str, Any],
     *,
     exclude_ids: set[str] | None = None,
     require_unblocked_routes: bool = False,
-) -> Optional[Mapping[str, Any]]:
+) -> list[Mapping[str, Any]]:
     exclude_ids = exclude_ids or set()
     claims = [
         row for row in state["claims"]
@@ -9268,12 +14354,15 @@ def _next_unverified_claim(
     if unpaused_claims:
         claims = unpaused_claims
     max_depth = _max_schedulable_reduction_depth(state)
-    frontier = frontier_claim_ids(state)
+    policy_index = build_graph_policy_index(state)
+    frontier = frontier_claim_ids(state, policy_index=policy_index)
 
     def priority(row: Mapping[str, Any]) -> tuple[int, int, int, int, int, int, float, int, str]:
         claim_id = str(row["claim_id"])
         depth = int(row.get("reduction_depth", 99))
-        root_distance = root_distance_for_claim_id(state, claim_id)
+        root_distance = root_distance_for_claim_id(
+            state, claim_id, policy_index=policy_index
+        )
         root_impact = float(row.get("root_impact", 0.0))
         is_bookkeeping = _is_meta_bookkeeping_text(
             _joined_text(row, "claim_id", "statement", "hypotheses")
@@ -9285,7 +14374,11 @@ def _next_unverified_claim(
             int(is_far_low_impact),
             int(is_overdeep),
             int(is_bookkeeping),
-            maturity_rank(proof_trunk_maturity(state, claim_id)),
+            maturity_rank(
+                proof_trunk_maturity(
+                    state, claim_id, policy_index=policy_index
+                )
+            ),
             root_distance,
             -root_impact,
             depth,
@@ -9293,6 +14386,20 @@ def _next_unverified_claim(
         )
 
     claims.sort(key=priority)
+    return claims
+
+
+def _next_unverified_claim(
+    state: Mapping[str, Any],
+    *,
+    exclude_ids: set[str] | None = None,
+    require_unblocked_routes: bool = False,
+) -> Optional[Mapping[str, Any]]:
+    claims = _next_unverified_claims(
+        state,
+        exclude_ids=exclude_ids,
+        require_unblocked_routes=require_unblocked_routes,
+    )
     return claims[0] if claims else None
 
 
@@ -9461,7 +14568,7 @@ def _blocking_debt_action(
             mode,
             target_id,
             "",
-            "active blocking source/citation debt",
+            "active blocking source/citation proof obligation",
             plan_step_budget(problem, mode, requested_tokens),
             debt_id=blocking_debt["debt_id"],
             research_mode=research_mode,
@@ -9471,7 +14578,10 @@ def _blocking_debt_action(
             librarian_level="reader",
         )
     decisive_signal = {}
-    if not _recent_intent_seen(state, DECISIVE_THEOREM_TEST_INTENT, window=6):
+    if (
+        is_decisive_theorem_test_obligation(blocking_debt)
+        and not _recent_intent_seen(state, DECISIVE_THEOREM_TEST_INTENT, window=6)
+    ):
         decisive_signal = decisive_theorem_test_signal(state, debt_id=str(blocking_debt.get("debt_id") or ""))
     decisive_payload = _decisive_theorem_test_payload(
         decisive_signal,
@@ -9487,7 +14597,7 @@ def _blocking_debt_action(
                 verify_mode,
                 target_id,
                 route_id,
-                "active blocking proof debt explicitly targets an inference for verification",
+                "active blocking proof obligation explicitly targets an inference for verification",
                 plan_step_budget(problem, verify_mode, requested_tokens),
                 debt_id=blocking_debt["debt_id"],
                 proof_repair_verification_required=True,
@@ -9508,7 +14618,7 @@ def _blocking_debt_action(
                 mode,
                 target_id,
                 route_id,
-                "active blocking proof debt is an exact theorem/counterexample test; decide it before routine route repair",
+                "active blocking proof obligation is an exact theorem/counterexample test; decide it before routine approach repair",
                 plan_action_budget(problem, mode, decisive_budget_action, requested_tokens),
                 proof_repair_required=True,
                 proof_construction_required=True,
@@ -9525,7 +14635,7 @@ def _blocking_debt_action(
             (
                 "central bridge obstruction needs researcher construction workbench before another verifier or search pass"
                 if central_payload
-                else "active blocking proof debt needs route repair before another verifier pass"
+                else "active blocking proof obligation needs approach repair before another verifier pass"
             ),
             plan_action_budget(
                 problem,
@@ -9591,7 +14701,7 @@ def _blocking_debt_action(
                 mode,
                 target_id,
                 "",
-                "active blocking proof debt is an exact theorem/counterexample test; decide it directly before routine repair",
+                "active blocking proof obligation is an exact theorem/counterexample test; decide it directly before routine repair",
                 plan_action_budget(problem, mode, decisive_budget_action, requested_tokens),
                 research_mode=research_mode,
                 direct_solve_required=True,
@@ -9607,7 +14717,7 @@ def _blocking_debt_action(
             (
                 "central bridge obstruction on an unrouted target needs construction workbench"
                 if central_payload
-                else "active blocking proof debt on an unrouted target; try a direct proof/counterexample attack before reducing"
+                else "active blocking proof obligation on a target without an approach; try a direct proof/counterexample attack before reducing"
             ),
             plan_step_budget(problem, mode, requested_tokens),
             debt_id=blocking_debt["debt_id"],
@@ -9634,7 +14744,7 @@ def _blocking_debt_action(
             mode,
             target_id,
             route_id,
-            "active blocking proof debt is an exact theorem/counterexample test",
+            "active blocking proof obligation is an exact theorem/counterexample test",
             plan_action_budget(problem, mode, decisive_budget_action, requested_tokens),
             proof_construction_required=bool(route_id and mode == "reduce"),
             citation_allowed_in_proof=bool(route_id and mode == "reduce"),
@@ -9648,7 +14758,7 @@ def _blocking_debt_action(
         mode,
         target_id,
         route_id,
-        "active blocking proof debt",
+        "active blocking proof obligation",
         plan_action_budget(
             problem,
             mode,
@@ -9731,15 +14841,9 @@ def _is_source_like_debt(debt: Mapping[str, Any]) -> bool:
 
 
 def _central_obstruction_payload(state: Mapping[str, Any], debt: Mapping[str, Any]) -> Dict[str, Any]:
-    normalized_debts: list[Dict[str, Any]] = []
-    selected_debt: Dict[str, Any] = dict(debt)
-    for row in state.get("debts", []):
-        normalized = dict(row)
-        normalized["suggested_next_target"] = _claim_target_for_debt(state, row)
-        normalized_debts.append(normalized)
-        if str(row.get("debt_id") or "") == str(debt.get("debt_id") or ""):
-            selected_debt = normalized
-    central = central_obstruction_for_debt(normalized_debts, selected_debt)
+    central = _central_obstruction_by_obligation_id(state).get(
+        str(debt.get("debt_id") or "")
+    )
     if not central:
         return {}
     return {
@@ -9756,6 +14860,33 @@ def _central_obstruction_payload(state: Mapping[str, Any], debt: Mapping[str, An
         "cas_check_recommended": not _is_source_like_debt(debt),
         "experiment_decision_gate_required": not _is_source_like_debt(debt),
     }
+
+
+def _central_obstruction_by_obligation_id(
+    state: Mapping[str, Any],
+) -> Mapping[str, Mapping[str, Any]]:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("central_obstruction_by_obligation_id")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, dict):
+        return cached
+    normalized_obligations: list[Dict[str, Any]] = []
+    for row in state.get("debts", []):
+        normalized = dict(row)
+        normalized["suggested_next_target"] = _claim_target_for_debt(state, row)
+        normalized_obligations.append(normalized)
+    result: dict[str, Mapping[str, Any]] = {}
+    for cluster in central_debt_clusters(normalized_obligations):
+        for obligation_id in cluster.get("alias_debt_ids", []):
+            obligation_id = str(obligation_id or "")
+            if obligation_id:
+                result[obligation_id] = cluster
+    if isinstance(cache, dict):
+        cache["central_obstruction_by_obligation_id"] = result
+    return result
 
 
 def _recursive_meta_drift(state: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -9862,23 +14993,70 @@ def _max_schedulable_reduction_depth(state: Mapping[str, Any]) -> int:
     problem = state.get("problem_state") or {}
     try:
         configured = int(problem.get("max_reduction_depth", DEFAULT_MAX_SCHEDULABLE_REDUCTION_DEPTH))
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         configured = DEFAULT_MAX_SCHEDULABLE_REDUCTION_DEPTH
     return max(1, configured)
 
 
 def _active_route_for_claim(state: Mapping[str, Any], claim_id: str, *, allow_paused: bool = False) -> str:
-    routes = [row for row in state["routes"] if row["conclusion_claim_id"] == claim_id and row["status"] == "active"]
-    routes.sort(key=lambda row: (row["relation_to_parent"] != "sufficient", row["route_id"]))
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    routes_by_claim = (
+        cache.get("active_routes_by_claim")
+        if isinstance(cache, dict)
+        else None
+    )
+    if not isinstance(routes_by_claim, dict):
+        grouped: Dict[str, list[Mapping[str, Any]]] = {}
+        for row in state.get("routes", []):
+            if str(row.get("status") or "") != "active":
+                continue
+            grouped.setdefault(
+                str(row.get("conclusion_claim_id") or ""), []
+            ).append(row)
+        routes_by_claim = {
+            target_id: tuple(
+                sorted(
+                    rows,
+                    key=lambda row: (
+                        str(row.get("relation_to_parent") or "") != "sufficient",
+                        str(row.get("route_id") or ""),
+                    ),
+                )
+            )
+            for target_id, rows in grouped.items()
+        }
+        if isinstance(cache, dict):
+            cache["active_routes_by_claim"] = routes_by_claim
+    routes = routes_by_claim.get(claim_id, ())
     if allow_paused:
-        return routes[0]["route_id"] if routes else ""
+        return str(routes[0].get("route_id") or "") if routes else ""
     paused = paused_route_ids(state)
-    unpaused = [row for row in routes if row["route_id"] not in paused]
-    return unpaused[0]["route_id"] if unpaused else ""
+    return next(
+        (
+            str(row.get("route_id") or "")
+            for row in routes
+            if str(row.get("route_id") or "") not in paused
+        ),
+        "",
+    )
 
 
 def _route_has_inference(state: Mapping[str, Any], route_id: str) -> bool:
-    return any(row.get("route_id") == route_id for row in state.get("inferences", []))
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    route_ids = (
+        cache.get("route_ids_with_inference")
+        if isinstance(cache, dict)
+        else None
+    )
+    if not isinstance(route_ids, frozenset):
+        route_ids = frozenset(
+            str(row.get("route_id") or "")
+            for row in state.get("inferences", [])
+            if str(row.get("route_id") or "")
+        )
+        if isinstance(cache, dict):
+            cache["route_ids_with_inference"] = route_ids
+    return route_id in route_ids
 
 
 def _debt_explicitly_targets_inference(state: Mapping[str, Any], debt: Mapping[str, Any], route_id: str) -> bool:
@@ -9933,44 +15111,74 @@ def _claims_with_active_route_blockers(state: Mapping[str, Any]) -> set[str]:
     return blocked
 
 
-def _route_without_inference(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+def _routes_without_inference(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     with_inference = {row["route_id"] for row in state["inferences"]}
     routes = [row for row in state["routes"] if row["status"] == "active" and row["route_id"] not in with_inference]
     routes.sort(key=lambda row: (row["relation_to_parent"] != "sufficient", row["route_id"]))
     paused = paused_route_ids(state)
-    unpaused = [row for row in routes if row["route_id"] not in paused]
-    return unpaused[0] if unpaused else None
+    return [row for row in routes if row["route_id"] not in paused]
+
+
+def _route_without_inference(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    routes = _routes_without_inference(state)
+    return routes[0] if routes else None
+
+
+def _root_alignment_audit_candidates(
+    state: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    run_count = int(state.get("run_count", 0) or 0)
+    if run_count < 8 or run_count % 8 != 0:
+        return []
+    if _recent_intent_seen(state, "root_alignment_audit", window=6):
+        return []
+    routes = [row for row in route_scoreboard(state, limit=8) if row["scoreboard_status"] not in {"low_yield", "stalled", "blocked", "abandoned"}]
+    routes_by_id = {
+        str(row.get("route_id") or ""): row for row in state.get("routes", [])
+    }
+    return [
+        routes_by_id[str(score.get("route_id") or "")]
+        for score in routes
+        if str(score.get("route_id") or "") in routes_by_id
+    ]
 
 
 def _root_alignment_audit_candidate(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-    run_count = int(state.get("run_count", 0) or 0)
-    if run_count < 8 or run_count % 8 != 0:
-        return None
-    if _recent_intent_seen(state, "root_alignment_audit", window=6):
-        return None
-    routes = [row for row in route_scoreboard(state, limit=8) if row["scoreboard_status"] not in {"low_yield", "stalled", "blocked", "abandoned"}]
-    if not routes:
-        return None
-    route_id = routes[0]["route_id"]
-    return next((row for row in state["routes"] if row["route_id"] == route_id), None)
+    candidates = _root_alignment_audit_candidates(state)
+    return candidates[0] if candidates else None
 
 
-def _proof_compression_candidate(state: Mapping[str, Any], *, ignore_cadence: bool = False) -> Optional[Mapping[str, Any]]:
+def _proof_compression_candidates(
+    state: Mapping[str, Any], *, ignore_cadence: bool = False
+) -> list[Mapping[str, Any]]:
     run_count = int(state.get("run_count", 0) or 0)
     if not ignore_cadence and (run_count < 6 or run_count % 6 != 0):
-        return None
+        return []
     if _recent_intent_seen(state, "proof_compression", window=8):
-        return None
+        return []
     scored = route_scoreboard(state, limit=8)
+    routes_by_id = {
+        str(row.get("route_id") or ""): row for row in state.get("routes", [])
+    }
+    candidates: list[Mapping[str, Any]] = []
     for score in scored:
         if score["scoreboard_status"] not in {"verified_part", "promising"}:
             continue
         if score["verified_inference_count"] < 2:
             continue
-        route = next((row for row in state["routes"] if row["route_id"] == score["route_id"]), None)
+        route = routes_by_id.get(str(score.get("route_id") or ""))
         if route:
-            return route
-    return None
+            candidates.append(route)
+    return candidates
+
+
+def _proof_compression_candidate(
+    state: Mapping[str, Any], *, ignore_cadence: bool = False
+) -> Optional[Mapping[str, Any]]:
+    candidates = _proof_compression_candidates(
+        state, ignore_cadence=ignore_cadence
+    )
+    return candidates[0] if candidates else None
 
 
 def _recent_intent_seen(state: Mapping[str, Any], intent: str, *, window: int) -> bool:
@@ -9993,6 +15201,8 @@ def _integration_candidate(state: Mapping[str, Any]) -> Optional[Mapping[str, An
 def _latest_clean_verification_at_from_state(
     state: Mapping[str, Any],
     entity: Mapping[str, Any],
+    *,
+    artifacts_by_id: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> str:
     """Return the newest zero-gap strict-verifier certificate on an entity."""
     evidence_ids = {
@@ -10003,14 +15213,17 @@ def _latest_clean_verification_at_from_state(
     if not evidence_ids:
         return ""
     latest = ""
-    artifacts = {
-        str(artifact.get("artifact_id") or ""): artifact
-        for artifact in [
-            *state.get("artifacts", []),
-            *state.get("audit_artifacts", []),
-        ]
-        if str(artifact.get("artifact_id") or "")
-    }
+    artifacts = artifacts_by_id
+    if artifacts is None:
+        artifacts = {
+            str(artifact.get("artifact_id") or ""): artifact
+            for source in (
+                state.get("artifacts", []),
+                state.get("audit_artifacts", []),
+            )
+            for artifact in source
+            if str(artifact.get("artifact_id") or "")
+        }
     for artifact in artifacts.values():
         if str(artifact.get("artifact_id") or "") not in evidence_ids:
             continue
@@ -10059,6 +15272,7 @@ def _integration_candidates(
     exclude_route_ids: set[str] | None = None,
     exclude_claim_ids: set[str] | None = None,
     limit: int | None = None,
+    distinct_claims: bool = True,
 ) -> list[Mapping[str, Any]]:
     """Return verified routes with at least one complete terminal inference.
 
@@ -10073,15 +15287,64 @@ def _integration_candidates(
         inferences_by_route.setdefault(inf["route_id"], []).append(inf)
     claim_by_id = {row["claim_id"]: row for row in state["claims"]}
     claim_status = {claim_id: row["validation_status"] for claim_id, row in claim_by_id.items()}
+    artifacts_by_id = {
+        str(artifact.get("artifact_id") or ""): artifact
+        for source in (
+            state.get("artifacts", []),
+            state.get("audit_artifacts", []),
+        )
+        for artifact in source
+        if str(artifact.get("artifact_id") or "")
+    }
+    blocking_debts_by_owner: dict[str, list[Mapping[str, Any]]] = {}
+    for debt in state.get("debts", []):
+        if (
+            str(debt.get("status") or "") == "active"
+            and str(debt.get("severity") or "") == "blocking"
+        ):
+            blocking_debts_by_owner.setdefault(
+                str(debt.get("owner_id") or ""), []
+            ).append(debt)
+    clean_verification_cache: dict[tuple[str, str], str] = {}
+
+    def latest_clean_verification(
+        entity_type: str,
+        entity_id: str,
+        entity: Mapping[str, Any],
+    ) -> str:
+        key = (entity_type, entity_id)
+        if key not in clean_verification_cache:
+            clean_verification_cache[key] = (
+                _latest_clean_verification_at_from_state(
+                    state,
+                    entity,
+                    artifacts_by_id=artifacts_by_id,
+                )
+            )
+        return clean_verification_cache[key]
+
     excluded_routes = {str(item) for item in (exclude_route_ids or set()) if str(item)}
     excluded_claims = {str(item) for item in (exclude_claim_ids or set()) if str(item)}
+    if limit is not None and int(limit) <= 0:
+        return []
+    selected_claims = set(excluded_claims)
     candidates: list[Mapping[str, Any]] = []
     for route in sorted(state["routes"], key=lambda row: row["route_id"]):
         if route["status"] != "active" or route["relation_to_parent"] != "sufficient":
             continue
         route_id = str(route["route_id"])
         conclusion_id = str(route["conclusion_claim_id"])
-        if route_id in excluded_routes or conclusion_id in excluded_claims:
+        if route_id in excluded_routes or (
+            distinct_claims and conclusion_id in selected_claims
+        ):
+            continue
+        conclusion_claim = claim_by_id.get(conclusion_id)
+        if not conclusion_claim or str(
+            conclusion_claim.get("lifecycle_status") or ""
+        ) != "active":
+            # Alternative sufficient routes can remain active after another
+            # route integrates their conclusion.  Verification status alone
+            # must not reopen an already integrated (or abandoned) claim.
             continue
         if claim_status.get(conclusion_id) not in verified:
             continue
@@ -10101,15 +15364,17 @@ def _integration_candidates(
             *[str(inf.get("inference_id") or "") for inf in route_inferences],
         }
         clean_verification_by_owner = {
-            conclusion_id: _latest_clean_verification_at_from_state(
-                state,
+            conclusion_id: latest_clean_verification(
+                "claim",
+                conclusion_id,
                 claim_by_id[conclusion_id],
             )
         }
         clean_verification_by_owner.update(
             {
-                str(inf.get("inference_id") or ""): _latest_clean_verification_at_from_state(
-                    state,
+                str(inf.get("inference_id") or ""): latest_clean_verification(
+                    "inference",
+                    str(inf.get("inference_id") or ""),
                     inf,
                 )
                 for inf in route_inferences
@@ -10117,11 +15382,9 @@ def _integration_candidates(
         )
         blockers = [
             debt
-            for debt in state.get("debts", [])
-            if str(debt.get("status") or "") == "active"
-            and str(debt.get("severity") or "") == "blocking"
-            and str(debt.get("owner_id") or "") in blocker_owner_ids
-            and _debt_blocks_integration_candidate(
+            for owner_id in blocker_owner_ids
+            for debt in blocking_debts_by_owner.get(owner_id, [])
+            if _debt_blocks_integration_candidate(
                 debt,
                 claim_id=conclusion_id,
                 clean_verification_by_owner=clean_verification_by_owner,
@@ -10134,24 +15397,27 @@ def _integration_candidates(
             str(inf["inference_id"]) for inf in terminal_inferences
         )
         candidates.append(candidate)
+        if distinct_claims:
+            selected_claims.add(conclusion_id)
         if limit is not None and len(candidates) >= max(0, int(limit)):
             break
     return candidates
 
 
-def _external_citation_candidate(state: Mapping[str, Any], *, target_id: str) -> Optional[Dict[str, str]]:
+def _external_citation_candidates(
+    state: Mapping[str, Any], *, target_id: str
+) -> list[Dict[str, str]]:
     target = _claim(state, target_id)
     if not target:
-        return None
+        return []
     if target.get("validation_status") in {"informally_verified", "formally_verified", "refuted"}:
-        return None
-    if _recent_intent_seen(state, "citation_certification", window=4):
-        return None
+        return []
     relation_rank = {
         "direct_match": 0,
         "stronger_match": 1,
         "equivalent_reformulation": 2,
     }
+    durable_triage = _citation_triage_status_by_card(state)
     candidates: list[Dict[str, str]] = []
     for card in state.get("retrieval_cards", []):
         applicability = _json_object(card.get("applicability_json"))
@@ -10168,15 +15434,157 @@ def _external_citation_candidate(state: Mapping[str, Any], *, target_id: str) ->
         missing = _json_list(card.get("missing_hypotheses_json"))
         if missing:
             continue
-        candidates.append({"card_id": str(card["card_id"]), "relation": relation})
+        card_id = str(card["card_id"])
+        if durable_triage.get(card_id) in {
+            "citation_triage_fail",
+            "failed",
+            "rejected",
+        }:
+            continue
+        if _recent_object_action_seen(
+            state,
+            intent="citation_certification",
+            candidate_prefix="base_evidence:external_citation_check:",
+            subject_id=card_id,
+            window=4,
+            target_id=target_id,
+        ):
+            continue
+        candidates.append({"card_id": card_id, "relation": relation})
     candidates.sort(key=lambda row: (relation_rank.get(row["relation"], 99), row["card_id"]))
+    return candidates
+
+
+def _external_citation_candidate(
+    state: Mapping[str, Any], *, target_id: str
+) -> Optional[Dict[str, str]]:
+    candidates = _external_citation_candidates(state, target_id=target_id)
     return candidates[0] if candidates else None
 
 
-def _definition_audit_candidate(state: Mapping[str, Any], *, target_id: str) -> Optional[Dict[str, str]]:
-    if _recent_intent_seen(state, "definition_audit", window=6):
-        return None
+def _citation_triage_status_by_card(state: Mapping[str, Any]) -> Mapping[str, str]:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("citation_triage_status_by_card")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, dict):
+        return cached
+    statuses: Dict[str, tuple[int, str]] = {}
+    for artifact in state.get("research_artifacts", []):
+        if str(artifact.get("artifact_type") or "") != "verification_report":
+            continue
+        metadata = _json_object(artifact.get("metadata_json"))
+        verdict = str(
+            metadata.get("citation_triage_verdict")
+            or metadata.get("verdict")
+            or ""
+        ).lower()
+        if verdict not in {
+            "citation_triage_pass",
+            "citation_triage_fail",
+            "passed",
+            "failed",
+            "rejected",
+        }:
+            continue
+        revision = _revision_number(artifact.get("state_revision"))
+        for card_id in _metadata_reference_ids(
+            metadata,
+            "retrieval_card_id",
+            "retrieval_card_ids",
+            "source_card_id",
+            "source_card_ids",
+        ):
+            current = statuses.get(card_id)
+            if current is None or revision >= current[0]:
+                statuses[card_id] = (revision, verdict)
+    result = {card_id: row[1] for card_id, row in statuses.items()}
+    if isinstance(cache, dict):
+        cache["citation_triage_status_by_card"] = result
+    return result
+
+
+def _definition_audited_card_ids(state: Mapping[str, Any]) -> set[str]:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("definition_audited_card_ids")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, set):
+        return cached
+    card_ids: set[str] = set()
+    for artifact in state.get("research_artifacts", []):
+        if str(artifact.get("artifact_type") or "") != "definition_audit_report":
+            continue
+        metadata = _json_object(artifact.get("metadata_json"))
+        card_ids.update(
+            _metadata_reference_ids(
+                metadata,
+                "retrieval_card_id",
+                "retrieval_card_ids",
+                "audited_source_id",
+                "audited_source_ids",
+            )
+        )
+    if isinstance(cache, dict):
+        cache["definition_audited_card_ids"] = card_ids
+    return card_ids
+
+
+def _classified_proof_candidate_artifact_ids(
+    state: Mapping[str, Any],
+) -> set[str]:
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    cached = (
+        cache.get("classified_proof_candidate_artifact_ids")
+        if isinstance(cache, dict)
+        else None
+    )
+    if isinstance(cached, set):
+        return cached
+    artifact_ids: set[str] = set()
+    for artifact in state.get("research_artifacts", []):
+        if str(artifact.get("artifact_type") or "") not in {
+            "research_diagnostic",
+            "route_obstruction",
+        }:
+            continue
+        metadata = _json_object(artifact.get("metadata_json"))
+        artifact_ids.update(
+            _metadata_reference_ids(
+                metadata,
+                "proof_candidate_artifact_id",
+                "proof_candidate_artifact_ids",
+                "classified_proof_artifact_id",
+            )
+        )
+    if isinstance(cache, dict):
+        cache["classified_proof_candidate_artifact_ids"] = artifact_ids
+    return artifact_ids
+
+
+def _metadata_reference_ids(
+    metadata: Mapping[str, Any], *keys: str
+) -> set[str]:
+    identifiers: set[str] = set()
+    for key in keys:
+        identifiers.update(
+            str(item)
+            for item in _json_list(metadata.get(key))
+            if str(item)
+        )
+    return identifiers
+
+
+def _definition_audit_candidates(
+    state: Mapping[str, Any], *, target_id: str
+) -> list[Dict[str, str]]:
     candidate_relations = {"direct_match", "stronger_match", "equivalent_reformulation", "conditional_match"}
+    audited_card_ids = _definition_audited_card_ids(state)
+    candidates: list[Dict[str, str]] = []
     for card in state.get("retrieval_cards", []):
         applicability = _json_object(card.get("applicability_json"))
         card_target = str(applicability.get("target_id") or target_id)
@@ -10187,15 +15595,45 @@ def _definition_audit_candidate(state: Mapping[str, Any], *, target_id: str) -> 
             continue
         missing = [str(item).lower() for item in _json_list(card.get("missing_hypotheses_json"))]
         status = str(applicability.get("theorem_matching_status") or "").lower()
+        card_id = str(card["card_id"])
+        if card_id in audited_card_ids:
+            continue
+        if _recent_object_action_seen(
+            state,
+            intent="definition_audit",
+            candidate_prefix="base_evidence:definition_audit:",
+            subject_id=card_id,
+            window=6,
+            target_id=target_id,
+        ):
+            continue
         if any("definition" in item or "terminology" in item or "hypoth" in item for item in missing):
-            return {"card_id": str(card["card_id"]), "reason": "definition or hypothesis uncertainty blocks theorem matching"}
-        if (
+            candidates.append(
+                {
+                    "card_id": card_id,
+                    "reason": "definition or hypothesis uncertainty blocks theorem matching",
+                }
+            )
+        elif (
             relation in {"direct_match", "stronger_match", "equivalent_reformulation"}
             and status
             and ("verified" not in status or "unverified" in status)
         ):
-            return {"card_id": str(card["card_id"]), "reason": "near-exact citation needs definition audit before certification"}
-    return None
+            candidates.append(
+                {
+                    "card_id": card_id,
+                    "reason": "near-exact citation needs definition audit before certification",
+                }
+            )
+    candidates.sort(key=lambda row: (row["reason"], row["card_id"]))
+    return candidates
+
+
+def _definition_audit_candidate(
+    state: Mapping[str, Any], *, target_id: str
+) -> Optional[Dict[str, str]]:
+    candidates = _definition_audit_candidates(state, target_id=target_id)
+    return candidates[0] if candidates else None
 
 
 def _source_synthesis_candidate(state: Mapping[str, Any], *, target_id: str) -> Optional[Dict[str, str]]:
@@ -10222,22 +15660,40 @@ def _source_synthesis_candidate(state: Mapping[str, Any], *, target_id: str) -> 
     return None
 
 
+def _route_triage_candidates(
+    state: Mapping[str, Any],
+    *,
+    active_trunk_pressure: Mapping[str, Any],
+) -> list[Dict[str, str]]:
+    if _recent_intent_seen(state, "route_triage", window=6):
+        return []
+    if active_trunk_pressure.get("over_trunk_cap"):
+        return [
+            {
+                "route_triage_id": "active-trunk-cap",
+                "reason": "too many active main proof trunks; triage before adding more work",
+            }
+        ]
+    candidates: list[Dict[str, str]] = []
+    for row in route_scoreboard(state, limit=8):
+        if row["scoreboard_status"] in {"stalled", "low_yield"} and int(row.get("repeated_blocker_count", 0)) >= 3:
+            candidates.append({
+                "route_triage_id": str(row["route_id"]),
+                "route_id": str(row["route_id"]),
+                "reason": "route has repeated blocking debt and needs triage",
+            })
+    return candidates
+
+
 def _route_triage_candidate(
     state: Mapping[str, Any],
     *,
     active_trunk_pressure: Mapping[str, Any],
 ) -> Optional[Dict[str, str]]:
-    if _recent_intent_seen(state, "route_triage", window=6):
-        return None
-    if active_trunk_pressure.get("over_trunk_cap"):
-        return {"reason": "too many active main proof trunks; triage before adding more work"}
-    for row in route_scoreboard(state, limit=8):
-        if row["scoreboard_status"] in {"stalled", "low_yield"} and int(row.get("repeated_blocker_count", 0)) >= 3:
-            return {
-                "route_id": str(row["route_id"]),
-                "reason": "route has repeated blocking debt and needs triage",
-            }
-    return None
+    candidates = _route_triage_candidates(
+        state, active_trunk_pressure=active_trunk_pressure
+    )
+    return candidates[0] if candidates else None
 
 
 def _active_main_trunk_pressure(state: Mapping[str, Any]) -> Dict[str, Any]:
@@ -10262,12 +15718,28 @@ def _active_main_trunk_pressure(state: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _route_for_owner(state: Mapping[str, Any], owner_id: str) -> str:
-    if any(row["route_id"] == owner_id for row in state["routes"]):
-        return owner_id
-    for inf in state["inferences"]:
-        if inf["inference_id"] == owner_id:
-            return inf["route_id"]
-    return ""
+    cache = state.get(SCHEDULER_PLANNING_CACHE_KEY)
+    route_by_owner = (
+        cache.get("route_by_owner_id") if isinstance(cache, dict) else None
+    )
+    if not isinstance(route_by_owner, dict):
+        route_by_owner = {
+            str(route.get("route_id") or ""): str(route.get("route_id") or "")
+            for route in state.get("routes", [])
+            if str(route.get("route_id") or "")
+        }
+        route_by_owner.update(
+            {
+                str(inference.get("inference_id") or ""): str(
+                    inference.get("route_id") or ""
+                )
+                for inference in state.get("inferences", [])
+                if str(inference.get("inference_id") or "")
+            }
+        )
+        if isinstance(cache, dict):
+            cache["route_by_owner_id"] = route_by_owner
+    return str(route_by_owner.get(owner_id) or "")
 
 
 def _route_for_debt(state: Mapping[str, Any], debt: Mapping[str, Any], target_id: str, *, allow_paused: bool = False) -> str:
@@ -10347,7 +15819,7 @@ def _final_proof_artifact(state: Mapping[str, Any], claim_id: str) -> Optional[M
         if isinstance(metadata, str):
             try:
                 metadata = json.loads(metadata)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 metadata = {}
         if not isinstance(metadata, Mapping):
             metadata = {}
@@ -10389,7 +15861,7 @@ def _writing_gate_action(
     if not certificate_id:
         return None
     if is_paper_audit_mode(research_mode):
-        # paper_solution_audit (TODO 6): the deliverable is a referee-style
+        # paper_solution_audit: the deliverable is a referee-style
         # audit report, never a polished paper; the writing gate's paper
         # authoring must not fire in this mode.
         return None
@@ -10501,19 +15973,6 @@ def _writing_existing_document_gate_action(
     document_type = str(paper_artifact.get("artifact_type") or "final_paper")
     document_format = revision_document_format(paper_artifact) if external_revision else "tex"
     document_label = "external manuscript" if external_revision else "final paper"
-    content = _writing_artifact_content(paper_artifact)
-    _sync_writing_lint_debts(
-        store,
-        artifact_id,
-        content,
-        include_paper_register=not external_revision,
-    )
-    # Externally submitted source is not assumed to be standalone: it may rely
-    # on a venue class, bibliography, or included files outside the ingested
-    # manuscript. A best-effort sidecar may be recorded, but only Albilich's
-    # internally generated final_paper has a blocking standalone compile gate.
-    if not external_revision:
-        _sync_writing_compile_debt(store, artifact_id)
     gate = _writing_gate_state(store, artifact_id)
     open_debts = gate["open_writing_debts"]
     all_blocking = [
@@ -10714,9 +16173,6 @@ def _publication_document_gate_action(
     """Unbounded writer--referee loop for an internally certified paper."""
 
     artifact_id = str(document_artifact.get("artifact_id") or "")
-    content = _writing_artifact_content(document_artifact)
-    _sync_writing_lint_debts(store, artifact_id, content, include_paper_register=True)
-    _sync_writing_compile_debt(store, artifact_id)
     gate = _writing_gate_state(store, artifact_id)
     open_debts = gate["open_writing_debts"]
     blocking = [
@@ -10796,32 +16252,65 @@ def _publication_document_gate_action(
     )
 
 
-def _publication_route_error_research_action(
+def _publication_only_test(state: Mapping[str, Any]) -> bool:
+    return any(
+        str(artifact.get("artifact_type") or "") == "final_paper"
+        and bool(
+            _json_object(artifact.get("metadata_json")).get(
+                "publication_only_test"
+            )
+        )
+        for artifact in (
+            list(state.get("artifacts", []))
+            + list(state.get("final_artifacts", []))
+        )
+    )
+
+
+def _latest_escalated_route_error_review(
+    state: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    reviews = [
+        dict(row)
+        for row in state.get("publication_reviews", [])
+        if str(row.get("verdict") or "") == "major_proof_route_error"
+        and str(row.get("escalated_at") or "")
+    ]
+    reviews.sort(
+        key=lambda row: (
+            int(row.get("round_number") or 0),
+            int(row.get("state_revision") or 0),
+            str(row.get("review_id") or ""),
+        ),
+        reverse=True,
+    )
+    return reviews[0] if reviews else None
+
+
+def _reconcile_publication_route_error(
     store: ProofStateStore,
     state: Mapping[str, Any],
     *,
-    problem: Mapping[str, Any],
-    requested_tokens: Optional[int],
     research_mode: str,
 ) -> Optional[Dict[str, Any]]:
-    """Challenge the integrated root and return a falsified route to research."""
+    """Persist a pending referee route error before scheduler selection."""
 
     review = pending_route_error_review(state)
     if review is None:
         return None
-    publication_only_test = any(
-        str(artifact.get("artifact_type") or "") == "final_paper"
-        and bool(_json_object(artifact.get("metadata_json")).get("publication_only_test"))
-        for artifact in (
-            list(state.get("artifacts", [])) + list(state.get("final_artifacts", []))
-        )
-    )
+    problem = state.get("problem_state", {})
     review_id = str(review.get("review_id") or "")
     route_id = str(review.get("affected_route_id") or "")
-    debt_id = f"referee-route-error-{fingerprint_text(review_id + route_id)[:12]}"
+    obligation_id = (
+        f"referee-route-error-{fingerprint_text(review_id + route_id)[:12]}"
+    )
     root = _claim(state, "root") or {}
-    existing_debt = next(
-        (debt for debt in state.get("debts", []) if str(debt.get("debt_id") or "") == debt_id),
+    existing_obligation = next(
+        (
+            item
+            for item in state.get("debts", [])
+            if str(item.get("debt_id") or "") == obligation_id
+        ),
         None,
     )
     operations: list[Dict[str, Any]] = []
@@ -10848,7 +16337,11 @@ def _publication_route_error_research_action(
             }
         )
     route = next(
-        (row for row in state.get("routes", []) if str(row.get("route_id") or "") == route_id),
+        (
+            row
+            for row in state.get("routes", [])
+            if str(row.get("route_id") or "") == route_id
+        ),
         None,
     )
     if route is not None and str(route.get("status") or "") != "blocked":
@@ -10877,18 +16370,19 @@ def _publication_route_error_research_action(
                 "evidence_artifact_ids": [review_id],
             }
         )
-    if existing_debt is None:
+    if existing_obligation is None:
         operations.append(
             {
                 "op": "add_debt",
-                "debt_id": debt_id,
+                "debt_id": obligation_id,
                 "owner_type": "claim",
                 "owner_id": "root",
                 "debt_type": "referee_route_error",
                 "severity": "blocking",
                 "status": "active",
                 "obligation": (
-                    "The publication referee supplied evidence that the integrated proof route is false. "
+                    "The publication referee supplied evidence that the integrated "
+                    "proof route is false. "
                     f"Falsified step: {str(review.get('falsified_step') or '')} "
                     f"Evidence: {str(review.get('mathematical_evidence') or '')}"
                 ),
@@ -10896,33 +16390,45 @@ def _publication_route_error_research_action(
                 "suggested_next_target": "root",
             }
         )
-    if operations:
-        outcome = apply_patch(
-            store,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "problem_id": store.problem_id,
-                "base_revision": int(problem.get("current_revision") or 0),
-                "actor_role": "scheduler",
-                "target_id": "root",
-                "evidence_artifact_ids": [review_id],
-                "operations": operations,
-                "rationale": "publication referee falsified the integrated proof route; reopen mathematical research",
-            },
+    operations.append(
+        {
+            "op": "mark_publication_review_escalated",
+            "review_id": review_id,
+        }
+    )
+    outcome = apply_system_patch(
+        store,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "problem_id": store.problem_id,
+            "base_revision": int(problem.get("current_revision") or 0),
+            "actor_role": "scheduler",
+            "target_id": "root",
+            "evidence_artifact_ids": [review_id],
+            "operations": operations,
+            "rationale": (
+                "publication referee falsified the integrated proof route; "
+                "reopen mathematical research"
+            ),
+        },
+    )
+    if not outcome.accepted:
+        return _action(
+            "stop_with_partial_results",
+            "root",
+            route_id,
+            "could not apply the referee route-error escalation",
+            plan_step_budget(problem, "stop_with_partial_results", 0),
+            research_mode=research_mode,
+            errors=outcome.errors,
+            stop_reason_code="referee_route_error_escalation_failed",
         )
-        if not outcome.accepted:
-            return _action(
-                "stop_with_partial_results",
-                "root",
-                route_id,
-                "could not apply the referee route-error escalation",
-                plan_step_budget(problem, "stop_with_partial_results", 0),
-                research_mode=research_mode,
-                errors=outcome.errors,
-                stop_reason_code="referee_route_error_escalation_failed",
-            )
     with store.connect() as conn:
-        escalated_at = mark_route_error_escalated(conn, review_id)
+        review_row = conn.execute(
+            "SELECT escalated_at FROM publication_reviews WHERE review_id = ?",
+            (review_id,),
+        ).fetchone()
+        escalated_at = str(review_row["escalated_at"] or "") if review_row else ""
         store.write_event(
             conn,
             store.get_revision(conn),
@@ -10930,11 +16436,50 @@ def _publication_route_error_research_action(
             {
                 "review_id": review_id,
                 "route_id": route_id,
-                "debt_id": debt_id,
+                "debt_id": obligation_id,
                 "escalated_at": escalated_at,
             },
         )
         conn.commit()
+    return None
+
+
+def _publication_route_error_research_action(
+    store: ProofStateStore,
+    state: Mapping[str, Any],
+    *,
+    problem: Mapping[str, Any],
+    requested_tokens: Optional[int],
+    research_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Challenge the integrated root and return a falsified route to research."""
+
+    # A pending review is handled by the explicit reconciliation phase in
+    # ``next_action``. Candidate generation never writes proof state.
+    if pending_route_error_review(state) is not None:
+        return None
+    review = _latest_escalated_route_error_review(state)
+    if review is None:
+        return None
+    publication_only_test = _publication_only_test(state)
+    review_id = str(review.get("review_id") or "")
+    route_id = str(review.get("affected_route_id") or "")
+    debt_id = f"referee-route-error-{fingerprint_text(review_id + route_id)[:12]}"
+    existing_debt = next(
+        (debt for debt in state.get("debts", []) if str(debt.get("debt_id") or "") == debt_id),
+        None,
+    )
+    if existing_debt is None or str(existing_debt.get("status") or "") != "active":
+        return None
+    if not publication_only_test and any(
+        str(run.get("search_intent") or "") == PUBLICATION_ROUTE_ERROR_RESEARCH_INTENT
+        and str(run.get("status") or "")
+        not in {"failed", "timeout", "no_patch", "cancelled", "patch_rejected"}
+        and str(run.get("created_at") or "")
+        >= str(review.get("escalated_at") or "")
+        for run in state.get("recent_runs", [])
+    ):
+        return None
     if publication_only_test:
         return _action(
             "await_human",
@@ -10953,6 +16498,26 @@ def _publication_route_error_research_action(
             falsified_route_id=route_id,
             publication_only_test=True,
             terminal_classification="publication_route_error_requires_operator",
+            human_blocker_request={
+                "kind": "publication_route_error",
+                "target_id": "root",
+                "summary": (
+                    f"Publication referee falsified proof route {route_id}"
+                ),
+                "detail": (
+                    f"The route has been challenged and proof obligation {debt_id} "
+                    "was opened. This publication-only run will not start a replacement "
+                    "proof search without operator direction."
+                ),
+                "options": [
+                    "authorize research on a replacement proof route",
+                    "provide a replacement theorem statement",
+                    "end the publication-only run",
+                ],
+                "fingerprint": f"publication-route-error:{review_id}",
+                "revision": int(problem.get("current_revision") or 0),
+                "required": True,
+            },
         )
     return _action(
         "reduce",
@@ -10980,7 +16545,7 @@ def _writing_human_consultation_action(
 ) -> Optional[Dict[str, Any]]:
     """Pause on an unanswered L3-TERM-03 consultation instead of guessing."""
 
-    snapshot = steering.snapshot(store.state_dir)
+    snapshot = steering.authenticated_snapshot(store)
     resolved = {
         str(blocker.get("fingerprint") or ""): blocker
         for blocker in snapshot.get("resolved_blockers", [])
@@ -10995,20 +16560,6 @@ def _writing_human_consultation_action(
         if fingerprint in resolved:
             continue
         question = obligation.split(WRITING_HUMAN_CONSULTATION_MARKER, 1)[1].strip()
-        blocker = steering.raise_blocker(
-            store.state_dir,
-            kind="terminology",
-            target_id=artifact_id,
-            summary=f"Human terminology decision required for {artifact_id}",
-            detail=question or obligation,
-            options=[
-                "use the established literature term",
-                "retain the new term and justify it explicitly",
-                "provide a different preferred term",
-            ],
-            fingerprint=fingerprint,
-            revision=int(problem.get("current_revision") or 0),
-        )
         return _action(
             "await_human",
             "root",
@@ -11017,9 +16568,22 @@ def _writing_human_consultation_action(
             plan_step_budget(problem, "await_human", 0),
             research_mode=research_mode,
             terminal_classification="writing_terminology_consultation_required",
-            human_blocker_id=str(blocker.get("id") or ""),
             terminology_debt_id=debt_id,
             artifact_reviewed=artifact_id,
+            human_blocker_request={
+                "kind": "terminology",
+                "target_id": artifact_id,
+                "summary": f"Human terminology decision required for {artifact_id}",
+                "detail": question or obligation,
+                "options": [
+                    "use the established literature term",
+                    "retain the new term and justify it explicitly",
+                    "provide a different preferred term",
+                ],
+                "fingerprint": fingerprint,
+                "revision": int(problem.get("current_revision") or 0),
+                "required": True,
+            },
         )
     return None
 
@@ -11053,7 +16617,7 @@ def _writing_quality_exhausted_action(
     fingerprint = f"writing-quality-exhausted:{debt_fingerprint}:round-{human_revision_rounds}"
     resolved = {
         str(blocker.get("fingerprint") or ""): blocker
-        for blocker in steering.snapshot(store.state_dir).get("resolved_blockers", [])
+        for blocker in steering.authenticated_snapshot(store).get("resolved_blockers", [])
         if str(blocker.get("answered_with") or "").strip()
     }
     if fingerprint in resolved:
@@ -11076,19 +16640,6 @@ def _writing_quality_exhausted_action(
             writing_gate_round=human_revision_rounds + 1,
             human_steering_authorized=True,
         )
-    blocker = steering.raise_blocker(
-        store.state_dir,
-        kind="writing_quality",
-        target_id=artifact_id,
-        summary=f"Writing revision budget exhausted with {len(debts)} gating finding(s)",
-        detail="; ".join(str(card.get("obligation") or "") for card in cards[:8]),
-        options=[
-            "supply a concrete rewrite or terminology decision",
-            "authorize another focused revision pass",
-        ],
-        fingerprint=fingerprint,
-        revision=int(problem.get("current_revision") or 0),
-    )
     return _action(
         "await_human",
         "root",
@@ -11097,9 +16648,25 @@ def _writing_quality_exhausted_action(
         plan_step_budget(problem, "await_human", 0),
         research_mode=research_mode,
         terminal_classification="writing_quality_human_resolution_required",
-        human_blocker_id=str(blocker.get("id") or ""),
         artifact_reviewed=artifact_id,
         open_writing_debts=cards,
+        human_blocker_request={
+            "kind": "writing_quality",
+            "target_id": artifact_id,
+            "summary": (
+                f"Writing revision budget exhausted with {len(debts)} gating finding(s)"
+            ),
+            "detail": "; ".join(
+                str(card.get("obligation") or "") for card in cards[:8]
+            ),
+            "options": [
+                "supply a concrete rewrite or terminology decision",
+                "authorize another focused revision pass",
+            ],
+            "fingerprint": fingerprint,
+            "revision": int(problem.get("current_revision") or 0),
+            "required": True,
+        },
     )
 
 
@@ -11107,13 +16674,16 @@ def _writing_artifact_content(final_artifact: Mapping[str, Any]) -> str:
     path_text = str(final_artifact.get("path") or "")
     if not path_text:
         return ""
-    path = Path(path_text)
     try:
-        if not path.is_file():
-            return ""
-        return path.read_text(encoding="utf-8")[:WRITING_GATE_MAX_ARTIFACT_CHARS]
-    except OSError:
-        return ""
+        return read_bounded_text(
+            Path(path_text),
+            max_bytes=WRITING_GATE_MAX_ARTIFACT_BYTES,
+            label="writing-gate document",
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            f"cannot validate the complete writing-gate document: {exc}"
+        ) from exc
 
 
 def _writing_lint_debt_id(artifact_id: str, rule_id: str, line: int, message: str) -> str:
@@ -11127,7 +16697,7 @@ def _sync_writing_lint_debts(
     content: str,
     *,
     include_paper_register: bool = True,
-) -> None:
+) -> list[str]:
     """Sync deterministic lint findings to writing debts (idempotent).
 
     The gated artifact is either final_paper or an external revision_document
@@ -11187,8 +16757,8 @@ def _sync_writing_lint_debts(
             }
         )
     if not operations:
-        return
-    apply_patch(
+        return []
+    outcome = apply_system_patch(
         store,
         {
             "schema_version": SCHEMA_VERSION,
@@ -11200,6 +16770,7 @@ def _sync_writing_lint_debts(
             "rationale": f"writing gate deterministic lint sync for final paper {artifact_id}",
         },
     )
+    return [] if outcome.accepted else list(outcome.errors)
 
 
 def _writing_compile_log_excerpt(log_path: str, limit: int = 600) -> str:
@@ -11207,8 +16778,12 @@ def _writing_compile_log_excerpt(log_path: str, limit: int = 600) -> str:
     if not log_path:
         return ""
     try:
-        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        text, _omitted, _size = read_text_tail(
+            Path(log_path),
+            max_bytes=128 * 1024,
+            label="LaTeX compile log",
+        )
+    except (OSError, ValueError):
         return ""
     error_lines = [line.strip() for line in text.splitlines() if line.startswith("!")]
     tail_lines = [line.rstrip() for line in text.splitlines()[-15:]]
@@ -11216,7 +16791,9 @@ def _writing_compile_log_excerpt(log_path: str, limit: int = 600) -> str:
     return _compact_text(combined, limit)
 
 
-def _sync_writing_compile_debt(store: ProofStateStore, artifact_id: str) -> None:
+def _sync_writing_compile_debt(
+    store: ProofStateStore, artifact_id: str
+) -> list[str]:
     """Sync the LaTeX-compile status of the current final_paper to a writing debt.
 
     Reads the compile outcome persisted on the artifact metadata at write time
@@ -11276,8 +16853,8 @@ def _sync_writing_compile_debt(store: ProofStateStore, artifact_id: str) -> None
             }
         )
     if not operations:
-        return
-    apply_patch(
+        return []
+    outcome = apply_system_patch(
         store,
         {
             "schema_version": SCHEMA_VERSION,
@@ -11289,6 +16866,7 @@ def _sync_writing_compile_debt(store: ProofStateStore, artifact_id: str) -> None
             "rationale": f"writing gate LaTeX-compile sync for final paper {artifact_id}",
         },
     )
+    return [] if outcome.accepted else list(outcome.errors)
 
 
 def _writing_gate_state(store: ProofStateStore, artifact_id: str) -> Dict[str, Any]:
@@ -11422,7 +17000,7 @@ def _json_object(value: Any) -> Dict[str, Any]:
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             return {}
         return dict(parsed) if isinstance(parsed, Mapping) else {}
     return {}
@@ -11446,7 +17024,7 @@ def _json_list(value: Any) -> list[Any]:
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             return [value] if value else []
         if isinstance(parsed, list):
             return parsed

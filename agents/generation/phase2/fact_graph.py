@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Danus-style fact graph as a GENERATED, READ-ONLY view (2026-07-09 TODO 3).
+"""Danus-style fact graph as a generated, read-only view.
 
 This module never writes to the store. It materializes a graph view over the
 existing SQLite proof state (claims, routes, inferences, debts, artifacts,
@@ -10,7 +10,7 @@ see which branches are deep, shallow, blocked, or converging. It is a lens,
 not a second store: the SQLite proof state stays authoritative and every node
 cites the row it was generated from.
 
-Node vocabulary (update-advice TODO 3):
+Node vocabulary:
 
 - ``VerifiedFact`` — a claim or inference accepted by a verifier
   (memory_status ``verified``), with its proof artifact ids and dependency

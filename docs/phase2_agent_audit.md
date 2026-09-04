@@ -1,5 +1,9 @@
 # Albilich v1 agent audit
 
+> Historical audit retained for provenance. It predates schema v3, host-bound
+> authority and certificates, host CAS/formal reproduction, and exact replay.
+> The current assessment is `third_pass_systems_review.md`.
+
 Last checked: 2026-06-21. This file compares the intended Albilich v1 prompt roles against the checked-in Albilich v1 implementation.
 
 | Prompt role or component | Implementation status | Code locations | Notes |
@@ -8,8 +12,8 @@ Last checked: 2026-06-21. This file compares the intended Albilich v1 prompt rol
 | Researcher | Implemented | `codex_runner.py`, `patches.py`, `counterexample.py` | Default role for proof routes, claims, inferences, proof artifacts, and candidate counterexamples. Cannot verify, confirm refutations, or integrate. |
 | Literature researcher | Implemented for research-mode retrieval, source synthesis, and definition audit | `research_policy.py`, `scheduler.py`, `retrieval.py`, `codex_runner.py`, `patches.py` | Standard Albilich v1 defaults to `balanced` research mode with live search scoped to the literature scan. The same `literature_researcher` actor handles retrieval, source synthesis, and definition audit modes. Retrieval depth remains adaptive: scout, reader, and research-librarian levels handle cheap search, theorem-card extraction, and hard theorem matching respectively. Only the literature researcher can cache retrieval cards. |
 | Strict informal verifier | Implemented | `codex_runner.py`, `patches.py`, `invariants.py` | Verifies only through compact zero-gap `verification_report` artifacts produced by `strict_informal_verifier`. |
-| Integration verifier | Implemented | `integration.py`, `patches.py`, `scheduler.py`, `result_status.py` | Integration requires verified conclusion, verified inferences, verified premises, integration evidence, and no blocking debt. Root integration additionally requires exact/equivalent/stronger root alignment with checked implication and no hidden extra assumptions. |
-| PhD advisor | Implemented for debt-driven repair and route triage | `advisor.py`, `scheduler.py`, `codex_runner.py` | Cadence helper is present. v1 scheduler invokes the advisor through debt-targeted reduce/weaken/strengthen actions and `triage_routes` rather than the older v0.5 mandatory loop. |
+| Integration verifier | Implemented | `integration.py`, `patches.py`, `scheduler.py`, `result_status.py` | Integration requires verified conclusion, verified inferences, verified premises, integration evidence, and no blocking proof obligation. Root integration additionally requires exact/equivalent/stronger root alignment with checked implication and no hidden extra assumptions. |
+| PhD advisor | Implemented for obligation-driven repair and proof-approach triage | `advisor.py`, `scheduler.py`, `codex_runner.py` | Cadence helper is present. v1 scheduler invokes the advisor through obligation-targeted reduce/weaken/strengthen actions and `triage_routes` rather than the older v0.5 mandatory loop. |
 | Formal backend | Partially implemented | `formal_handoff.py`, `codex_runner.py`, `patches.py` | Artifact gates and handoff manifests exist. A real prover-specific backend adapter is not included. |
 | Counterexample hunting | Implemented as researcher submode | `counterexample.py`, `codex_runner.py`, `models.py` | Candidate counterexample patches use the non-verifying `researcher` actor. The scheduler does not yet proactively choose refute mode. |
 | Counterexample validator | Implemented | `counterexample.py`, `codex_runner.py`, `patches.py` | Only confirmed counterexample evidence from this role can mark a claim refuted. Root refutation requires explicit root confirmation. |

@@ -12,20 +12,87 @@ import hashlib
 import json
 import os
 import re
+import stat
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
+from .bounded_io import read_bounded_bytes, read_bounded_text
 from .budget import plan_step_budget
 from .models import utc_now
-from .receipt import compile_latex_artifact
+from .receipt import (
+    MAX_LATEX_OUTPUT_BYTES,
+    MAX_LATEX_SOURCE_BYTES,
+    compile_latex_artifact,
+)
 from .store import ProofStateStore
 from .writing.latex_template import normalize_paper_template
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX compatibility
+    fcntl = None  # type: ignore
 
 HMT_ARTIFACT_TYPE = "human_readable_mathematical_text"
 HMT_INTEGRATED_CLAIM_INTERVAL_ENV = "ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL"
 LEGACY_HMT_INTERVAL_ENV = "ALBILICH_HMT_REVISION_INTERVAL"
 DEFAULT_HMT_INTEGRATED_CLAIM_INTERVAL = 10
 CATALOG_VERSION = 2
+MAX_HMT_CATALOG_BYTES = 8 * 1024 * 1024
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_tmp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    tmp = Path(raw_tmp)
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(tmp, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        tmp.unlink(missing_ok=True)
+
+
+@contextmanager
+def _catalog_lock(store: ProofStateStore):
+    directory = hmt_sidecar_dir(store)
+    if directory.is_symlink():
+        raise ValueError("HMT sidecar directory must not be a symbolic link")
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.resolve().relative_to(store.state_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("HMT sidecar directory escaped the proof-state directory") from exc
+    lock_path = directory / ".catalog.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    handle = os.fdopen(descriptor, "r+")
+    try:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError("HMT catalog lock must be a regular file")
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
 
 
 def hmt_integrated_claim_interval() -> int:
@@ -86,8 +153,14 @@ def read_hmt_catalog(store: ProofStateStore) -> list[Dict[str, Any]]:
     """Return only catalog entries whose source and compiled PDF still exist."""
     path = hmt_catalog_path(store)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(
+            read_bounded_text(
+                path,
+                max_bytes=MAX_HMT_CATALOG_BYTES,
+                label="HMT catalog",
+            )
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
         return []
     rows = payload.get("papers", []) if isinstance(payload, Mapping) else []
     root = hmt_sidecar_dir(store).resolve()
@@ -104,6 +177,21 @@ def read_hmt_catalog(store: ProofStateStore) -> list[Dict[str, Any]]:
         except (OSError, ValueError):
             continue
         if not tex_path.is_file() or not pdf_path.is_file():
+            continue
+        expected_tex_sha256 = str(row.get("sha256") or "")
+        expected_pdf_sha256 = str(row.get("pdf_sha256") or "")
+        try:
+            actual_pdf_size = pdf_path.stat().st_size
+        except OSError:
+            continue
+        if actual_pdf_size > MAX_LATEX_OUTPUT_BYTES:
+            continue
+        expected_pdf_size = int(row.get("pdf_size_bytes") or 0)
+        if expected_pdf_size > 0 and actual_pdf_size != expected_pdf_size:
+            continue
+        if expected_tex_sha256 and _file_sha256(tex_path) != expected_tex_sha256:
+            continue
+        if expected_pdf_sha256 and _file_sha256(pdf_path) != expected_pdf_sha256:
             continue
         row["tex_path"] = str(tex_path)
         row["pdf_path"] = str(pdf_path)
@@ -124,6 +212,62 @@ def hmt_paper_by_id(store: ProofStateStore, artifact_id: str) -> Optional[Dict[s
         (row for row in read_hmt_catalog(store) if str(row.get("artifact_id") or "") == artifact_id),
         None,
     )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _record_hmt_catalog_row(store: ProofStateStore, row: Dict[str, Any]) -> None:
+    """Serialize catalog replacement and bind it to the current paper files."""
+
+    with _catalog_lock(store):
+        tex_path = Path(str(row.get("tex_path") or ""))
+        pdf_path = Path(str(row.get("pdf_path") or ""))
+        if (
+            not tex_path.is_file()
+            or not pdf_path.is_file()
+            or _file_sha256(tex_path) != str(row.get("sha256") or "")
+            or _file_sha256(pdf_path) != str(row.get("pdf_sha256") or "")
+            or int(pdf_path.stat().st_size) != int(row.get("pdf_size_bytes") or 0)
+        ):
+            raise ValueError(
+                "HMT source or PDF changed before its catalog entry could be committed"
+            )
+        papers = [
+            existing
+            for existing in read_hmt_catalog(store)
+            if str(existing.get("artifact_id") or "")
+            != str(row.get("artifact_id") or "")
+        ]
+        papers.append(row)
+        # HMT authoring is asynchronous. A recovery may publish an older
+        # completed paper after a newer sidecar; canonicalize at commit time.
+        papers.sort(
+            key=lambda paper: (
+                int(paper.get("source_revision") or 0),
+                int(paper.get("source_integrated_claim_count") or 0),
+                str(paper.get("created_at") or ""),
+                str(paper.get("artifact_id") or ""),
+            )
+        )
+        for sequence, paper in enumerate(papers, start=1):
+            paper["sequence"] = sequence
+        payload = json.dumps(
+            {"catalog_version": CATALOG_VERSION, "papers": papers},
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(payload) > MAX_HMT_CATALOG_BYTES:
+            raise ValueError(
+                f"HMT catalog exceeds the {MAX_HMT_CATALOG_BYTES}-byte limit"
+            )
+        _atomic_write(hmt_catalog_path(store), payload)
 
 
 def periodic_hmt_sidecar_action(
@@ -227,8 +371,13 @@ def publish_hmt_sidecar(
     if source_path.suffix.lower() != ".tex" or not source_path.is_file():
         return {"accepted": False, "errors": ["HMT source path is not an existing .tex file"]}
     try:
-        source = source_path.read_text(encoding="utf-8")
-    except OSError as exc:
+        source_bytes = read_bounded_bytes(
+            source_path,
+            max_bytes=MAX_LATEX_SOURCE_BYTES,
+            label="HMT LaTeX source",
+        )
+        source = source_bytes.decode("utf-8")
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
         return {"accepted": False, "errors": [f"could not read HMT source: {exc}"]}
     source = normalize_paper_template(source)
     if "\\documentclass" not in source or "\\begin{document}" not in source or "\\end{document}" not in source:
@@ -237,19 +386,42 @@ def publish_hmt_sidecar(
     raw_id = str(attachment.get("artifact_id") or "hmt-snapshot")
     artifact_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_id).strip(".-") or "hmt-snapshot"
     sidecar_dir = hmt_sidecar_dir(store)
-    sidecar_dir.mkdir(parents=True, exist_ok=True)
-    tex_path = sidecar_dir / f"{artifact_id}.tex"
-    pdf_path = sidecar_dir / f"{artifact_id}.pdf"
-    tmp_path = tex_path.with_suffix(".tex.tmp")
-    tmp_path.write_text(source, encoding="utf-8")
-    os.replace(tmp_path, tex_path)
-    compile_result = compile_latex_artifact(tex_path, pdf_path)
-    if str(compile_result.get("pdf_status") or "") != "compiled" or not pdf_path.is_file():
+    if sidecar_dir.is_symlink():
         return {
             "accepted": False,
-            "errors": ["HMT LaTeX did not compile"],
-            "compile": dict(compile_result),
+            "errors": ["HMT sidecar directory must not be a symbolic link"],
         }
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        sidecar_dir.resolve().relative_to(store.state_dir.resolve())
+    except ValueError:
+        return {
+            "accepted": False,
+            "errors": ["HMT sidecar directory escaped the proof-state directory"],
+        }
+    tex_path = sidecar_dir / f"{artifact_id}.tex"
+    pdf_path = sidecar_dir / f"{artifact_id}.pdf"
+    _atomic_write(tex_path, source.encode("utf-8"))
+    pdf_descriptor, raw_pdf_tmp = tempfile.mkstemp(
+        prefix=f".{artifact_id}.", suffix=".pdf", dir=sidecar_dir
+    )
+    os.close(pdf_descriptor)
+    pdf_tmp = Path(raw_pdf_tmp)
+    try:
+        compile_result = compile_latex_artifact(tex_path, pdf_tmp)
+        if (
+            str(compile_result.get("pdf_status") or "") != "compiled"
+            or not pdf_tmp.is_file()
+        ):
+            return {
+                "accepted": False,
+                "errors": ["HMT LaTeX did not compile"],
+                "compile": dict(compile_result),
+            }
+        os.replace(pdf_tmp, pdf_path)
+        compile_result["pdf_path"] = str(pdf_path.resolve())
+    finally:
+        pdf_tmp.unlink(missing_ok=True)
 
     metadata = attachment.get("metadata") if isinstance(attachment.get("metadata"), Mapping) else {}
     source_revision = int(action.get("hmt_source_revision") or metadata.get("source_revision") or 0)
@@ -264,7 +436,6 @@ def publish_hmt_sidecar(
         or DEFAULT_HMT_INTEGRATED_CLAIM_INTERVAL
     )
     requested_sequence = int(action.get("hmt_sequence") or metadata.get("sequence") or 1)
-    existing_papers = read_hmt_catalog(store)
     row = {
         "artifact_id": artifact_id,
         "artifact_type": HMT_ARTIFACT_TYPE,
@@ -277,34 +448,18 @@ def publish_hmt_sidecar(
         "tex_path": str(tex_path.resolve()),
         "pdf_path": str(pdf_path.resolve()),
         "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "pdf_sha256": str(compile_result.get("pdf_sha256") or ""),
+        "pdf_size_bytes": int(compile_result.get("pdf_size_bytes") or 0),
+        "latex_compiler_sha256": str(
+            compile_result.get("latex_compiler_sha256") or ""
+        ),
+        "latex_compilation_sandboxed": bool(
+            compile_result.get("latex_compilation_sandboxed")
+        ),
         "content_summary": str(attachment.get("content_summary") or ""),
         "run_id": str(execution.get("run_id") or ""),
         "usage": dict(execution.get("usage") or {}),
         "non_certifying": True,
     }
-    papers = [
-        existing for existing in existing_papers
-        if str(existing.get("artifact_id") or "") != artifact_id
-    ]
-    papers.append(row)
-    # HMT authoring is asynchronous.  A recovery may publish an older
-    # completed paper after a newer sidecar has already entered the catalog,
-    # and both actions may carry the sequence that was correct when each
-    # started.  Canonicalize the full catalog at publication time so ordering
-    # follows accepted-state chronology and sequence labels stay unique.
-    papers.sort(
-        key=lambda paper: (
-            int(paper.get("source_revision") or 0),
-            int(paper.get("source_integrated_claim_count") or 0),
-            str(paper.get("created_at") or ""),
-            str(paper.get("artifact_id") or ""),
-        )
-    )
-    for sequence, paper in enumerate(papers, start=1):
-        paper["sequence"] = sequence
-    payload = {"catalog_version": CATALOG_VERSION, "papers": papers}
-    catalog = hmt_catalog_path(store)
-    catalog_tmp = catalog.with_suffix(".json.tmp")
-    catalog_tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
-    os.replace(catalog_tmp, catalog)
+    _record_hmt_catalog_row(store, row)
     return {"accepted": True, "paper": row, "proof_state_revision_unchanged": store.get_revision()}

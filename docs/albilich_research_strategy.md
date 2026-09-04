@@ -15,10 +15,10 @@ ordinary claims, routes, and inferences pass their existing verifier gates.
 | `advisor_synthesis` | PhD advisor | Periodic global proof architecture and budget allocation | One decisive missing statement; newest artifact must supersede the prior synthesis |
 | `invention_authorization` | PhD advisor | Exceptional permission to invent an auxiliary definition or object | All authorization conditions true; at most 2 candidates and 2 research passes |
 | `definition_candidate` | researcher | Bounded candidate lifecycle under one authorization | Only `adopted` after well-defined, nontrivial, proof-relevant checks and an exact root-relevant theorem |
-| `conjecture_portfolio` | researcher or villain | Bottleneck-local intermediate conjectures | 1-3 candidates; at most 2 selected; explicit prechecks and falsification plan |
+| `conjecture_portfolio` | researcher or adversarial reviewer | Bottleneck-local intermediate conjectures | 1-3 candidates; at most 2 selected; explicit prechecks and falsification plan |
 | `proof_compression` | researcher or PhD advisor | Shortest plausible proof skeleton and weakest sufficient bridge | Full history preserved; essential dependency ids must exist |
-| `deep_session_report` | researcher | Delta-bearing fallback when a root-critical long session cannot emit a proof dossier | Productive mathematical delta required; no verification authority |
-| `cas_experiment_report` | researcher or villain | Decision-oriented experimental mathematics | New reports use `experiment_workflow_version=1` and the complete experiment contract |
+| `deep_session_report` | researcher | Delta-bearing fallback when a root-critical long session cannot emit a proof draft | Productive mathematical delta required; no verification authority |
+| `cas_experiment_report` | researcher or adversarial reviewer | Decision-oriented experimental mathematics | New reports use `experiment_workflow_version=2`, capture reproducible input and environment data, and require host reproduction before computational evidence can support verification |
 
 All new strategy-specific artifacts use `strategy_schema_version=1`. Historical
 CAS artifacts remain readable; a newly scheduled experiment receives the strict
@@ -27,7 +27,7 @@ versioned contract.
 ## Deterministic planning
 
 The scheduler first preserves high-priority retrieval, verification, integration,
-writing, counterexample validation, exact non-research debt repair, and existing
+writing, counterexample validation, exact non-research obligation handling, and existing
 circuit breakers. On a new hard problem, exact source scouting can run in
 parallel while the first researcher pass builds an approach portfolio instead
 of committing immediately to a local calculation. For unprotected mature-run
@@ -55,29 +55,30 @@ strategic verifier rejection, or the meaningful-action cadence. A fresh
 synthesis suppresses stale directives until a new major event or its revision
 window expires.
 
-Every scheduled action exposes score components:
+Every scheduled action exposes ordinal priority components:
 
-- probability of closing the bottleneck;
-- probability of refuting a route;
-- expected root progress;
-- expected information gain;
+- estimated ability to close the bottleneck;
+- estimated ability to refute a proof approach;
+- root relevance;
+- discriminating value;
 - reuse value;
 - duplication risk;
 - token, wall-time, and verification cost.
 
-Before local evidence exists, the probability-like terms are deliberately
-labeled as heuristics. As the run proceeds, the scheduler builds a Bayesian
-local posterior for each strategy family from its own later verifier/integration
-evidence. Producing prose is not success: credit requires an output artifact to
+These values only order admissible actions. They are not probabilities,
+expected utilities, information-theoretic quantities, or Bayesian posteriors.
+As the run proceeds, the scheduler updates a local outcome heuristic for each
+host-assigned strategy family using later verifier/integration evidence.
+Producing prose is not success: credit requires an output artifact to
 enter verified evidence, a concrete target claim to be verified, or the worked
-route to integrate. The score weights verified contributions placed in a
-sufficient root route more heavily than isolated local verifications.
+approach to integrate. The heuristic weights verified contributions placed in a
+sufficient root approach more heavily than isolated local verifications.
 Rejections and timeouts are negative evidence. No reference
 solution and no private cross-problem run cache is consulted. When scores are
 close, work-mode rotation remains the diversity tie-breaker. Speculative actions
 never consume the protected verification reserve.
 
-## Brainstorming, creativity, and debt layers
+## Brainstorming, creativity, and proof obligations
 
 Brainstorming has a short dedicated researcher prompt rather than the full
 local-proof instruction block. Each approach card records its mechanism,
@@ -94,10 +95,10 @@ The search state separates three layers:
    and mutually incompatible.
 2. **Research questions** are conceptual, source, counterexample, or experiment
    questions. Up to six decision-changing questions may be recorded as minor
-   nonblocking debts once a concrete graph owner exists (major only for a
-   selected pilot); the system does not create one debt per idea.
-3. **Proof debts** remain exact obligations on selected claims, routes, or
-   inferences. A blocking debt is created only after a selected route exposes a
+   nonblocking proof obligations once a concrete graph owner exists (major only
+   for a selected pilot); the system does not create one obligation per idea.
+3. **Proof obligations** are exact requirements on selected claims, proof
+   approaches, or inferences. A blocking obligation is created only after a selected approach exposes a
    statement whose proof is actually necessary.
 
 The qualitative allocation is 50% exploitation, 30% exploration, and 20%
@@ -106,8 +107,8 @@ a relaxation of verification.
 
 ## Graph-derived decisive obligation frontier
 
-For every active, unpaused sufficient route near the root, the strategy layer
-derives its unresolved premises, unchecked inferences, and active owned debts.
+For every active, unpaused sufficient proof approach near the root, the strategy layer
+derives its unresolved premises, unchecked inferences, and active owned obligations.
 It chooses the route with the smallest weighted obligation cut and exposes its
 highest-severity item as the decisive obligation. This graph calculation does
 not trust model-reported root leverage. Research may replace the decisive item
@@ -149,8 +150,9 @@ The report states the mathematical question, competing hypotheses, finite
 scope, method and code, decisive expected outputs, observations,
 counterexamples, interpretation, changed research decision, and next proof
 move. Computation cannot certify an infinite statement without a separately
-verified complete finite reduction. A researcher-submitted CAS report can
-submit a debt repair, but only a verifier can close the mathematical debt.
+verified complete finite reduction. A researcher-submitted CAS report may
+provide evidence toward a proof obligation, but only a verifier can discharge
+that obligation.
 
 ## Method cards and memory separation
 
@@ -179,9 +181,9 @@ There is no automatic cross-user or cross-project learning from private runs.
 Deep sessions are limited to a central bridge, difficult source adaptation,
 near-integration route, repeatedly surviving bottleneck, or other high-leverage
 branch. The packet contains the exact target and root relation, verified
-support, debts, negative results, selected sources, competing approaches,
+support, proof obligations, negative results, selected sources, competing approaches,
 budget, and latest synthesis. It cannot inspect unrelated result directories or
-self-verify. A proof dossier is the preferred output. A `deep_session_report` is
+self-verify. A proof draft is the preferred output. A `deep_session_report` is
 only a fallback and must record a productive mathematical delta such as a proved
 lemma, verifier-ready proof, refuted conjecture, source adaptation, narrowed
 obligation, route-killing obstruction, or decisive counterexample. Two recent
@@ -229,8 +231,8 @@ same `research_strategy` payload. The dashboard renders every approach with its
 possible root contribution, bridge, decisive test, failure mode, cost, novelty,
 confidence, and selection status. “Steer to pilot” and “Generate new
 approaches” populate the existing human-steering control; they never mutate
-proof state silently. Each workflow action also exposes its information-gain
-score components and the synthesis directive it follows.
+proof state silently. Each workflow action also exposes its ordinal
+action-priority components and the synthesis directive it follows.
 
 ## Proof programs, coverage, and long research sessions
 
@@ -240,7 +242,7 @@ root implication, decisive obligation, validation evidence, reset criterion,
 covered cases, and open cases. This is a view over the existing graph, not a new
 role, approval gate, or database authority. Advisors compare genuinely
 different programs only at evidence-triggered checkpoints: new counterevidence,
-repeated research without verifier handoff, semantic debt duplication,
+repeated research without verifier handoff, semantically duplicate obligations,
 uncovered root cases, or multiple mature proof philosophies.
 
 Elapsed time is never a strategy-reset signal. `attempt` defaults to `--steps 0`
@@ -255,7 +257,7 @@ integrated route. Fresh counterevidence propagates to downstream certified
 dependencies as `threatened_pending_revalidation`; certification remains
 recorded until the strict verifier confirms a repair or a refutation.
 
-Semantically overlapping blocking debts are collapsed into one scheduling
+Semantically overlapping blocking proof obligations are collapsed into one scheduling
 frontier without rewriting their database status. Aliases remain provenance and
 only verifier-certified mathematical work resolves them. Reports and metrics
 therefore emphasize root-closing programs, terminal root inferences, exhaustive

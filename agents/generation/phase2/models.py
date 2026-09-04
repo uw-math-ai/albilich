@@ -3,11 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
-SCHEMA_VERSION = 1
+from .action_contract import RUN_MODES
+
+# Patch/context protocol version. Database migrations are deliberately tracked
+# separately: changing this value invalidates every persisted patch contract.
+SCHEMA_VERSION = 3
+STORE_MIGRATION_VERSION = 21
 
 CLAIM_KINDS = {"theorem", "lemma", "definition", "hypothesis", "obstruction", "counterexample", "reference"}
 VALIDATION_STATUSES = {
@@ -38,34 +44,15 @@ RUN_STATUSES = {
     "completed",
 }
 # Run-level completion policy (problem_state.completion_policy, 2026-07-09
-# TODO 7). full_proof_first is the default for theorem-solving problem files;
+# Completion-policy design. full_proof_first is the default for theorem-solving problem files;
 # publication_ready explicitly opts into post-proof paper authoring/review, and
 # only partial_ok/exploratory select a partial deliverable.
 COMPLETION_POLICIES = {"full_proof_first", "publication_ready", "partial_ok", "exploratory"}
 DEFAULT_COMPLETION_POLICY = "full_proof_first"
-RUN_MODES = {
-    "prove",
-    "refute",
-    "validate_counterexample",
-    "reduce",
-    "weaken",
-    "strengthen",
-    "retrieve",
-    "synthesize_sources",
-    "audit_definitions",
-    "triage_routes",
-    "integrate",
-    "formalize",
-    "write",
-    "review_writing",
-    "await_human",
-    "stop_with_partial_results",
-    "stop_solved",
-}
-
 VERIFYING_ROLES = {"strict_informal_verifier", "formal_backend", "counterexample_validator", "integration_verifier"}
 NON_VERIFYING_ROLES = {
     "researcher",
+    "adversarial_reviewer",
     "villain",
     "literature_researcher",
     "scheduler",
@@ -87,12 +74,20 @@ def json_dumps(value: Any) -> str:
     return json.dumps(value if value is not None else [], sort_keys=True, ensure_ascii=False)
 
 
-def json_loads(value: Optional[str], default: Any = None) -> Any:
+def json_loads(value: Any, default: Any = None) -> Any:
     if value in (None, ""):
+        return [] if default is None else default
+    # Scheduler-state helpers are intentionally usable with both raw SQLite
+    # rows and already-decoded test/API dictionaries.  Treat decoded JSON as
+    # decoded instead of passing it back through ``json.loads`` (which raises a
+    # TypeError rather than JSONDecodeError for lists and mappings).
+    if isinstance(value, (dict, list, int, float, bool)):
+        return value
+    if not isinstance(value, (str, bytes, bytearray)):
         return [] if default is None else default
     try:
         return json.loads(value)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return [] if default is None else default
 
 
@@ -114,11 +109,25 @@ def statement_is_interrogative_problem(text: str) -> bool:
     )
 
 
-def fingerprint_text(text: str, *, length: int = 16) -> str:
-    normalized = normalize_text(text)
-    if len(normalized) > 500:
-        normalized = normalized[:500]
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:length] if normalized else ""
+def canonical_math_text(text: str) -> str:
+    """Canonicalize storage text without erasing mathematical syntax.
+
+    This intentionally preserves case, negation, order relations, operators,
+    quantifiers, punctuation, and the entire statement.  It is suitable for an
+    exact identity hash, not semantic-similarity search.
+    """
+
+    normalized = unicodedata.normalize("NFKC", str(text or "")).replace("\r\n", "\n").replace("\r", "\n")
+    return " ".join(normalized.split())
+
+
+def fingerprint_text(text: str, *, length: int = 64) -> str:
+    canonical = canonical_math_text(text)
+    if not canonical:
+        return ""
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    bounded_length = max(1, min(64, int(length)))
+    return digest[:bounded_length]
 
 
 def sha256_bytes(data: bytes) -> str:

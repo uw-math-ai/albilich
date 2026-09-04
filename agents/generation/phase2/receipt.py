@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -9,12 +10,25 @@ import subprocess
 import tempfile
 from typing import Any, Dict, Iterable, List, Mapping
 
+from .executable_attestation import (
+    attest_executable_identity,
+    attested_executable_unchanged,
+)
+from .bounded_io import read_text_prefix
 from .models import json_dumps, json_loads
+from .sandbox_runtime import SANDBOX_NPROC_LIMIT, append_runtime_mounts, sandbox_runtime_mounts
 
 VERIFIED_SIDE_LEMMA_STATUSES = {"informally_verified", "formally_verified"}
 PARTIAL_RECEIPT_VERIFIED_HEADING = "## Verified Side Lemmas"
-PARTIAL_RECEIPT_LEDGER_HEADING = "## Claim Status Ledger"
+PARTIAL_RECEIPT_SUMMARY_HEADING = "## Claim Status Summary"
+# Compatibility name for callers written before the terminology cleanup.
+PARTIAL_RECEIPT_LEDGER_HEADING = PARTIAL_RECEIPT_SUMMARY_HEADING
+DEFAULT_RECEIPT_PROOF_CHARS = 12_000
+MAX_RECEIPT_ARTIFACT_CHARS = 2 * 1024 * 1024
 LATEX_TIMEOUT_SECONDS = 120
+MAX_LATEX_SOURCE_BYTES = 8 * 1024 * 1024
+MAX_LATEX_LOG_BYTES = 2 * 1024 * 1024
+MAX_LATEX_OUTPUT_BYTES = 64 * 1024 * 1024
 PDFLATEX_ENV_VAR = "ALBILICH_PDFLATEX"
 PDFLATEX_STANDARD_PATHS = (
     Path("/Library/TeX/texbin/pdflatex"),
@@ -62,7 +76,7 @@ def format_partial_receipt_appendix(
     claims: Iterable[Mapping[str, Any]],
     *,
     artifacts: Iterable[Mapping[str, Any]] | None = None,
-    max_proof_chars: int | None = None,
+    max_proof_chars: int | None = DEFAULT_RECEIPT_PROOF_CHARS,
 ) -> str:
     inventory = build_partial_receipt_inventory(
         claims,
@@ -529,6 +543,11 @@ def _format_artifact_block(artifact: Mapping[str, Any]) -> List[str]:
     if artifact.get("content"):
         lines.extend(["    Content:", ""])
         lines.append(str(artifact["content"]).rstrip())
+        if artifact.get("content_truncated"):
+            lines.append(
+                "[Content truncated by the partial-result size bound; use the "
+                "recorded artifact path and SHA-256 entry for the complete proof.]"
+            )
         lines.append("")
     elif artifact.get("missing"):
         lines.append("    Content: [artifact not found in current proof state]")
@@ -591,6 +610,9 @@ def _proof_artifacts(
                 }
             )
             continue
+        content, content_truncated = _artifact_content(
+            _field(artifact, "path", ""), max_chars=max_chars
+        )
         proof_artifacts.append(
             {
                 "artifact_id": artifact_id,
@@ -599,24 +621,30 @@ def _proof_artifacts(
                 "state_revision": _field(artifact, "state_revision", ""),
                 "content_summary": _one_line(_field(artifact, "content_summary", "")),
                 "path": str(_field(artifact, "path", "")),
-                "content": _artifact_content(_field(artifact, "path", ""), max_chars=max_chars),
+                "content": content,
+                "content_truncated": content_truncated,
                 "missing": False,
             }
         )
     return proof_artifacts
 
 
-def _artifact_content(path_value: Any, *, max_chars: int | None) -> str:
+def _artifact_content(path_value: Any, *, max_chars: int | None) -> tuple[str, bool]:
     path = Path(str(path_value or ""))
     if not path.exists() or not path.is_file():
-        return ""
+        return "", False
+    limit = MAX_RECEIPT_ARTIFACT_CHARS if max_chars is None else max(1, int(max_chars))
     try:
-        text = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-    if max_chars is None:
-        return text
-    return _compact_text(text, max_chars)
+        text, truncated, _size = read_text_prefix(
+            path,
+            max_chars=min(limit, MAX_RECEIPT_ARTIFACT_CHARS),
+            label="partial-result proof artifact",
+            errors="replace",
+        )
+        text = text.strip()
+    except (OSError, ValueError):
+        return "", False
+    return text, truncated
 
 
 def _field(row: Mapping[str, Any], key: str, default: Any = "") -> Any:
@@ -676,49 +704,213 @@ def _find_pdflatex() -> str:
 
 
 def _compile_latex(tex_path: Path, pdf_path: Path) -> Dict[str, str]:
-    # The compiler runs from an isolated temporary directory, so a caller's
-    # relative source path would otherwise be interpreted relative to that
-    # directory and reported as a misleading TeX compile failure.
     source_path = tex_path.resolve()
     pdflatex = _find_pdflatex()
     if not pdflatex:
         return {"pdf_status": "pdflatex_missing", "pdf_path": ""}
+    log_path = tex_path.with_suffix(".latex.log")
+    try:
+        if source_path.stat().st_size > MAX_LATEX_SOURCE_BYTES:
+            raise ValueError(
+                f"LaTeX source exceeds the {MAX_LATEX_SOURCE_BYTES}-byte compile limit"
+            )
+    except OSError as exc:
+        log_path.write_text(str(exc), encoding="utf-8")
+        return {
+            "pdf_status": "compile_error",
+            "pdf_path": "",
+            "latex_log_path": str(log_path),
+        }
+    bwrap = shutil.which("bwrap")
+    prlimit = shutil.which("prlimit")
+    if not bwrap or not prlimit:
+        log_path.write_text(
+            "bubblewrap and prlimit are required for isolated LaTeX compilation",
+            encoding="utf-8",
+        )
+        return {
+            "pdf_status": "sandbox_unavailable",
+            "pdf_path": "",
+            "latex_log_path": str(log_path),
+        }
+    attestation = attest_executable_identity(pdflatex)
+    if not attestation.get("valid"):
+        log_path.write_text(
+            "pdflatex executable attestation failed: "
+            + str(attestation.get("error") or "unknown executable"),
+            encoding="utf-8",
+        )
+        return {
+            "pdf_status": "compile_error",
+            "pdf_path": "",
+            "latex_log_path": str(log_path),
+        }
+    try:
+        runtime_mounts, sandbox_pdflatex, _runtime_root = sandbox_runtime_mounts(
+            str(attestation["executable_path"]),
+            mount_target="/albilich-pdflatex",
+        )
+    except OSError as exc:
+        log_path.write_text(str(exc), encoding="utf-8")
+        return {
+            "pdf_status": "compile_error",
+            "pdf_path": "",
+            "latex_log_path": str(log_path),
+        }
+
     with tempfile.TemporaryDirectory(prefix="albilich_receipt_latex_") as tmp:
-        tmpdir = Path(tmp)
-        result: subprocess.CompletedProcess[str] | None = None
+        temporary_root = Path(tmp)
+        input_directory = temporary_root / "input"
+        output_directory = temporary_root / "output"
+        input_directory.mkdir()
+        output_directory.mkdir()
+        staged_source = input_directory / source_path.name
+        shutil.copyfile(source_path, staged_source)
+        command = [
+            prlimit,
+            "--as=2147483648",
+            f"--cpu={LATEX_TIMEOUT_SECONDS}",
+            f"--nproc={SANDBOX_NPROC_LIMIT}",
+            f"--fsize={MAX_LATEX_OUTPUT_BYTES}",
+            "--",
+            bwrap,
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-pid",
+            "--clearenv",
+            "--setenv",
+            "HOME",
+            "/tmp",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--setenv",
+            "TEXMFOUTPUT",
+            "/work",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--ro-bind",
+            str(input_directory),
+            "/input",
+            "--bind",
+            str(output_directory),
+            "/work",
+            "--chdir",
+            "/work",
+        ]
+        for directory in ("/usr", "/bin", "/lib", "/lib64"):
+            if Path(directory).exists():
+                command.extend(["--ro-bind", directory, directory])
+        for directory in ("/etc/fonts", "/etc/texmf", "/var/lib/texmf"):
+            if Path(directory).exists():
+                command.extend(["--ro-bind", directory, directory])
+        append_runtime_mounts(command, runtime_mounts)
+        command.extend(
+            [
+                "--",
+                sandbox_pdflatex,
+                "-fmt=pdflatex",
+                "-no-shell-escape",
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                "-output-directory",
+                "/work",
+                f"/input/{staged_source.name}",
+            ]
+        )
+        returncode = -1
+        output = b""
+        sandbox_resource_unavailable = False
         try:
             for _ in range(2):
-                result = subprocess.run(
-                    [
-                        pdflatex,
-                        "-interaction=nonstopmode",
-                        "-halt-on-error",
-                        "-output-directory",
-                        str(tmpdir),
-                        str(source_path),
-                    ],
-                    cwd=str(tmpdir),
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    timeout=LATEX_TIMEOUT_SECONDS,
-                    check=False,
-                )
-                if result.returncode != 0:
+                for attempt in range(3):
+                    with tempfile.TemporaryFile() as output_file:
+                        completed = subprocess.run(
+                            command,
+                            cwd=str(output_directory),
+                            stdout=output_file,
+                            stderr=subprocess.STDOUT,
+                            timeout=LATEX_TIMEOUT_SECONDS,
+                            check=False,
+                            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                        )
+                        returncode = int(completed.returncode)
+                        output_file.seek(0)
+                        output = output_file.read(MAX_LATEX_LOG_BYTES + 1)
+                    lowered_output = output.lower()
+                    sandbox_resource_unavailable = (
+                        returncode != 0
+                        and b"creating new namespace failed" in lowered_output
+                        and b"resource temporarily unavailable" in lowered_output
+                    )
+                    if not sandbox_resource_unavailable or attempt == 2:
+                        break
+                if len(output) > MAX_LATEX_LOG_BYTES or returncode != 0:
                     break
         except (OSError, subprocess.TimeoutExpired) as exc:
-            log_path = tex_path.with_suffix(".latex.log")
             log_path.write_text(str(exc), encoding="utf-8")
-            return {"pdf_status": "compile_error", "pdf_path": "", "latex_log_path": str(log_path)}
-        output_pdf = tmpdir / f"{tex_path.stem}.pdf"
-        if result and result.returncode == 0 and output_pdf.exists():
+            return {
+                "pdf_status": "compile_error",
+                "pdf_path": "",
+                "latex_log_path": str(log_path),
+            }
+        output_pdf = output_directory / f"{source_path.stem}.pdf"
+        executable_unchanged = attested_executable_unchanged(attestation)
+        output_size_valid = (
+            output_pdf.is_file()
+            and output_pdf.stat().st_size <= MAX_LATEX_OUTPUT_BYTES
+        )
+        if (
+            returncode == 0
+            and len(output) <= MAX_LATEX_LOG_BYTES
+            and output_size_valid
+            and executable_unchanged
+        ):
             shutil.copyfile(output_pdf, pdf_path)
-            return {"pdf_status": "compiled", "pdf_path": str(pdf_path)}
-        log_path = tex_path.with_suffix(".latex.log")
-        log_path.write_text((result.stdout if result else "") or "", encoding="utf-8")
-        return {"pdf_status": "compile_failed", "pdf_path": "", "latex_log_path": str(log_path)}
+            return {
+                "pdf_status": "compiled",
+                "pdf_path": str(pdf_path),
+                "pdf_sha256": _file_sha256(pdf_path),
+                "pdf_size_bytes": pdf_path.stat().st_size,
+                "latex_compiler_sha256": str(
+                    attestation.get("executable_sha256") or ""
+                ),
+                "latex_compilation_sandboxed": True,
+            }
+        detail = output[:MAX_LATEX_LOG_BYTES].decode(
+            "utf-8", errors="replace"
+        )
+        if not executable_unchanged:
+            detail += "\npdflatex executable changed during compilation"
+        if len(output) > MAX_LATEX_LOG_BYTES:
+            detail += "\npdflatex output exceeded the bounded log limit"
+        if output_pdf.exists() and not output_size_valid:
+            detail += "\npdflatex PDF exceeded the bounded output limit"
+        log_path.write_text(detail, encoding="utf-8")
+        return {
+            "pdf_status": (
+                "sandbox_unavailable"
+                if sandbox_resource_unavailable
+                else "compile_failed"
+            ),
+            "pdf_path": "",
+            "latex_log_path": str(log_path),
+        }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 MATH_SYMBOL_RE = (

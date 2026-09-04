@@ -18,7 +18,7 @@ def candidate_counterexample_patch(
         "schema_version": SCHEMA_VERSION,
         "problem_id": store.problem_id,
         "base_revision": store.get_revision(),
-        "actor_role": "villain",
+        "actor_role": "adversarial_reviewer",
         "target_id": claim_id,
         "operations": [
             {

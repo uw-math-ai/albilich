@@ -10,9 +10,14 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 from .audit import PAPER_AUDIT_RESEARCH_MODE, ingest_paper_audit
+from .bounded_io import read_bounded_text
+from .audit_checkpoint import (
+    create_signed_audit_checkpoint,
+    verify_signed_audit_checkpoint,
+)
 from .claude_runner import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CLAUDE_PERMISSION_MODE,
@@ -25,13 +30,20 @@ from .context_builder import build_context_manifest
 from .formal_handoff import write_formalization_manifest
 from .invariants import validate_conn
 from .metrics import compute_metrics
-from .models import COMPLETION_POLICIES, DEFAULT_COMPLETION_POLICY, problem_id_from_file, sanitize_problem_id
+from .models import (
+    COMPLETION_POLICIES,
+    DEFAULT_COMPLETION_POLICY,
+    SCHEMA_VERSION,
+    problem_id_from_file,
+    sanitize_problem_id,
+)
 from .monitor import BackgroundMonitor, start_background_monitor
-from .patches import apply_patch, reconcile_integrated_claims
+from .patches import apply_operator_patch, reconcile_integrated_claims
 from .report import build_markdown_report, write_markdown_report
 from .result_status import classify_result
 from .research_policy import DEFAULT_RESEARCH_MODE, DEFAULT_WEB_SEARCH, RESEARCH_MODES
 from .reference_solution import ingest_reference_solution
+from .replay import verify_event_journal, verify_patch_journal
 from .scheduler import DEFAULT_MULTI_BRANCH_WORKERS, next_action
 from .scope_state import import_certified_scope
 from .store import GENERATION_ROOT, ProofStateStore
@@ -49,6 +61,8 @@ DEFAULT_INIT_VERIFICATION_RESERVE = 12_000_000
 DEFAULT_ATTEMPT_TOTAL_TOKEN_BUDGET = 80_000_000
 DEFAULT_ATTEMPT_VERIFICATION_RESERVE = 12_000_000
 DEFAULT_ATTEMPT_MAX_REDUCTION_DEPTH = 4
+MAX_OPERATOR_PATCH_BYTES = 16 * 1024 * 1024
+MAX_PROBLEM_DOCUMENT_BYTES = 8 * 1024 * 1024
 
 
 class _WorkflowTerminationSignal(BaseException):
@@ -97,14 +111,46 @@ def main(argv: list[str] | None = None) -> None:
     p_status = sub.add_parser("status", help="print proof-state metrics")
     p_status.add_argument("problem")
 
-    p_check = sub.add_parser("check", help="run invariant checks")
+    p_check = sub.add_parser(
+        "check", help="run proof invariants, journal replay, and artifact-file integrity checks"
+    )
     p_check.add_argument("problem")
+
+    p_checkpoint = sub.add_parser(
+        "audit-checkpoint",
+        help="write an Ed25519-signed audit root outside the mutable run directory",
+    )
+    p_checkpoint.add_argument("problem")
+    p_checkpoint.add_argument("--private-key", required=True)
+    p_checkpoint.add_argument("--output", required=True)
+
+    p_verify_checkpoint = sub.add_parser(
+        "verify-audit-checkpoint",
+        help="verify an external signed audit checkpoint against this append-only history",
+    )
+    p_verify_checkpoint.add_argument("problem")
+    p_verify_checkpoint.add_argument("checkpoint")
+    p_verify_checkpoint.add_argument("--public-key", required=True)
 
     p_reconcile = sub.add_parser(
         "reconcile-integrations",
-        help="reconcile stale verification debt and claim/route integration lifecycle state",
+        help="reconcile stale verification obligations and claim/proof-approach integration state",
     )
     p_reconcile.add_argument("problem")
+
+    p_assurance = sub.add_parser(
+        "set-claim-assurance",
+        help="designate the independent-review requirement for a claim",
+    )
+    p_assurance.add_argument("problem")
+    p_assurance.add_argument("claim_id")
+    p_assurance.add_argument(
+        "--level",
+        choices=("standard", "heterogeneous_review"),
+        required=True,
+    )
+    p_assurance.add_argument("--rationale", required=True)
+    p_assurance.add_argument("--allow-downgrade", action="store_true")
 
     p_scope = sub.add_parser(
         "scope-import",
@@ -166,7 +212,12 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--reasoning-effort", default=DEFAULT_REASONING_EFFORT)
     p_run.add_argument("--codex-bin", default="codex")
     _add_backend_args(p_run)
-    p_run.add_argument("--sandbox", default=DEFAULT_SANDBOX)
+    p_run.add_argument(
+        "--sandbox",
+        choices=(DEFAULT_SANDBOX, "read-only"),
+        default=DEFAULT_SANDBOX,
+        help="child command boundary; the default is the capsule-only permission profile",
+    )
     p_run.add_argument("--web-search", choices=["disabled", "live"], default=DEFAULT_WEB_SEARCH, help="Codex web_search policy for executed sessions")
     p_run.add_argument("--research-mode", choices=sorted(RESEARCH_MODES), default=DEFAULT_RESEARCH_MODE)
     _add_completion_policy_arg(p_run)
@@ -175,6 +226,14 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--parallel-librarian-verifier", dest="parallel_librarian_verifier", action="store_true", default=True)
     p_run.add_argument("--no-parallel-librarian-verifier", dest="parallel_librarian_verifier", action="store_false")
     _add_parallel_branches_arg(p_run)
+    p_run.add_argument(
+        "--parallel-admission-assignment",
+        help=(
+            "JSON file containing a preregistered randomized v9/v10 parallel-"
+            "admission assignment; protocol v2 covers every workflow wave, "
+            "while legacy protocol v1 requires --steps 1"
+        ),
+    )
     p_run.add_argument("--write-report", action="store_true")
     p_run.add_argument("--write-console", dest="write_console", action="store_true", default=True)
     p_run.add_argument("--no-write-console", dest="write_console", action="store_false")
@@ -201,7 +260,12 @@ def main(argv: list[str] | None = None) -> None:
     p_attempt.add_argument("--reasoning-effort", default=DEFAULT_REASONING_EFFORT)
     p_attempt.add_argument("--codex-bin", default="codex")
     _add_backend_args(p_attempt)
-    p_attempt.add_argument("--sandbox", default=DEFAULT_SANDBOX)
+    p_attempt.add_argument(
+        "--sandbox",
+        choices=(DEFAULT_SANDBOX, "read-only"),
+        default=DEFAULT_SANDBOX,
+        help="child command boundary; the default is the capsule-only permission profile",
+    )
     p_attempt.add_argument("--web-search", choices=["disabled", "live"], default=DEFAULT_WEB_SEARCH)
     p_attempt.add_argument("--research-mode", choices=sorted(RESEARCH_MODES), default=DEFAULT_RESEARCH_MODE)
     _add_completion_policy_arg(p_attempt)
@@ -215,6 +279,14 @@ def main(argv: list[str] | None = None) -> None:
     p_attempt.add_argument("--parallel-librarian-verifier", dest="parallel_librarian_verifier", action="store_true", default=True)
     p_attempt.add_argument("--no-parallel-librarian-verifier", dest="parallel_librarian_verifier", action="store_false")
     _add_parallel_branches_arg(p_attempt)
+    p_attempt.add_argument(
+        "--parallel-admission-assignment",
+        help=(
+            "JSON file containing a preregistered randomized v9/v10 parallel-"
+            "admission assignment; protocol v2 covers every workflow wave, "
+            "while legacy protocol v1 requires --steps 1"
+        ),
+    )
     p_attempt.add_argument("--total-token-budget", type=int, default=DEFAULT_ATTEMPT_TOTAL_TOKEN_BUDGET)
     p_attempt.add_argument("--reserved-verification-budget", type=int, default=DEFAULT_ATTEMPT_VERIFICATION_RESERVE)
     p_attempt.add_argument("--max-reduction-depth", type=int, default=DEFAULT_ATTEMPT_MAX_REDUCTION_DEPTH)
@@ -320,7 +392,7 @@ def main(argv: list[str] | None = None) -> None:
             max_reduction_depth=args.max_reduction_depth,
         )
         _apply_completion_policy(store, args)
-        # Root-intent parsing (TODO 7): record how exploratory wording in the
+        # Root-intent parsing: record how exploratory wording in the
         # problem file relates to the formal target; soft wording never flips
         # the completion policy by itself.
         state["root_intent_resolution"] = record_root_intent_resolution(store, markdown=root_statement)
@@ -403,10 +475,66 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "check":
         with store.connect() as conn:
-            errors = validate_conn(conn)
-        _print({"ok": not errors, "errors": errors})
+            invariant_errors = validate_conn(conn)
+        replay = verify_patch_journal(store)
+        event_replay = verify_event_journal(store)
+        errors = [
+            *invariant_errors,
+            *[f"replay: {error}" for error in replay["errors"]],
+            *[f"event replay: {error}" for error in event_replay["errors"]],
+        ]
+        _print(
+            {
+                "ok": not errors,
+                "errors": errors,
+                "invariant_errors": invariant_errors,
+                "replay": replay,
+                "event_replay": event_replay,
+            }
+        )
+    elif args.command == "audit-checkpoint":
+        _print(
+            create_signed_audit_checkpoint(
+                store,
+                output_path=Path(args.output),
+                private_key_path=Path(args.private_key),
+            )
+        )
+    elif args.command == "verify-audit-checkpoint":
+        _print(
+            verify_signed_audit_checkpoint(
+                store,
+                checkpoint_path=Path(args.checkpoint),
+                public_key_path=Path(args.public_key),
+            )
+        )
     elif args.command == "reconcile-integrations":
         _print(reconcile_integrated_claims(store))
+    elif args.command == "set-claim-assurance":
+        _print(
+            apply_operator_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "human_operator",
+                    "target_id": args.claim_id,
+                    "operations": [
+                        {
+                            "op": "set_claim_assurance",
+                            "claim_id": args.claim_id,
+                            "assurance_level": args.level,
+                            "rationale": args.rationale,
+                            "allow_assurance_downgrade": bool(
+                                args.allow_downgrade
+                            ),
+                        }
+                    ],
+                    "rationale": "operator claim-assurance designation",
+                },
+            ).to_dict()
+        )
     elif args.command == "snapshot":
         store.write_snapshot()
         _print({"path": str(store.snapshot_path)})
@@ -443,6 +571,7 @@ def main(argv: list[str] | None = None) -> None:
             write_report=args.write_report,
             write_console=args.write_console,
             executor=_executor_for(args),
+            parallel_admission_assignment=_parallel_admission_assignment(args),
         )
         if dashboard:
             result["dashboard"] = dashboard
@@ -474,6 +603,7 @@ def main(argv: list[str] | None = None) -> None:
                     write_report=args.write_report,
                     write_console=args.write_console,
                     executor=_executor_for(args),
+                    parallel_admission_assignment=_parallel_admission_assignment(args),
                 )
         except _WorkflowTerminationSignal as exc:
             raise SystemExit(128 + exc.signum) from None
@@ -481,8 +611,14 @@ def main(argv: list[str] | None = None) -> None:
             result["dashboard"] = dashboard
         _print(result)
     elif args.command == "apply-patch":
-        patch = json.loads(Path(args.patch_json).read_text(encoding="utf-8"))
-        _print(apply_patch(store, patch).to_dict())
+        patch = json.loads(
+            read_bounded_text(
+                Path(args.patch_json),
+                max_bytes=MAX_OPERATOR_PATCH_BYTES,
+                label="operator patch document",
+            )
+        )
+        _print(apply_operator_patch(store, patch).to_dict())
     elif args.command == "report":
         if args.write:
             _print({"path": str(write_markdown_report(store))})
@@ -542,11 +678,32 @@ def _add_parallel_branches_arg(parser: argparse.ArgumentParser) -> None:
         choices=[0, 2, 3, 4, 5],
         default=DEFAULT_MULTI_BRANCH_WORKERS,
         help=(
-            "multi_branch_research mode: plan up to N (2-5) simultaneous branch-scoped researcher/villain "
+            "multi_branch_research mode: plan up to N (2-5) simultaneous branch-scoped researcher/adversarial-review "
             f"workers per step window (default {DEFAULT_MULTI_BRANCH_WORKERS}; use 0 to disable); "
             "the worker count and mode name are recorded on problem_state"
         ),
     )
+
+
+def _parallel_admission_assignment(
+    args: argparse.Namespace,
+) -> Mapping[str, Any] | None:
+    path = getattr(args, "parallel_admission_assignment", None)
+    if not path:
+        return None
+    try:
+        value = json.loads(
+            read_bounded_text(
+                Path(path),
+                max_bytes=MAX_OPERATOR_PATCH_BYTES,
+                label="parallel admission assignment",
+            )
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid parallel admission assignment file: {exc}") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError("parallel admission assignment file must contain an object")
+    return value
 
 
 def _add_completion_policy_arg(parser: argparse.ArgumentParser) -> None:
@@ -565,7 +722,7 @@ def _add_completion_policy_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def _apply_completion_policy(store: ProofStateStore, args: argparse.Namespace) -> None:
-    """Persist an explicitly requested completion policy (TODO 7).
+    """Persist an explicitly requested completion policy.
 
     Only the explicit flag changes the persisted policy; commands without the
     flag (or with it unset) leave the stored policy untouched.
@@ -594,7 +751,8 @@ def _add_backend_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--claude-permission-mode",
         default=DEFAULT_CLAUDE_PERMISSION_MODE,
-        help="Claude Code --permission-mode for executed sessions (default bypassPermissions so CAS/file tool calls run headlessly)",
+        choices=("dontAsk", "default", "manual", "plan", "acceptEdits", "auto"),
+        help="Claude Code permission mode (default dontAsk inside the mandatory fail-closed evidence-capsule sandbox)",
     )
     parser.add_argument("--claude-max-turns", type=int, default=None, help="optional Claude Code --max-turns cap per session")
     parser.add_argument(
@@ -653,7 +811,7 @@ def _maybe_start_run_dashboard(args: argparse.Namespace, store: ProofStateStore)
             poll_ms=max(500, int(float(getattr(args, "dashboard_interval", 3.0) or 3.0) * 1000)),
             open_browser=bool(getattr(args, "open_dashboard", True)),
         )
-    except Exception as exc:
+    except Exception as exc:  # intentional-boundary: dashboard startup is optional and reported to stderr/result JSON
         info = {
             "enabled": False,
             "error": str(exc),
@@ -757,7 +915,11 @@ def _read_root_statement(problem: str) -> str:
         path = GENERATION_ROOT / path
     if not path.exists():
         raise FileNotFoundError(path)
-    return path.read_text(encoding="utf-8").strip()
+    return read_bounded_text(
+        path,
+        max_bytes=MAX_PROBLEM_DOCUMENT_BYTES,
+        label="problem document",
+    ).strip()
 
 
 def _ensure_initialized_if_problem_file(
@@ -771,8 +933,9 @@ def _ensure_initialized_if_problem_file(
     try:
         store.get_revision()
         return
-    except Exception:
-        pass
+    except ValueError as exc:
+        if str(exc) != "problem state is not initialized":
+            raise
     path = Path(problem)
     normalized = problem.replace("\\", "/")
     looks_like_problem_file = normalized.endswith(".md") and (normalized.startswith("data/") or "agents/generation/data/" in normalized or path.exists())

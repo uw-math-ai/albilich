@@ -4,12 +4,13 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from agents.generation.phase2.codex_runner import actor_role_for_action, prepare_session
 from agents.generation.phase2.context_builder import build_context_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.patches import apply_patch, preflight_patch_errors
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch, preflight_patch_errors
 from agents.generation.phase2.report import build_markdown_report
 from agents.generation.phase2.scheduler import (
     PUBLICATION_REFEREE_INTENT,
@@ -25,6 +26,7 @@ from agents.generation.tests.test_phase2_writing_gate import (
     insert_final_paper,
     make_solved_store,
 )
+from agents.generation.tests._phase2_test_support import journal_legacy_fixture_mutation
 
 
 ROUTE_ERROR_EVIDENCE = (
@@ -108,7 +110,7 @@ class PublicationLoopTest(unittest.TestCase):
         store = make_solved_store(Path(tmpdir), problem_id)
         attach_final_proof(store, "final-proof-1", CLEAN_FINAL_PROOF)
         insert_final_paper(store, "final-paper-1", CLEAN_FINAL_PAPER)
-        with sqlite3.connect(store.db_path) as conn:
+        def mark_publication_workflow(conn: sqlite3.Connection, _state_revision: int) -> None:
             metadata = json.loads(
                 conn.execute(
                     "SELECT metadata_json FROM artifacts WHERE artifact_id = 'final-paper-1'"
@@ -120,7 +122,11 @@ class PublicationLoopTest(unittest.TestCase):
                 "UPDATE artifacts SET metadata_json = ? WHERE artifact_id = 'final-paper-1'",
                 (json.dumps(metadata),),
             )
-            conn.commit()
+        journal_legacy_fixture_mutation(
+            store,
+            mark_publication_workflow,
+            fixture_id="publication-workflow-metadata",
+        )
         return store
 
     def test_clean_paper_dispatches_domain_referee_with_full_packet(self) -> None:
@@ -228,7 +234,10 @@ class PublicationLoopTest(unittest.TestCase):
                 CLEAN_FINAL_PAPER.replace("present note", "revised note"),
                 created_at="2026-01-05T00:00:00+00:00",
             )
-            with sqlite3.connect(store.db_path) as conn:
+            def mark_revised_publication_workflow(
+                conn: sqlite3.Connection,
+                _state_revision: int,
+            ) -> None:
                 metadata = json.loads(
                     conn.execute(
                         "SELECT metadata_json FROM artifacts WHERE artifact_id = 'final-paper-2'"
@@ -245,7 +254,11 @@ class PublicationLoopTest(unittest.TestCase):
                     "UPDATE artifacts SET metadata_json = ? WHERE artifact_id = 'final-paper-2'",
                     (json.dumps(metadata),),
                 )
-                conn.commit()
+            journal_legacy_fixture_mutation(
+                store,
+                mark_revised_publication_workflow,
+                fixture_id="revised-publication-workflow-metadata",
+            )
             action = next_action(store, web_search="disabled")
             self.assertEqual("review_writing", action["mode"], action)
             self.assertEqual("final-paper-2", action["artifact_reviewed"])
@@ -253,7 +266,7 @@ class PublicationLoopTest(unittest.TestCase):
     def test_publication_only_boundary_is_inherited_by_writer_revisions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._paper_store(tmpdir, "publication-only-lineage")
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 metadata = json.loads(
                     conn.execute(
                         "SELECT metadata_json FROM artifacts WHERE artifact_id = 'final-paper-1'"
@@ -266,7 +279,7 @@ class PublicationLoopTest(unittest.TestCase):
                 )
                 conn.commit()
 
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 revised_metadata = prepare_final_paper_metadata(
                     conn,
@@ -312,7 +325,7 @@ class PublicationLoopTest(unittest.TestCase):
     def test_major_route_error_pauses_publication_only_test_without_research(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._paper_store(tmpdir, "publication-only-route-error")
-            with sqlite3.connect(store.db_path) as conn:
+            def mark_publication_only(conn: sqlite3.Connection, _state_revision: int) -> None:
                 metadata = json.loads(
                     conn.execute(
                         "SELECT metadata_json FROM artifacts WHERE artifact_id = 'final-paper-1'"
@@ -323,7 +336,11 @@ class PublicationLoopTest(unittest.TestCase):
                     "UPDATE artifacts SET metadata_json = ? WHERE artifact_id = 'final-paper-1'",
                     (json.dumps(metadata),),
                 )
-                conn.commit()
+            journal_legacy_fixture_mutation(
+                store,
+                mark_publication_only,
+                fixture_id="publication-only-metadata",
+            )
             outcome = attach_referee_report(
                 store,
                 report_id="referee-report-publication-only-route-error",
@@ -359,54 +376,169 @@ class PublicationLoopTest(unittest.TestCase):
             )
             self.assertTrue(outcome.accepted, outcome.errors)
             next_action(store, web_search="disabled")  # persist escalation
-            now = "2026-01-08T00:00:00+00:00"
-            with sqlite3.connect(store.db_path) as conn:
-                conn.execute(
-                    """INSERT INTO routes(
-                           route_id, conclusion_claim_id, label, strategy, status,
-                           relation_to_parent, assumptions_json, conditions_json,
-                           evidence_artifact_ids_json, failure_fingerprint, created_at, updated_at
-                       ) VALUES ('route-replacement', 'root', 'Replacement proof route',
-                                 'Use a different invariant that avoids the refuted implication.',
-                                 'integrated', 'sufficient', '[]', '[]', '[]', '', ?, ?)""",
-                    (now, now),
-                )
-                conn.execute(
-                    "UPDATE claims SET lifecycle_status='integrated', validation_status='informally_verified' WHERE claim_id='root'"
-                )
-                conn.execute(
-                    """INSERT INTO inferences(
-                           inference_id, route_id, conclusion_claim_id, explanation,
-                           conditions_json, condition_claim_ids_json, validation_status,
-                           evidence_artifact_ids_json, created_at, updated_at
-                       ) VALUES ('inf-replacement', 'route-replacement', 'root',
-                                 'The replacement invariant proves the root claim without the refuted implication.',
-                                 '[]', '[]', 'informally_verified', '[]', ?, ?)""",
-                    (now, now),
-                )
-                conn.commit()
+            route_error_debt_id = next(
+                debt["debt_id"]
+                for debt in store.get_state()["debts"]
+                if debt["debt_type"] == "referee_route_error" and debt["status"] == "active"
+            )
+            replacement = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "researcher",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "add_route",
+                            "route_id": "route-replacement",
+                            "conclusion_claim_id": "root",
+                            "label": "Replacement proof route",
+                            "strategy": "Use a different invariant that avoids the refuted implication.",
+                            "relation_to_parent": "sufficient",
+                        },
+                        {
+                            "op": "add_inference",
+                            "inference_id": "inf-replacement",
+                            "route_id": "route-replacement",
+                            "conclusion_claim_id": "root",
+                            "premise_claim_ids": [],
+                            "validation_status": "plausible",
+                            "explanation": (
+                                "The replacement invariant proves the root claim without the refuted implication."
+                            ),
+                        },
+                    ],
+                    "rationale": "construct a genuinely different replacement route",
+                },
+            )
+            self.assertTrue(replacement.accepted, replacement.errors)
+            verified = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "strict_informal_verifier",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "verification-root-replacement",
+                            "artifact_type": "verification_report",
+                            "content": "The replacement proof is complete and avoids the refuted implication.",
+                            "metadata": {
+                                "verdict": "informally_verified",
+                                "verification_report": {
+                                    "checked_items": ["the replacement terminal implication"],
+                                    "critical_errors": [],
+                                    "gaps": [],
+                                    "blocking_gap": False,
+                                },
+                            },
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "inference",
+                            "target_id": "inf-replacement",
+                            "status_type": "validation",
+                            "new_status": "informally_verified",
+                            "evidence_artifact_ids": ["verification-root-replacement"],
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "claim",
+                            "target_id": "root",
+                            "status_type": "validation",
+                            "new_status": "informally_verified",
+                            "evidence_artifact_ids": ["verification-root-replacement"],
+                        },
+                        {
+                            "op": "resolve_debt",
+                            "debt_id": route_error_debt_id,
+                            "resolution_evidence_artifact_ids": ["verification-root-replacement"],
+                            "resolution_evidence": {
+                                "explanation": "The replacement route removes the falsified implication."
+                            },
+                        },
+                    ],
+                    "rationale": "strictly verify the replacement route and its repair",
+                },
+            )
+            self.assertTrue(verified.accepted, verified.errors)
+            integrated = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "integration_verifier",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "integration-root-replacement",
+                            "artifact_type": "integration_report",
+                            "content": "The replacement route proves the original root theorem exactly.",
+                            "metadata": {
+                                "integrates": True,
+                                "route_id": "route-replacement",
+                                "claim_id": "root",
+                                "root_alignment": {
+                                    "relation_to_root": "exact",
+                                    "target_statement": "prove the root theorem",
+                                    "proved_statement": "prove the root theorem",
+                                    "implication_verified": True,
+                                    "hidden_assumptions": False,
+                                    "extra_assumptions": [],
+                                },
+                            },
+                        },
+                        {
+                            "op": "propose_status_transition",
+                            "target_type": "claim",
+                            "target_id": "root",
+                            "status_type": "lifecycle",
+                            "new_status": "integrated",
+                            "route_id": "route-replacement",
+                            "evidence_artifact_ids": ["integration-root-replacement"],
+                        },
+                    ],
+                    "rationale": "integrate the independently certified replacement route",
+                },
+            )
+            self.assertTrue(integrated.accepted, integrated.errors)
 
             action = next_action(store, web_search="disabled")
             self.assertEqual("write", action["mode"], action)
             self.assertTrue(action["final_output_required"])
             self.assertNotIn("certificate_artifact_id", action)
 
-            proof_path = store.state_dir / "artifacts" / "final-proof-2.md"
-            proof_path.write_text(CLEAN_FINAL_PROOF, encoding="utf-8")
-            with sqlite3.connect(store.db_path) as conn:
-                conn.execute(
-                    """INSERT INTO artifacts(
-                           artifact_id, artifact_type, path, sha256, producer_role, run_id,
-                           state_revision, content_summary, metadata_json, created_at
-                       ) VALUES ('final-proof-2', 'final_proof', ?, 'new-proof-sha', 'writer', '',
-                                 10, 'The replacement route proves the root theorem.', ?, ?)""",
-                    (
-                        str(proof_path),
-                        json.dumps({"claim_id": "root", "route_id": "route-replacement"}),
-                        now,
-                    ),
-                )
-                conn.commit()
+            final_proof = apply_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(),
+                    "actor_role": "writer",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": "final-proof-2",
+                            "artifact_type": "final_proof",
+                            "content": CLEAN_FINAL_PROOF.replace(
+                                "We argue directly.",
+                                "We use the independently checked replacement invariant.",
+                            ),
+                            "metadata": {"claim_id": "root", "route_id": "route-replacement"},
+                        }
+                    ],
+                    "rationale": "write the replacement certified proof",
+                },
+            )
+            self.assertTrue(final_proof.accepted, final_proof.errors)
 
             action = next_action(store, web_search="disabled")
             self.assertEqual("write", action["mode"], action)

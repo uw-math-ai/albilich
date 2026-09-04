@@ -1,13 +1,48 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import os
 import re
+import shutil
 import sqlite3
+import stat
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
+from .action_contract import (
+    EXECUTABLE_RUN_MODES,
+    scheduler_actor_role_for_action,
+    scheduler_action_contract_errors,
+    scheduler_action_contract_trace_errors,
+    scheduler_budget_class_for_action,
+    scheduler_dispatch_action_errors,
+)
 from .artifacts import artifact_hash, artifact_summary
+from .authority import (
+    PatchAuthority,
+    authority_contract_errors,
+    operator_authority,
+    system_authority,
+)
+from .audit_chain import GENESIS_HASH, patch_entry_hash
+from .assurance import claim_assurance_errors
+from .decision_policy import (
+    action_sha256,
+    candidate_rows_sha256,
+    decision_deferral_state_after_trace,
+    decision_trace_is_parallel_companion,
+    decision_trace_errors,
+)
+from .dispatch_execution import execution_contract_errors
+from .parallel_admission import (
+    parallel_candidate_deferral_counts_from_state,
+    parallel_outcome_is_fairness_eligible,
+    parallel_v3_candidate_alias,
+)
 from .graph_policy import obvious_duplicate_claim_id, obvious_duplicate_route_id
 from .invariants import VERIFIED_STATUSES, validate_conn
 from .models import (
@@ -18,7 +53,6 @@ from .models import (
     LIFECYCLE_STATUSES,
     ROUTE_RELATIONS,
     ROUTE_STATUSES,
-    RUN_MODES,
     SCHEMA_VERSION,
     VALIDATION_STATUSES,
     NON_VERIFYING_ROLES,
@@ -28,16 +62,42 @@ from .models import (
     json_dumps,
     json_loads,
     normalize_text,
+    sha256_text,
     statement_is_interrogative_problem,
     utc_now,
 )
-from .budget import run_spend_from_operation
+from .memory_policy import artifact_is_raw_log
+from .budget import (
+    parse_token_usage,
+    run_may_use_verification_reserve,
+    run_spend_from_operation,
+)
+from .bounded_io import read_bounded_text, stable_file_sha256_size
+from .cas_reproduction import reproduce_computation
+from .formal_reproduction import check_formal_artifact
+from .certificates import (
+    artifact_has_current_binding,
+    bind_new_certificates,
+    entity_subject_digest,
+    invalidate_dependents,
+    invalidate_stale_refuted_obligations,
+)
 from .receipt import compile_latex_artifact, format_partial_receipt_appendix, receipt_appendix_present, write_latex_pdf_sidecars
 from .research_intelligence import validate_state_independent_artifact_metadata
 from .research_strategy import STRATEGIC_MARKDOWN_ARTIFACT_TYPES, strategic_artifact_errors
 from .research_policy import normalize_retrieval_relation, theorem_matching_confidence
+from .randomized_assignment import (
+    WORKFLOW_RANDOMIZED_ASSIGNMENT_PROTOCOL_VERSIONS,
+    randomized_assignment_design_sha256,
+    randomized_assignment_errors,
+    randomized_assignment_metadata,
+)
 from .result_status import SOLVED_RELATIONS, root_alignment_from_metadata
 from .store import ProofStateStore
+from .scheduler_provenance import (
+    append_scheduler_provenance_entry,
+    scheduler_provenance_summary,
+)
 from .verification import (
     POSITIVE_VERIFICATION_VERDICTS,
     clean_verification_metadata,
@@ -50,6 +110,7 @@ from .writing.linter import run_paper_lint, run_residue_scan
 from .writing.paper_contract import SUPPORTED_WRITING_REVIEW_LENSES
 from .writing.publication import (
     REFEREE_VERDICTS,
+    mark_route_error_escalated,
     prepare_final_paper_metadata,
     prepare_referee_report_metadata,
     record_referee_report,
@@ -70,37 +131,171 @@ class _ArtifactFileJournal:
     """Undo filesystem mutations when the enclosing SQLite patch rolls back."""
 
     def __init__(self) -> None:
-        self._before: Dict[Path, Optional[bytes]] = {}
+        self._before: Dict[Path, Optional[Path]] = {}
+        self._backup_dir: Optional[tempfile.TemporaryDirectory[str]] = None
 
     def capture(self, path: Path) -> None:
-        path = path.resolve()
+        path = path.parent.resolve() / path.name
         if path not in self._before:
-            self._before[path] = path.read_bytes() if path.is_file() else None
+            if path.is_symlink():
+                raise PatchRejected(
+                    [f"artifact destination must not be a symbolic link: {path}"]
+                )
+            if path.is_file():
+                if self._backup_dir is None:
+                    self._backup_dir = tempfile.TemporaryDirectory(
+                        prefix="albilich-artifact-rollback-"
+                    )
+                backup = Path(self._backup_dir.name) / f"{len(self._before):08d}.bak"
+                shutil.copy2(path, backup)
+                self._before[path] = backup
+            elif path.exists():
+                raise PatchRejected(
+                    [f"artifact destination is not a regular file: {path}"]
+                )
+            else:
+                self._before[path] = None
 
     def write_text(self, path: Path, content: str) -> None:
-        self.capture(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        self.write_bytes(path, content.encode("utf-8"))
 
     def write_bytes(self, path: Path, content: bytes) -> None:
+        path = path.parent.resolve() / path.name
         self.capture(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
+        descriptor, raw_temporary_path = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".write", dir=path.parent
+        )
+        temporary_path = Path(raw_temporary_path)
+        try:
+            offset = 0
+            while offset < len(content):
+                offset += os.write(descriptor, content[offset:])
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary_path, path)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            temporary_path.unlink(missing_ok=True)
+
+    def copy_stable_file(
+        self,
+        destination: Path,
+        source: Path,
+        *,
+        max_bytes: int,
+        expected_sha256: str = "",
+        expected_size: Optional[int] = None,
+    ) -> int:
+        """Copy one stable regular file without following its final symlink."""
+
+        destination = destination.parent.resolve() / destination.name
+        self.capture(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            source_descriptor = os.open(source, flags)
+        except OSError as exc:
+            raise PatchRejected([f"could not open artifact source {source}: {exc}"]) from exc
+        temporary_descriptor = -1
+        temporary_path: Optional[Path] = None
+        try:
+            before = os.fstat(source_descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise PatchRejected([f"artifact source is not a regular file: {source}"])
+            if before.st_size > max_bytes:
+                raise PatchRejected(
+                    [
+                        f"artifact source is {before.st_size} bytes; copied artifacts "
+                        f"are limited to {max_bytes} bytes"
+                    ]
+                )
+            if expected_size is not None and before.st_size != expected_size:
+                raise PatchRejected(
+                    [f"artifact source size changed since result persistence: {source}"]
+                )
+            temporary_descriptor, raw_temporary_path = tempfile.mkstemp(
+                prefix=f".{destination.name}.",
+                suffix=".copy",
+                dir=destination.parent,
+            )
+            temporary_path = Path(raw_temporary_path)
+            copied = 0
+            digest = hashlib.sha256()
+            while True:
+                block = os.read(source_descriptor, 1024 * 1024)
+                if not block:
+                    break
+                copied += len(block)
+                if copied > max_bytes:
+                    raise PatchRejected(
+                        [f"artifact source grew beyond the {max_bytes}-byte copy limit"]
+                    )
+                digest.update(block)
+                offset = 0
+                while offset < len(block):
+                    offset += os.write(temporary_descriptor, block[offset:])
+            after = os.fstat(source_descriptor)
+            if (
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or copied != after.st_size
+            ):
+                raise PatchRejected([f"artifact source changed while it was copied: {source}"])
+            if expected_sha256 and digest.hexdigest() != expected_sha256:
+                raise PatchRejected(
+                    [f"artifact source content changed since result persistence: {source}"]
+                )
+            os.fsync(temporary_descriptor)
+            os.close(temporary_descriptor)
+            temporary_descriptor = -1
+            os.replace(temporary_path, destination)
+            temporary_path = None
+            return copied
+        finally:
+            os.close(source_descriptor)
+            if temporary_descriptor >= 0:
+                os.close(temporary_descriptor)
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def rollback(self) -> None:
-        for path, content in reversed(list(self._before.items())):
-            if content is None:
+        for path, backup in reversed(list(self._before.items())):
+            if backup is None:
                 path.unlink(missing_ok=True)
             else:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(content)
+                descriptor, raw_restore_path = tempfile.mkstemp(
+                    prefix=f".{path.name}.", suffix=".restore", dir=path.parent
+                )
+                os.close(descriptor)
+                restore_path = Path(raw_restore_path)
+                try:
+                    shutil.copy2(backup, restore_path)
+                    os.replace(restore_path, path)
+                finally:
+                    restore_path.unlink(missing_ok=True)
         self._before.clear()
+        if self._backup_dir is not None:
+            self._backup_dir.cleanup()
+            self._backup_dir = None
 
     def commit(self) -> None:
         self._before.clear()
+        if self._backup_dir is not None:
+            self._backup_dir.cleanup()
+            self._backup_dir = None
 
 
 ARTIFACT_PRODUCER_ROLES = {
+    "audit_subject": {"human_operator"},
+    "branch_workbench": {"scheduler"},
     "verification_report": {"strict_informal_verifier"},
     "formal_backend_result": {"formal_backend"},
     "confirmed_counterexample": {"counterexample_validator"},
@@ -109,15 +304,20 @@ ARTIFACT_PRODUCER_ROLES = {
     "writing_review": {"writing_critic"},
     "final_paper": {"writer"},
     "human_readable_mathematical_text": {"writer"},
-    REVISION_DOCUMENT_ARTIFACT_TYPE: {"writer"},
+    # The immutable source manuscript is submitted by the human operator;
+    # later revision_document artifacts are produced by the writer and pass
+    # the lineage checks in _prepare_revision_document_metadata.
+    REVISION_DOCUMENT_ARTIFACT_TYPE: {"human_operator", "writer"},
     "advisor_synthesis": {"phd_advisor", "advisor"},
     "invention_authorization": {"phd_advisor", "advisor"},
     "approach_portfolio": {"researcher"},
     "bridge_lemma_search": {"researcher"},
-    "conjecture_portfolio": {"researcher", "villain"},
+    "conjecture_portfolio": {"researcher", "adversarial_reviewer", "villain"},
     "definition_candidate": {"researcher"},
     "deep_session_report": {"researcher"},
     "proof_compression": {"researcher", "phd_advisor", "advisor"},
+    "reference_solution": {"human_operator"},
+    "run_interruption_event": {"human_operator"},
 }
 STRICT_VERIFIER_ARTIFACT_TYPES = {"verification_report"}
 WRITING_CRITIC_ROLE = "writing_critic"
@@ -141,6 +341,7 @@ WRITER_RESIDUE_SCANNED_ARTIFACT_TYPES = {
 # final_paper's content IS complete LaTeX source, so it ships as a .tex file
 # that the attach-time sidecar compiles directly (no markdown->LaTeX pass).
 ARTIFACT_CONTENT_EXTENSIONS = {
+    "branch_workbench": ".json",
     "final_paper": ".tex",
     "human_readable_mathematical_text": ".tex",
 }
@@ -171,6 +372,13 @@ WRITER_PATH_ATTACH_ARTIFACT_TYPES = (
     WRITER_RESIDUE_SCANNED_ARTIFACT_TYPES | WRITER_REFERENCE_REQUIRED_ARTIFACT_TYPES
 )
 WRITER_PATH_ATTACH_MAX_BYTES = 2 * 1024 * 1024
+MAX_INLINE_ARTIFACT_BYTES = 8 * 1024 * 1024
+MAX_COPIED_ARTIFACT_BYTES = 256 * 1024 * 1024
+MAX_PATCH_OPERATIONS = 512
+MAX_PATCH_NESTING_DEPTH = 40
+MAX_PATCH_JSON_NODES = 100_000
+MAX_PATCH_TOTAL_UTF8_BYTES = 16 * 1024 * 1024
+MAX_PATCH_STRING_BYTES = 8 * 1024 * 1024
 REFERENCE_SECTION_RE = re.compile(
     r"(?im)^\s*(?:#{1,6}\s+References|References|\\section\*?\{References\})\s*$"
 )
@@ -190,6 +398,92 @@ WRITER_RAW_LEDGER_MARKERS = (
 )
 EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
+_STATE_JOURNAL_TABLE_KEYS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("problem_state", ("problem_id",)),
+    ("claims", ("claim_id",)),
+    ("routes", ("route_id",)),
+    ("inferences", ("inference_id",)),
+    ("inference_premises", ("inference_id", "premise_claim_id")),
+    ("debts", ("debt_id",)),
+    ("artifacts", ("artifact_id",)),
+    ("runs", ("run_id",)),
+    ("scheduler_dispatches", ("dispatch_id",)),
+    ("retrieval_cards", ("card_id",)),
+    ("theorem_library_entries", ("entry_id",)),
+    ("publication_reviews", ("review_id",)),
+    ("context_requests", ("request_id",)),
+    ("claim_assurance", ("claim_id",)),
+)
+
+
+def _patch_resource_errors(patch: Mapping[str, Any]) -> List[str]:
+    """Reject non-JSON or computationally unbounded patch structures early."""
+
+    errors: List[str] = []
+    operations = patch.get("operations")
+    if isinstance(operations, list) and len(operations) > MAX_PATCH_OPERATIONS:
+        errors.append(
+            f"patch has {len(operations)} operations; limit is {MAX_PATCH_OPERATIONS}"
+        )
+
+    stack: list[tuple[Any, int]] = [(patch, 0)]
+    nodes = 0
+    utf8_bytes = 0
+    while stack and not errors:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_PATCH_JSON_NODES:
+            errors.append(
+                f"patch JSON exceeds the {MAX_PATCH_JSON_NODES}-node structural limit"
+            )
+            break
+        if depth > MAX_PATCH_NESTING_DEPTH:
+            errors.append(
+                f"patch JSON exceeds the {MAX_PATCH_NESTING_DEPTH}-level nesting limit"
+            )
+            break
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    errors.append("patch JSON object keys must be strings")
+                    break
+                key_bytes = len(key.encode("utf-8"))
+                if key_bytes > MAX_PATCH_STRING_BYTES:
+                    errors.append("patch JSON contains an oversized object key")
+                    break
+                utf8_bytes += key_bytes
+                stack.append((child, depth + 1))
+        elif isinstance(value, list):
+            stack.extend((child, depth + 1) for child in value)
+        elif isinstance(value, str):
+            value_bytes = len(value.encode("utf-8"))
+            if value_bytes > MAX_PATCH_STRING_BYTES:
+                errors.append(
+                    f"patch JSON string exceeds the {MAX_PATCH_STRING_BYTES}-byte limit"
+                )
+                break
+            utf8_bytes += value_bytes
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                errors.append("patch JSON contains a non-finite number")
+                break
+        elif isinstance(value, int):
+            if not isinstance(value, bool) and value.bit_length() > 1024:
+                errors.append("patch JSON contains an oversized integer")
+                break
+        elif value is not None:
+            errors.append(
+                f"patch contains a non-JSON value of type {type(value).__name__}"
+            )
+            break
+        if utf8_bytes > MAX_PATCH_TOTAL_UTF8_BYTES:
+            errors.append(
+                "patch JSON strings exceed the aggregate "
+                f"{MAX_PATCH_TOTAL_UTF8_BYTES}-byte limit"
+            )
+            break
+    return errors
+
 
 def preflight_patch_errors(patch: Mapping[str, Any], actor_role: str) -> List[str]:
     """Runner-side contract checks that predict certain guard rejections.
@@ -199,10 +493,16 @@ def preflight_patch_errors(patch: Mapping[str, Any], actor_role: str) -> List[st
     whole step to a workflow rejection. Anything that needs store state stays
     with apply_patch.
     """
+    resource_errors = _patch_resource_errors(patch)
+    if resource_errors:
+        return resource_errors
     try:
         normalized = _normalize_patch_aliases(dict(patch))
-    except Exception:
+    except (TypeError, ValueError):
         return []
+    normalized_resource_errors = _patch_resource_errors(normalized)
+    if normalized_resource_errors:
+        return normalized_resource_errors
     operations = [op for op in normalized.get("operations") or [] if isinstance(op, Mapping)]
     attached_ops = {
         str(op.get("artifact_id") or ""): op
@@ -656,7 +956,13 @@ def _stale_rebase_assessment(store: ProofStateStore, patch: Mapping[str, Any]) -
     return {"ok": True, "current_revision": current_revision, "reason": "row-disjoint or commutative patch"}
 
 
-def apply_patch_with_stale_retry(store: ProofStateStore, patch: Dict[str, Any], *, max_retries: int = 3) -> PatchOutcome:
+def apply_patch_with_stale_retry(
+    store: ProofStateStore,
+    patch: Dict[str, Any],
+    *,
+    authority: PatchAuthority,
+    max_retries: int = 3,
+) -> PatchOutcome:
     """apply_patch, but auto-rebase provably safe patches past staleness.
 
     Parallel companions and long researcher sessions routinely go stale because
@@ -664,7 +970,13 @@ def apply_patch_with_stale_retry(store: ProofStateStore, patch: Dict[str, Any], 
     and row-disjoint or commutative with everything that landed in between,
     retry it instead of discarding the whole session's work.
     """
-    outcome = apply_patch(store, patch)
+    original_base_revision = int(patch.get("base_revision") or 0)
+    outcome = apply_patch(
+        store,
+        patch,
+        authority=authority,
+        original_base_revision=original_base_revision,
+    )
     retries = 0
     while (
         not outcome.accepted
@@ -686,12 +998,19 @@ def apply_patch_with_stale_retry(store: ProofStateStore, patch: Dict[str, Any], 
                         },
                     )
                     conn.commit()
-            except Exception:
+            except (OSError, sqlite3.Error, TypeError, ValueError):
+                # Diagnostic event failure cannot change the already-declined
+                # mathematical mutation; the returned rejection remains authoritative.
                 pass
             break
         patch = dict(patch)
         patch["base_revision"] = assessment["current_revision"]
-        outcome = apply_patch(store, patch)
+        outcome = apply_patch(
+            store,
+            patch,
+            authority=authority,
+            original_base_revision=original_base_revision,
+        )
         retries += 1
         if outcome.accepted:
             try:
@@ -708,7 +1027,8 @@ def apply_patch_with_stale_retry(store: ProofStateStore, patch: Dict[str, Any], 
                         },
                     )
                     conn.commit()
-            except Exception:
+            except (OSError, sqlite3.Error, TypeError, ValueError):
+                # Diagnostic event failure cannot reverse an accepted, committed patch.
                 pass
     return outcome
 
@@ -717,14 +1037,18 @@ def _record_patch_rejection(store: ProofStateStore, patch: Mapping[str, Any], pa
     """Persist a patch_rejected event so failed sessions are diagnosable post-hoc."""
     try:
         payload = {
-            "patch_id": patch_id,
+            "patch_id": str(patch_id)[:512],
             "actor_role": str(patch.get("actor_role") or ""),
             "target_id": str(patch.get("target_id") or ""),
             "base_revision": patch.get("base_revision"),
             "kind": kind,
             "op_kinds": [
                 str(op.get("op") or "")
-                for op in (patch.get("operations") or [])
+                for op in (
+                    patch.get("operations")
+                    if isinstance(patch.get("operations"), list)
+                    else []
+                )
                 if isinstance(op, Mapping)
             ][:16],
             "errors": [str(error)[:400] for error in (errors or [])][:8],
@@ -732,14 +1056,563 @@ def _record_patch_rejection(store: ProofStateStore, patch: Mapping[str, Any], pa
         with store.connect() as conn:
             store.write_event(conn, store.get_revision(conn), "patch_rejected", payload)
             conn.commit()
-    except Exception:
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        # intentional-boundary: rejection telemetry is best-effort and has no proof authority
         pass
 
 
-def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
-    patch = _normalize_patch_aliases(patch)
+def _state_journal_projection(conn: sqlite3.Connection) -> Dict[str, list[Dict[str, Any]]]:
+    """Canonical projection of mathematical state and resource constraints.
+
+    Scheduler dispatch and run telemetry have their own authenticated,
+    append-only history. Keeping those ever-growing control-plane rows in the
+    proof-state digest made every later mathematical transition linear in the
+    lifetime execution count. Empty compatibility components preserve the
+    revision-zero hash used by stores created before migration v15.
+    """
+
+    projection: Dict[str, list[Dict[str, Any]]] = {}
+    for table, key_columns in _STATE_JOURNAL_TABLE_KEYS:
+        if table == "runs":
+            projection[table] = []
+            continue
+        if table == "scheduler_dispatches":
+            continue
+        order = ", ".join(key_columns)
+        columns = "*"
+        if table == "problem_state":
+            # Run-control/UI policy fields change outside proof revisions and
+            # are intentionally not part of mathematical replay identity.
+            columns = (
+                "problem_id, schema_version, current_revision, root_statement, status, "
+                "total_token_budget, remaining_token_budget, reserved_verification_budget, "
+                "max_reduction_depth"
+            )
+        rows = [
+            dict(row)
+            for row in conn.execute(f"SELECT {columns} FROM {table} ORDER BY {order}").fetchall()
+        ]
+        # Preserve every pre-v11 proof-state hash when the newly introduced
+        # table is empty.  Once a dispatch exists it is a native replay row.
+        if table == "scheduler_dispatches" and not rows:
+            continue
+        projection[table] = rows
+    return projection
+
+
+def _legacy_v14_state_journal_projection(
+    conn: sqlite3.Connection,
+) -> Dict[str, list[Dict[str, Any]]]:
+    """Reproduce the proof projection used through store migration v14."""
+
+    projection = _state_journal_projection(conn)
+    projection["runs"] = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT run_id, actor_role, mode, target_id, route_id, state_revision, "
+            "context_revision, session_id, model_profile, model, reasoning_effort, "
+            "search_setting, search_intent, strategy_family, researcher_work_mode, "
+            "work_mode_source, failure_kind, sandbox_setting, budget_requested, "
+            "input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, "
+            "total_tokens, wall_time_seconds, peak_memory_mb, status, prompt_context_hash, "
+            "output_artifact_ids_json, error_artifact_id, created_at, "
+            "budget_overrun_tokens FROM runs ORDER BY run_id"
+        ).fetchall()
+    ]
+    dispatches = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT dispatch_id, dispatch_group_id, dispatch_position, is_companion, "
+            "actor_role, mode, target_id, route_id, decision_state_revision, "
+            "proof_state_hash, prior_run_provenance_hash, selection_design, "
+            "candidate_set_hash, selection_policy_version, decision_trace_json, "
+            "dispatched_action_hash, committed_at FROM scheduler_dispatches "
+            "ORDER BY dispatch_id"
+        ).fetchall()
+    ]
+    if dispatches:
+        projection["scheduler_dispatches"] = dispatches
+    return projection
+
+
+def _state_projection_hash(projection: Mapping[str, Any]) -> str:
+    return sha256_text(json_dumps(projection))
+
+
+def _run_provenance_hash(
+    conn: sqlite3.Connection,
+    *,
+    include_dispatch_execution: bool = True,
+    include_result_run_id: bool = True,
+    use_incremental: bool = True,
+) -> str:
+    """Hash run-selection fields excluded from legacy row-replay identity.
+
+    Migration v4 added these columns after native replay hashes already
+    existed.  Rewriting that history would invalidate genuine checkpoints, so
+    v9 binds the live values with a companion seal instead.
+    """
+
+    incremental_available = (
+        use_incremental
+        and conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'scheduler_provenance_entries'"
+        ).fetchone()
+        is not None
+        and conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = 15"
+        ).fetchone()
+        is not None
+    )
+    candidate_deferrals = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT candidate_id, consecutive_capacity_deferrals, last_wave_id, "
+            "policy_version, updated_run_id, updated_dispatch_id "
+            "FROM scheduler_candidate_deferrals ORDER BY candidate_id"
+        ).fetchall()
+    ]
+    fairness_meta = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT singleton, last_wave_id, last_state_revision, policy_version, "
+            "updated_run_id, updated_dispatch_id FROM scheduler_fairness_meta "
+            "ORDER BY singleton"
+        ).fetchall()
+    ]
+    decision_deferrals = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT candidate_id, consecutive_deferrals, last_decision_id, "
+            "policy_version, updated_run_id, updated_dispatch_id "
+            "FROM scheduler_decision_deferrals ORDER BY candidate_id"
+        ).fetchall()
+    ]
+    decision_fairness_meta = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT singleton, last_decision_id, last_state_revision, "
+            "policy_version, updated_run_id, updated_dispatch_id "
+            "FROM scheduler_decision_fairness_meta ORDER BY singleton"
+        ).fetchall()
+    ]
+    projection = {
+        "scheduler_candidate_deferrals": candidate_deferrals,
+        "scheduler_fairness_meta": fairness_meta,
+        "scheduler_decision_deferrals": decision_deferrals,
+        "scheduler_decision_fairness_meta": decision_fairness_meta,
+    }
+    if incremental_available:
+        projection["scheduler_provenance"] = scheduler_provenance_summary(conn)
+    else:
+        projection["runs"] = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT run_id, selection_design, assignment_probability, "
+                "exploration_stratum, candidate_set_hash, selection_policy_version, "
+                "decision_trace_json, decision_state_revision, scheduler_dispatch_id, "
+                "dispatched_action_hash FROM runs ORDER BY run_id"
+            ).fetchall()
+        ]
+        projection["scheduler_dispatches"] = [
+            dict(row)
+            for row in conn.execute(
+                # The action digest commits to the canonical recovery body.
+                "SELECT dispatch_id, dispatch_group_id, dispatch_position, is_companion, "
+                "actor_role, mode, target_id, route_id, decision_state_revision, "
+                "proof_state_hash, prior_run_provenance_hash, selection_design, "
+                "candidate_set_hash, selection_policy_version, decision_trace_json, "
+                "dispatched_action_hash, execution_contract_json, committed_at "
+                "FROM scheduler_dispatches ORDER BY dispatch_id"
+            ).fetchall()
+        ]
+    if include_dispatch_execution and not incremental_available:
+        # The potentially large result body is committed by result_hash and
+        # checked before recovery/full audit.  Keeping only that digest in the
+        # current-state seal avoids making every later proof patch rehash a
+        # multi-megabyte model response.
+        projection["scheduler_dispatch_attempts"] = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT attempt_id, dispatch_id, attempt_number, "
+                "session_plan_hash, executor_identity, claimed_at, event_id "
+                "FROM scheduler_dispatch_attempts ORDER BY attempt_id"
+            ).fetchall()
+        ]
+        result_columns = (
+            "result_id, dispatch_id, attempt_id, run_id, result_hash, "
+            if include_result_run_id
+            else "result_id, dispatch_id, attempt_id, result_hash, "
+        )
+        projection["scheduler_dispatch_results"] = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT "
+                + result_columns
+                + "completed_at, event_id FROM scheduler_dispatch_results "
+                "ORDER BY result_id"
+            ).fetchall()
+        ]
+    return sha256_text(json_dumps(projection))
+
+
+def _legacy_v12_run_provenance_hash(conn: sqlite3.Connection) -> str:
+    """Reproduce the v12 seal before durable attempt/result records existed."""
+
+    return _run_provenance_hash(
+        conn,
+        include_dispatch_execution=False,
+        use_incremental=False,
+    )
+
+
+def _legacy_v13_run_provenance_hash(conn: sqlite3.Connection) -> str:
+    """Reproduce the v13 seal before result run IDs were reserved."""
+
+    return _run_provenance_hash(
+        conn,
+        include_dispatch_execution=True,
+        include_result_run_id=False,
+        use_incremental=False,
+    )
+
+
+def _legacy_v14_run_provenance_hash(conn: sqlite3.Connection) -> str:
+    """Reproduce the exact v14 full-history seal for migration checks."""
+
+    return _run_provenance_hash(conn, use_incremental=False)
+
+
+def _legacy_v9_run_provenance_hash(conn: sqlite3.Connection) -> str:
+    """Reproduce the exact pre-v10 run-selection seal for migration checks."""
+
+    rows = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT run_id, selection_design, assignment_probability, "
+            "exploration_stratum, candidate_set_hash, selection_policy_version, "
+            "decision_trace_json FROM runs ORDER BY run_id"
+        ).fetchall()
+    ]
+    return sha256_text(json_dumps(rows))
+
+
+def _legacy_v10_run_provenance_hash(conn: sqlite3.Connection) -> str:
+    """Reproduce the exact pre-v11 scheduler/run seal for migration checks."""
+
+    rows = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT run_id, selection_design, assignment_probability, "
+            "exploration_stratum, candidate_set_hash, selection_policy_version, "
+            "decision_trace_json FROM runs ORDER BY run_id"
+        ).fetchall()
+    ]
+    candidate_deferrals = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT candidate_id, consecutive_capacity_deferrals, last_wave_id, "
+            "policy_version, updated_run_id "
+            "FROM scheduler_candidate_deferrals ORDER BY candidate_id"
+        ).fetchall()
+    ]
+    fairness_meta = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT singleton, last_wave_id, last_state_revision, policy_version, "
+            "updated_run_id FROM scheduler_fairness_meta ORDER BY singleton"
+        ).fetchall()
+    ]
+    decision_deferrals = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT candidate_id, consecutive_deferrals, last_decision_id, "
+            "policy_version, updated_run_id "
+            "FROM scheduler_decision_deferrals ORDER BY candidate_id"
+        ).fetchall()
+    ]
+    decision_fairness_meta = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT singleton, last_decision_id, last_state_revision, "
+            "policy_version, updated_run_id "
+            "FROM scheduler_decision_fairness_meta ORDER BY singleton"
+        ).fetchall()
+    ]
+    return sha256_text(
+        json_dumps(
+            {
+                "runs": rows,
+                "scheduler_candidate_deferrals": candidate_deferrals,
+                "scheduler_fairness_meta": fairness_meta,
+                "scheduler_decision_deferrals": decision_deferrals,
+                "scheduler_decision_fairness_meta": decision_fairness_meta,
+            }
+        )
+    )
+
+
+def _legacy_v11_run_provenance_hash(conn: sqlite3.Connection) -> str:
+    """Reproduce the exact pre-v12 dispatch/run seal for migration checks."""
+
+    rows = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT run_id, selection_design, assignment_probability, "
+            "exploration_stratum, candidate_set_hash, selection_policy_version, "
+            "decision_trace_json, decision_state_revision, scheduler_dispatch_id, "
+            "dispatched_action_hash FROM runs ORDER BY run_id"
+        ).fetchall()
+    ]
+    dispatches = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT dispatch_id, dispatch_group_id, dispatch_position, is_companion, "
+            "actor_role, mode, target_id, route_id, decision_state_revision, "
+            "proof_state_hash, prior_run_provenance_hash, selection_design, "
+            "candidate_set_hash, selection_policy_version, decision_trace_json, "
+            "dispatched_action_hash, committed_at "
+            "FROM scheduler_dispatches ORDER BY dispatch_id"
+        ).fetchall()
+    ]
+    candidate_deferrals = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT candidate_id, consecutive_capacity_deferrals, last_wave_id, "
+            "policy_version, updated_run_id, updated_dispatch_id "
+            "FROM scheduler_candidate_deferrals ORDER BY candidate_id"
+        ).fetchall()
+    ]
+    fairness_meta = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT singleton, last_wave_id, last_state_revision, policy_version, "
+            "updated_run_id, updated_dispatch_id FROM scheduler_fairness_meta "
+            "ORDER BY singleton"
+        ).fetchall()
+    ]
+    decision_deferrals = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT candidate_id, consecutive_deferrals, last_decision_id, "
+            "policy_version, updated_run_id, updated_dispatch_id "
+            "FROM scheduler_decision_deferrals ORDER BY candidate_id"
+        ).fetchall()
+    ]
+    decision_fairness_meta = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT singleton, last_decision_id, last_state_revision, "
+            "policy_version, updated_run_id, updated_dispatch_id "
+            "FROM scheduler_decision_fairness_meta ORDER BY singleton"
+        ).fetchall()
+    ]
+    return sha256_text(
+        json_dumps(
+            {
+                "runs": rows,
+                "scheduler_dispatches": dispatches,
+                "scheduler_candidate_deferrals": candidate_deferrals,
+                "scheduler_fairness_meta": fairness_meta,
+                "scheduler_decision_deferrals": decision_deferrals,
+                "scheduler_decision_fairness_meta": decision_fairness_meta,
+            }
+        )
+    )
+
+
+def _state_delta(
+    before: Mapping[str, list[Mapping[str, Any]]],
+    after: Mapping[str, list[Mapping[str, Any]]],
+) -> list[Dict[str, Any]]:
+    """Return row-exact changes sufficient to replay one accepted revision."""
+
+    changes: list[Dict[str, Any]] = []
+    for table, key_columns in _STATE_JOURNAL_TABLE_KEYS:
+        def key_for(row: Mapping[str, Any]) -> tuple[str, ...]:
+            return tuple(str(row.get(column) or "") for column in key_columns)
+
+        before_rows = {key_for(row): dict(row) for row in before.get(table, [])}
+        after_rows = {key_for(row): dict(row) for row in after.get(table, [])}
+        for row_key in sorted(set(before_rows) | set(after_rows)):
+            old = before_rows.get(row_key)
+            new = after_rows.get(row_key)
+            if old == new:
+                continue
+            key_card = {column: row_key[index] for index, column in enumerate(key_columns)}
+            if old is None:
+                changes.append({"op": "insert_row", "table": table, "key": key_card, "after": new})
+            elif new is None:
+                changes.append({"op": "delete_row", "table": table, "key": key_card, "before": old})
+            else:
+                changes.append(
+                    {
+                        "op": "update_row",
+                        "table": table,
+                        "key": key_card,
+                        "before": old,
+                        "after": new,
+                    }
+                )
+    return changes
+
+
+def append_applied_patch_entry(
+    conn: sqlite3.Connection,
+    *,
+    patch_id: str,
+    problem_id: str,
+    base_revision: int,
+    actor_role: str,
+    target_id: str,
+    operations: Any,
+    evidence_artifact_ids: Any,
+    rationale: str,
+    created_at: str,
+    applied_revision: int,
+    authority: PatchAuthority,
+    state_delta: Any,
+    state_hash_before: str,
+    state_hash_after: str,
+) -> str:
+    """Append one accepted patch with a hash over its complete audit record."""
+
+    previous_row = conn.execute(
+        "SELECT journal_entry_hash FROM patches WHERE status = 'applied' "
+        "ORDER BY applied_revision DESC, patch_id DESC LIMIT 1"
+    ).fetchone()
+    previous = (
+        str(previous_row["journal_entry_hash"] or GENESIS_HASH)
+        if previous_row
+        else GENESIS_HASH
+    )
+    operations_json = json_dumps(operations)
+    evidence_json = json_dumps(evidence_artifact_ids)
+    authority_json = json_dumps(authority.to_audit_dict())
+    state_delta_json = json_dumps(state_delta)
+    row = {
+        "patch_id": patch_id,
+        "schema_version": SCHEMA_VERSION,
+        "problem_id": problem_id,
+        "base_revision": int(base_revision),
+        "actor_role": actor_role,
+        "target_id": target_id,
+        "operations_json": operations_json,
+        "evidence_artifact_ids_json": evidence_json,
+        "rationale": rationale,
+        "status": "applied",
+        "rejection_reason": "",
+        "created_at": created_at,
+        "applied_revision": int(applied_revision),
+        "authority_source": authority.source,
+        "authority_json": authority_json,
+        "state_delta_json": state_delta_json,
+        "state_hash_before": state_hash_before,
+        "state_hash_after": state_hash_after,
+        "previous_entry_hash": previous,
+    }
+    digest = patch_entry_hash(row)
+    conn.execute(
+        """
+        INSERT INTO patches(
+            patch_id, schema_version, problem_id, base_revision, actor_role,
+            target_id, operations_json, evidence_artifact_ids_json, rationale,
+            status, rejection_reason, created_at, applied_revision,
+            authority_source, authority_json, state_delta_json,
+            state_hash_before, state_hash_after, previous_entry_hash,
+            journal_entry_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied', '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            patch_id,
+            SCHEMA_VERSION,
+            problem_id,
+            int(base_revision),
+            actor_role,
+            target_id,
+            operations_json,
+            evidence_json,
+            rationale,
+            created_at,
+            int(applied_revision),
+            authority.source,
+            authority_json,
+            state_delta_json,
+            state_hash_before,
+            state_hash_after,
+            previous,
+            digest,
+        ),
+    )
+    return digest
+
+
+def apply_patch(
+    store: ProofStateStore,
+    patch: Dict[str, Any],
+    *,
+    authority: PatchAuthority | None = None,
+    original_base_revision: int | None = None,
+) -> PatchOutcome:
+    """Apply a patch under host-issued authority.
+
+    This is the proof-state kernel boundary.  Callers processing model output
+    must pass a session authority.  Human CLI code should use
+    :func:`apply_operator_patch`; deterministic host code should use
+    :func:`apply_system_patch`.
+    """
+
     patch_id = str(patch.get("patch_id") or f"patch-{uuid.uuid4().hex[:12]}")
+    resource_errors = _patch_resource_errors(patch)
+    if resource_errors:
+        _record_patch_rejection(
+            store,
+            patch,
+            patch_id,
+            resource_errors,
+            kind="resource_limit",
+        )
+        return PatchOutcome(False, _safe_revision(store), patch_id, resource_errors)
+    try:
+        patch = _normalize_patch_aliases(patch)
+    except (TypeError, ValueError) as exc:
+        errors = [f"patch normalization failed: {exc}"]
+        _record_patch_rejection(
+            store,
+            patch,
+            patch_id,
+            errors,
+            kind="invalid_shape",
+        )
+        return PatchOutcome(False, _safe_revision(store), patch_id, errors)
+    normalized_resource_errors = _patch_resource_errors(patch)
+    if normalized_resource_errors:
+        _record_patch_rejection(
+            store,
+            patch,
+            patch_id,
+            normalized_resource_errors,
+            kind="resource_limit",
+        )
+        return PatchOutcome(
+            False,
+            _safe_revision(store),
+            patch_id,
+            normalized_resource_errors,
+        )
+    if authority is None:
+        errors = ["host-issued patch authority is required"]
+        _record_patch_rejection(store, patch, patch_id, errors, kind="missing_authority")
+        return PatchOutcome(False, _safe_revision(store), patch_id, errors)
     errors = _validate_patch_shape(store.problem_id, patch)
+    errors.extend(
+        authority_contract_errors(
+            patch,
+            authority,
+            original_base_revision=original_base_revision,
+        )
+    )
     if errors:
         _record_patch_rejection(store, patch, patch_id, errors, kind="invalid_shape")
         return PatchOutcome(False, _safe_revision(store), patch_id, errors)
@@ -752,12 +1625,64 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
         try:
             conn.execute("BEGIN IMMEDIATE")
             current_revision = store.get_revision(conn)
-        except Exception as exc:
+        except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
             conn.rollback()
             current_revision = _safe_revision(store)
             lock_errors = [str(exc)]
             _record_patch_rejection(store, patch, patch_id, lock_errors, kind="exception")
             return PatchOutcome(False, current_revision, patch_id, lock_errors)
+        current_seal = store.current_state_seal(
+            conn,
+            include_projection=True,
+        )
+        if not current_seal["valid"]:
+            seal_errors = [
+                "current proof-state seal is invalid: " + str(error)
+                for error in current_seal["errors"]
+            ]
+            conn.rollback()
+            _record_patch_rejection(
+                store, patch, patch_id, seal_errors, kind="state_seal_invalid"
+            )
+            return PatchOutcome(False, current_revision, patch_id, seal_errors)
+        state_before = current_seal.pop("_proof_state_projection", None)
+        if not isinstance(state_before, dict):
+            conn.rollback()
+            seal_errors = [
+                "current proof-state seal did not return its authenticated projection"
+            ]
+            _record_patch_rejection(
+                store,
+                patch,
+                patch_id,
+                seal_errors,
+                kind="state_seal_invalid",
+            )
+            return PatchOutcome(False, current_revision, patch_id, seal_errors)
+        if authority.source == "session":
+            policy_row = conn.execute(
+                "SELECT policy_event_head FROM problem_state WHERE problem_id = ?",
+                (store.problem_id,),
+            ).fetchone()
+            current_policy_head = (
+                str(policy_row["policy_event_head"] or "") if policy_row else ""
+            )
+            if current_policy_head != authority.policy_event_head:
+                policy_errors = [
+                    "session policy changed after context construction: "
+                    f"{authority.policy_event_head} != {current_policy_head}"
+                ]
+                conn.rollback()
+                _record_patch_rejection(
+                    store,
+                    patch,
+                    patch_id,
+                    policy_errors,
+                    kind="stale_policy_context",
+                )
+                return PatchOutcome(
+                    False, current_revision, patch_id, policy_errors
+                )
         if int(patch["base_revision"]) != current_revision:
             stale_errors = [f"stale patch: base_revision {patch['base_revision']} != current_revision {current_revision}"]
             conn.rollback()
@@ -765,8 +1690,8 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
             return PatchOutcome(False, current_revision, patch_id, stale_errors)
 
         try:
-            verification_debt_reconciliations = _resolve_stale_verified_entity_debts(conn)
-            counterexample_debt_reconciliations = _resolve_confirmed_counterexample_debts(conn)
+            verification_debt_reconciliations: list[Dict[str, Any]] = []
+            counterexample_debt_reconciliations: list[Dict[str, Any]] = []
             pending_owners = _owners_created_by_patch(patch["operations"])
             for op in patch["operations"]:
                 _apply_operation(
@@ -774,18 +1699,53 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
                     store,
                     patch,
                     op,
+                    authority=authority,
                     pending_owners=pending_owners,
                     artifact_files=artifact_files,
                 )
 
-            # No-hanging-proofs invariant: every proven claim is kept verifier-ready.
-            _ensure_proven_claims_routed(conn)
-            _ensure_verified_statement_repairs_supersede_stale_work(conn)
-            verification_debt_reconciliations.extend(_resolve_stale_verified_entity_debts(conn))
-            counterexample_debt_reconciliations.extend(_resolve_confirmed_counterexample_debts(conn))
+            if authority.context_request_ids:
+                _mark_context_requests_fulfilled(
+                    conn,
+                    authority.context_request_ids,
+                    # The requested packet was constructed from this exact
+                    # pre-patch revision; record delivery at that revision.
+                    fulfilled_revision=current_revision,
+                )
+
+            # Certificate invalidation is deterministic kernel behavior. Other
+            # convenience changes (auto-routing, heuristic obligation closure,
+            # and tag-driven supersession) are deliberately not inferred here;
+            # they must arrive as explicit operations.
             integration_reconciliations = _reconcile_invalid_integrations(conn)
 
-            invariant_errors = validate_conn(conn)
+            bind_new_certificates(conn, applied_revision=current_revision + 1)
+            certificate_revocations = invalidate_stale_refuted_obligations(conn)
+
+            pending_run_ids = {
+                str(op.get("run_id") or "")
+                for op in patch["operations"]
+                if isinstance(op, Mapping)
+                and str(op.get("op") or "") == "record_run_metrics"
+                and str(op.get("run_id") or "")
+            }
+            pending_dispatch_ids = {
+                str(op.get("dispatch_id") or "")
+                for op in patch["operations"]
+                if isinstance(op, Mapping)
+                and str(op.get("op") or "") == "record_scheduler_dispatch"
+                and str(op.get("dispatch_id") or "")
+            }
+            invariant_errors = validate_conn(
+                conn,
+                pending_run_ids=pending_run_ids,
+                pending_dispatch_ids=pending_dispatch_ids,
+                # current_state_seal was verified immediately above and the
+                # run/dispatch tables are append-only. Revalidate only rows
+                # created by this transaction; explicit audits retain the
+                # full-history path.
+                immutable_history_sealed=True,
+            )
             if invariant_errors:
                 raise PatchRejected(invariant_errors)
 
@@ -795,29 +1755,55 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
                 "UPDATE problem_state SET current_revision = ?, updated_at = ? WHERE problem_id = ?",
                 (new_revision, now, store.problem_id),
             )
+            state_after = _state_journal_projection(conn)
+            state_delta = _state_delta(state_before, state_after)
+            state_hash_before = str(current_seal["proof_state_hash"])
+            state_hash_after = _state_projection_hash(state_after)
+            journal_entry_hash = append_applied_patch_entry(
+                conn,
+                patch_id=patch_id,
+                problem_id=store.problem_id,
+                base_revision=int(patch["base_revision"]),
+                actor_role=str(patch["actor_role"]),
+                target_id=str(patch.get("target_id") or ""),
+                operations=patch["operations"],
+                evidence_artifact_ids=patch.get("evidence_artifact_ids", []),
+                rationale=str(patch.get("rationale") or ""),
+                created_at=now,
+                applied_revision=new_revision,
+                authority=authority,
+                state_delta=state_delta,
+                state_hash_before=state_hash_before,
+                state_hash_after=state_hash_after,
+            )
+            # Session-patch population is maintained by an AFTER INSERT
+            # statistic trigger, so compute the companion seal only after the
+            # patch journal row exists.
+            run_provenance_hash = _run_provenance_hash(conn)
             conn.execute(
-                """
-                INSERT INTO patches(
-                    patch_id, schema_version, problem_id, base_revision, actor_role,
-                    target_id, operations_json, evidence_artifact_ids_json, rationale,
-                    status, rejection_reason, created_at, applied_revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied', '', ?, ?)
-                """,
+                "UPDATE problem_state SET proof_state_hash = ?, "
+                "run_provenance_hash = ?, patch_journal_head = ? WHERE problem_id = ?",
                 (
-                    patch_id,
-                    SCHEMA_VERSION,
+                    state_hash_after,
+                    run_provenance_hash,
+                    journal_entry_hash,
                     store.problem_id,
-                    int(patch["base_revision"]),
-                    patch["actor_role"],
-                    patch.get("target_id", ""),
-                    json_dumps(patch["operations"]),
-                    json_dumps(patch.get("evidence_artifact_ids", [])),
-                    patch.get("rationale", ""),
-                    now,
-                    new_revision,
                 ),
             )
-            store.write_event(conn, new_revision, "patch_applied", {"patch_id": patch_id, "actor_role": patch["actor_role"]})
+            store.write_event(
+                conn,
+                new_revision,
+                "patch_applied",
+                {
+                    "patch_id": patch_id,
+                    "actor_role": authority.actor_role,
+                    "authority": authority.to_audit_dict(),
+                    "state_hash_before": state_hash_before,
+                    "state_hash_after": state_hash_after,
+                    "state_delta_operation_count": len(state_delta),
+                    "journal_entry_hash": journal_entry_hash,
+                },
+            )
             if integration_reconciliations:
                 store.write_event(
                     conn,
@@ -839,6 +1825,13 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
                     "confirmed_counterexample_debt_resolved",
                     {"changes": counterexample_debt_reconciliations},
                 )
+            if certificate_revocations:
+                store.write_event(
+                    conn,
+                    new_revision,
+                    "certificate_revoked",
+                    {"changes": certificate_revocations},
+                )
             conn.commit()
             artifact_files.commit()
         except PatchRejected as exc:
@@ -846,25 +1839,67 @@ def apply_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
             artifact_files.rollback()
             _record_patch_rejection(store, patch, patch_id, exc.errors, kind="guard_rejected")
             return PatchOutcome(False, current_revision, patch_id, exc.errors)
-        except Exception as exc:  # keep caller-facing error structured
+        except (OSError, sqlite3.Error, TypeError, ValueError, KeyError) as exc:
             conn.rollback()
             artifact_files.rollback()
             _record_patch_rejection(store, patch, patch_id, [str(exc)], kind="exception")
             return PatchOutcome(False, current_revision, patch_id, [str(exc)])
+        except BaseException:  # intentional-boundary: clean staged files before propagating programmer errors/signals
+            conn.rollback()
+            artifact_files.rollback()
+            raise
 
     if store.auto_snapshot:
         store.write_snapshot()
     return PatchOutcome(True, new_revision, patch_id, [])
 
 
-def reconcile_integrated_claims(store: ProofStateStore) -> Dict[str, Any]:
-    """Repair legacy verification debt and integration lifecycle state.
+def apply_operator_patch(store: ProofStateStore, patch: Dict[str, Any]) -> PatchOutcome:
+    """Apply a patch explicitly submitted by the local human operator."""
 
-    Normal patch application performs the same reconciliation automatically.
-    This explicit entry point exists for proof databases created before that
-    behavior was introduced, so a paused run can be repaired without inventing
-    a synthetic mathematical patch.
-    """
+    return apply_patch(store, patch, authority=operator_authority(patch))
+
+
+def apply_system_patch(
+    store: ProofStateStore,
+    patch: Dict[str, Any],
+    *,
+    mode: str = "",
+    route_id: str = "",
+) -> PatchOutcome:
+    """Apply a deterministic orchestrator patch, never model-generated JSON."""
+
+    return apply_patch(
+        store,
+        patch,
+        authority=system_authority(
+            actor_role=str(patch.get("actor_role") or "scheduler"),
+            mode=mode,
+            target_id=str(patch.get("target_id") or "root"),
+            route_id=route_id,
+            context_revision=int(patch.get("base_revision") or 0),
+        ),
+    )
+
+
+def apply_operator_patch_with_stale_retry(
+    store: ProofStateStore,
+    patch: Dict[str, Any],
+    *,
+    max_retries: int = 3,
+) -> PatchOutcome:
+    """Compatibility helper for explicit local/operator test patches."""
+
+    return apply_patch_with_stale_retry(
+        store,
+        patch,
+        authority=operator_authority(patch),
+        max_retries=max_retries,
+    )
+
+
+def reconcile_integrated_claims(store: ProofStateStore) -> Dict[str, Any]:
+    """Explicitly repair legacy obligation and integration lifecycle state."""
 
     patch_id = f"integration-reconcile-{uuid.uuid4().hex[:12]}"
     with store.connect() as conn:
@@ -874,9 +1909,20 @@ def reconcile_integrated_claims(store: ProofStateStore) -> Dict[str, Any]:
             # serialized with those writers as well.
             conn.execute("BEGIN IMMEDIATE")
             current_revision = store.get_revision(conn)
-            changes = _resolve_stale_verified_entity_debts(conn)
-            changes.extend(_resolve_confirmed_counterexample_debts(conn))
-            changes.extend(_reconcile_invalid_integrations(conn))
+            state_before = _state_journal_projection(conn)
+            current_seal = store.current_state_seal(conn)
+            if not current_seal["valid"]:
+                raise RuntimeError(
+                    "current proof-state seal is invalid: "
+                    + "; ".join(
+                        str(error) for error in current_seal["errors"][:8]
+                    )
+                )
+            # Reconciliation is conservative: it may revoke an invalid
+            # integration, but it never guesses that an active proof
+            # obligation has been discharged.  Discharge/refutation always
+            # requires an explicit operation naming exact evidence.
+            changes = _reconcile_invalid_integrations(conn)
             if not changes:
                 conn.rollback()
                 return {
@@ -896,34 +1942,61 @@ def reconcile_integrated_claims(store: ProofStateStore) -> Dict[str, Any]:
                 "UPDATE problem_state SET current_revision = ?, updated_at = ? WHERE problem_id = ?",
                 (new_revision, now, store.problem_id),
             )
+            state_after = _state_journal_projection(conn)
+            state_delta = _state_delta(state_before, state_after)
+            state_hash_before = _state_projection_hash(state_before)
+            state_hash_after = _state_projection_hash(state_after)
+            run_provenance_hash = _run_provenance_hash(conn)
+            authority = system_authority(
+                actor_role="system",
+                mode="integrate",
+                target_id="integration_reconciliation",
+                context_revision=current_revision,
+            )
+            journal_entry_hash = append_applied_patch_entry(
+                conn,
+                patch_id=patch_id,
+                problem_id=store.problem_id,
+                base_revision=current_revision,
+                actor_role="system",
+                target_id="integration_reconciliation",
+                operations=changes,
+                evidence_artifact_ids=[],
+                rationale=(
+                    "reconcile stale verification obligations and integration "
+                    "lifecycle with current proof obligations"
+                ),
+                created_at=now,
+                applied_revision=new_revision,
+                authority=authority,
+                state_delta=state_delta,
+                state_hash_before=state_hash_before,
+                state_hash_after=state_hash_after,
+            )
             conn.execute(
-                """
-                INSERT INTO patches(
-                    patch_id, schema_version, problem_id, base_revision, actor_role,
-                    target_id, operations_json, evidence_artifact_ids_json, rationale,
-                    status, rejection_reason, created_at, applied_revision
-                ) VALUES (?, ?, ?, ?, 'system', 'integration_reconciliation', ?, '[]', ?,
-                          'applied', '', ?, ?)
-                """,
+                "UPDATE problem_state SET proof_state_hash = ?, "
+                "run_provenance_hash = ?, patch_journal_head = ? WHERE problem_id = ?",
                 (
-                    patch_id,
-                    SCHEMA_VERSION,
+                    state_hash_after,
+                    run_provenance_hash,
+                    journal_entry_hash,
                     store.problem_id,
-                    current_revision,
-                    json_dumps(changes),
-                    "reconcile stale verification debt and integration lifecycle with current proof obligations",
-                    now,
-                    new_revision,
                 ),
             )
             store.write_event(
                 conn,
                 new_revision,
                 "integration_reconciled",
-                {"patch_id": patch_id, "changes": changes},
+                {
+                    "patch_id": patch_id,
+                    "changes": changes,
+                    "state_hash_before": state_hash_before,
+                    "state_hash_after": state_hash_after,
+                    "journal_entry_hash": journal_entry_hash,
+                },
             )
             conn.commit()
-        except Exception:
+        except BaseException:  # intentional-boundary: preserve transactional rollback on interruption
             conn.rollback()
             raise
 
@@ -940,7 +2013,7 @@ def reconcile_integrated_claims(store: ProofStateStore) -> Dict[str, Any]:
 def _safe_revision(store: ProofStateStore) -> int:
     try:
         return store.get_revision()
-    except Exception:
+    except (OSError, sqlite3.Error, TypeError, ValueError):
         return -1
 
 
@@ -1130,6 +2203,12 @@ def _normalize_patch_aliases(patch: Dict[str, Any]) -> Dict[str, Any]:
             continue
         normalized_op = dict(op)
         kind = _op_kind(normalized_op)
+        kind = {
+            "add_proof_obligation": "add_debt",
+            "update_proof_obligation": "update_debt",
+            "resolve_proof_obligation": "resolve_debt",
+            "refute_proof_obligation": "update_debt",
+        }.get(str(kind or ""), kind)
         if kind:
             normalized_op["op"] = kind
         if kind == "set_claim_validation_status":
@@ -1179,12 +2258,54 @@ def _normalize_patch_aliases(patch: Dict[str, Any]) -> Dict[str, Any]:
             # Agents sometimes nest the artifact under an "artifact" object.
             if "artifact_id" not in normalized_op and isinstance(normalized_op.get("artifact"), dict):
                 _flatten_nested(normalized_op, "artifact")
+            # Public/model-facing terminology uses proof_draft.  Preserve the
+            # historical database value so old queries and archives remain
+            # readable without silently rewriting persisted provenance.
+            if normalized_op.get("artifact_type") == "proof_draft":
+                normalized_op["artifact_type"] = "proof_dossier"
             if "artifact_id" not in normalized_op and normalized_op.get("id"):
                 normalized_op["artifact_id"] = normalized_op["id"]
             if "artifact_id" not in normalized_op:
                 artifact_id = _derive_artifact_id(normalized_op, normalized)
                 if artifact_id:
                     normalized_op["artifact_id"] = artifact_id
+            if isinstance(normalized_op.get("metadata"), Mapping):
+                metadata = dict(normalized_op["metadata"])
+                for public_key, legacy_key in (
+                    (
+                        "directed_adversarial_review_mode",
+                        "directed_villain_mode",
+                    ),
+                    (
+                        "directed_adversarial_review_mode_reason",
+                        "directed_villain_mode_reason",
+                    ),
+                    (
+                        "directed_adversarial_review_mode_steps",
+                        "directed_villain_mode_steps",
+                    ),
+                ):
+                    if legacy_key not in metadata and metadata.get(public_key) is not None:
+                        metadata[legacy_key] = metadata[public_key]
+                    metadata.pop(public_key, None)
+                if (
+                    "creates_parallel_dossier" not in metadata
+                    and metadata.get("creates_parallel_proof_draft") is not None
+                ):
+                    metadata["creates_parallel_dossier"] = metadata[
+                        "creates_parallel_proof_draft"
+                    ]
+                metadata.pop("creates_parallel_proof_draft", None)
+                if "resolved_debt_ids" not in metadata and metadata.get("resolved_proof_obligation_ids") is not None:
+                    metadata["resolved_debt_ids"] = metadata["resolved_proof_obligation_ids"]
+                if (
+                    "resolved_debt_justifications" not in metadata
+                    and metadata.get("resolved_proof_obligation_justifications") is not None
+                ):
+                    metadata["resolved_debt_justifications"] = metadata[
+                        "resolved_proof_obligation_justifications"
+                    ]
+                normalized_op["metadata"] = metadata
             if normalized_op.get("artifact_type") == "verification_report":
                 _backfill_verification_metadata(normalized_op)
                 metadata = normalized_op.get("metadata") if isinstance(normalized_op.get("metadata"), Mapping) else {}
@@ -1217,9 +2338,17 @@ def _normalize_patch_aliases(patch: Dict[str, Any]) -> Dict[str, Any]:
                 _normalize_route_fields(normalized_op)
             elif kind == "add_inference":
                 _normalize_inference_fields(normalized_op)
-        if kind in {"add_debt", "update_debt"}:
+        if kind in {"add_debt", "update_debt", "resolve_debt"}:
+            if isinstance(normalized_op.get("proof_obligation"), dict):
+                _flatten_nested(normalized_op, "proof_obligation")
             if isinstance(normalized_op.get("debt"), dict):
                 _flatten_nested(normalized_op, "debt")
+            if "debt_id" not in normalized_op and normalized_op.get("proof_obligation_id"):
+                normalized_op["debt_id"] = normalized_op["proof_obligation_id"]
+            if "debt_type" not in normalized_op and normalized_op.get("obligation_type"):
+                normalized_op["debt_type"] = normalized_op["obligation_type"]
+            if str(_op_kind(op) or "") == "refute_proof_obligation":
+                normalized_op["status"] = "refuted"
             _normalize_debt_fields(normalized_op, patch_target_id=str(normalized.get("target_id") or ""))
         if kind in {"update_claim", "update_inference", "set_claim_status", "set_inference_status"}:
             # Models frequently express an update as {"patch": {...}} or
@@ -1309,12 +2438,17 @@ def _bind_evidence_targets(operations: Sequence[Any], patch: Mapping[str, Any]) 
         for op in operations
         if isinstance(op, dict) and str(op.get("op") or "") == "propose_status_transition"
     ]
-    debt_refutations = [
+    debt_transitions = [
         op
         for op in operations
         if isinstance(op, dict)
-        and str(op.get("op") or "") == "update_debt"
-        and str(op.get("status") or "") == "refuted"
+        and (
+            str(op.get("op") or "") == "resolve_debt"
+            or (
+                str(op.get("op") or "") == "update_debt"
+                and str(op.get("status") or "") == "refuted"
+            )
+        )
     ]
     patch_evidence = {str(item) for item in (patch.get("evidence_artifact_ids") or []) if str(item)}
     for op in operations:
@@ -1345,7 +2479,7 @@ def _bind_evidence_targets(operations: Sequence[Any], patch: Mapping[str, Any]) 
                     "route_id": str(transition.get("route_id") or ""),
                 }
             )
-        for debt_op in debt_refutations:
+        for debt_op in debt_transitions:
             cited = {
                 str(item)
                 for item in (
@@ -1413,6 +2547,8 @@ def _artifact_op_field(op: Mapping[str, Any], key: str) -> Any:
 
 
 def _normalize_status_transition_fields(op: Dict[str, Any]) -> None:
+    if "resolved_debt_ids" not in op and op.get("resolved_proof_obligation_ids") is not None:
+        op["resolved_debt_ids"] = op["resolved_proof_obligation_ids"]
     if "target_type" not in op and "entity_type" in op:
         op["target_type"] = op["entity_type"]
     if "target_type" not in op and "target_kind" in op:
@@ -1731,14 +2867,29 @@ def _apply_operation(
     patch: Dict[str, Any],
     op: Dict[str, Any],
     *,
+    authority: PatchAuthority,
     pending_owners: Mapping[str, set[str]] | None = None,
     artifact_files: _ArtifactFileJournal,
 ) -> None:
     kind = op["op"]
     if kind == "attach_artifact":
-        _attach_artifact(conn, store, patch, _normalize_artifact_operation(op), artifact_files=artifact_files)
+        _attach_artifact(
+            conn,
+            store,
+            patch,
+            _normalize_artifact_operation(op),
+            authority=authority,
+            artifact_files=artifact_files,
+        )
     elif kind == "add_artifact":
-        _attach_artifact(conn, store, patch, _normalize_artifact_operation(op), artifact_files=artifact_files)
+        _attach_artifact(
+            conn,
+            store,
+            patch,
+            _normalize_artifact_operation(op),
+            authority=authority,
+            artifact_files=artifact_files,
+        )
     elif kind == "add_claim":
         if isinstance(op.get("claim"), dict):
             normalized = dict(op["claim"])
@@ -1769,7 +2920,34 @@ def _apply_operation(
     elif kind == "propose_status_transition":
         _status_transition(conn, patch, op)
     elif kind == "record_run_metrics":
-        _record_run(conn, op, problem_id=str(patch.get("problem_id") or store.problem_id))
+        if authority.source != "system":
+            raise PatchRejected(["record_run_metrics is host telemetry and requires system authority"])
+        _record_run(
+            conn,
+            op,
+            problem_id=str(patch.get("problem_id") or store.problem_id),
+            authority=authority,
+        )
+    elif kind == "record_scheduler_dispatch":
+        if authority.source != "system":
+            raise PatchRejected(
+                ["record_scheduler_dispatch requires system authority"]
+            )
+        _record_scheduler_dispatch(conn, op, authority=authority)
+    elif kind == "mark_publication_review_escalated":
+        if authority.source != "system":
+            raise PatchRejected(
+                ["mark_publication_review_escalated requires deterministic system authority"]
+            )
+        review_id = _required(op, "review_id")
+        review = conn.execute(
+            "SELECT escalated_at FROM publication_reviews WHERE review_id = ?", (review_id,)
+        ).fetchone()
+        if review is None:
+            raise PatchRejected([f"publication review does not exist: {review_id}"])
+        if str(review["escalated_at"] or ""):
+            raise PatchRejected([f"publication review is already escalated: {review_id}"])
+        mark_route_error_escalated(conn, review_id)
     elif kind == "abandon_route":
         _guard_debt_bearing_route_not_abandoned(conn, _required(op, "route_id"))
         _set_route_status(conn, op, "abandoned")
@@ -1782,9 +2960,268 @@ def _apply_operation(
     elif kind == "certify_external_citation":
         if patch["actor_role"] != "strict_informal_verifier":
             raise PatchRejected(["certify_external_citation requires strict_informal_verifier actor"])
-        _certify_external_citation(conn, store, patch, op, artifact_files=artifact_files)
+        _certify_external_citation(
+            conn,
+            store,
+            patch,
+            op,
+            authority=authority,
+            artifact_files=artifact_files,
+        )
+    elif kind == "request_context_entity":
+        _request_context_entity(conn, patch, op, authority=authority)
+    elif kind == "cancel_context_request":
+        _cancel_context_request(conn, op, authority=authority)
+    elif kind == "set_claim_assurance":
+        _set_claim_assurance(conn, op, authority=authority)
     else:
         raise PatchRejected([f"unknown operation: {kind}"])
+
+
+_CONTEXT_REQUEST_TARGETS: tuple[tuple[str, str, str, str], ...] = (
+    ("claim", "claims", "claim_id", "requested_claim_id"),
+    ("route", "routes", "route_id", "requested_route_id"),
+    ("inference", "inferences", "inference_id", "requested_inference_id"),
+    (
+        "proof_obligation",
+        "debts",
+        "debt_id",
+        "requested_proof_obligation_id",
+    ),
+    ("artifact", "artifacts", "artifact_id", "requested_artifact_id"),
+    (
+        "retrieval_card",
+        "retrieval_cards",
+        "card_id",
+        "requested_retrieval_card_id",
+    ),
+    (
+        "theorem_library_entry",
+        "theorem_library_entries",
+        "entry_id",
+        "requested_theorem_library_entry_id",
+    ),
+)
+
+
+def _request_context_entity(
+    conn: sqlite3.Connection,
+    patch: Mapping[str, Any],
+    op: Mapping[str, Any],
+    *,
+    authority: PatchAuthority,
+) -> None:
+    """Persist a non-certifying request for one omitted proof-state object."""
+
+    allowed_roles = {
+        "researcher",
+        "adversarial_reviewer",
+        "literature_researcher",
+        "phd_advisor",
+        "advisor",
+    }
+    actor = str(patch.get("actor_role") or "")
+    if authority.source != "session" or actor not in allowed_roles:
+        raise PatchRejected(
+            ["request_context_entity requires an active research session"]
+        )
+    request_id = _required(op, "request_id")
+    entity_id = _required(op, "requested_entity_id")
+    if len(request_id) > 180 or not re.fullmatch(r"[A-Za-z0-9_.:/-]+", request_id):
+        raise PatchRejected(["context request_id contains unsupported characters"])
+    if len(entity_id) > 500:
+        raise PatchRejected(["requested_entity_id is too long"])
+    if conn.execute(
+        "SELECT 1 FROM context_requests WHERE request_id = ?", (request_id,)
+    ).fetchone():
+        raise PatchRejected([f"context request already exists: {request_id}"])
+    pending_count = int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM context_requests WHERE status = 'pending'"
+        ).fetchone()["n"]
+    )
+    if pending_count >= 32:
+        raise PatchRejected(
+            ["too many pending context requests; process or cancel existing requests"]
+        )
+
+    requested_type = str(op.get("requested_entity_type") or "")
+    match: tuple[str, str, str, str] | None = None
+    matched_row: Mapping[str, Any] | None = None
+    for candidate in _CONTEXT_REQUEST_TARGETS:
+        entity_type, table, key_column, _typed_column = candidate
+        if requested_type and requested_type != entity_type:
+            continue
+        row = conn.execute(
+            f"SELECT * FROM {table} WHERE {key_column} = ?", (entity_id,)
+        ).fetchone()
+        if row is not None:
+            match = candidate
+            matched_row = dict(row)
+            break
+    if match is None:
+        label = requested_type or "known requestable"
+        raise PatchRejected([f"unknown {label} entity: {entity_id}"])
+    entity_type, _table, _key_column, typed_column = match
+    if entity_type == "artifact" and matched_row is not None and artifact_is_raw_log(
+        matched_row
+    ):
+        raise PatchRejected(["raw run logs and transcripts are never requestable context"])
+    if conn.execute(
+        f"SELECT 1 FROM context_requests WHERE status = 'pending' "
+        f"AND {typed_column} = ? AND requester_role = ?",
+        (entity_id, actor),
+    ).fetchone():
+        raise PatchRejected(
+            [f"a pending context request already covers {entity_type} {entity_id}"]
+        )
+
+    typed_values = {column: None for *_prefix, column in _CONTEXT_REQUEST_TARGETS}
+    typed_values[typed_column] = entity_id
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO context_requests(
+            request_id, requested_entity_type,
+            requested_claim_id, requested_route_id, requested_inference_id,
+            requested_proof_obligation_id, requested_artifact_id,
+            requested_retrieval_card_id, requested_theorem_library_entry_id,
+            requester_role, request_mode, original_target_id, original_route_id,
+            status, requested_at, fulfilled_at, fulfilled_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, '', 0)
+        """,
+        (
+            request_id,
+            entity_type,
+            typed_values["requested_claim_id"],
+            typed_values["requested_route_id"],
+            typed_values["requested_inference_id"],
+            typed_values["requested_proof_obligation_id"],
+            typed_values["requested_artifact_id"],
+            typed_values["requested_retrieval_card_id"],
+            typed_values["requested_theorem_library_entry_id"],
+            actor,
+            str(authority.mode or "prove"),
+            str(authority.target_id or patch.get("target_id") or "root"),
+            str(authority.route_id or ""),
+            now,
+        ),
+    )
+
+
+def _mark_context_requests_fulfilled(
+    conn: sqlite3.Connection,
+    request_ids: Sequence[str],
+    *,
+    fulfilled_revision: int,
+) -> None:
+    now = utc_now()
+    for request_id in request_ids:
+        row = conn.execute(
+            "SELECT status FROM context_requests WHERE request_id = ?", (request_id,)
+        ).fetchone()
+        if row is None:
+            raise PatchRejected([f"scheduled context request is missing: {request_id}"])
+        if str(row["status"] or "") != "pending":
+            raise PatchRejected(
+                [f"scheduled context request is no longer pending: {request_id}"]
+            )
+        conn.execute(
+            "UPDATE context_requests SET status='fulfilled', fulfilled_at=?, "
+            "fulfilled_revision=? WHERE request_id=?",
+            (now, int(fulfilled_revision), request_id),
+        )
+
+
+def _cancel_context_request(
+    conn: sqlite3.Connection,
+    op: Mapping[str, Any],
+    *,
+    authority: PatchAuthority,
+) -> None:
+    """Cancel an unusable pending request under explicit host/operator authority."""
+
+    if authority.source not in {"operator", "system"}:
+        raise PatchRejected(
+            ["cancel_context_request requires operator or deterministic system authority"]
+        )
+    request_id = _required(op, "request_id")
+    row = conn.execute(
+        "SELECT status FROM context_requests WHERE request_id = ?", (request_id,)
+    ).fetchone()
+    if row is None:
+        raise PatchRejected([f"context request does not exist: {request_id}"])
+    if str(row["status"] or "") != "pending":
+        raise PatchRejected(
+            [f"only a pending context request can be cancelled: {request_id}"]
+        )
+    conn.execute(
+        "UPDATE context_requests SET status='cancelled' WHERE request_id = ?",
+        (request_id,),
+    )
+
+
+def _set_claim_assurance(
+    conn: sqlite3.Connection,
+    op: Mapping[str, Any],
+    *,
+    authority: PatchAuthority,
+) -> None:
+    if authority.source not in {"operator", "system"}:
+        raise PatchRejected(
+            ["claim assurance can be designated only by an operator or host policy"]
+        )
+    claim_id = _required(op, "claim_id")
+    level = _required(op, "assurance_level")
+    if level not in {"standard", "heterogeneous_review"}:
+        raise PatchRejected([f"unsupported claim assurance level: {level}"])
+    if not conn.execute(
+        "SELECT 1 FROM claims WHERE claim_id = ?", (claim_id,)
+    ).fetchone():
+        raise PatchRejected([f"unknown claim for assurance designation: {claim_id}"])
+    rationale = str(op.get("rationale") or "").strip()
+    if len(rationale) < 12:
+        raise PatchRejected(
+            ["claim assurance designation requires a concrete rationale"]
+        )
+    existing = conn.execute(
+        "SELECT assurance_level FROM claim_assurance WHERE claim_id = ?",
+        (claim_id,),
+    ).fetchone()
+    if (
+        existing
+        and str(existing["assurance_level"] or "") == "heterogeneous_review"
+        and level == "standard"
+        and op.get("allow_assurance_downgrade") is not True
+    ):
+        raise PatchRejected(
+            [
+                "downgrading heterogeneous review requires "
+                "allow_assurance_downgrade=true"
+            ]
+        )
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO claim_assurance(
+            claim_id, assurance_level, rationale, designated_by,
+            designated_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(claim_id) DO UPDATE SET
+            assurance_level=excluded.assurance_level,
+            rationale=excluded.rationale,
+            designated_by=excluded.designated_by,
+            updated_at=excluded.updated_at
+        """,
+        (
+            claim_id,
+            level,
+            rationale,
+            authority.reviewer_identity or authority.source,
+            now,
+            now,
+        ),
+    )
 
 
 def _normalize_artifact_operation(op: Dict[str, Any]) -> Dict[str, Any]:
@@ -1819,6 +3256,7 @@ def _certify_external_citation(
     patch: Dict[str, Any],
     op: Dict[str, Any],
     *,
+    authority: PatchAuthority,
     artifact_files: _ArtifactFileJournal,
 ) -> None:
     """Turn an exact, checked theorem citation into ordinary verifier evidence.
@@ -1933,6 +3371,7 @@ def _certify_external_citation(
             "metadata": metadata,
             "content_summary": summary,
         },
+        authority=authority,
         artifact_files=artifact_files,
     )
 
@@ -2003,8 +3442,13 @@ def _certify_external_citation(
         """,
         (json_dumps(sorted(set(_claim_evidence(conn, target_id) + [artifact_id]))), now, target_id),
     )
-    if op.get("resolve_target_blocking_debts", True):
-        _resolve_external_citation_debts(conn, target_id, route_id, artifact_id, card_id, applicability)
+    if "resolve_target_blocking_debts" in op:
+        raise PatchRejected(
+            [
+                "resolve_target_blocking_debts is no longer supported; name each discharged proof obligation "
+                "in a separate resolve_proof_obligation operation with exact evidence"
+            ]
+        )
     _upsert_theorem_library_entry(
         conn,
         entry_id=str(op.get("library_entry_id") or f"library-{digest}"),
@@ -2017,72 +3461,13 @@ def _certify_external_citation(
         evidence_artifact_ids=[artifact_id],
         tags=["external_citation", f"target:{target_id}", f"retrieval:{card_id}"],
     )
-
-
-def _resolve_external_citation_debts(
-    conn: sqlite3.Connection,
-    target_id: str,
-    citation_route_id: str,
-    artifact_id: str,
-    card_id: str,
-    applicability: Mapping[str, Any],
-) -> None:
-    related_claim_ids = {target_id}
-    related_route_ids = {citation_route_id}
-    app_route_id = str(applicability.get("route_id") or "").strip()
-    if app_route_id:
-        related_route_ids.add(app_route_id)
-    for row in conn.execute("SELECT route_id FROM routes WHERE conclusion_claim_id = ?", (target_id,)).fetchall():
-        related_route_ids.add(str(row["route_id"]))
-    for route_id in sorted(related_route_ids):
-        for row in conn.execute(
-            """
-            SELECT premise_claim_id
-            FROM inference_premises
-            JOIN inferences USING(inference_id)
-            WHERE inferences.route_id = ?
-            """,
-            (route_id,),
-        ).fetchall():
-            related_claim_ids.add(str(row["premise_claim_id"]))
-
-    now = utc_now()
-    evidence = json_dumps({"resolved_by": "external_citation", "artifact_id": artifact_id, "retrieval_card_id": card_id})
-    for claim_id in sorted(related_claim_ids):
-        conn.execute(
-            """
-            UPDATE debts
-            SET status = 'resolved',
-                last_seen = ?,
-                resolution_evidence_json = ?
-            WHERE status = 'active'
-              AND severity = 'blocking'
-              AND (owner_id = ? OR suggested_next_target = ?)
-            """,
-            (now, evidence, claim_id, claim_id),
-        )
-    for route_id in sorted(related_route_ids):
-        conn.execute(
-            """
-            UPDATE debts
-            SET status = 'resolved',
-                last_seen = ?,
-                resolution_evidence_json = ?
-            WHERE status = 'active'
-              AND severity = 'blocking'
-              AND owner_type = 'route'
-              AND owner_id = ?
-            """,
-            (now, evidence, route_id),
-        )
-
-
 def _attach_artifact(
     conn: sqlite3.Connection,
     store: ProofStateStore,
     patch: Dict[str, Any],
     op: Dict[str, Any],
     *,
+    authority: PatchAuthority,
     artifact_files: _ArtifactFileJournal,
 ) -> None:
     artifact_id = _required(op, "artifact_id")
@@ -2096,7 +3481,69 @@ def _attach_artifact(
     metadata = op.get("metadata", {})
     if not isinstance(metadata, dict):
         raise PatchRejected(["artifact metadata must be an object"])
+    forbidden_host_metadata = {
+        key
+        for key in (
+            "host_reproduction",
+            "host_formal_check",
+            "host_formal_target_binding",
+            "host_certificate_bindings",
+            "host_reviewer_provenance",
+            "pdf_status",
+            "pdf_path",
+            "pdf_sha256",
+            "pdf_size_bytes",
+            "latex_compiler_sha256",
+            "latex_compilation_sandboxed",
+        )
+        if key in metadata
+    }
+    if forbidden_host_metadata:
+        raise PatchRejected(
+            [
+                "host-computed artifact metadata is host-managed and must be omitted: "
+                + ", ".join(sorted(forbidden_host_metadata))
+            ]
+        )
     metadata = _compact_artifact_metadata(artifact_type, metadata)
+    if artifact_type == "cas_experiment_report":
+        reproduction = reproduce_computation(metadata)
+        metadata = {**metadata, "host_reproduction": reproduction}
+    if artifact_type == "formal_backend_result":
+        target_type = str(metadata.get("target_type") or "claim")
+        target_id = str(metadata.get("target_id") or patch.get("target_id") or "")
+        subject_digest = entity_subject_digest(conn, target_type, target_id)
+        metadata = {
+            **metadata,
+            "host_formal_check": check_formal_artifact(metadata),
+            "host_formal_target_binding": {
+                "binding_version": 1,
+                "target_type": target_type,
+                "target_id": target_id,
+                "subject_digest": subject_digest,
+            },
+        }
+    if artifact_type in {
+        "verification_report",
+        "integration_report",
+        "formal_backend_result",
+        "confirmed_counterexample",
+    }:
+        metadata = {
+            **metadata,
+            "host_reviewer_provenance": {
+                "source": authority.source,
+                "reviewer_identity": authority.reviewer_identity,
+                "independence_class": authority.reviewer_independence_class,
+                "backend": authority.reviewer_backend,
+                "backend_version": authority.reviewer_backend_version,
+                "backend_contract_hash": authority.backend_contract_hash,
+                "model": authority.reviewer_model,
+                "run_id": authority.run_id,
+                "session_id": authority.session_id,
+                "context_hash": authority.context_hash,
+            },
+        }
     metadata = _prepare_revision_document_metadata(conn, actor, artifact_type, metadata)
     try:
         metadata = prepare_final_paper_metadata(
@@ -2114,6 +3561,13 @@ def _attach_artifact(
     except ValueError as exc:
         raise PatchRejected([str(exc)]) from exc
     content = _artifact_inline_content(op)
+    if content is not None and len(content.encode("utf-8")) > MAX_INLINE_ARTIFACT_BYTES:
+        raise PatchRejected(
+            [
+                f"inline artifact content exceeds the {MAX_INLINE_ARTIFACT_BYTES}-byte limit; "
+                "store large reproducible data outside the patch and attach a bounded report"
+            ]
+        )
     strategy_errors = strategic_artifact_errors(
         conn,
         artifact_type=artifact_type,
@@ -2134,6 +3588,32 @@ def _attach_artifact(
     )
     if content is not None and path:
         raise PatchRejected(["attach_artifact with inline content must omit path; the proof-state store writes artifacts under state_dir/artifacts"])
+    expected_source_sha256 = str(op.get("source_file_sha256") or "")
+    expected_source_size_raw = op.get("source_file_size_bytes")
+    if bool(expected_source_sha256) != (expected_source_size_raw is not None):
+        raise PatchRejected(
+            [
+                "path-based artifact source identity requires both "
+                "source_file_sha256 and source_file_size_bytes"
+            ]
+        )
+    expected_source_size: Optional[int] = None
+    if expected_source_sha256:
+        if (
+            len(expected_source_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_source_sha256
+            )
+            or type(expected_source_size_raw) is not int
+            or expected_source_size_raw < 0
+        ):
+            raise PatchRejected(["path-based artifact source identity is malformed"])
+        if content is not None or not path:
+            raise PatchRejected(
+                ["artifact source identity is valid only for a path-based attach"]
+            )
+        expected_source_size = expected_source_size_raw
     if path and actor == "writer" and artifact_type == REVISION_DOCUMENT_ARTIFACT_TYPE:
         expected_suffix = f".{metadata['document_format']}"
         actual_suffix = Path(path).suffix.lower()
@@ -2150,8 +3630,48 @@ def _attach_artifact(
         # guard chain below runs on it exactly as for inline content.
         content = _load_writer_staged_content(path)
         staged_from_path = True
+        if expected_source_size is not None:
+            source_bytes = content.encode("utf-8")
+            if len(source_bytes) != expected_source_size:
+                raise PatchRejected(
+                    [
+                        "artifact source size changed since result persistence: "
+                        f"{path}"
+                    ]
+                )
+            if hashlib.sha256(source_bytes).hexdigest() != expected_source_sha256:
+                raise PatchRejected(
+                    [
+                        "artifact source content changed since result persistence: "
+                        f"{path}"
+                    ]
+                )
     if content is not None and not content.endswith("\n"):
         content += "\n"
+    incoming_bytes = (
+        len(content.encode("utf-8"))
+        if content is not None
+        else int(Path(path).stat().st_size)
+        if path
+        else 0
+    )
+    # Import locally to avoid a module cycle through replay.py. The check is
+    # deterministic over local files and runs before the artifact is copied.
+    from .storage_policy import StoragePolicyError, audit_local_storage
+
+    try:
+        storage_report = audit_local_storage(store)
+    except StoragePolicyError as exc:
+        raise PatchRejected([str(exc)]) from exc
+    if int(storage_report["total_local_bytes"]) + incoming_bytes >= int(
+        storage_report["hard_limit_bytes"]
+    ):
+        raise PatchRejected(
+            [
+                "artifact would exceed the configured local proof-state storage hard limit; "
+                "archive eligible session material or increase the explicit operator limit"
+            ]
+        )
     if actor == REFEREE_ROLE and artifact_type == "referee_report":
         expected_token = str(metadata.get("decision_token") or "")
         if not content or not content.lstrip().startswith(expected_token):
@@ -2166,11 +3686,44 @@ def _attach_artifact(
     _guard_writer_generation_residue(actor, artifact_type, content)
     _guard_writer_paper_register(artifact_type, content)
     _guard_writing_review_metadata(artifact_type, artifact_id, metadata)
+    if content is not None and len(content.encode("utf-8")) > MAX_INLINE_ARTIFACT_BYTES:
+        raise PatchRejected(
+            [
+                "artifact content exceeds the inline byte limit after host-side "
+                "normalization or partial-result augmentation"
+            ]
+        )
     if content is not None or path:
         metadata = {
             **metadata,
             "integrity": {"algorithm": "sha256", "scope": "file_bytes", "version": 1},
         }
+    if content is None and path:
+        # Copy first and hash the immutable store-managed result. Hashing the
+        # staging path and copying it later admitted a check/use race in which
+        # the recorded digest described bytes other than the accepted artifact.
+        path = str(
+            _copy_artifact_file(
+                store,
+                artifact_id,
+                artifact_type,
+                Path(path),
+                artifact_files=artifact_files,
+                expected_sha256=expected_source_sha256,
+                expected_size=expected_source_size,
+            )
+        )
+        try:
+            storage_after_copy = audit_local_storage(store)
+        except StoragePolicyError as exc:
+            raise PatchRejected([str(exc)]) from exc
+        if not storage_after_copy["within_hard_limit"]:
+            raise PatchRejected(
+                [
+                    "copied artifact reached the configured local proof-state storage "
+                    "hard limit; the staged copy will be rolled back"
+                ]
+            )
     # Always recompute the digest: a caller-supplied sha256 was trusted verbatim
     # here, letting an agent bypass duplicate-artifact rejection with a bogus hash.
     digest = artifact_hash(
@@ -2203,16 +3756,6 @@ def _attach_artifact(
                 artifact_files=artifact_files,
             )
         )
-    elif content is None and path:
-        path = str(
-            _copy_artifact_file(
-                store,
-                artifact_id,
-                artifact_type,
-                Path(path),
-                artifact_files=artifact_files,
-            )
-        )
     if actor == "writer" and content is not None and path:
         artifact_path = Path(path)
         for sidecar_path in (
@@ -2236,14 +3779,34 @@ def _attach_artifact(
         pdf_status = str(sidecars.get("pdf_status") or "")
         if pdf_status:
             metadata = {**metadata, "pdf_status": pdf_status}
-            pdf_path = str(sidecars.get("pdf_path") or "")
-            if pdf_path:
-                metadata["pdf_path"] = pdf_path
+            for key in (
+                "pdf_path",
+                "pdf_sha256",
+                "pdf_size_bytes",
+                "latex_compiler_sha256",
+                "latex_compilation_sandboxed",
+            ):
+                value = sidecars.get(key)
+                if value not in (None, ""):
+                    metadata[key] = value
             log_path = str(sidecars.get("latex_log_path") or "")
             if log_path:
                 metadata["latex_log_path"] = log_path
     created_at = utc_now()
-    artifact_state_revision = int(op.get("state_revision", patch["base_revision"]))
+    if "state_revision" in op:
+        raise PatchRejected(["artifact state_revision is host-managed and must be omitted"])
+    asserted_run_id = str(op.get("run_id") or "")
+    if authority.source == "session":
+        if not authority.run_id:
+            raise PatchRejected(["session artifact authority is missing the host run_id"])
+        if asserted_run_id and asserted_run_id != authority.run_id:
+            raise PatchRejected(["artifact run_id does not match the host-issued execution run_id"])
+        artifact_run_id = authority.run_id
+    else:
+        artifact_run_id = asserted_run_id
+    # The artifact becomes visible in the revision committed by this patch,
+    # not in the revision from which the child read context.
+    artifact_state_revision = int(patch["base_revision"]) + 1
     conn.execute(
         """
         INSERT INTO artifacts(
@@ -2257,7 +3820,7 @@ def _attach_artifact(
             path,
             digest,
             actor,
-            op.get("run_id", ""),
+            artifact_run_id,
             artifact_state_revision,
             op.get("content_summary") or artifact_summary(metadata, fallback=content or ""),
             json_dumps(metadata),
@@ -2343,22 +3906,14 @@ def _load_writer_staged_content(path: str) -> str:
     state_dir/artifacts/staging/<artifact_id>.tex). Size-capped so a runaway
     staging file cannot be slurped into the guards whole.
     """
-    staged = Path(path)
     try:
-        size = staged.stat().st_size
-    except OSError as exc:
-        raise PatchRejected([f"could not stat staged artifact file {path}: {exc}"])
-    if size > WRITER_PATH_ATTACH_MAX_BYTES:
-        raise PatchRejected(
-            [
-                f"staged artifact file {path} is {size} bytes; path-based attach_artifact accepts at most "
-                f"{WRITER_PATH_ATTACH_MAX_BYTES} bytes"
-            ]
+        return read_bounded_text(
+            Path(path),
+            max_bytes=WRITER_PATH_ATTACH_MAX_BYTES,
+            label="writer-staged artifact",
         )
-    try:
-        return staged.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise PatchRejected([f"could not read staged artifact file {path} as UTF-8 text: {exc}"])
+    except ValueError as exc:
+        raise PatchRejected([str(exc)]) from exc
 
 
 def _augment_writer_partial_receipt_content(
@@ -2606,7 +4161,7 @@ def _add_claim(conn: sqlite3.Connection, op: Dict[str, Any]) -> None:
     if kind not in CLAIM_KINDS:
         raise PatchRejected([f"invalid claim kind: {kind}"])
     statement = _required(op, "statement")
-    fingerprint = op.get("fingerprint") or fingerprint_text(statement)
+    fingerprint = fingerprint_text(statement)
     existing_claims = [
         dict(row)
         for row in conn.execute(
@@ -2656,179 +4211,6 @@ def _add_claim(conn: sqlite3.Connection, op: Dict[str, Any]) -> None:
             now,
         ),
     )
-
-
-ROUTE_READY_EVIDENCE_ARTIFACT_TYPES = {
-    "proof_dossier",
-    "proof_blueprint",
-    "route_obstruction",
-    "hypothesis_gap",
-    "construction_failure",
-    "necessary_condition",
-}
-NEGATIVE_ROUTE_READY_TERMS = (
-    "failed proof",
-    "proof failed",
-    "not verifier-ready",
-    "not verifier ready",
-    "does not prove",
-    "cannot close",
-    "no proof",
-)
-
-
-def _route_ready_inference_evidence(conn: sqlite3.Connection, claim_id: str, ev_json: str) -> bool:
-    """Return whether evidence can safely auto-create a route to verifier/adjudicator."""
-    claim = conn.execute("SELECT kind FROM claims WHERE claim_id = ?", (claim_id,)).fetchone()
-    claim_kind = str(claim["kind"] if claim else "")
-    try:
-        evidence_ids = [str(item) for item in json.loads(ev_json or "[]") if str(item)]
-    except (ValueError, TypeError):
-        evidence_ids = []
-    for evidence_id in evidence_ids:
-        row = conn.execute(
-            "SELECT artifact_type, content_summary FROM artifacts WHERE artifact_id = ?",
-            (evidence_id,),
-        ).fetchone()
-        if row is None:
-            # Backward-compatible fallback for older proof states that only encoded names.
-            if ("dossier" in evidence_id or "proof" in evidence_id) and claim_kind in {"obstruction", "counterexample"}:
-                return True
-            continue
-        artifact_type = str(row["artifact_type"] or "")
-        summary = str(row["content_summary"] or "").lower()
-        if artifact_type not in ROUTE_READY_EVIDENCE_ARTIFACT_TYPES:
-            continue
-        if claim_kind in {"obstruction", "counterexample"}:
-            return True
-        if not any(term in summary for term in NEGATIVE_ROUTE_READY_TERMS):
-            return True
-    return False
-
-
-def _ensure_proven_claims_routed(conn: sqlite3.Connection) -> None:
-    """Deterministic no-hanging-proofs invariant, enforced on every patch apply.
-
-    A claim that already has a proof-dossier-backed inference concluding it can only be
-    verified through an active route that *concludes it* — but agents often attach such
-    inferences to a parent/sibling route (e.g. the package lemma's route), leaving the
-    claim with no route of its own, so the verifier is never scheduled and the proof
-    hangs. Here we close that gap structurally: for any non-terminal claim that has a
-    dossier-backed inference but no active route concluding it, auto-create one route
-    concluding the claim and move that inference onto it. No agent required.
-    """
-    routed = {
-        row[0]
-        for row in conn.execute(
-            "SELECT DISTINCT conclusion_claim_id FROM routes WHERE status = 'active'"
-        ).fetchall()
-    }
-    for claim_id, vstatus in conn.execute(
-        "SELECT claim_id, validation_status FROM claims"
-    ).fetchall():
-        if vstatus in ("informally_verified", "formally_verified", "refuted"):
-            continue
-        if claim_id in routed:
-            continue
-        dossier_inf = None
-        for inf_id, ev_json in conn.execute(
-            "SELECT inference_id, evidence_artifact_ids_json FROM inferences WHERE conclusion_claim_id = ?",
-            (claim_id,),
-        ).fetchall():
-            if _route_ready_inference_evidence(conn, claim_id, ev_json):
-                dossier_inf = inf_id
-                break
-        if not dossier_inf:
-            continue
-        route_id = f"route-auto-{claim_id}"
-        if conn.execute("SELECT 1 FROM routes WHERE route_id = ?", (route_id,)).fetchone():
-            continue
-        now = utc_now()
-        conn.execute(
-            """
-            INSERT INTO routes(
-                route_id, conclusion_claim_id, label, strategy, status, relation_to_parent,
-                assumptions_json, conditions_json, evidence_artifact_ids_json,
-                failure_fingerprint, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                route_id,
-                claim_id,
-                f"auto-assembled route for {claim_id}",
-                "auto_assembled_from_dossier",
-                "active",
-                "sufficient",
-                "[]",
-                "[]",
-                "[]",
-                "",
-                now,
-                now,
-            ),
-        )
-        conn.execute(
-            "UPDATE inferences SET route_id = ?, updated_at = ? WHERE inference_id = ?",
-            (route_id, now, dossier_inf),
-        )
-        routed.add(claim_id)
-
-
-def _ensure_verified_statement_repairs_supersede_stale_work(conn: sqlite3.Connection) -> None:
-    """Mark stale exact-wording claims/routes superseded after a verified repair.
-
-    A common research pattern is: a verifier rejects the old exact statement,
-    the researcher creates a tagged ``statement_repair`` child, and the verifier
-    certifies that corrected theorem. At that point the old unverified wording
-    should stop receiving ordinary proof work.
-    """
-    now = utc_now()
-    for claim in conn.execute(
-        """
-        SELECT claim_id, parent_ids_json, tags_json, validation_status, lifecycle_status
-        FROM claims
-        """
-    ).fetchall():
-        tags = set(json_loads(claim["tags_json"]))
-        if "statement_repair" not in tags:
-            continue
-        if claim["validation_status"] not in {"informally_verified", "formally_verified"} and claim["lifecycle_status"] != "integrated":
-            continue
-        for parent_id in [str(item) for item in json_loads(claim["parent_ids_json"]) if str(item)]:
-            if parent_id == "root":
-                continue
-            parent = conn.execute(
-                "SELECT validation_status, lifecycle_status FROM claims WHERE claim_id = ?",
-                (parent_id,),
-            ).fetchone()
-            if parent is None:
-                continue
-            if parent["lifecycle_status"] in {"active", "blocked"} and parent["validation_status"] not in {"informally_verified", "formally_verified", "refuted"}:
-                conn.execute(
-                    "UPDATE claims SET lifecycle_status = 'superseded', updated_at = ? WHERE claim_id = ?",
-                    (now, parent_id),
-                )
-            for route in conn.execute(
-                "SELECT route_id, status FROM routes WHERE conclusion_claim_id = ?",
-                (parent_id,),
-            ).fetchall():
-                if route["status"] not in {"active", "blocked"}:
-                    continue
-                verified_inference = conn.execute(
-                    """
-                    SELECT 1 FROM inferences
-                    WHERE route_id = ?
-                    AND validation_status IN ('informally_verified', 'formally_verified')
-                    LIMIT 1
-                    """,
-                    (route["route_id"],),
-                ).fetchone()
-                if verified_inference:
-                    continue
-                conn.execute(
-                    "UPDATE routes SET status = 'superseded', updated_at = ? WHERE route_id = ?",
-                    (now, route["route_id"]),
-                )
 
 
 def _add_route(conn: sqlite3.Connection, op: Dict[str, Any]) -> None:
@@ -2976,6 +4358,8 @@ def _update_inference(conn: sqlite3.Connection, op: Dict[str, Any]) -> None:
             inference_id,
         ),
     )
+    if append and row["validation_status"] in {"informally_verified", "formally_verified"}:
+        invalidate_dependents(conn, changed_inference_ids=[inference_id])
 
 
 def _debt_operation(
@@ -2992,6 +4376,20 @@ def _debt_operation(
         if row is None:
             raise PatchRejected([f"unknown debt: {debt_id}"])
         evidence = dict(op.get("resolution_evidence", {}))
+        evidence_ids = list(
+            dict.fromkeys(
+                [
+                    str(item)
+                    for item in (
+                        op.get("resolution_evidence_artifact_ids")
+                        or op.get("evidence_artifact_ids")
+                        or []
+                    )
+                    if str(item or "")
+                ]
+                + [str(item) for item in (patch.get("evidence_artifact_ids") or []) if str(item or "")]
+            )
+        )
         actor = str(patch.get("actor_role") or "")
         if row["status"] == "refuted":
             existing_evidence = json_loads(row["resolution_evidence_json"], {})
@@ -3023,6 +4421,42 @@ def _debt_operation(
                 ),
             )
             return
+        has_evidence = False
+        if actor == "strict_informal_verifier":
+            has_evidence = _has_clean_verification(
+                conn,
+                evidence_ids,
+                outcome="positive",
+                target_type="debt",
+                target_id=debt_id,
+                producer_role="strict_informal_verifier",
+            )
+        elif actor == "formal_backend":
+            has_evidence = _has_valid_formal_backend_result(
+                conn,
+                evidence_ids,
+                target_type="debt",
+                target_id=debt_id,
+            )
+        elif actor == "counterexample_validator":
+            has_evidence = _has_artifact_type(
+                conn,
+                evidence_ids,
+                "confirmed_counterexample",
+                target_type="debt",
+                target_id=debt_id,
+                producer_role="counterexample_validator",
+            )
+        if not has_evidence:
+            raise PatchRejected(
+                [
+                    f"resolving proof obligation {debt_id} requires current evidence bound to that obligation: "
+                    "a clean strict verification report, a host-checked formal result, or a confirmed counterexample"
+                ]
+            )
+        evidence["resolution_evidence_artifact_ids"] = evidence_ids
+        evidence["resolved_by"] = actor
+        evidence["resolution_status"] = "closed_by_explicit_verification"
         conn.execute(
             "UPDATE debts SET status = 'resolved', last_seen = ?, resolution_evidence_json = ? WHERE debt_id = ?",
             (utc_now(), json_dumps(evidence), debt_id),
@@ -3290,15 +4724,40 @@ def _status_transition(conn: sqlite3.Connection, patch: Dict[str, Any], op: Dict
         producer_role="strict_informal_verifier",
     ):
         raise PatchRejected(["informally_verified requires a strict_informal_verifier verification_report artifact with zero errors and gaps"])
-    if new_status == "formally_verified" and not _has_artifact_type(
+    if new_status == "formally_verified" and not _has_valid_formal_backend_result(
         conn,
         evidence_ids,
-        "formal_backend_result",
         target_type=target_type,
         target_id=target_id,
-        producer_role="formal_backend",
     ):
-        raise PatchRejected(["formally_verified requires formal_backend_result evidence produced by formal_backend"])
+        raise PatchRejected([
+            "formally_verified requires a host-executed, successful formal_backend_result from an allowlisted proof checker"
+        ])
+    if new_status == "formally_verified":
+        status_table = {
+            "claim": ("claims", "claim_id"),
+            "inference": ("inferences", "inference_id"),
+        }.get(target_type)
+        if status_table is None:
+            raise PatchRejected(
+                ["formal verification is supported only for claims and inferences"]
+            )
+        table, identifier_column = status_table
+        previous_status_row = conn.execute(
+            f"SELECT validation_status FROM {table} WHERE {identifier_column} = ?",
+            (target_id,),
+        ).fetchone()
+        previous_status = str(
+            previous_status_row["validation_status"] if previous_status_row else ""
+        )
+        if previous_status not in {"informally_verified", "formally_verified"}:
+            raise PatchRejected(
+                [
+                    "formal verification may upgrade only a claim or inference that already passed "
+                    "strict informal verification; this prevents an unrelated formal encoding from "
+                    "certifying an otherwise unchecked mathematical statement"
+                ]
+            )
     if new_status == "refuted":
         has_confirmed_counterexample = _has_artifact_type(
             conn,
@@ -3340,12 +4799,24 @@ def _status_transition(conn: sqlite3.Connection, patch: Dict[str, Any], op: Dict
             resolved_debt_ids=resolved_debt_ids,
             resolved_debt_justifications=resolved_debt_justifications,
         )
-        conn.execute("UPDATE routes SET status = 'integrated', updated_at = ? WHERE route_id = ?", (utc_now(), op.get("route_id")))
+        route_id = str(op.get("route_id") or "")
+        # The integration report certifies both the claim transition and the
+        # exact sufficient route.  Persist that provenance on the route itself
+        # so the host can bind and later revoke the route certificate without
+        # guessing from artifact prose or optional metadata.
+        conn.execute(
+            "UPDATE routes SET status = 'integrated', evidence_artifact_ids_json = ?, updated_at = ? WHERE route_id = ?",
+            (
+                json_dumps(sorted(set(_route_evidence(conn, route_id) + evidence_ids))),
+                utc_now(),
+                route_id,
+            ),
+        )
         _resolve_integration_debts(
             conn,
             resolved_debt_ids,
             claim_id=target_id,
-            route_id=str(op.get("route_id") or ""),
+            route_id=route_id,
             evidence_ids=evidence_ids,
             resolved_debt_justifications=resolved_debt_justifications,
         )
@@ -3364,6 +4835,8 @@ def _status_transition(conn: sqlite3.Connection, patch: Dict[str, Any], op: Dict
             f"UPDATE claims SET {col} = ?, evidence_artifact_ids_json = ?, updated_at = ? WHERE claim_id = ?",
             (new_status, json_dumps(sorted(set(_claim_evidence(conn, target_id) + evidence_ids))), utc_now(), target_id),
         )
+        if new_status in {"refuted", "superseded"}:
+            invalidate_dependents(conn, changed_claim_ids=[target_id])
     elif target_type == "inference":
         if not conn.execute("SELECT 1 FROM inferences WHERE inference_id = ?", (target_id,)).fetchone():
             raise PatchRejected([f"unknown inference: {target_id}"])
@@ -3408,6 +4881,11 @@ def _guard_integration(
     conclusion = conn.execute("SELECT * FROM claims WHERE claim_id = ?", (claim_id,)).fetchone()
     if conclusion is None or conclusion["validation_status"] not in VERIFIED_STATUSES:
         raise PatchRejected([f"claim {claim_id} is not verified"])
+    assurance_errors = claim_assurance_errors(
+        conn, claim_id=claim_id, route_id=str(route_id)
+    )
+    if assurance_errors:
+        raise PatchRejected(assurance_errors)
     integration_errors = _integration_report_errors(conn, evidence_ids, claim_id=claim_id, route=route, producer_role="integration_verifier")
     if integration_errors:
         raise PatchRejected(integration_errors)
@@ -3439,16 +4917,7 @@ def _guard_integration(
             route_inference_ids=route_inference_ids,
             justification=str(justifications.get(debt_id) or ""),
         )
-    clean_verification_by_owner = _clean_verification_times_for_route(conn, conclusion, inferences)
-    if any(
-        _debt_blocks_integration(
-            row,
-            claim_id=claim_id,
-            clean_verification_by_owner=clean_verification_by_owner,
-        )
-        for row in blockers
-        if row["debt_id"] not in resolved
-    ):
+    if any(row["debt_id"] not in resolved for row in blockers):
         raise PatchRejected(["active blocking debt prevents integration"])
     verified_terminal_inferences = []
     for inf in inferences:
@@ -3594,293 +5063,6 @@ def _resolve_integration_debts(
         )
 
 
-def _latest_clean_claim_verification_at(
-    conn: sqlite3.Connection,
-    evidence_ids: Sequence[str],
-    *,
-    target_type: str,
-    target_id: str,
-) -> str:
-    """Timestamp of the newest clean verifier/formal certificate on an entity."""
-    latest = ""
-    for artifact_id in evidence_ids:
-        row = conn.execute(
-            "SELECT artifact_type, producer_role, created_at FROM artifacts WHERE artifact_id = ?",
-            (artifact_id,),
-        ).fetchone()
-        if not row:
-            continue
-        artifact_type = str(row["artifact_type"] or "")
-        producer_role = str(row["producer_role"] or "")
-        clean = (
-            artifact_type == "verification_report"
-            and producer_role == "strict_informal_verifier"
-            and _has_clean_verification(
-                conn,
-                [artifact_id],
-                outcome="positive",
-                target_type=target_type,
-                target_id=target_id,
-                producer_role="strict_informal_verifier",
-            )
-        ) or (
-            artifact_type == "formal_backend_result"
-            and producer_role == "formal_backend"
-        )
-        if clean:
-            latest = max(latest, str(row["created_at"] or ""))
-    return latest
-
-
-def _clean_verification_times_for_route(
-    conn: sqlite3.Connection,
-    claim: sqlite3.Row | None,
-    inferences: Sequence[sqlite3.Row],
-) -> Dict[str, str]:
-    times: Dict[str, str] = {}
-    if claim is not None:
-        times[str(claim["claim_id"] or "")] = _latest_clean_claim_verification_at(
-            conn,
-            json_loads(claim["evidence_artifact_ids_json"], []),
-            target_type="claim",
-            target_id=str(claim["claim_id"] or ""),
-        )
-    for inference in inferences:
-        times[str(inference["inference_id"] or "")] = _latest_clean_claim_verification_at(
-            conn,
-            json_loads(inference["evidence_artifact_ids_json"], []),
-            target_type="inference",
-            target_id=str(inference["inference_id"] or ""),
-        )
-    return times
-
-
-def _resolve_confirmed_counterexample_debts(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    """Close candidate-validation debts covered by a durable confirmation.
-
-    Legacy validator packets did not record ``candidate_artifact_id``.  For
-    those packets, associate the confirmation only with the newest earlier
-    candidate for the same target.  A later candidate remains independent and
-    must still be validated.
-    """
-
-    candidates = list(
-        conn.execute(
-            """
-            SELECT artifact_id, state_revision, metadata_json
-            FROM artifacts
-            WHERE artifact_type = 'candidate_counterexample'
-            ORDER BY state_revision ASC, created_at ASC
-            """
-        )
-    )
-    candidate_by_id = {str(row["artifact_id"] or ""): row for row in candidates}
-    confirmations = list(
-        conn.execute(
-            """
-            SELECT artifact_id, state_revision, metadata_json
-            FROM artifacts
-            WHERE artifact_type = 'confirmed_counterexample'
-            ORDER BY state_revision ASC, created_at ASC
-            """
-        )
-    )
-    changes: List[Dict[str, Any]] = []
-    for confirmation in confirmations:
-        metadata = json_loads(confirmation["metadata_json"], {})
-        if not isinstance(metadata, dict):
-            metadata = {}
-        raw_refs: list[Any] = []
-        for key in (
-            "candidate_artifact_id",
-            "candidate_counterexample_artifact_id",
-            "source_artifact_id",
-            "source_artifact_ids",
-            "evidence_artifact_ids",
-            "evidence_paths",
-        ):
-            raw = metadata.get(key)
-            raw_refs.extend(raw if isinstance(raw, list) else [raw])
-        candidate_ids = {
-            candidate_id
-            for candidate_id in candidate_by_id
-            if any(candidate_id == str(ref or "") or candidate_id in str(ref or "") for ref in raw_refs)
-        }
-        target_id = str(metadata.get("target_claim_id") or metadata.get("target_id") or "")
-        if not candidate_ids:
-            eligible = []
-            for candidate in candidates:
-                candidate_metadata = json_loads(candidate["metadata_json"], {})
-                if not isinstance(candidate_metadata, dict):
-                    continue
-                if str(candidate_metadata.get("target_id") or "") != target_id:
-                    continue
-                if int(candidate["state_revision"] or 0) > int(confirmation["state_revision"] or 0):
-                    continue
-                eligible.append(candidate)
-            if eligible:
-                newest = max(
-                    eligible,
-                    key=lambda row: (int(row["state_revision"] or 0), str(row["artifact_id"] or "")),
-                )
-                candidate_ids.add(str(newest["artifact_id"] or ""))
-        for candidate_id in sorted(candidate_ids):
-            candidate = candidate_by_id.get(candidate_id)
-            if not candidate:
-                continue
-            candidate_metadata = json_loads(candidate["metadata_json"], {})
-            if not isinstance(candidate_metadata, dict):
-                candidate_metadata = {}
-            candidate_target = str(candidate_metadata.get("target_id") or target_id)
-            debts = list(
-                conn.execute(
-                    """
-                    SELECT * FROM debts
-                    WHERE status = 'active'
-                      AND debt_type = 'counterexample_validation'
-                      AND (owner_id = ? OR suggested_next_target = ?)
-                    """,
-                    (candidate_target, candidate_target),
-                )
-            )
-            for debt in debts:
-                source_ids = {str(item) for item in json_loads(debt["source_artifact_ids_json"], [])}
-                if candidate_id not in source_ids and candidate_id not in str(debt["obligation"] or ""):
-                    continue
-                evidence = json_loads(debt["resolution_evidence_json"], {})
-                if not isinstance(evidence, dict):
-                    evidence = {}
-                evidence.update(
-                    {
-                        "resolved_by": "system",
-                        "resolution_status": "closed_by_confirmed_counterexample",
-                        "candidate_artifact_id": candidate_id,
-                        "confirmed_counterexample_artifact_id": str(confirmation["artifact_id"] or ""),
-                    }
-                )
-                conn.execute(
-                    "UPDATE debts SET status = 'resolved', last_seen = ?, resolution_evidence_json = ? WHERE debt_id = ?",
-                    (utc_now(), json_dumps(evidence), debt["debt_id"]),
-                )
-                changes.append(
-                    {
-                        "entity_type": "debt",
-                        "entity_id": str(debt["debt_id"] or ""),
-                        "from_status": "active",
-                        "to_status": "resolved",
-                        "reason": "covered by durable confirmed counterexample",
-                        "candidate_artifact_id": candidate_id,
-                        "confirmed_counterexample_artifact_id": str(confirmation["artifact_id"] or ""),
-                    }
-                )
-    return changes
-
-
-def _resolve_stale_verified_entity_debts(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    """Resolve blockers superseded by a later zero-gap entity verification.
-
-    Claim and inference verification are entity-local.  They may supersede an
-    older blocker owned by that exact entity, but never route-level assembly or
-    source-to-target bridge debt.
-    """
-
-    changes: List[Dict[str, Any]] = []
-    for owner_type, table, id_column in (
-        ("claim", "claims", "claim_id"),
-        ("inference", "inferences", "inference_id"),
-    ):
-        rows = conn.execute(
-            f"""
-            SELECT {id_column} AS entity_id, evidence_artifact_ids_json
-            FROM {table}
-            WHERE validation_status IN ('informally_verified', 'formally_verified')
-            """
-        )
-        for row in rows:
-            entity_id = str(row["entity_id"] or "")
-            clean_verification_at = _latest_clean_claim_verification_at(
-                conn,
-                json_loads(row["evidence_artifact_ids_json"], []),
-                target_type=owner_type,
-                target_id=entity_id,
-            )
-            if not clean_verification_at:
-                continue
-            debts = list(
-                conn.execute(
-                    """
-                    SELECT * FROM debts
-                    WHERE owner_type = ?
-                      AND owner_id = ?
-                      AND status = 'active'
-                      AND severity = 'blocking'
-                      AND last_seen < ?
-                    """,
-                    (owner_type, entity_id, clean_verification_at),
-                )
-            )
-            for debt in debts:
-                evidence = json_loads(debt["resolution_evidence_json"], {})
-                if not isinstance(evidence, dict):
-                    evidence = {}
-                evidence.update(
-                    {
-                        "resolved_by": "system",
-                        "resolution_status": "superseded_by_later_clean_verification",
-                        "owner_type": owner_type,
-                        "owner_id": entity_id,
-                        "verification_at": clean_verification_at,
-                    }
-                )
-                conn.execute(
-                    "UPDATE debts SET status = 'resolved', resolution_evidence_json = ? WHERE debt_id = ?",
-                    (json_dumps(evidence), debt["debt_id"]),
-                )
-                changes.append(
-                    {
-                        "entity_type": "debt",
-                        "entity_id": str(debt["debt_id"] or ""),
-                        "owner_type": owner_type,
-                        "owner_id": entity_id,
-                        "from_status": "active",
-                        "to_status": "resolved",
-                        "reason": "superseded by later clean verification of the same entity",
-                        "verification_at": clean_verification_at,
-                    }
-                )
-    return changes
-
-
-def _debt_blocks_integration(
-    debt: sqlite3.Row,
-    *,
-    claim_id: str,
-    clean_verification_by_owner: Mapping[str, str] | None = None,
-) -> bool:
-    owner_type = str(debt["owner_type"] or "")
-    owner_id = str(debt["owner_id"] or "")
-    clean_verification_at = str((clean_verification_by_owner or {}).get(owner_id) or "")
-    if (
-        owner_type in {"claim", "inference"}
-        and clean_verification_at
-        and clean_verification_at > str(debt["last_seen"] or "")
-    ):
-        return False
-    if owner_type != "claim" or owner_id != claim_id:
-        return True
-    debt_type = str(debt["debt_type"] or "")
-    if debt_type == "missing_proof_or_counterexample":
-        return False
-    if debt_type == "blocking_bridge" and _looks_like_downstream_claim_debt(debt):
-        return False
-    # A later zero-gap strict/formal certificate adjudicates the exact claim
-    # after this debt was recorded.  The old debt may still describe useful
-    # downstream root work, but it must not trap the already verified claim in
-    # an endless integration-rejection loop.  Any blocker added or refreshed
-    # after the certificate remains binding.
-    return True
-
-
 def _route_integration_health(conn: sqlite3.Connection, route: sqlite3.Row) -> Dict[str, Any]:
     """Return the current structural integration verdict for one route."""
 
@@ -3926,18 +5108,12 @@ def _route_integration_health(conn: sqlite3.Connection, route: sqlite3.Row) -> D
         issues.append("route has no verified terminal inference with verified premises")
 
     owner_ids = {claim_id, route_id, *[str(row["inference_id"] or "") for row in inferences]}
-    clean_verification_by_owner = _clean_verification_times_for_route(conn, claim, inferences)
     blocking_debt_ids = [
         str(debt["debt_id"] or "")
         for debt in conn.execute(
             "SELECT * FROM debts WHERE status = 'active' AND severity = 'blocking'"
         )
         if str(debt["owner_id"] or "") in owner_ids
-        and _debt_blocks_integration(
-            debt,
-            claim_id=claim_id,
-            clean_verification_by_owner=clean_verification_by_owner,
-        )
     ]
     if blocking_debt_ids:
         issues.append("active blocking debt")
@@ -4078,47 +5254,1273 @@ def _reconcile_invalid_integrations(conn: sqlite3.Connection) -> List[Dict[str, 
     return changes
 
 
-def _looks_like_downstream_claim_debt(debt: sqlite3.Row) -> bool:
-    text = " ".join(
-        str(debt[key] or "").lower()
-        for key in ("debt_id", "obligation", "suggested_next_target")
+def _update_scheduler_fairness_state(
+    conn: sqlite3.Connection,
+    *,
+    decision_trace: Mapping[str, Any],
+    selection_design: str,
+    run_id: str = "",
+    dispatch_id: str = "",
+) -> None:
+    """Advance authenticated compact deferral counters exactly once per wave."""
+
+    if bool(run_id) == bool(dispatch_id):
+        raise PatchRejected(
+            ["scheduler fairness update requires exactly one provenance source"]
+        )
+
+    wave = decision_trace.get("parallel_wave_admission")
+    if wave is None:
+        return
+    if not isinstance(wave, Mapping) or selection_design not in {
+        "deterministic",
+        "randomized",
+    }:
+        raise PatchRejected(
+            ["parallel wave fairness state requires auditable decision provenance"]
+        )
+    wave_id = str(wave.get("wave_id") or "")
+    policy_version = int(wave.get("policy_version") or 0)
+    state_revision = (
+        int(wave.get("state_revision") or 0) if policy_version >= 4 else 0
     )
-    downstream_cues = (
-        "after",
-        "remaining",
-        "now forced",
-        "once",
-        "downstream",
-        "bottleneck",
+    meta = conn.execute(
+        "SELECT last_wave_id, last_state_revision FROM scheduler_fairness_meta "
+        "WHERE singleton = 1"
+    ).fetchone()
+    if meta is not None and str(meta["last_wave_id"] or "") == wave_id:
+        return
+    if meta is not None and state_revision <= int(
+        meta["last_state_revision"] or 0
+    ):
+        # Another decision from this snapshot (or a newer one) reached the
+        # store first. Preserve this run's telemetry without replaying stale
+        # fairness input over the current compact state.
+        return
+    rows = wave.get("candidates")
+    if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
+        raise PatchRejected(["parallel wave fairness candidates are malformed"])
+    companion_rows = [
+        row
+        for row in rows
+        if str(row.get("candidate_id") or "") != "parallel:primary"
+    ]
+    candidate_ids = [str(row.get("candidate_id") or "") for row in companion_rows]
+    aliases: Dict[str, tuple[str, ...]] = {}
+    if 4 <= policy_version < 7:
+        for candidate_id, row in zip(candidate_ids, companion_rows):
+            identity = (
+                row.get("semantic_identity")
+                if isinstance(row.get("semantic_identity"), list)
+                else ()
+            )
+            candidate_aliases = tuple(
+                alias
+                for alias in (parallel_v3_candidate_alias(identity),)
+                if alias
+            )
+            if candidate_aliases:
+                aliases[candidate_id] = candidate_aliases
+    stored_counts = {
+        str(row["candidate_id"]): int(row["consecutive_capacity_deferrals"])
+        for row in conn.execute(
+            "SELECT candidate_id, consecutive_capacity_deferrals "
+            "FROM scheduler_candidate_deferrals"
+        ).fetchall()
+    }
+    try:
+        prior_counts = parallel_candidate_deferral_counts_from_state(
+            stored_counts,
+            candidate_ids,
+            candidate_aliases=aliases,
+        )
+    except ValueError as exc:
+        raise PatchRejected([str(exc)]) from exc
+    for row in companion_rows:
+        candidate_id = str(row.get("candidate_id") or "")
+        if int(row.get("consecutive_deferrals") or 0) != prior_counts[candidate_id]:
+            raise PatchRejected(
+                [
+                    "parallel wave deferral input disagrees with authenticated "
+                    f"scheduler state for {candidate_id}"
+                ]
+            )
+
+    conn.execute("DELETE FROM scheduler_candidate_deferrals")
+    for row in companion_rows:
+        if str(row.get("disposition") or "") != "rejected" or not (
+            parallel_outcome_is_fairness_eligible(
+                row,
+                policy_version=policy_version,
+            )
+        ):
+            continue
+        candidate_id = str(row.get("candidate_id") or "")
+        conn.execute(
+            "INSERT INTO scheduler_candidate_deferrals("
+            "candidate_id, consecutive_capacity_deferrals, last_wave_id, "
+            "policy_version, updated_run_id, updated_dispatch_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                candidate_id,
+                prior_counts[candidate_id] + 1,
+                wave_id,
+                policy_version,
+                run_id or None,
+                dispatch_id or None,
+            ),
+        )
+    conn.execute(
+        "INSERT INTO scheduler_fairness_meta("
+        "singleton, last_wave_id, last_state_revision, policy_version, "
+        "updated_run_id, updated_dispatch_id) VALUES (1, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(singleton) DO UPDATE SET "
+        "last_wave_id = excluded.last_wave_id, "
+        "last_state_revision = excluded.last_state_revision, "
+        "policy_version = excluded.policy_version, "
+        "updated_run_id = excluded.updated_run_id, "
+        "updated_dispatch_id = excluded.updated_dispatch_id",
+        (
+            wave_id,
+            state_revision,
+            policy_version,
+            run_id or None,
+            dispatch_id or None,
+        ),
     )
-    local_gap_cues = (
-        "gap in the proof",
-        "missing proof",
-        "missing hypothesis",
-        "unjustified",
-        "not justified",
-        "verify the claim",
-        "verify this claim",
-    )
-    return any(cue in text for cue in downstream_cues) and not any(cue in text for cue in local_gap_cues)
 
 
-def _record_run(conn: sqlite3.Connection, op: Dict[str, Any], *, problem_id: str = "") -> None:
+def _update_scheduler_decision_fairness_state(
+    conn: sqlite3.Connection,
+    *,
+    decision_trace: Mapping[str, Any],
+    selection_design: str,
+    state_revision: int,
+    run_id: str = "",
+    dispatch_id: str = "",
+) -> None:
+    """Advance generic/nested fairness only for a primary scheduler decision."""
+
+    if bool(run_id) == bool(dispatch_id):
+        raise PatchRejected(
+            ["scheduler decision fairness update requires exactly one provenance source"]
+        )
+
+    rows = decision_trace.get("candidates")
+    if selection_design not in {"deterministic", "randomized"} or not isinstance(
+        rows, list
+    ) or not rows:
+        return
+    wave = decision_trace.get("parallel_wave_admission")
+    if decision_trace_is_parallel_companion(decision_trace):
+        return
+    if isinstance(wave, Mapping):
+        decision_id = str(wave.get("wave_id") or "")
+    else:
+        decision_id = dispatch_id or run_id
+    if not decision_id:
+        raise PatchRejected(["scheduler decision fairness identifier is missing"])
+    meta = conn.execute(
+        "SELECT last_decision_id, last_state_revision "
+        "FROM scheduler_decision_fairness_meta "
+        "WHERE singleton = 1"
+    ).fetchone()
+    if meta is not None and str(meta["last_decision_id"] or "") == decision_id:
+        return
+    if meta is not None and state_revision <= int(meta["last_state_revision"] or 0):
+        # Concurrent or late completion from an already-consumed snapshot.
+        # Its run record remains authoritative telemetry, but it cannot apply
+        # stale comparison input to current fairness state.
+        return
+    stored_counts = {
+        str(row["candidate_id"]): int(row["consecutive_deferrals"])
+        for row in conn.execute(
+            "SELECT candidate_id, consecutive_deferrals "
+            "FROM scheduler_decision_deferrals"
+        ).fetchall()
+    }
+    try:
+        updated_counts = decision_deferral_state_after_trace(
+            stored_counts, decision_trace
+        )
+    except ValueError as exc:
+        raise PatchRejected([str(exc)]) from exc
+    policy_version = int(decision_trace.get("decision_policy_version") or 0)
+    conn.execute("DELETE FROM scheduler_decision_deferrals")
+    for candidate_id, count in updated_counts.items():
+        conn.execute(
+            "INSERT INTO scheduler_decision_deferrals("
+            "candidate_id, consecutive_deferrals, last_decision_id, "
+            "policy_version, updated_run_id, updated_dispatch_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                candidate_id,
+                count,
+                decision_id,
+                policy_version,
+                run_id or None,
+                dispatch_id or None,
+            ),
+        )
+    conn.execute(
+        "INSERT INTO scheduler_decision_fairness_meta("
+        "singleton, last_decision_id, last_state_revision, policy_version, "
+        "updated_run_id, updated_dispatch_id) VALUES (1, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(singleton) DO UPDATE SET "
+        "last_decision_id = excluded.last_decision_id, "
+        "last_state_revision = excluded.last_state_revision, "
+        "policy_version = excluded.policy_version, "
+        "updated_run_id = excluded.updated_run_id, "
+        "updated_dispatch_id = excluded.updated_dispatch_id",
+        (
+            decision_id,
+            state_revision,
+            policy_version,
+            run_id or None,
+            dispatch_id or None,
+        ),
+    )
+
+
+def _record_scheduler_dispatch(
+    conn: sqlite3.Connection,
+    op: Dict[str, Any],
+    *,
+    authority: PatchAuthority,
+) -> None:
+    """Persist one exact scheduler allocation before external execution."""
+
+    if authority.source != "system":
+        raise PatchRejected(["scheduler dispatch requires system authority"])
+    dispatch_id = _required(op, "dispatch_id")
+    if conn.execute(
+        "SELECT 1 FROM scheduler_dispatches WHERE dispatch_id = ?",
+        (dispatch_id,),
+    ).fetchone():
+        raise PatchRejected([f"scheduler dispatch is append-only: {dispatch_id}"])
+    group_id = _required(op, "dispatch_group_id")
+    latest_dispatch = conn.execute(
+        "SELECT d.dispatch_group_id FROM scheduler_source_entries AS s "
+        "JOIN scheduler_dispatches AS d ON d.dispatch_id = s.record_id "
+        "WHERE s.record_kind = 'dispatch' ORDER BY s.sequence DESC LIMIT 1"
+    ).fetchone()
+    latest_group_id = (
+        str(latest_dispatch["dispatch_group_id"] or "")
+        if latest_dispatch is not None
+        else ""
+    )
+    unresolved_other_group = None
+    if latest_group_id and latest_group_id != group_id:
+        unresolved_other_group = conn.execute(
+            "SELECT d.dispatch_id FROM scheduler_dispatches AS d "
+            "LEFT JOIN runs AS r ON r.scheduler_dispatch_id = d.dispatch_id "
+            "WHERE d.dispatch_group_id = ? AND r.run_id IS NULL LIMIT 1",
+            (latest_group_id,),
+        ).fetchone()
+    if unresolved_other_group is not None:
+        raise PatchRejected(
+            [
+                "a new scheduler wave cannot be committed while an earlier "
+                "dispatch group remains unresolved"
+            ]
+        )
+    actor_role = _required(op, "actor_role")
+    target_id = _required(op, "target_id")
+    committed_at = _required(op, "committed_at")
+    position = op.get("dispatch_position")
+    if type(position) is not int or position < 0:
+        raise PatchRejected(["scheduler dispatch position must be nonnegative"])
+    is_companion = op.get("is_companion")
+    if type(is_companion) is not bool:
+        raise PatchRejected(["scheduler dispatch companion flag must be boolean"])
+    if (position > 0) != is_companion:
+        raise PatchRejected(
+            ["scheduler dispatch position and companion flag disagree"]
+        )
+    mode = _required(op, "mode")
+    if mode not in EXECUTABLE_RUN_MODES:
+        raise PatchRejected([f"invalid executable scheduler dispatch mode: {mode}"])
+    state_revision = op.get("decision_state_revision")
+    if type(state_revision) is not int or state_revision < 0:
+        raise PatchRejected(
+            ["scheduler dispatch state revision must be nonnegative"]
+        )
+    state = conn.execute(
+        "SELECT current_revision, proof_state_hash, run_provenance_hash, "
+        "remaining_token_budget, reserved_verification_budget "
+        "FROM problem_state"
+    ).fetchone()
+    if state is None:
+        raise PatchRejected(["problem state is missing"])
+    if (
+        state_revision != int(state["current_revision"])
+        or str(op.get("proof_state_hash") or "") != str(state["proof_state_hash"] or "")
+        or str(op.get("prior_run_provenance_hash") or "")
+        != str(state["run_provenance_hash"] or "")
+    ):
+        raise PatchRejected(
+            ["scheduler dispatch does not match the authenticated planning snapshot"]
+        )
+    selection_design = str(op.get("selection_design") or "")
+    if selection_design not in {"deterministic", "randomized"}:
+        raise PatchRejected(
+            ["scheduler dispatch must have deterministic or randomized provenance"]
+        )
+    decision_trace = op.get("decision_trace")
+    if not isinstance(decision_trace, Mapping):
+        raise PatchRejected(["scheduler dispatch decision trace must be an object"])
+    candidate_set_hash = str(op.get("candidate_set_hash") or "")
+    policy_version = op.get("selection_policy_version")
+    if type(policy_version) is not int or policy_version <= 0:
+        raise PatchRejected(["scheduler dispatch policy version must be positive"])
+    if (
+        str(decision_trace.get("candidate_set_sha256") or "") != candidate_set_hash
+        or decision_trace.get("decision_policy_version") != policy_version
+    ):
+        raise PatchRejected(
+            ["scheduler dispatch provenance disagrees with its decision trace"]
+        )
+    trace_errors = decision_trace_errors(decision_trace)
+    if trace_errors:
+        raise PatchRejected(trace_errors)
+    contract_trace_errors = scheduler_action_contract_trace_errors(
+        decision_trace, required=True
+    )
+    if contract_trace_errors:
+        raise PatchRejected(contract_trace_errors)
+    action_hash = str(op.get("dispatched_action_hash") or "")
+    if (
+        len(action_hash) != 64
+        or any(character not in "0123456789abcdef" for character in action_hash)
+        or str(decision_trace.get("dispatched_action_sha256") or "") != action_hash
+    ):
+        raise PatchRejected(
+            ["scheduler dispatch action hash disagrees with its decision trace"]
+        )
+    if position == 0:
+        prior_primary_row = conn.execute(
+            "SELECT d.decision_trace_json FROM scheduler_source_entries AS s "
+            "JOIN scheduler_dispatches AS d ON d.dispatch_id = s.record_id "
+            "WHERE s.record_kind = 'dispatch' AND d.dispatch_position = 0 "
+            "ORDER BY s.sequence DESC LIMIT 1"
+        ).fetchone()
+        if prior_primary_row is not None:
+            prior_primary_trace = json_loads(
+                prior_primary_row["decision_trace_json"], None
+            )
+            prior_primary_certificate = (
+                prior_primary_trace.get("randomized_assignment")
+                if isinstance(prior_primary_trace, Mapping)
+                else None
+            )
+            if (
+                isinstance(prior_primary_certificate, Mapping)
+                and prior_primary_certificate.get("protocol_version")
+                in WORKFLOW_RANDOMIZED_ASSIGNMENT_PROTOCOL_VERSIONS
+            ):
+                current_primary_certificate = decision_trace.get(
+                    "randomized_assignment"
+                )
+                if (
+                    selection_design != "randomized"
+                    or not isinstance(current_primary_certificate, Mapping)
+                    or current_primary_certificate.get("protocol_version")
+                    not in WORKFLOW_RANDOMIZED_ASSIGNMENT_PROTOCOL_VERSIONS
+                    or current_primary_certificate.get(
+                        "assignment_input_sha256"
+                    )
+                    != prior_primary_certificate.get(
+                        "assignment_input_sha256"
+                    )
+                ):
+                    raise PatchRejected(
+                        [
+                            "an active workflow randomized assignment must govern "
+                            "every subsequent dispatch wave"
+                        ]
+                    )
+    if selection_design == "randomized":
+        assignment_wave = decision_trace.get("parallel_wave_admission")
+        assignment_errors = randomized_assignment_errors(
+            decision_trace.get("randomized_assignment"),
+            candidate_set_sha256=candidate_set_hash,
+            selection_policy_version=policy_version,
+            dispatched_action_sha256=action_hash,
+            parallel_admission_policy_version=(
+                assignment_wave.get("policy_version")
+                if isinstance(assignment_wave, Mapping)
+                and type(assignment_wave.get("policy_version")) is int
+                else None
+            ),
+        )
+        if assignment_errors:
+            raise PatchRejected(assignment_errors)
+        try:
+            assignment_metadata = randomized_assignment_metadata(
+                decision_trace
+            )
+        except ValueError as exc:
+            raise PatchRejected([str(exc)]) from exc
+        if (
+            assignment_metadata["candidate_set_hash"] != candidate_set_hash
+            or assignment_metadata["selection_policy_version"] != policy_version
+        ):
+            raise PatchRejected(
+                ["randomized scheduler dispatch metadata is inconsistent"]
+            )
+        current_certificate = decision_trace["randomized_assignment"]
+        group_row = conn.execute(
+            "SELECT decision_trace_json FROM scheduler_dispatches "
+            "WHERE dispatch_group_id = ? AND selection_design = 'randomized' "
+            "ORDER BY dispatch_position LIMIT 1",
+            (group_id,),
+        ).fetchone()
+        if group_row is not None:
+            group_trace = json_loads(group_row["decision_trace_json"], None)
+            group_certificate = (
+                group_trace.get("randomized_assignment")
+                if isinstance(group_trace, Mapping)
+                else None
+            )
+            if not isinstance(group_certificate, Mapping):
+                raise PatchRejected(
+                    ["randomized scheduler dispatch group has invalid provenance"]
+                )
+            for field in (
+                "protocol_version",
+                "experiment_id",
+                "assignment_unit_id",
+                "assignment_scope",
+                "exposure_index",
+                "assignment_input_sha256",
+                "selected_arm_id",
+                "selected_policy_version",
+            ):
+                if group_certificate.get(field) != current_certificate.get(field):
+                    raise PatchRejected(
+                        [
+                            "randomized scheduler dispatch group contains "
+                            "inconsistent assignment certificates"
+                        ]
+                    )
+            if position == 0:
+                raise PatchRejected(
+                    ["randomized scheduler dispatch group has multiple primary actions"]
+                )
+        else:
+            if position != 0:
+                raise PatchRejected(
+                    [
+                        "randomized scheduler dispatch companions require their "
+                        "primary action to be committed first"
+                    ]
+                )
+            experiment_id = str(current_certificate["experiment_id"])
+            assignment_unit_id = str(
+                current_certificate["assignment_unit_id"]
+            )
+            prior_unit_row = conn.execute(
+                "SELECT decision_trace_json FROM scheduler_dispatches "
+                "WHERE selection_design = 'randomized' AND dispatch_position = 0 "
+                "AND json_extract(decision_trace_json, "
+                "'$.randomized_assignment.experiment_id') = ? "
+                "AND json_extract(decision_trace_json, "
+                "'$.randomized_assignment.assignment_unit_id') = ? "
+                "ORDER BY COALESCE(json_extract(decision_trace_json, "
+                "'$.randomized_assignment.exposure_index'), -1) DESC LIMIT 1",
+                (experiment_id, assignment_unit_id),
+            ).fetchone()
+            current_protocol_version = int(
+                current_certificate["protocol_version"]
+            )
+            if prior_unit_row is None:
+                if (
+                    current_protocol_version
+                    in WORKFLOW_RANDOMIZED_ASSIGNMENT_PROTOCOL_VERSIONS
+                    and current_certificate["exposure_index"] != 0
+                ):
+                    raise PatchRejected(
+                        [
+                            "workflow randomized assignment exposures must begin "
+                            "at index zero"
+                        ]
+                    )
+            else:
+                prior_unit_trace = json_loads(
+                    prior_unit_row["decision_trace_json"], None
+                )
+                prior_unit_certificate = (
+                    prior_unit_trace.get("randomized_assignment")
+                    if isinstance(prior_unit_trace, Mapping)
+                    else None
+                )
+                if (
+                    current_protocol_version
+                    not in WORKFLOW_RANDOMIZED_ASSIGNMENT_PROTOCOL_VERSIONS
+                ):
+                    raise PatchRejected(
+                        [
+                            "randomized assignment unit is duplicated within "
+                            f"experiment {experiment_id}: {assignment_unit_id}"
+                        ]
+                    )
+                if (
+                    not isinstance(prior_unit_certificate, Mapping)
+                    or prior_unit_certificate.get("protocol_version")
+                    not in WORKFLOW_RANDOMIZED_ASSIGNMENT_PROTOCOL_VERSIONS
+                    or prior_unit_certificate.get("assignment_input_sha256")
+                    != current_certificate.get("assignment_input_sha256")
+                    or prior_unit_certificate.get("selected_arm_id")
+                    != current_certificate.get("selected_arm_id")
+                    or prior_unit_certificate.get("selected_policy_version")
+                    != current_certificate.get("selected_policy_version")
+                ):
+                    raise PatchRejected(
+                        [
+                            "workflow randomized assignment changes within "
+                            f"experimental unit {experiment_id}: {assignment_unit_id}"
+                        ]
+                    )
+                prior_exposure_index = prior_unit_certificate.get(
+                    "exposure_index"
+                )
+                if (
+                    type(prior_exposure_index) is not int
+                    or current_certificate["exposure_index"]
+                    != prior_exposure_index + 1
+                ):
+                    raise PatchRejected(
+                        [
+                            "workflow randomized assignment exposure index must "
+                            "be the next contiguous value"
+                        ]
+                    )
+            prior_experiment = conn.execute(
+                "SELECT decision_trace_json FROM scheduler_dispatches "
+                "WHERE selection_design = 'randomized' AND dispatch_position = 0 "
+                "AND json_extract(decision_trace_json, "
+                "'$.randomized_assignment.experiment_id') = ? LIMIT 1",
+                (experiment_id,),
+            ).fetchone()
+            if prior_experiment is not None:
+                prior_trace = json_loads(
+                    prior_experiment["decision_trace_json"], None
+                )
+                prior_certificate = (
+                    prior_trace.get("randomized_assignment")
+                    if isinstance(prior_trace, Mapping)
+                    else None
+                )
+                try:
+                    prior_design = randomized_assignment_design_sha256(
+                        prior_certificate
+                    )
+                    current_design = randomized_assignment_design_sha256(
+                        current_certificate
+                    )
+                except ValueError as exc:
+                    raise PatchRejected(
+                        [
+                            "randomized scheduler experiment has invalid prior "
+                            f"provenance: {exc}"
+                        ]
+                    ) from exc
+                if prior_design != current_design:
+                    raise PatchRejected(
+                        [
+                            "randomized assignment design changes within "
+                            f"experiment {experiment_id}"
+                        ]
+                    )
+    elif decision_trace.get("randomized_assignment") is not None:
+        raise PatchRejected(
+            ["deterministic scheduler dispatch cannot contain randomized assignment"]
+        )
+    dispatched_action = op.get("dispatched_action")
+    if not isinstance(dispatched_action, Mapping):
+        raise PatchRejected(
+            ["scheduler dispatch requires a recoverable action object"]
+        )
+    if "decision_trace" in dispatched_action:
+        raise PatchRejected(
+            ["scheduler dispatch action body must exclude its decision trace"]
+        )
+    routing_errors = scheduler_dispatch_action_errors(dispatched_action)
+    if routing_errors:
+        raise PatchRejected(routing_errors)
+    try:
+        observed_action_hash = action_sha256(dispatched_action)
+        dispatched_action_json = json_dumps(dispatched_action)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise PatchRejected(
+            [f"scheduler dispatch action body is not canonical JSON: {exc}"]
+        )
+    if observed_action_hash != action_hash:
+        raise PatchRejected(
+            ["scheduler dispatch action body does not match its action hash"]
+        )
+    if (
+        str(dispatched_action.get("mode") or "") != mode
+        or str(dispatched_action.get("target_id") or "") != target_id
+        or str(dispatched_action.get("route_id") or "")
+        != str(op.get("route_id") or "")
+    ):
+        raise PatchRejected(
+            ["scheduler dispatch action body disagrees with its routing fields"]
+        )
+    expected_actor_role = scheduler_actor_role_for_action(dispatched_action)
+    if actor_role != expected_actor_role:
+        raise PatchRejected(
+            [
+                "scheduler dispatch actor role disagrees with the versioned "
+                "action contract"
+            ]
+        )
+    allocation = dispatched_action["budget"]
+    actual_remaining = int(state["remaining_token_budget"])
+    actual_reserve = int(state["reserved_verification_budget"])
+    if (
+        int(allocation["remaining_token_budget"]) != actual_remaining
+        or int(allocation["reserved_verification_budget"]) != actual_reserve
+    ):
+        raise PatchRejected(
+            [
+                "scheduler dispatch resource allocation disagrees with the "
+                "authenticated planning state"
+            ]
+        )
+    group_actions: list[Mapping[str, Any]] = []
+    for row in conn.execute(
+        "SELECT dispatched_action_json FROM scheduler_dispatches "
+        "WHERE dispatch_group_id = ? ORDER BY dispatch_position",
+        (group_id,),
+    ).fetchall():
+        prior_action = json_loads(row["dispatched_action_json"], None)
+        if not isinstance(prior_action, Mapping):
+            raise PatchRejected(
+                ["scheduler dispatch group contains an invalid action body"]
+            )
+        group_actions.append(prior_action)
+    group_actions.append(dispatched_action)
+    total_requested = 0
+    nonverification_requested = 0
+    for group_action in group_actions:
+        group_allocation = group_action.get("budget")
+        if not isinstance(group_allocation, Mapping):
+            raise PatchRejected(
+                ["scheduler dispatch group contains an invalid resource allocation"]
+            )
+        requested = int(group_allocation.get("requested_tokens") or 0)
+        total_requested += requested
+        if scheduler_budget_class_for_action(group_action) != "verification":
+            nonverification_requested += requested
+    if total_requested > actual_remaining:
+        raise PatchRejected(
+            [
+                "scheduler dispatch group requests more than the remaining "
+                "resource allocation"
+            ]
+        )
+    if nonverification_requested > max(0, actual_remaining - actual_reserve):
+        raise PatchRejected(
+            [
+                "scheduler dispatch group assigns protected verification "
+                "resources to non-verification work"
+            ]
+        )
+    execution_contract = op.get("execution_contract")
+    if not isinstance(execution_contract, Mapping):
+        raise PatchRejected(
+            ["scheduler dispatch requires an execution recovery contract"]
+        )
+    try:
+        execution_contract_json = json_dumps(execution_contract)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise PatchRejected(
+            [f"scheduler dispatch execution contract is not canonical JSON: {exc}"]
+        )
+    contract_errors = execution_contract_errors(execution_contract)
+    if contract_errors:
+        raise PatchRejected(
+            [
+                "scheduler dispatch execution contract is invalid: "
+                + "; ".join(contract_errors)
+            ]
+        )
+    if decision_trace_is_parallel_companion(decision_trace) != is_companion:
+        raise PatchRejected(
+            ["scheduler dispatch companion flag disagrees with its decision trace"]
+        )
+    wave = decision_trace.get("parallel_wave_admission")
+    if (
+        isinstance(wave, Mapping)
+        and int(wave.get("policy_version") or 0) >= 4
+        and wave.get("state_revision") != state_revision
+    ):
+        raise PatchRejected(
+            ["scheduler dispatch state revision disagrees with its parallel wave"]
+        )
+    conn.execute(
+        "INSERT INTO scheduler_dispatches("
+        "dispatch_id, dispatch_group_id, dispatch_position, is_companion, "
+        "actor_role, mode, target_id, route_id, decision_state_revision, "
+        "proof_state_hash, prior_run_provenance_hash, selection_design, "
+        "candidate_set_hash, selection_policy_version, decision_trace_json, "
+        "dispatched_action_hash, dispatched_action_json, execution_contract_json, "
+        "committed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            dispatch_id,
+            group_id,
+            position,
+            int(is_companion),
+            actor_role,
+            mode,
+            target_id,
+            str(op.get("route_id") or ""),
+            state_revision,
+            str(op.get("proof_state_hash") or ""),
+            str(op.get("prior_run_provenance_hash") or ""),
+            selection_design,
+            candidate_set_hash,
+            policy_version,
+            json_dumps(decision_trace),
+            action_hash,
+            dispatched_action_json,
+            execution_contract_json,
+            committed_at,
+        ),
+    )
+    _update_scheduler_fairness_state(
+        conn,
+        decision_trace=decision_trace,
+        dispatch_id=dispatch_id,
+        selection_design=selection_design,
+    )
+    _update_scheduler_decision_fairness_state(
+        conn,
+        decision_trace=decision_trace,
+        dispatch_id=dispatch_id,
+        selection_design=selection_design,
+        state_revision=state_revision,
+    )
+    append_scheduler_provenance_entry(
+        conn,
+        record_kind="dispatch",
+        record_id=dispatch_id,
+    )
+
+
+def _record_run(
+    conn: sqlite3.Connection,
+    op: Dict[str, Any],
+    *,
+    problem_id: str = "",
+    authority: PatchAuthority,
+) -> None:
+    if authority.source != "system":
+        raise PatchRejected(["run telemetry requires system authority"])
     run_id = _required(op, "run_id")
     mode = _required(op, "mode")
-    if mode not in RUN_MODES:
-        raise PatchRejected([f"invalid run mode: {mode}"])
+    if mode not in EXECUTABLE_RUN_MODES:
+        raise PatchRejected([f"invalid executable run mode: {mode}"])
+    if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone():
+        raise PatchRejected([f"run telemetry is append-only; duplicate run_id: {run_id}"])
+    selection_design = str(op.get("selection_design") or "observational")
+    state_revision = op.get("state_revision", 0)
+    context_revision = op.get("context_revision", 0)
+    decision_state_revision = op.get("decision_state_revision", state_revision)
+    if type(state_revision) is not int or state_revision < 0:
+        raise PatchRejected(["run state_revision must be a nonnegative integer"])
+    if type(context_revision) is not int or context_revision < 0:
+        raise PatchRejected(["run context_revision must be a nonnegative integer"])
+    if type(decision_state_revision) is not int or decision_state_revision < 0:
+        raise PatchRejected(
+            ["run decision_state_revision must be a nonnegative integer"]
+        )
+    raw_assignment_probability = op.get("assignment_probability") or 0.0
+    if isinstance(raw_assignment_probability, bool):
+        raise PatchRejected(["run assignment_probability must be finite numeric data"])
+    try:
+        assignment_probability = float(raw_assignment_probability)
+    except (TypeError, ValueError, OverflowError):
+        raise PatchRejected(
+            ["run assignment_probability must be finite numeric data"]
+        )
+    if not math.isfinite(assignment_probability):
+        raise PatchRejected(["run assignment_probability must be finite numeric data"])
+    exploration_stratum = str(op.get("exploration_stratum") or "")
+    candidate_set_hash = str(op.get("candidate_set_hash") or "")
+    selection_policy_version = int(op.get("selection_policy_version") or 0)
+    decision_trace = op.get("decision_trace") or {}
+    if not isinstance(decision_trace, Mapping):
+        raise PatchRejected(["decision_trace must be an object"])
+    if selection_design not in {"observational", "deterministic", "randomized"}:
+        raise PatchRejected([f"invalid selection_design: {selection_design}"])
+    if selection_design == "observational":
+        if (
+            assignment_probability != 0.0
+            or exploration_stratum
+            or candidate_set_hash
+            or selection_policy_version != 0
+        ):
+            raise PatchRejected(
+                ["observational run telemetry cannot claim randomized-assignment metadata"]
+            )
+    elif selection_design in {"deterministic", "randomized"}:
+        if (
+            len(candidate_set_hash) != 64
+            or any(character not in "0123456789abcdef" for character in candidate_set_hash)
+            or selection_policy_version < 1
+            or not decision_trace
+        ):
+            raise PatchRejected(
+                [
+                    f"{selection_design} run telemetry requires a lowercase SHA-256 "
+                    "candidate-set hash, a positive policy version, and a decision trace"
+                ]
+            )
+        raw_trace_policy_version = decision_trace.get("decision_policy_version")
+        try:
+            trace_policy_version = int(raw_trace_policy_version or 0)
+        except (TypeError, ValueError, OverflowError):
+            raise PatchRejected(["decision trace policy version must be an integer"])
+        if (
+            str(decision_trace.get("candidate_set_sha256") or "") != candidate_set_hash
+            or trace_policy_version != selection_policy_version
+        ):
+            raise PatchRejected(
+                ["deterministic run provenance disagrees with its decision trace"]
+            )
+        trace_candidates = decision_trace.get("candidates")
+        if not isinstance(trace_candidates, list) or any(
+            not isinstance(row, Mapping) for row in trace_candidates
+        ):
+            raise PatchRejected(
+                ["deterministic decision trace candidates must be a list of objects"]
+            )
+        if candidate_rows_sha256(
+            trace_candidates,
+            decision_policy_version=trace_policy_version,
+        ) != candidate_set_hash:
+            raise PatchRejected(
+                ["deterministic candidate-set hash does not match the trace candidates"]
+            )
+        trace_errors = decision_trace_errors(decision_trace)
+        if trace_errors:
+            raise PatchRejected(trace_errors)
+        contract_trace_errors = scheduler_action_contract_trace_errors(
+            decision_trace, required=True
+        )
+        if contract_trace_errors:
+            raise PatchRejected(contract_trace_errors)
+        wave = decision_trace.get("parallel_wave_admission")
+        if (
+            isinstance(wave, Mapping)
+            and int(wave.get("policy_version") or 0) >= 4
+            and wave.get("state_revision") != decision_state_revision
+        ):
+            raise PatchRejected(
+                [
+                    "run decision state revision disagrees with its parallel "
+                    "wave snapshot"
+                ]
+            )
+        if selection_design == "deterministic":
+            if assignment_probability != 0.0 or exploration_stratum:
+                raise PatchRejected(
+                    [
+                        "deterministic run telemetry requires zero assignment "
+                        "probability and no exploration stratum"
+                    ]
+                )
+            if decision_trace.get("randomized_assignment") is not None:
+                raise PatchRejected(
+                    ["deterministic run telemetry cannot contain randomized assignment"]
+                )
+        else:
+            assignment_wave = decision_trace.get("parallel_wave_admission")
+            assignment_errors = randomized_assignment_errors(
+                decision_trace.get("randomized_assignment"),
+                candidate_set_sha256=candidate_set_hash,
+                selection_policy_version=selection_policy_version,
+                assignment_probability=assignment_probability,
+                exploration_stratum=exploration_stratum,
+                dispatched_action_sha256=str(
+                    decision_trace.get("dispatched_action_sha256") or ""
+                ),
+                parallel_admission_policy_version=(
+                    assignment_wave.get("policy_version")
+                    if isinstance(assignment_wave, Mapping)
+                    and type(assignment_wave.get("policy_version")) is int
+                    else None
+                ),
+            )
+            if assignment_errors:
+                raise PatchRejected(assignment_errors)
+            try:
+                assignment_metadata = randomized_assignment_metadata(
+                    decision_trace
+                )
+            except ValueError as exc:
+                raise PatchRejected([str(exc)]) from exc
+            if (
+                assignment_metadata["assignment_probability"]
+                != assignment_probability
+                or assignment_metadata["exploration_stratum"]
+                != exploration_stratum
+                or assignment_metadata["candidate_set_hash"]
+                != candidate_set_hash
+                or assignment_metadata["selection_policy_version"]
+                != selection_policy_version
+            ):
+                raise PatchRejected(
+                    ["randomized run telemetry metadata is inconsistent"]
+                )
+    scheduler_dispatch_id = str(op.get("scheduler_dispatch_id") or "")
+    dispatched_action_hash = str(op.get("dispatched_action_hash") or "")
+    if selection_design in {"deterministic", "randomized"} and not scheduler_dispatch_id:
+        raise PatchRejected(
+            [
+                f"new {selection_design} run telemetry requires a prior durable "
+                "scheduler dispatch"
+            ]
+        )
+    result_reserving_run_id = conn.execute(
+        "SELECT dispatch_id FROM scheduler_dispatch_results WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if result_reserving_run_id is not None and str(
+        result_reserving_run_id["dispatch_id"] or ""
+    ) != scheduler_dispatch_id:
+        raise PatchRejected(
+            [
+                "run_id is reserved by a different durable scheduler result: "
+                f"{run_id}"
+            ]
+        )
+    reserved_result = None
+    if scheduler_dispatch_id:
+        reserved_result = conn.execute(
+            "SELECT run_id, session_plan_json, execution_json, "
+            "validation_errors_json "
+            "FROM scheduler_dispatch_results WHERE dispatch_id = ?",
+            (scheduler_dispatch_id,),
+        ).fetchone()
+    if reserved_result is not None and str(
+        reserved_result["run_id"] or ""
+    ) != run_id:
+        raise PatchRejected(
+            [
+                "run telemetry run_id disagrees with its durable scheduler "
+                "result"
+            ]
+        )
+    if scheduler_dispatch_id:
+        dispatch = conn.execute(
+            "SELECT * FROM scheduler_dispatches WHERE dispatch_id = ?",
+            (scheduler_dispatch_id,),
+        ).fetchone()
+        if dispatch is None:
+            raise PatchRejected(
+                ["run telemetry references a missing scheduler dispatch"]
+            )
+        dispatch_trace = json_loads(dispatch["decision_trace_json"], None)
+        if (
+            not dispatched_action_hash
+            or dispatch_trace != dict(decision_trace)
+            or dispatched_action_hash
+            != str(dispatch["dispatched_action_hash"] or "")
+            or selection_design != str(dispatch["selection_design"] or "")
+            or candidate_set_hash != str(dispatch["candidate_set_hash"] or "")
+            or selection_policy_version
+            != int(dispatch["selection_policy_version"] or 0)
+            or decision_state_revision
+            != int(dispatch["decision_state_revision"] or 0)
+            or mode != str(dispatch["mode"] or "")
+            or str(op.get("target_id") or "")
+            != str(dispatch["target_id"] or "")
+            or str(op.get("route_id") or "")
+            != str(dispatch["route_id"] or "")
+            or str(op.get("actor_role") or "")
+            != str(dispatch["actor_role"] or "")
+        ):
+            raise PatchRejected(
+                ["run telemetry disagrees with its scheduler dispatch"]
+            )
+        dispatched_action = json_loads(dispatch["dispatched_action_json"], None)
+        if not isinstance(dispatched_action, Mapping):
+            raise PatchRejected(
+                ["run telemetry scheduler dispatch has no recoverable action"]
+            )
+        dispatched_allocation = dispatched_action.get("budget")
+        budget_requested = op.get("budget_requested")
+        if (
+            not isinstance(dispatched_allocation, Mapping)
+            or isinstance(budget_requested, bool)
+            or not isinstance(budget_requested, int)
+            or budget_requested < 0
+            or budget_requested
+            != dispatched_allocation.get("requested_tokens")
+        ):
+            raise PatchRejected(
+                [
+                    "run telemetry requested allocation disagrees with its "
+                    "scheduler dispatch"
+                ]
+            )
+        for field in ("researcher_work_mode", "work_mode_source"):
+            if str(op.get(field) or "") != str(
+                dispatched_action.get(field) or ""
+            ):
+                raise PatchRejected(
+                    [
+                        f"run telemetry {field} disagrees with its scheduler "
+                        "dispatch"
+                    ]
+                )
+        action_search_intent = str(
+            dispatched_action.get("search_intent") or ""
+        )
+        if action_search_intent and str(op.get("search_intent") or "") != (
+            action_search_intent
+        ):
+            raise PatchRejected(
+                [
+                    "run telemetry search intent disagrees with its scheduler "
+                    "dispatch"
+                ]
+            )
+        if reserved_result is None:
+            raise PatchRejected(
+                [
+                    "run telemetry requires a prior durable scheduler result "
+                    "for its dispatch"
+                ]
+            )
+        result_plan = json_loads(reserved_result["session_plan_json"], None)
+        result_execution = json_loads(
+            reserved_result["execution_json"], None
+        )
+        result_validation_errors = json_loads(
+            reserved_result["validation_errors_json"], None
+        )
+        if not isinstance(result_plan, Mapping) or not isinstance(
+            result_execution, Mapping
+        ) or not isinstance(result_validation_errors, list) or not all(
+            isinstance(error, str) for error in result_validation_errors
+        ):
+            raise PatchRejected(
+                ["run telemetry has a malformed durable scheduler result"]
+            )
+        expected_usage = parse_token_usage(result_execution.get("usage"))
+        # ``run_metrics_operation`` deliberately treats a provider's
+        # total-only usage footer as input usage.  Authenticate against
+        # that same conservative normalization rather than the less
+        # informative raw representation.
+        if (
+            expected_usage["total_tokens"]
+            and not expected_usage["input_tokens"]
+            and not expected_usage["output_tokens"]
+        ):
+            expected_usage["input_tokens"] = expected_usage[
+                "total_tokens"
+            ]
+        for field, expected_value in expected_usage.items():
+            observed_value = op.get(field)
+            if (
+                isinstance(observed_value, bool)
+                or not isinstance(observed_value, int)
+                or observed_value != expected_value
+            ):
+                raise PatchRejected(
+                    [
+                        f"run telemetry {field} disagrees with its durable "
+                        "scheduler result"
+                    ]
+                )
+        for field in ("wall_time_seconds", "peak_memory_mb"):
+            if isinstance(op.get(field), bool):
+                raise PatchRejected(
+                    [f"run telemetry {field} is not finite numeric data"]
+                )
+            try:
+                observed_value = float(op.get(field) or 0.0)
+                expected_value = float(result_execution.get(field) or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                raise PatchRejected(
+                    [f"run telemetry {field} is not finite numeric data"]
+                )
+            if not math.isfinite(observed_value) or not math.isclose(
+                observed_value,
+                expected_value,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise PatchRejected(
+                    [
+                        f"run telemetry {field} disagrees with its durable "
+                        "scheduler result"
+                    ]
+                )
+        execution_contract = json_loads(
+            dispatch["execution_contract_json"], None
+        )
+        if not isinstance(execution_contract, Mapping):
+            raise PatchRejected(
+                ["run telemetry scheduler execution contract is malformed"]
+            )
+        expected_text_fields = {
+            "session_id": result_execution.get("session_id", ""),
+            "model_profile": result_plan.get("model_profile", "default"),
+            "model": result_execution.get("model")
+            or execution_contract.get("model", ""),
+            "reasoning_effort": result_execution.get("reasoning_effort")
+            or execution_contract.get("reasoning_effort", ""),
+            "sandbox_setting": result_execution.get("sandbox")
+            or execution_contract.get("sandbox", ""),
+            "search_setting": result_execution.get("web_search")
+            or result_plan.get("web_search")
+            or "disabled",
+            "prompt_context_hash": result_plan.get("context_hash", ""),
+            "search_intent": result_plan.get("search_intent", ""),
+            "strategy_family": result_plan.get("strategy_family", ""),
+            "failure_kind": result_execution.get("failure_kind", ""),
+        }
+        for field, expected_value in expected_text_fields.items():
+            if str(op.get(field) or "") != str(expected_value or ""):
+                raise PatchRejected(
+                    [
+                        f"run telemetry {field} disagrees with its durable "
+                        "scheduler result"
+                    ]
+                )
+        result_patch = result_execution.get("patch")
+        patch_accepted = False
+        if not result_validation_errors and isinstance(result_patch, Mapping):
+            result_patch_id = str(result_patch.get("patch_id") or "")
+            patch_row = conn.execute(
+                "SELECT status FROM patches WHERE patch_id = ?",
+                (result_patch_id,),
+            ).fetchone()
+            patch_accepted = bool(
+                patch_row is not None
+                and str(patch_row["status"] or "") == "applied"
+            )
+        expected_status = str(result_execution.get("status") or "completed")
+        if not patch_accepted and expected_status not in {
+            "failed",
+            "timeout",
+            "no_patch",
+            "cancelled",
+            "blocked",
+        }:
+            expected_status = "patch_rejected"
+        if str(op.get("status") or "completed") != expected_status:
+            raise PatchRejected(
+                [
+                    "run telemetry status disagrees with its durable scheduler "
+                    "result and patch outcome"
+                ]
+            )
+
+        expected_output_ids: list[str] = []
+        if patch_accepted and isinstance(result_patch, Mapping):
+            for operation in result_patch.get("operations", []):
+                if not isinstance(operation, Mapping):
+                    continue
+                operation_kind = next(
+                    (
+                        str(operation.get(key))
+                        for key in (
+                            "op",
+                            "operation_type",
+                            "operation",
+                            "operation_name",
+                            "type",
+                        )
+                        if isinstance(operation.get(key), str)
+                        and operation.get(key)
+                    ),
+                    "",
+                )
+                if operation_kind not in {"attach_artifact", "add_artifact"}:
+                    continue
+                artifact = operation.get("artifact")
+                artifact_id = (
+                    artifact.get("artifact_id")
+                    if isinstance(artifact, Mapping)
+                    else operation.get("artifact_id")
+                )
+                if isinstance(artifact_id, str):
+                    expected_output_ids.append(artifact_id)
+        if op.get("output_artifact_ids", []) != expected_output_ids:
+            raise PatchRejected(
+                [
+                    "run telemetry output artifact identifiers disagree with "
+                    "its durable scheduler result"
+                ]
+            )
+        if state_revision != context_revision:
+            raise PatchRejected(
+                ["dispatched run state and context revisions must agree"]
+            )
+        if context_revision <= decision_state_revision:
+            raise PatchRejected(
+                [
+                    "dispatched run context must include the durable dispatch "
+                    "revision"
+                ]
+            )
+    elif dispatched_action_hash:
+        raise PatchRejected(
+            ["run action hash requires a scheduler dispatch identifier"]
+        )
+    spent = run_spend_from_operation(op)
+    budget_overrun = 0
+    new_remaining: int | None = None
+    if spent:
+        if problem_id:
+            row = conn.execute(
+                "SELECT remaining_token_budget, reserved_verification_budget "
+                "FROM problem_state WHERE problem_id = ?",
+                (problem_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT remaining_token_budget, reserved_verification_budget "
+                "FROM problem_state"
+            ).fetchone()
+        remaining = int(row["remaining_token_budget"]) if row else 0
+        reserve = int(row["reserved_verification_budget"]) if row else 0
+        requested = max(0, int(op.get("budget_requested", 0)))
+        if run_may_use_verification_reserve(op):
+            new_remaining = max(0, remaining - spent)
+            reserve_overrun = 0
+        else:
+            spendable = max(0, remaining - reserve)
+            new_remaining = max(reserve, remaining - min(spent, spendable))
+            reserve_overrun = max(0, spent - spendable)
+        budget_overrun = max(
+            reserve_overrun,
+            max(0, spent - requested) if requested else 0,
+        )
     conn.execute(
         """
-        INSERT OR REPLACE INTO runs(
+        INSERT INTO runs(
             run_id, actor_role, mode, target_id, route_id, state_revision, context_revision,
             session_id, model_profile, model, reasoning_effort, search_setting,
-            search_intent, researcher_work_mode, work_mode_source, failure_kind,
+            search_intent, strategy_family, researcher_work_mode, work_mode_source, failure_kind,
+            selection_design, assignment_probability, exploration_stratum,
+            candidate_set_hash, selection_policy_version,
+            decision_trace_json,
             sandbox_setting, budget_requested, input_tokens, cached_input_tokens,
             output_tokens, reasoning_output_tokens, total_tokens, wall_time_seconds,
             peak_memory_mb, status,
-            prompt_context_hash, output_artifact_ids_json, error_artifact_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            prompt_context_hash, output_artifact_ids_json, error_artifact_id, created_at,
+            decision_state_revision, scheduler_dispatch_id, dispatched_action_hash,
+            budget_overrun_tokens
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -4126,17 +6528,24 @@ def _record_run(conn: sqlite3.Connection, op: Dict[str, Any], *, problem_id: str
             mode,
             op.get("target_id", ""),
             op.get("route_id", ""),
-            int(op.get("state_revision", 0)),
-            int(op.get("context_revision", 0)),
+            state_revision,
+            context_revision,
             op.get("session_id", ""),
             op.get("model_profile", "standard"),
             op.get("model", ""),
             op.get("reasoning_effort", ""),
             op.get("search_setting", "disabled"),
             op.get("search_intent", ""),
+            op.get("strategy_family", "unclassified"),
             op.get("researcher_work_mode", ""),
             op.get("work_mode_source", ""),
             op.get("failure_kind", ""),
+            selection_design,
+            assignment_probability,
+            exploration_stratum,
+            candidate_set_hash,
+            selection_policy_version,
+            json_dumps(decision_trace),
             op.get("sandbox_setting", "workspace-write"),
             int(op.get("budget_requested", 0)),
             int(op.get("input_tokens", 0)),
@@ -4150,27 +6559,44 @@ def _record_run(conn: sqlite3.Connection, op: Dict[str, Any], *, problem_id: str
             op.get("prompt_context_hash", ""),
             json_dumps(op.get("output_artifact_ids", [])),
             op.get("error_artifact_id", ""),
-            utc_now(),
+            str(op.get("created_at") or utc_now()),
+            decision_state_revision,
+            scheduler_dispatch_id or None,
+            dispatched_action_hash,
+            budget_overrun,
         ),
     )
-    spent = run_spend_from_operation(op)
-    if spent:
-        if problem_id:
-            row = conn.execute(
-                "SELECT remaining_token_budget FROM problem_state WHERE problem_id = ?", (problem_id,)
-            ).fetchone()
-        else:
-            row = conn.execute("SELECT remaining_token_budget FROM problem_state").fetchone()
-        remaining = int(row["remaining_token_budget"]) if row else 0
+    if not scheduler_dispatch_id:
+        # Direct/legacy telemetry still advances fairness.  Normal workflow
+        # executions cite a prior dispatch and cannot apply it twice.
+        _update_scheduler_fairness_state(
+            conn,
+            decision_trace=decision_trace,
+            run_id=run_id,
+            selection_design=selection_design,
+        )
+        _update_scheduler_decision_fairness_state(
+            conn,
+            decision_trace=decision_trace,
+            run_id=run_id,
+            selection_design=selection_design,
+            state_revision=decision_state_revision,
+        )
+    append_scheduler_provenance_entry(
+        conn,
+        record_kind="run",
+        record_id=run_id,
+    )
+    if spent and new_remaining is not None:
         if problem_id:
             conn.execute(
                 "UPDATE problem_state SET remaining_token_budget = ?, updated_at = ? WHERE problem_id = ?",
-                (max(0, remaining - spent), utc_now(), problem_id),
+                (new_remaining, utc_now(), problem_id),
             )
         else:
             conn.execute(
                 "UPDATE problem_state SET remaining_token_budget = ?, updated_at = ?",
-                (max(0, remaining - spent), utc_now()),
+                (new_remaining, utc_now()),
             )
 
 
@@ -4721,6 +7147,13 @@ def _write_artifact_content(
     if artifact_type == REVISION_DOCUMENT_ARTIFACT_TYPE:
         document_format = str((metadata or {}).get("document_format") or "").strip().lower()
         suffix = ".tex" if document_format == "tex" else ".md"
+    elif artifact_type in {"audit_subject", "reference_solution"}:
+        source_format = str(
+            (metadata or {}).get("format")
+            or (metadata or {}).get("stored_format")
+            or ""
+        ).strip().lower()
+        suffix = f".{source_format}" if source_format in {"md", "tex", "txt"} else ".md"
     else:
         suffix = ARTIFACT_CONTENT_EXTENSIONS.get(
             artifact_type, ".md" if artifact_type in markdown_types else ".txt"
@@ -4740,12 +7173,45 @@ def _copy_artifact_file(
     source_path: Path,
     *,
     artifact_files: _ArtifactFileJournal,
+    expected_sha256: str = "",
+    expected_size: Optional[int] = None,
 ) -> Path:
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", artifact_id).strip("._") or "artifact"
     suffix = ARTIFACT_CONTENT_EXTENSIONS.get(artifact_type) or source_path.suffix or ".txt"
     destination = store.state_dir / "artifacts" / f"{safe_id}{suffix}"
     if source_path.resolve() != destination.resolve():
-        artifact_files.write_bytes(destination, source_path.read_bytes())
+        artifact_files.copy_stable_file(
+            destination,
+            source_path,
+            max_bytes=MAX_COPIED_ARTIFACT_BYTES,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+        )
+    else:
+        try:
+            source_sha256, source_size = stable_file_sha256_size(
+                source_path,
+                max_bytes=MAX_COPIED_ARTIFACT_BYTES,
+                label="artifact source",
+            )
+        except ValueError as exc:
+            raise PatchRejected(
+                [str(exc)]
+            ) from exc
+        if expected_size is not None and source_size != expected_size:
+            raise PatchRejected(
+                [
+                    "artifact source size changed since result persistence: "
+                    f"{source_path}"
+                ]
+            )
+        if expected_sha256 and source_sha256 != expected_sha256:
+            raise PatchRejected(
+                [
+                    "artifact source content changed since result persistence: "
+                    f"{source_path}"
+                ]
+            )
     return destination.resolve()
 
 
@@ -4821,6 +7287,53 @@ def _guard_artifact_actor(actor: str, artifact_type: str, artifact_id: str) -> N
         raise PatchRejected([f"{actor} cannot attach {artifact_type} artifact {artifact_id}; expected {expected}"])
 
 
+def _has_valid_formal_backend_result(
+    conn: sqlite3.Connection,
+    evidence_ids: Sequence[str],
+    *,
+    target_type: str,
+    target_id: str,
+) -> bool:
+    for artifact_id in evidence_ids:
+        row = conn.execute(
+            "SELECT artifact_type, producer_role, metadata_json FROM artifacts WHERE artifact_id = ?",
+            (artifact_id,),
+        ).fetchone()
+        if (
+            row is None
+            or str(row["artifact_type"] or "") != "formal_backend_result"
+            or str(row["producer_role"] or "") != "formal_backend"
+        ):
+            continue
+        metadata = json_loads(row["metadata_json"], {})
+        host_check = metadata.get("host_formal_check") if isinstance(metadata, Mapping) else None
+        if not isinstance(host_check, Mapping) or host_check.get("host_checked") is not True:
+            continue
+        target_binding = (
+            metadata.get("host_formal_target_binding")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        if not isinstance(target_binding, Mapping):
+            continue
+        if (
+            str(target_binding.get("target_type") or "") != target_type
+            or str(target_binding.get("target_id") or "") != target_id
+            or str(target_binding.get("subject_digest") or "")
+            != entity_subject_digest(conn, target_type, target_id)
+        ):
+            continue
+        if _artifact_is_bound_to_entity(
+            conn,
+            str(artifact_id),
+            metadata,
+            target_type=target_type,
+            target_id=target_id,
+        ):
+            return True
+    return False
+
+
 def _has_artifact_type(
     conn: sqlite3.Connection,
     evidence_ids: Sequence[str],
@@ -4877,6 +7390,25 @@ def _artifact_is_bound_to_entity(
     target_type: str,
     target_id: str,
 ) -> bool:
+    if artifact_has_current_binding(
+        conn,
+        artifact_id,
+        entity_type=target_type,
+        entity_id=target_id,
+    ):
+        return True
+    artifact_row = conn.execute(
+        "SELECT state_revision FROM artifacts WHERE artifact_id = ?",
+        (artifact_id,),
+    ).fetchone()
+    current_row = conn.execute("SELECT current_revision FROM problem_state").fetchone()
+    is_new_in_current_patch = bool(
+        artifact_row
+        and current_row
+        and int(artifact_row["state_revision"] or 0) == int(current_row["current_revision"] or 0) + 1
+    )
+    if not is_new_in_current_patch:
+        return False
     declared_targets = evidence_targets(metadata)
     if declared_targets:
         return evidence_matches_target(metadata, target_type=target_type, target_id=target_id)

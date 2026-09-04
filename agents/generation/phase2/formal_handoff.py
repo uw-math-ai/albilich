@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -11,7 +13,10 @@ VERIFIED = {"informally_verified", "formally_verified"}
 
 
 def build_formalization_manifest(store: ProofStateStore, *, claim_id: str = "root", route_id: Optional[str] = None) -> Dict[str, Any]:
-    state = store.get_state()
+    with store.connect() as conn:
+        conn.execute("BEGIN")
+        audit_heads = store.audit_chain_heads(conn)
+        state = store.snapshot_from_conn(conn, include_audit_journal=False)
     claim = next((row for row in state["claims"] if row["claim_id"] == claim_id), None)
     if claim is None:
         raise ValueError(f"unknown claim: {claim_id}")
@@ -27,6 +32,7 @@ def build_formalization_manifest(store: ProofStateStore, *, claim_id: str = "roo
         "created_at": utc_now(),
         "problem_id": store.problem_id,
         "state_revision": state["problem_state"]["current_revision"],
+        "audit_chain_heads": audit_heads,
         "claim": _claim_card(claim),
         "route": route,
         "verified_claims": [_claim_card(row) for row in state["claims"] if row["validation_status"] in VERIFIED],
@@ -43,7 +49,24 @@ def write_formalization_manifest(store: ProofStateStore, *, claim_id: str = "roo
     manifest = build_formalization_manifest(store, claim_id=claim_id, route_id=route_id)
     path = store.state_dir / "formal_handoff" / f"{claim_id}_manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+    descriptor, raw_temporary_path = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(raw_temporary_path)
+    try:
+        payload = json.dumps(
+            manifest, indent=2, sort_keys=True, ensure_ascii=False
+        ).encode("utf-8")
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
     return path
 
 

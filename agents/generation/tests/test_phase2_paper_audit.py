@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,7 @@ from agents.generation.phase2.codex_runner import actor_role_for_action, build_s
 from agents.generation.phase2.completion_policy import latest_root_intent_resolution
 from agents.generation.phase2.context_builder import build_context_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch
 from agents.generation.phase2.report import build_markdown_report
 from agents.generation.phase2.research_policy import (
     RESEARCH_MODES,
@@ -46,6 +47,10 @@ from agents.generation.phase2.scheduler import (
     parallel_companion_actions,
 )
 from agents.generation.phase2.store import ProofStateStore
+from agents.generation.tests._phase2_test_support import (
+    certify_and_integrate_claim,
+    strictly_verify_entities,
+)
 
 # A synthetic submitted "proof" with a known hidden gap: step 2 silently
 # assumes the group is abelian, which the hypotheses never grant.
@@ -75,26 +80,12 @@ def make_solved_store(tmpdir: Path, problem_id: str) -> ProofStateStore:
     """Store with an integrated root plus a final_proof certificate."""
     store = ProofStateStore(problem_id, generation_root=tmpdir / "generation")
     store.init_problem("prove the root theorem")
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute(
-            "INSERT INTO routes(route_id, conclusion_claim_id, label, strategy, status, relation_to_parent,"
-            " assumptions_json, conditions_json, evidence_artifact_ids_json, failure_fingerprint, created_at, updated_at)"
-            " VALUES ('route-root', 'root', 'root route', 'direct', 'integrated', 'sufficient',"
-            " '[]', '[]', '[]', '', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
-        )
-        conn.execute(
-            "UPDATE claims SET lifecycle_status='integrated', validation_status='informally_verified'"
-            " WHERE claim_id='root'"
-        )
-        conn.execute(
-            "INSERT INTO inferences(inference_id, route_id, conclusion_claim_id, explanation,"
-            " conditions_json, condition_claim_ids_json, validation_status, evidence_artifact_ids_json,"
-            " created_at, updated_at)"
-            " VALUES ('inf-root', 'route-root', 'root', 'Verified direct proof of the root claim.',"
-            " '[]', '[]', 'informally_verified', '[]',"
-            " '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
-        )
-        conn.commit()
+    certify_and_integrate_claim(
+        store,
+        claim_id="root",
+        route_id="route-root",
+        inference_id="inf-root",
+    )
     outcome = apply_patch(
         store,
         {
@@ -438,7 +429,7 @@ class PaperAuditSchedulerTest(unittest.TestCase):
             )
             self.assertEqual([], manifest["routes"])
             self.assertEqual([], manifest["inferences"])
-            self.assertEqual([], manifest["debts"])
+            self.assertEqual([], manifest["proof_obligations"])
             self.assertEqual([], manifest["retrieval_cards"])
             self.assertEqual([], manifest["theorem_library"])
             self.assertEqual("strict_verifier", manifest["patch_contract"]["context_role"])
@@ -628,7 +619,7 @@ class PaperAuditContractTest(unittest.TestCase):
     def test_verifier_directive_uses_bounded_packets(self) -> None:
         prompt = self._prompt("strict_informal_verifier", {"mode": "prove", "route_id": "r1"})
         self.assertIn("Verify one paper claim at a time", prompt)
-        self.assertIn("proof_dossier attached by the researcher", prompt)
+        self.assertIn("proof_draft attached by the researcher", prompt)
         self.assertIn("Never use proposed_repair artifacts as evidence", prompt)
 
     def test_verifier_only_document_directives_forbid_repair_and_packaging(self) -> None:
@@ -641,7 +632,7 @@ class PaperAuditContractTest(unittest.TestCase):
             },
         )
         self.assertIn("VERIFIER-ONLY DOCUMENT REVIEW", prompt)
-        self.assertIn("do not request proof_dossier packaging", prompt)
+        self.assertIn("do not request proof_draft packaging", prompt)
         self.assertIn("Attach exactly one verification_report", prompt)
         self.assertIn("Do not use errata", prompt)
 
@@ -673,7 +664,7 @@ class PaperAuditContractTest(unittest.TestCase):
 
     def test_researcher_directive_requires_normal_proof_route_packet(self) -> None:
         prompt = self._prompt("researcher")
-        self.assertIn("attach one proof_dossier", prompt)
+        self.assertIn("attach one proof_draft", prompt)
         self.assertIn("add one active sufficient route", prompt)
         self.assertIn("add a terminal plausible inference", prompt)
         self.assertIn("premise_claim_ids", prompt)
@@ -754,7 +745,7 @@ class PaperAuditVerificationPipelineTest(unittest.TestCase):
                 {AUDIT_SUBJECT_ARTIFACT_ID, "paper-proof-packet-1"},
                 {artifact["artifact_id"] for artifact in manifest["artifacts"]},
             )
-            self.assertEqual([], manifest["debts"])
+            self.assertEqual([], manifest["proof_obligations"])
             self.assertEqual([], manifest["retrieval_cards"])
             self.assertEqual([], manifest["theorem_library"])
             self.assertEqual(
@@ -764,7 +755,7 @@ class PaperAuditVerificationPipelineTest(unittest.TestCase):
                     for artifact in manifest["verification_packet"]["proof_artifacts"]
                 ],
             )
-            self.assertEqual([], manifest["verification_packet"]["active_debts"])
+            self.assertEqual([], manifest["verification_packet"]["active_proof_obligations"])
             serialized = json.dumps(manifest, sort_keys=True)
             self.assertNotIn("unrelated-counterexample-1", serialized)
             self.assertNotIn("unrelated-counterexample-debt", serialized)
@@ -788,16 +779,13 @@ class PaperAuditVerificationPipelineTest(unittest.TestCase):
             self.assertEqual("paper-route-1", strict_action["route_id"])
             self.assertEqual("strict_informal_verifier", actor_role_for_action(strict_action))
 
-            with store.connect() as conn:
-                conn.execute(
-                    "UPDATE claims SET validation_status='informally_verified' "
-                    "WHERE claim_id IN ('paper-theorem-1', 'paper-theorem-1-hypothesis')"
-                )
-                conn.execute(
-                    "UPDATE inferences SET validation_status='informally_verified' "
-                    "WHERE inference_id='paper-inference-1'"
-                )
-                conn.commit()
+            strictly_verify_entities(
+                store,
+                target_id="paper-theorem-1",
+                claim_ids=["paper-theorem-1-hypothesis", "paper-theorem-1"],
+                inference_ids=["paper-inference-1"],
+                artifact_id="verification-paper-theorem-1",
+            )
 
             integration_action = next_action(
                 store,

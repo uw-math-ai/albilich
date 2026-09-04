@@ -14,7 +14,7 @@ from .writing.revision import latest_revision_document, revision_document_format
 SOLVED_RELATIONS = {"exact", "equivalent", "stronger"}
 PARTIAL_RELATIONS = {"weaker", "conditional", "partial", "method", "background", "orthogonal", "unknown"}
 
-# Report-facing outcome vocabulary (2026-07-09 TODO 7): the final report must
+# Report-facing outcome vocabulary: the final report must
 # distinguish these five outcomes (plus in_progress while the run is live).
 REPORT_CLASSIFICATIONS = {
     "full_theorem_solved",
@@ -70,7 +70,7 @@ def classify_state(state: Mapping[str, Any]) -> Dict[str, Any]:
     elif any(row["status"] == "active" for row in state.get("debts", [])):
         public_status = "unresolved_with_debt"
         result_kind = "unresolved"
-        summary = "The root theorem is unresolved and active proof debt remains."
+        summary = "The root theorem is unresolved and active proof obligations remain."
     else:
         public_status = "in_progress"
         result_kind = "unresolved"
@@ -166,7 +166,7 @@ def _classify_writing_revision(
         classification = "writing_revision_in_progress"
         summary = "The external manuscript is still moving through writing revision and audit."
     obligations = [
-        f"{debt.get('severity', 'debt')}: {debt.get('obligation', '')}" for debt in gating_debts[:8]
+        f"{debt.get('severity', 'proof obligation')}: {debt.get('obligation', '')}" for debt in gating_debts[:8]
     ]
     obligations.extend(f"run the {lens.replace('_', ' ')} audit" for lens in missing_lenses)
     problem = state.get("problem_state", {})
@@ -190,7 +190,7 @@ def _classify_writing_revision(
 
 
 def _report_classification(public_status: str, root: Mapping[str, Any], partials: list[Dict[str, Any]]) -> str:
-    """Five-way report outcome (TODO 7): full theorem solved, weaker theorem
+    """Five-way report outcome: full theorem solved, weaker theorem
     proved, conditional proof, partial progress, or statement likely false."""
     if str(root.get("validation_status") or "") == "refuted":
         return "statement_likely_false"
@@ -339,7 +339,7 @@ def _remaining_obligations(state: Mapping[str, Any], public_status: str) -> list
         return obligations
     active_debts = [row for row in state.get("debts", []) if row.get("status") == "active"]
     for debt in active_debts[:8]:
-        obligations.append(f"{debt.get('severity', 'debt')}: {debt.get('obligation', '')}")
+        obligations.append(f"{debt.get('severity', 'proof obligation')}: {debt.get('obligation', '')}")
     if public_status == "certified_partial_progress":
         obligations.append("The root theorem still requires an exact, equivalent, or stronger verified route.")
     return obligations

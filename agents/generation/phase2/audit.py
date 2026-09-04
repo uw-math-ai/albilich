@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Paper solution audit mode (2026-07-09 TODO 6): a conservative referee.
+"""Paper solution audit mode: a conservative referee.
 
 ``--research-mode paper_solution_audit`` (or the ``audit-paper`` CLI command)
 turns a submitted LaTeX/markdown/pasted proof into the AUDIT SUBJECT: the
@@ -10,7 +10,7 @@ existing roles are reused at the directive level:
 - researcher/verifier decompose the document into paper_claims (existing
   claims tagged with the conventions below), check local implications first,
   and mark each claim with the audit status vocabulary;
-- the villain hunts hidden hypotheses, counterexamples, and notation
+- the adversarial reviewer hunts hidden hypotheses, counterexamples, and notation
   mismatches in the submitted argument;
 - the literature researcher checks citations exactly (source + theorem number
   + hypotheses) through the existing retrieval machinery;
@@ -28,7 +28,8 @@ artifacts use artifact_type ``proposed_repair`` and are rendered in their own
 report section, never merged into the claim map.
 
 Verification pipeline: the researcher transcribes each submitted
-statement/proof pair into an immutable ``proof_dossier`` packet and creates a
+statement/proof pair into an immutable proof record (stored under the legacy
+internal artifact type ``proof_dossier``) and creates a
 paper claim, a sufficient route, and a terminal inference backed by that
 packet.  The ordinary strict informal verifier then checks the author's local
 argument, and the integration verifier checks the verified dependency route.
@@ -39,7 +40,10 @@ research instead of treating referee labels as verification authority.
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
-from .models import json_dumps, json_loads, sha256_text, utc_now
+from .bounded_io import read_bounded_text
+from .models import SCHEMA_VERSION, json_loads, sha256_text
+
+MAX_AUDIT_DOCUMENT_BYTES = 8 * 1024 * 1024
 
 PAPER_AUDIT_RESEARCH_MODE = "paper_solution_audit"
 AUDIT_SUBJECT_ARTIFACT_TYPE = "audit_subject"
@@ -160,7 +164,11 @@ def ingest_paper_audit(
     from .completion_policy import record_root_intent_resolution
 
     document = Path(document)
-    text = document.read_text(encoding="utf-8")
+    text = read_bounded_text(
+        document,
+        max_bytes=MAX_AUDIT_DOCUMENT_BYTES,
+        label="paper audit document",
+    )
     resolved_title = title.strip() or document_title(text, fallback=document.stem.replace("_", " "))
     root_statement = audit_root_statement(resolved_title)
     init_kwargs: Dict[str, Any] = {}
@@ -171,45 +179,78 @@ def ingest_paper_audit(
     store.init_problem(root_statement, **init_kwargs)
 
     suffix = document.suffix.lower() if document.suffix.lower() in {".tex", ".md", ".txt"} else ".md"
-    artifact_dir = store.state_dir / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifact_dir / f"{AUDIT_SUBJECT_ARTIFACT_ID}{suffix}"
-    artifact_path.write_text(text, encoding="utf-8")
-    now = utc_now()
     metadata = {
         "source_file": str(document),
         "title": resolved_title,
         "format": suffix.lstrip("."),
+        "original_sha256": sha256_text(text),
         "role": "audit_subject",
         "note": "This document is the object under audit, not proof-state evidence produced by the run.",
     }
+    from .patches import apply_operator_patch
+
     with store.connect() as conn:
-        revision = int(store.get_problem_row(conn)["current_revision"])
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO artifacts(
-                artifact_id, artifact_type, path, sha256, producer_role, run_id,
-                state_revision, content_summary, metadata_json, created_at
-            ) VALUES (?, ?, ?, ?, 'human_operator', '', ?, ?, ?, ?)
-            """,
-            (
-                AUDIT_SUBJECT_ARTIFACT_ID,
-                AUDIT_SUBJECT_ARTIFACT_TYPE,
-                str(artifact_path),
-                sha256_text(text),
-                revision,
-                f"Submitted proof document under audit: {resolved_title}"[:500],
-                json_dumps(metadata),
-                now,
-            ),
+        existing = conn.execute(
+            "SELECT path, artifact_type, metadata_json FROM artifacts WHERE artifact_id = ?",
+            (AUDIT_SUBJECT_ARTIFACT_ID,),
+        ).fetchone()
+    newly_attached = existing is None
+    outcome = None
+    if existing is not None:
+        existing_metadata = json_loads(existing["metadata_json"], {})
+        if not isinstance(existing_metadata, Mapping):
+            existing_metadata = {}
+        if (
+            str(existing["artifact_type"] or "") != AUDIT_SUBJECT_ARTIFACT_TYPE
+            or str(existing_metadata.get("original_sha256") or "") != metadata["original_sha256"]
+        ):
+            raise ValueError(
+                f"audit problem {store.problem_id!r} already has a different immutable audit subject"
+            )
+    else:
+        revision = store.get_revision()
+        outcome = apply_operator_patch(
+            store,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "problem_id": store.problem_id,
+                "base_revision": revision,
+                "actor_role": "human_operator",
+                "target_id": AUDIT_SUBJECT_ARTIFACT_ID,
+                "operations": [
+                    {
+                        "op": "attach_artifact",
+                        "artifact_id": AUDIT_SUBJECT_ARTIFACT_ID,
+                        "artifact_type": AUDIT_SUBJECT_ARTIFACT_TYPE,
+                        "content": text,
+                        "content_summary": f"Submitted proof document under audit: {resolved_title}"[:500],
+                        "metadata": metadata,
+                    }
+                ],
+                "evidence_artifact_ids": [],
+                "rationale": "ingest the operator-submitted document as the immutable audit subject",
+            },
         )
-        store.write_event(
-            conn,
-            revision,
-            PAPER_AUDIT_INGESTED_EVENT,
-            {"artifact_id": AUDIT_SUBJECT_ARTIFACT_ID, "title": resolved_title, "source_file": str(document)},
-        )
-        conn.commit()
+        if not outcome.accepted:
+            raise RuntimeError("audit-subject patch rejected: " + "; ".join(outcome.errors))
+    with store.connect() as conn:
+        artifact = conn.execute(
+            "SELECT path FROM artifacts WHERE artifact_id = ?", (AUDIT_SUBJECT_ARTIFACT_ID,)
+        ).fetchone()
+        artifact_path = Path(str(artifact["path"]))
+        if newly_attached and outcome is not None:
+            store.write_event(
+                conn,
+                outcome.revision,
+                PAPER_AUDIT_INGESTED_EVENT,
+                {
+                    "artifact_id": AUDIT_SUBJECT_ARTIFACT_ID,
+                    "title": resolved_title,
+                    "source_file": str(document),
+                    "patch_id": outcome.patch_id,
+                },
+            )
+            conn.commit()
     intent = record_root_intent_resolution(store, research_mode=PAPER_AUDIT_RESEARCH_MODE)
     return {
         "problem_id": store.problem_id,
@@ -328,9 +369,10 @@ def paper_audit_context_card(state: Mapping[str, Any]) -> Dict[str, Any]:
         "verification_pipeline": {
             "stages": ["researcher_packet", "strict_informal_verifier", "integration_verifier"],
             "researcher_packet": (
-                "For each theorem, lemma, or decisive proof segment, attach one proof_dossier containing the "
+                "For each theorem, lemma, or decisive proof segment, attach one proof record containing the "
                 "author's statement and proof as written; add a paper_claim, a sufficient route concluding it, "
-                "and a terminal inference whose evidence_artifact_ids contains that dossier. Represent the "
+                "and a terminal inference whose evidence_artifact_ids contains that proof record. Use the "
+                "compatibility artifact type proof_dossier for this record. Represent the "
                 "paper's explicit hypotheses/ambient assumptions as premise claims; terminal inferences never "
                 "use an empty premise list."
             ),
@@ -491,6 +533,10 @@ def _artifact_content(artifact: Mapping[str, Any]) -> str:
     if not path:
         return ""
     try:
-        return Path(path).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        return read_bounded_text(
+            Path(path),
+            max_bytes=MAX_AUDIT_DOCUMENT_BYTES,
+            label="paper audit artifact",
+        )
+    except (OSError, UnicodeDecodeError, ValueError):
         return ""

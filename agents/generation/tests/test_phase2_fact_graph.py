@@ -43,10 +43,14 @@ from agents.generation.phase2.fact_graph import (
 )
 from agents.generation.phase2.memory_policy import claim_memory_status
 from agents.generation.phase2.models import SCHEMA_VERSION, utc_now
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch
 from agents.generation.phase2.report import build_markdown_report
 from agents.generation.phase2.scheduler import _branch_packet_card
 from agents.generation.phase2.store import ProofStateStore
+from agents.generation.tests._phase2_test_support import (
+    journal_legacy_fixture_mutation,
+    strictly_verify_entities,
+)
 
 
 def _make_store(tmpdir: str, problem_id: str) -> ProofStateStore:
@@ -73,9 +77,14 @@ def _apply(store: ProofStateStore, operations: list[dict], *, actor_role: str = 
 
 
 def _sql(store: ProofStateStore, statement: str, params: tuple = ()) -> None:
-    with closing(store.connect()) as conn:
+    def mutation(conn, _state_revision: int) -> None:
         conn.execute(statement, params)
-        conn.commit()
+
+    journal_legacy_fixture_mutation(
+        store,
+        mutation,
+        fixture_id=f"fact-graph-sql-{store.get_revision() + 1}",
+    )
 
 
 def _seed_graph_problem(store: ProofStateStore) -> None:
@@ -171,21 +180,95 @@ def _seed_graph_problem(store: ProofStateStore) -> None:
         ],
         actor_role="literature_researcher",
     )
-    # Status shaping that patch ops gate behind evidence rules: direct SQL.
-    for claim_id in ("lemma-done", "lemma-base"):
-        _sql(store, "UPDATE claims SET validation_status = 'informally_verified' WHERE claim_id = ?", (claim_id,))
-    _sql(store, "UPDATE claims SET validation_status = 'refuted' WHERE claim_id = 'lemma-bad'")
-    _sql(store, "UPDATE claims SET validation_status = 'challenged' WHERE claim_id = 'lemma-chal'")
-    _sql(store, "UPDATE claims SET lifecycle_status = 'superseded' WHERE claim_id = 'lemma-old'")
+    strictly_verify_entities(
+        store,
+        target_id="lemma-done",
+        claim_ids=["lemma-done", "lemma-base"],
+        inference_ids=["inf-base"],
+        artifact_id="verification-comb-base",
+    )
+    _apply(
+        store,
+        [
+            {
+                "op": "attach_artifact",
+                "artifact_id": "refutation-smoothing",
+                "artifact_type": "verification_report",
+                "content": "The proposed universal smoothing assertion is false.",
+                "metadata": {
+                    "verdict": "refuted",
+                    "target_id": "lemma-bad",
+                    "verification_report": {
+                        "critical_errors": [],
+                        "gaps": [],
+                        "blocking_gap": False,
+                    },
+                },
+            },
+            {
+                "op": "propose_status_transition",
+                "target_type": "claim",
+                "target_id": "lemma-bad",
+                "status_type": "validation",
+                "new_status": "refuted",
+                "evidence_artifact_ids": ["refutation-smoothing"],
+            },
+            {
+                "op": "attach_artifact",
+                "artifact_id": "verification-debt-fixed",
+                "artifact_type": "verification_report",
+                "content": "The corrected argument discharges the exact fixed-source obligation.",
+                "metadata": {
+                    "verdict": "informally_verified",
+                    "verification_report": {
+                        "checked_items": ["the exact fixed-source obligation"],
+                        "critical_errors": [],
+                        "gaps": [],
+                        "blocking_gap": False,
+                    },
+                },
+            },
+            {
+                "op": "resolve_debt",
+                "debt_id": "debt-fixed",
+                "resolution_evidence_artifact_ids": [
+                    "verification-debt-fixed",
+                    "verification-comb-base",
+                ],
+                "resolution_evidence": {"explanation": "The correction was independently verified."},
+            },
+        ],
+        actor_role="strict_informal_verifier",
+    )
+    _apply(
+        store,
+        [
+            {
+                "op": "propose_status_transition",
+                "target_type": "claim",
+                "target_id": "lemma-chal",
+                "status_type": "validation",
+                "new_status": "challenged",
+            },
+            {
+                "op": "propose_status_transition",
+                "target_type": "claim",
+                "target_id": "lemma-old",
+                "status_type": "lifecycle",
+                "new_status": "superseded",
+            },
+            {
+                "op": "propose_status_transition",
+                "target_type": "route",
+                "target_id": "route-dead",
+                "status_type": "route",
+                "new_status": "abandoned",
+            },
+        ],
+    )
     _sql(
         store,
         "UPDATE claims SET fingerprint = (SELECT fingerprint FROM claims WHERE claim_id = 'lemma-done') WHERE claim_id = 'lemma-twin'",
-    )
-    _sql(store, "UPDATE routes SET status = 'abandoned' WHERE route_id = 'route-dead'")
-    _sql(
-        store,
-        "UPDATE debts SET status = 'resolved', resolution_evidence_json = ? WHERE debt_id = 'debt-fixed'",
-        (json.dumps({"resolution_evidence_artifact_ids": ["done-dossier"]}),),
     )
     # Duplicate retrieval card (same exact_statement): canonicalization fodder.
     _sql(
@@ -260,10 +343,10 @@ class FactGraphNodeTests(unittest.TestCase):
                 for fact in graph.facts_for_branch(cluster.branch_id, verified_only=True, include_inferences=True):
                     self.assertIsInstance(fact, VerifiedFact)
                     self.assertEqual(fact.memory_status, "verified")
-            # route-main's cluster is lemma-main <- lemma-done (inf-base lives
-            # on its own auto route because it concludes lemma-done).
+            # Both certified steps in the dependency ladder belong to the
+            # route-main closure; the unverified conclusion remains excluded.
             verified_ids = {fact.source_id for fact in graph.facts_for_branch("route-main", verified_only=True)}
-            self.assertEqual(verified_ids, {"lemma-done"})
+            self.assertEqual(verified_ids, {"lemma-done", "lemma-base"})
             self.assertNotIn("lemma-main", verified_ids)  # candidate conclusion
             all_ids = {fact.source_id for fact in graph.facts_for_branch("route-main", verified_only=False)}
             self.assertIn("lemma-main", all_ids)
@@ -404,12 +487,12 @@ class FactGraphFirstUseTests(unittest.TestCase):
             packet = _branch_packet_card(state, "route-main", "lemma-main", "main_proof_spine")
             fact_view = packet["fact_graph"]
             self.assertEqual(fact_view["view"], "fact_graph.facts_for_branch(verified_only=True)")
-            self.assertEqual(fact_view["verified_fact_count"], 1)
+            self.assertEqual(fact_view["verified_fact_count"], 2)
             rendered = " | ".join(fact_view["verified_facts"])
             self.assertIn("lemma-done", rendered)
             self.assertNotIn("lemma-main:", rendered)  # candidate facts never enter the settled list
             # Target-only packets (no anchor route) carry no fact-graph view.
-            self.assertNotIn("fact_graph", _branch_packet_card(state, "", "lemma-main", "villain_toy_model"))
+            self.assertNotIn("fact_graph", _branch_packet_card(state, "", "lemma-main", "adversarial_toy_model"))
 
     def test_report_renders_fact_graph_section(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -432,12 +515,11 @@ class FactGraphFirstUseTests(unittest.TestCase):
             main = report["route-main"]
             self.assertEqual(main["classification"], "blocked")  # blocking debt wins
             self.assertTrue(main["blocked"])
-            self.assertEqual(main["depth"], 1)  # lemma-main -> lemma-done inside the cluster
-            self.assertEqual(main["verified_fact_count"], 1)
-            # inf-base's auto route shares lemma-done with route-main: converging.
-            auto = report["route-auto-lemma-done"]
-            self.assertEqual(auto["classification"], "converging")
-            self.assertTrue(auto["converging"])
+            self.assertEqual(main["depth"], 2)  # lemma-main -> lemma-done -> lemma-base
+            self.assertEqual(main["verified_fact_count"], 3)
+            # Inferences remain on their declared route; the graph must not
+            # manufacture a synthetic route for a verified intermediate lemma.
+            self.assertNotIn("route-auto-lemma-done", report)
             dead = report["route-dead"]
             self.assertEqual(dead["classification"], "shallow")
             self.assertFalse(dead["blocked"])

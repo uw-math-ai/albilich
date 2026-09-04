@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Mapping, Optional
 
-CAS_ENABLED_ROLES = frozenset({"researcher", "villain"})
+CAS_ENABLED_ROLES = frozenset({"researcher", "adversarial_reviewer", "villain"})
 CAS_ENABLED_ENV = "ALBILICH_CAS_ENABLED"
 CAS_DISABLED_VALUES = frozenset({"0", "false", "no", "off"})
 ADVISOR_ENABLED_ENV = "ALBILICH_ADVISOR_ENABLED"
@@ -38,7 +38,8 @@ def session_cas_enabled(role: str, action: Optional[Mapping[str, Any]] = None) -
     """Whether one scheduled session should get CAS tooling.
 
     Both work-mode-scheduled mathematicians — the researcher (prover) and the
-    villain (refuter) — get CAS in cas mode (or on a legacy unstamped action)
+    adversarial reviewer (the legacy name was ``villain``) — get CAS in cas
+    mode (or on a legacy unstamped action)
     and run without it in online/offline passes, keeping the loop's separation
     clean. Other roles keep the plain role gate.
     """
@@ -47,7 +48,7 @@ def session_cas_enabled(role: str, action: Optional[Mapping[str, Any]] = None) -
     # research mode / scheduling identical while withholding all CAS tooling.
     if not cas_globally_enabled() or not role_can_use_cas(role):
         return False
-    if role not in {"researcher", "villain"}:
+    if role not in {"researcher", "adversarial_reviewer", "villain"}:
         return True
     work_mode = str((action or {}).get("researcher_work_mode") or "").strip().lower()
     return work_mode not in CAS_SUPPRESSED_WORK_MODES

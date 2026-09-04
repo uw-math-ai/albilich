@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -12,11 +13,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from agents.generation.phase2.budget import run_spend_from_operation
+from agents.generation.phase2.budget import parse_token_usage, run_spend_from_operation
 from agents.generation.phase2.codex_runner import (
+    AggregateProcessTreeRSSGovernor,
     DEFAULT_CODEX_CHILD_DISABLED_FEATURES,
     DEFAULT_CODEX_STALE_RETRY_SECONDS,
     DEFAULT_SANDBOX,
+    MAX_SESSION_USAGE_TAIL_BYTES,
     _codex_child_exec_args,
     _codex_child_env,
     _should_suppress_child_log_line,
@@ -28,6 +31,7 @@ from agents.generation.phase2.codex_runner import (
     resolve_cli_usage,
 )
 from agents.generation.phase2.console import _live_usage_scope
+from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.store import ProofStateStore
 
 
@@ -60,6 +64,107 @@ def token_count_event(total_tokens: int, *, input_tokens: int, output_tokens: in
 
 
 class Phase2TokenUsageTest(unittest.TestCase):
+    def test_builtin_session_enforces_aggregate_child_rss_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_codex = root / "fake_memory_codex.py"
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import time\n"
+                "memory = bytearray(16 * 1024 * 1024)\n"
+                "print('memory-ready', flush=True)\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            store = ProofStateStore(
+                "codex-aggregate-rss-limit-test",
+                generation_root=root / "generation",
+            )
+            store.init_problem("Prove the target theorem.")
+            action = {"mode": "prove", "target_id": "root"}
+            plan = prepare_session(store, action)
+            governor = AggregateProcessTreeRSSGovernor(1.0)
+            old_heartbeat = os.environ.get("ALBILICH_UI_HEARTBEAT_SECONDS")
+            os.environ["ALBILICH_UI_HEARTBEAT_SECONDS"] = "0.05"
+            try:
+                result = execute_session(
+                    store,
+                    action,
+                    plan,
+                    codex_bin=str(fake_codex),
+                    timeout_sec=5,
+                    progress_callback=lambda _progress: None,
+                    stop_event=threading.Event(),
+                    aggregate_rss_governor=governor,
+                    enforce_backend_contract=False,
+                )
+            finally:
+                if old_heartbeat is None:
+                    os.environ.pop("ALBILICH_UI_HEARTBEAT_SECONDS", None)
+                else:
+                    os.environ["ALBILICH_UI_HEARTBEAT_SECONDS"] = old_heartbeat
+
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("resource_limit", result["failure_kind"])
+            self.assertGreater(result["observed_aggregate_peak_memory_mb"], 1.0)
+            self.assertEqual(
+                1.0,
+                result["resource_limits"][
+                    "max_aggregate_child_process_tree_rss_mb"
+                ],
+            )
+            self.assertIn(
+                "aggregate child process-tree RSS",
+                Path(result["log_path"]).read_text(encoding="utf-8"),
+            )
+            self.assertEqual(0, governor.snapshot()["participant_count"])
+
+    def test_tripped_aggregate_limit_blocks_later_child_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launch_marker = root / "launched"
+            fake_codex = root / "must_not_launch.py"
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                f"Path({str(launch_marker)!r}).write_text('launched')\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            store = ProofStateStore(
+                "codex-prelaunch-aggregate-rss-test",
+                generation_root=root / "generation",
+            )
+            store.init_problem("Prove the target theorem.")
+            action = {"mode": "prove", "target_id": "root"}
+            plan = prepare_session(store, action)
+            governor = AggregateProcessTreeRSSGovernor(1.0)
+            stop_event = threading.Event()
+            governor.observe("earlier-child", 2.0, stop_event=stop_event)
+
+            result = execute_session(
+                store,
+                action,
+                plan,
+                codex_bin=str(fake_codex),
+                timeout_sec=5,
+                progress_callback=lambda _progress: None,
+                stop_event=stop_event,
+                aggregate_rss_governor=governor,
+                enforce_backend_contract=False,
+            )
+
+            self.assertFalse(launch_marker.exists())
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("resource_limit", result["failure_kind"])
+            self.assertIn(
+                "resource limit before launch",
+                Path(result["log_path"]).read_text(encoding="utf-8"),
+            )
+            governor.release("earlier-child")
+
+
     def test_missing_codex_path_uses_configured_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fallback = Path(temp_dir) / "codex"
@@ -94,7 +199,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
                     os.environ["ALBILICH_CODEX_BIN_FALLBACK"] = old
 
     def test_codex_child_default_sandbox_allows_cas_temp_files(self) -> None:
-        self.assertEqual(DEFAULT_SANDBOX, "workspace-write")
+        self.assertEqual(DEFAULT_SANDBOX, "permission-profile:albilich-evidence-capsule")
 
     def test_codex_child_ignores_user_config_by_default(self) -> None:
         old = os.environ.pop("ALBILICH_CODEX_CHILD_USE_USER_CONFIG", None)
@@ -112,11 +217,11 @@ class Phase2TokenUsageTest(unittest.TestCase):
             if old is not None:
                 os.environ["ALBILICH_CODEX_CHILD_USE_USER_CONFIG"] = old
 
-    def test_codex_child_user_config_escape_hatch(self) -> None:
+    def test_codex_child_user_config_escape_hatch_is_ignored(self) -> None:
         old = os.environ.get("ALBILICH_CODEX_CHILD_USE_USER_CONFIG")
         os.environ["ALBILICH_CODEX_CHILD_USE_USER_CONFIG"] = "1"
         try:
-            self.assertEqual(_codex_child_exec_args(["--json"]), ["--json"])
+            self.assertEqual(_codex_child_exec_args(["--json"])[0], "--ignore-user-config")
         finally:
             if old is None:
                 os.environ.pop("ALBILICH_CODEX_CHILD_USE_USER_CONFIG", None)
@@ -362,6 +467,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
                     plan,
                     codex_bin=str(fake_codex),
                     timeout_sec=5,
+                    enforce_backend_contract=False,
                 )
             finally:
                 if old_stale is None:
@@ -391,7 +497,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
             root = Path(tmpdir)
             fake_codex = root / "fake_codex.py"
             patch = {
-                "schema_version": 1,
+                "schema_version": SCHEMA_VERSION,
                 "problem_id": "codex-active-retry-grace-test",
                 "base_revision": 0,
                 "actor_role": "researcher",
@@ -433,6 +539,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
                     plan,
                     codex_bin=str(fake_codex),
                     timeout_sec=5,
+                    enforce_backend_contract=False,
                 )
             finally:
                 if old_stale is None:
@@ -458,7 +565,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
             root = Path(tmpdir)
             fake_codex = root / "fake_codex.py"
             patch = {
-                "schema_version": 1,
+                "schema_version": SCHEMA_VERSION,
                 "problem_id": "codex-old-retry-warning-test",
                 "base_revision": 0,
                 "actor_role": "researcher",
@@ -500,6 +607,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
                     plan,
                     codex_bin=str(fake_codex),
                     timeout_sec=5,
+                    enforce_backend_contract=False,
                 )
             finally:
                 if old_stale is None:
@@ -551,6 +659,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
                         plan,
                         codex_bin=str(fake_codex),
                         timeout_sec=5,
+                        enforce_backend_contract=False,
                     )
 
                     self.assertEqual(result["status"], "failed")
@@ -561,7 +670,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
             root = Path(tmpdir)
             fake_codex = root / "fake_codex.py"
             repaired_patch = {
-                "schema_version": 1,
+                "schema_version": SCHEMA_VERSION,
                 "problem_id": "codex-malformed-json-repair-test",
                 "base_revision": 0,
                 "actor_role": "researcher",
@@ -584,7 +693,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
                 "state = pathlib.Path(__file__).with_suffix('.state')\n"
                 "if not state.exists():\n"
                 "    print('session id: 019ef5aa-0000-7000-9000-jsonfix001', flush=True)\n"
-                "    out.write_text(r'{\"schema_version\":1,\"problem_id\":\"codex-malformed-json-repair-test\",\"base_revision\":0,\"actor_role\":\"researcher\",\"target_id\":\"root\",\"operations\":[{\"op\":\"attach_artifact\",\"artifact_id\":\"broken\",\"artifact_type\":\"proof_dossier\",\"content\":\"G\\uZZZZ H\"}]}')\n"
+                f"    out.write_text(r'{{\"schema_version\":{SCHEMA_VERSION},\"problem_id\":\"codex-malformed-json-repair-test\",\"base_revision\":0,\"actor_role\":\"researcher\",\"target_id\":\"root\",\"operations\":[{{\"op\":\"attach_artifact\",\"artifact_id\":\"broken\",\"artifact_type\":\"proof_dossier\",\"content\":\"G\\uZZZZ H\"}}]}}')\n"
                 "    state.write_text('repair')\n"
                 "else:\n"
                 f"    out.write_text({json.dumps(json.dumps(repaired_patch))})\n",
@@ -602,6 +711,7 @@ class Phase2TokenUsageTest(unittest.TestCase):
                 plan,
                 codex_bin=str(fake_codex),
                 timeout_sec=200,
+                enforce_backend_contract=False,
             )
 
             self.assertEqual(result["status"], "completed")
@@ -675,8 +785,37 @@ class Phase2TokenUsageTest(unittest.TestCase):
         self.assertEqual(usage["total_tokens"], 9_999)
         self.assertEqual(usage["input_tokens"], 9_000)
 
-    def test_budget_spend_excludes_cached_input(self) -> None:
-        # 1.30M processed but 1.20M cached -> only new work is charged.
+    def test_session_usage_parser_reads_a_bounded_tail_of_large_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "sessions"
+            session_id = "019ef5aa-0000-7000-9000-tokenfix-tail"
+            session_path = root / f"rollout-{session_id}.jsonl"
+            session_path.parent.mkdir(parents=True)
+            with session_path.open("wb") as handle:
+                block = b'{"type":"irrelevant"}\n' * 4096
+                remaining = MAX_SESSION_USAGE_TAIL_BYTES + 1024
+                while remaining > 0:
+                    chunk = block[:remaining]
+                    handle.write(chunk)
+                    remaining -= len(chunk)
+                handle.write(b"\n")
+                handle.write(
+                    (
+                        token_count_event(
+                            12_345, input_tokens=12_000, output_tokens=345
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
+
+            usage = parse_codex_session_usage(session_id, session_root=root)
+
+        self.assertEqual(12_345, usage["total_tokens"])
+        self.assertEqual(345, usage["output_tokens"])
+
+    def test_budget_spend_uses_provider_total_without_double_counting_reasoning(self) -> None:
+        # Cached input is still processed model usage, while reasoning tokens
+        # are already included in output/provider total and are not added twice.
         op = {
             "input_tokens": 1_300_000,
             "cached_input_tokens": 1_200_000,
@@ -684,12 +823,33 @@ class Phase2TokenUsageTest(unittest.TestCase):
             "reasoning_output_tokens": 5_000,
             "total_tokens": 1_314_000,
         }
-        self.assertEqual(run_spend_from_operation(op), 100_000 + 9_000 + 5_000)
+        self.assertEqual(run_spend_from_operation(op), 1_314_000)
 
     def test_budget_spend_falls_back_to_total_without_breakdown(self) -> None:
         # Collapsed CLI footer: only a total, no component breakdown.
         self.assertEqual(run_spend_from_operation({"total_tokens": 6_368}), 6_368)
         self.assertEqual(run_spend_from_operation({"input_tokens": 6_368, "total_tokens": 6_368}), 6_368)
+
+    def test_inconsistent_usage_cannot_understate_resource_consumption(self) -> None:
+        usage = parse_token_usage(
+            {
+                "input_tokens": 100,
+                "cached_input_tokens": 120,
+                "output_tokens": 20,
+                "reasoning_output_tokens": 30,
+                "total_tokens": 1,
+            }
+        )
+        self.assertEqual(120, usage["input_tokens"])
+        self.assertEqual(30, usage["output_tokens"])
+        self.assertEqual(150, usage["total_tokens"])
+        self.assertEqual(150, run_spend_from_operation(usage))
+        self.assertEqual(
+            200,
+            run_spend_from_operation(
+                {"input_tokens": 100, "output_tokens": 100, "total_tokens": 1}
+            ),
+        )
 
     def test_session_breakdown_preferred_over_equal_total_cli_footer(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

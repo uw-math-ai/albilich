@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import functools
 import os
 import tempfile
 import threading
@@ -22,11 +24,58 @@ from agents.generation.phase2.hmt_sidecar import (
     publish_hmt_sidecar,
     read_hmt_catalog,
 )
+from agents.generation.phase2.dispatch_execution import (
+    CUSTOM_EXECUTOR_AGGREGATE_RSS_CAPABILITY,
+    CUSTOM_EXECUTOR_CONCURRENCY_ATTRIBUTE,
+    CUSTOM_EXECUTOR_PARALLEL_CAPABILITY,
+    CUSTOM_EXECUTOR_RESOURCE_ATTRIBUTE,
+)
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import (
+    apply_operator_patch as apply_patch,
+    apply_system_patch,
+)
 from agents.generation.phase2.scheduler import next_action
 from agents.generation.phase2.store import ProofStateStore
 from agents.generation.phase2.workflow import run_workflow
+from agents.generation.tests._phase2_test_support import (
+    journal_legacy_fixture_mutation,
+    strictly_verify_entities,
+)
+
+
+def _declare_parallel_local_executor(executor):
+    @functools.wraps(executor)
+    def supervised(*args, aggregate_rss_governor=None, **kwargs):
+        result = dict(executor(*args, **kwargs))
+        snapshot = (
+            aggregate_rss_governor.snapshot()
+            if aggregate_rss_governor is not None
+            else {"peak_mb": 0.0}
+        )
+        result["observed_aggregate_peak_memory_mb"] = float(
+            snapshot["peak_mb"]
+        )
+        result["resource_limits"] = {
+            "max_aggregate_child_process_tree_rss_mb": (
+                aggregate_rss_governor.limit_mb
+                if aggregate_rss_governor is not None
+                else None
+            )
+        }
+        return result
+
+    setattr(
+        supervised,
+        CUSTOM_EXECUTOR_CONCURRENCY_ATTRIBUTE,
+        CUSTOM_EXECUTOR_PARALLEL_CAPABILITY,
+    )
+    setattr(
+        supervised,
+        CUSTOM_EXECUTOR_RESOURCE_ATTRIBUTE,
+        CUSTOM_EXECUTOR_AGGREGATE_RSS_CAPABILITY,
+    )
+    return supervised
 
 
 HMT_LATEX = r"""\documentclass[11pt]{article}
@@ -60,48 +109,142 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
 
     @staticmethod
     def _set_revision(store: ProofStateStore, revision: int) -> None:
-        with store.connect() as conn:
-            conn.execute(
-                "UPDATE problem_state SET current_revision=? WHERE problem_id=?",
-                (revision, store.problem_id),
+        while store.get_revision() < revision:
+            current = store.get_revision()
+            outcome = apply_system_patch(
+                store,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "problem_id": store.problem_id,
+                    "base_revision": current,
+                    "actor_role": "scheduler",
+                    "target_id": "root",
+                    "operations": [
+                        {
+                            "op": "attach_artifact",
+                            "artifact_id": f"hmt-test-revision-{current + 1}",
+                            "artifact_type": "test_fixture_revision_marker",
+                            "content": f"Test fixture revision marker {current + 1}.",
+                            "content_summary": "Test-only revision marker.",
+                        }
+                    ],
+                    "rationale": "advance the test fixture through the authenticated patch journal",
+                },
             )
-            conn.commit()
+            if not outcome.accepted:
+                raise AssertionError(outcome.errors)
 
     @staticmethod
     def _set_integrated_claim_count(store: ProofStateStore, count: int) -> None:
-        now = "2026-01-01T00:00:00+00:00"
-        with store.connect() as conn:
-            conn.execute("DELETE FROM claims WHERE claim_id LIKE 'hmt-integrated-%'")
-            conn.executemany(
-                """
-                INSERT INTO claims(
-                    claim_id, kind, statement, normalized_statement, fingerprint,
-                    hypotheses, conditions_json, validation_status, lifecycle_status,
-                    root_impact, reduction_depth, parent_ids_json, source_ids_json,
-                    tags_json, evidence_artifact_ids_json, created_at, updated_at
-                ) VALUES (?, 'lemma', ?, ?, ?, '', '[]', 'formally_verified',
-                          'integrated', 0.1, 1, '["root"]', '[]', '[]', '[]', ?, ?)
-                """,
+        if count <= 0:
+            return
+        claim_ids = [f"hmt-integrated-{index}" for index in range(1, count + 1)]
+        inference_ids = [f"hmt-inference-{index}" for index in range(1, count + 1)]
+        seed_operations: list[dict] = []
+        for index, (claim_id, inference_id) in enumerate(
+            zip(claim_ids, inference_ids), start=1
+        ):
+            route_id = f"hmt-route-{index}"
+            seed_operations.extend(
                 [
-                    (
-                        f"hmt-integrated-{index}",
-                        f"Integrated HMT test claim {index}.",
-                        f"integrated hmt test claim {index}",
-                        f"hmt-integrated-fingerprint-{index}",
-                        now,
-                        now,
-                    )
-                    for index in range(1, count + 1)
-                ],
+                    {
+                        "op": "add_claim",
+                        "claim_id": claim_id,
+                        "kind": "lemma",
+                        "statement": f"Integrated HMT test claim {index}.",
+                        "parent_ids": ["root"],
+                        "root_impact": 0.1,
+                        "reduction_depth": 1,
+                    },
+                    {
+                        "op": "add_route",
+                        "route_id": route_id,
+                        "conclusion_claim_id": claim_id,
+                        "relation_to_parent": "sufficient",
+                        "strategy": "A direct certified fixture argument.",
+                    },
+                    {
+                        "op": "add_inference",
+                        "inference_id": inference_id,
+                        "route_id": route_id,
+                        "conclusion_claim_id": claim_id,
+                        "premise_claim_ids": [],
+                        "validation_status": "plausible",
+                        "explanation": "The direct fixture argument proves the claim.",
+                    },
+                ]
             )
-            conn.commit()
+        seeded = apply_patch(
+            store,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "problem_id": store.problem_id,
+                "base_revision": store.get_revision(),
+                "actor_role": "researcher",
+                "target_id": "root",
+                "operations": seed_operations,
+                "rationale": "seed genuinely certifiable HMT fixture claims",
+            },
+        )
+        if not seeded.accepted:
+            raise AssertionError(seeded.errors)
+        verification_id = "hmt-fixture-verification"
+        strictly_verify_entities(
+            store,
+            target_id="root",
+            claim_ids=claim_ids,
+            inference_ids=inference_ids,
+            artifact_id=verification_id,
+        )
+        integration_operations: list[dict] = []
+        for index, claim_id in enumerate(claim_ids, start=1):
+            route_id = f"hmt-route-{index}"
+            artifact_id = f"hmt-integration-{index}"
+            integration_operations.extend(
+                [
+                    {
+                        "op": "attach_artifact",
+                        "artifact_id": artifact_id,
+                        "artifact_type": "integration_report",
+                        "content": f"The certified route {route_id} proves {claim_id}.",
+                        "metadata": {
+                            "integrates": True,
+                            "route_id": route_id,
+                            "claim_id": claim_id,
+                        },
+                    },
+                    {
+                        "op": "propose_status_transition",
+                        "target_type": "claim",
+                        "target_id": claim_id,
+                        "status_type": "lifecycle",
+                        "new_status": "integrated",
+                        "route_id": route_id,
+                        "evidence_artifact_ids": [artifact_id],
+                    },
+                ]
+            )
+        integrated = apply_patch(
+            store,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "problem_id": store.problem_id,
+                "base_revision": store.get_revision(),
+                "actor_role": "integration_verifier",
+                "target_id": "root",
+                "operations": integration_operations,
+                "rationale": "integrate the strictly verified HMT fixture claims",
+            },
+        )
+        if not integrated.accepted:
+            raise AssertionError(integrated.errors)
 
     def test_scheduler_emits_one_hmt_action_per_integrated_claim_interval(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
             os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
         ):
             store = self._store(tmpdir)
-            self._set_revision(store, 100)
+            self._set_revision(store, 1)
 
             with patch(
                 "agents.generation.phase2.scheduler.integrated_claim_count",
@@ -118,7 +261,7 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
 
             self.assertEqual(action["mode"], "write")
             self.assertTrue(action["periodic_hmt"])
-            self.assertEqual(action["hmt_source_revision"], 100)
+            self.assertEqual(action["hmt_source_revision"], 1)
             self.assertEqual(action["hmt_source_integrated_claim_count"], 10)
             self.assertEqual(action["hmt_integrated_claim_interval"], 10)
             self.assertEqual(action["hmt_sequence"], 1)
@@ -127,21 +270,23 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
             artifact_path = store.state_dir / "artifacts" / "hmt-1.tex"
             artifact_path.parent.mkdir(parents=True, exist_ok=True)
             artifact_path.write_text(HMT_LATEX, encoding="utf-8")
-            with store.connect() as conn:
+            def insert_hmt(conn, state_revision: int) -> None:
                 conn.execute(
                     """
                     INSERT INTO artifacts(
                         artifact_id, artifact_type, path, sha256, producer_role, run_id,
                         state_revision, content_summary, metadata_json, created_at
-                    ) VALUES ('hmt-1', 'human_readable_mathematical_text', ?, 'sha',
-                              'writer', 'write-1', 100, 'The trivial case is proved.', ?,
+                    ) VALUES ('hmt-1', 'human_readable_mathematical_text', ?, ?,
+                              'writer', 'write-1', ?, 'The trivial case is proved.', ?,
                               '2026-01-01T00:00:00+00:00')
                     """,
                     (
                         str(artifact_path),
+                        hashlib.sha256(HMT_LATEX.encode("utf-8")).hexdigest(),
+                        state_revision,
                         json.dumps(
                             {
-                                "source_revision": 100,
+                                "source_revision": 1,
                                 "source_integrated_claim_count": 10,
                                 "integrated_claim_interval": 10,
                                 "sequence": 1,
@@ -149,9 +294,11 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
                         ),
                     ),
                 )
-                conn.commit()
+            journal_legacy_fixture_mutation(
+                store, insert_hmt, fixture_id="hmt-cadence-record"
+            )
 
-            self._set_revision(store, 999)
+            self._set_revision(store, 2)
             not_due = next_action(store)
             self.assertFalse(not_due.get("periodic_hmt", False))
 
@@ -189,27 +336,31 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
             os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
         ):
             store = self._store(tmpdir)
-            self._set_revision(store, 50)
+            self._set_revision(store, 1)
             self._set_integrated_claim_count(store, 10)
             artifact_path = store.state_dir / "artifacts" / "legacy-hmt.tex"
             artifact_path.parent.mkdir(parents=True, exist_ok=True)
             artifact_path.write_text(HMT_LATEX, encoding="utf-8")
-            with store.connect() as conn:
+            def insert_legacy_hmt(conn, state_revision: int) -> None:
                 conn.execute(
                     """
                     INSERT INTO artifacts(
                         artifact_id, artifact_type, path, sha256, producer_role, run_id,
                         state_revision, content_summary, metadata_json, created_at
-                    ) VALUES ('legacy-hmt', 'human_readable_mathematical_text', ?, 'sha',
-                              'writer', 'legacy-write', 40, 'Legacy paper.', ?,
+                    ) VALUES ('legacy-hmt', 'human_readable_mathematical_text', ?, ?,
+                              'writer', 'legacy-write', ?, 'Legacy paper.', ?,
                               '2026-01-01T00:00:00+00:00')
                     """,
                     (
                         str(artifact_path),
-                        json.dumps({"source_revision": 40, "sequence": 1}),
+                        hashlib.sha256(HMT_LATEX.encode("utf-8")).hexdigest(),
+                        state_revision,
+                        json.dumps({"source_revision": 0, "sequence": 1}),
                     ),
                 )
-                conn.commit()
+            journal_legacy_fixture_mutation(
+                store, insert_legacy_hmt, fixture_id="legacy-hmt-cadence-record"
+            )
 
             action = periodic_hmt_sidecar_action(store)
 
@@ -223,7 +374,7 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
             os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
         ):
             store = self._store(tmpdir)
-            self._set_revision(store, 10)
+            self._set_revision(store, 1)
 
             with patch(
                 "agents.generation.phase2.hmt_sidecar.integrated_claim_count",
@@ -242,13 +393,14 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
             os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
         ):
             store = self._store(tmpdir)
-            self._set_revision(store, 10)
+            self._set_revision(store, 1)
             self._set_integrated_claim_count(store, 10)
             staging = store.state_dir / "artifacts" / "staging" / "hmt-sidecar.tex"
             staging.parent.mkdir(parents=True, exist_ok=True)
             staging.write_text(HMT_LATEX, encoding="utf-8")
             action = periodic_hmt_sidecar_action(store)
-            before = store.get_state()["problem_state"]
+            state_before = store.get_state()
+            before = state_before["problem_state"]
             outcome = publish_hmt_sidecar(
                 store,
                 action=action,
@@ -275,12 +427,16 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
             self.assertTrue(outcome["accepted"], outcome)
             self.assertEqual(after["current_revision"], before["current_revision"])
             self.assertEqual(after["remaining_token_budget"], before["remaining_token_budget"])
-            self.assertEqual(store.get_state()["artifacts"], [])
+            self.assertEqual(store.get_state()["artifacts"], state_before["artifacts"])
             self.assertEqual(read_hmt_catalog(store)[0]["artifact_id"], "hmt-sidecar")
             self.assertEqual(
                 read_hmt_catalog(store)[0]["source_integrated_claim_count"], 10
             )
-            self.assertTrue(Path(read_hmt_catalog(store)[0]["pdf_path"]).is_file())
+            pdf_path = Path(read_hmt_catalog(store)[0]["pdf_path"])
+            self.assertTrue(pdf_path.is_file())
+            with pdf_path.open("ab") as handle:
+                handle.write(b"tampered")
+            self.assertEqual(read_hmt_catalog(store), [])
 
     def test_sidecar_publication_allocates_sequence_against_live_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -349,7 +505,7 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
             os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
         ):
             store = self._store(tmpdir)
-            self._set_revision(store, 10)
+            self._set_revision(store, 1)
             hmt_started = threading.Event()
             research_actions: list[dict] = []
 
@@ -418,7 +574,7 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
                     parallel_branches=0,
                     write_on_stop=False,
                     write_console=False,
-                    executor=executor,
+                    executor=_declare_parallel_local_executor(executor),
                 )
             elapsed = time.monotonic() - started
 
@@ -435,12 +591,57 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
                 for run in store.get_state()["runs"]
             ))
 
+    def test_hmt_is_deferred_for_undeclared_serial_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
+        ):
+            store = self._store(tmpdir)
+            self._set_revision(store, 1)
+            calls: list[dict] = []
+
+            def serial_executor(*, action, **_kwargs):
+                calls.append(dict(action))
+                return {
+                    "run_id": "serial-research-only",
+                    "status": "failed",
+                    "returncode": 1,
+                    "wall_time_seconds": 0.01,
+                    "peak_memory_mb": 1.0,
+                    "usage": {"total_tokens": 1},
+                    "patch": None,
+                    "patch_error": "synthetic stop",
+                    "failure_kind": "test_failure",
+                    "output_artifact_ids": [],
+                }
+
+            with patch(
+                "agents.generation.phase2.hmt_sidecar.integrated_claim_count",
+                return_value=10,
+            ):
+                result = run_workflow(
+                    store,
+                    steps=1,
+                    execute=True,
+                    parallel_librarian_verifier=False,
+                    parallel_branches=0,
+                    write_on_stop=False,
+                    write_console=False,
+                    executor=serial_executor,
+                )
+
+            self.assertEqual(1, len(calls))
+            self.assertFalse(calls[0].get("periodic_hmt", False))
+            self.assertEqual(
+                "deferred_serial_executor",
+                result["steps"][0]["hmt_sidecar_status"],
+            )
+
     def test_late_hmt_progress_does_not_resurrect_finished_owner_step(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
             os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
         ):
             store = self._store(tmpdir)
-            self._set_revision(store, 10)
+            self._set_revision(store, 1)
             second_research_started = threading.Event()
             hmt_returning = threading.Event()
             research_calls = 0
@@ -515,7 +716,7 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
                     parallel_branches=0,
                     write_on_stop=False,
                     write_console=False,
-                    executor=executor,
+                    executor=_declare_parallel_local_executor(executor),
                 )
 
             self.assertEqual(research_calls, 2)
@@ -527,7 +728,7 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
             os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
         ):
             store = self._store(tmpdir)
-            self._set_revision(store, 10)
+            self._set_revision(store, 1)
             hmt_calls = 0
             hmt_finished = threading.Event()
             research_calls = 0
@@ -626,7 +827,7 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
                     parallel_branches=0,
                     write_on_stop=False,
                     write_console=False,
-                    executor=executor,
+                    executor=_declare_parallel_local_executor(executor),
                 )
 
             self.assertEqual(hmt_calls, 2)
@@ -641,8 +842,9 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
             os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
         ):
             store = self._store(tmpdir)
-            self._set_revision(store, 10)
+            self._set_revision(store, 1)
             self._set_integrated_claim_count(store, 10)
+            source_revision = store.get_revision()
             action = periodic_hmt_sidecar_action(store)
             assert action is not None
 
@@ -655,7 +857,7 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
             staging_created = Path(manifest["human_readable_text_packet"]["staging_dir"]).is_dir()
 
         packet = manifest["human_readable_text_packet"]
-        self.assertEqual(packet["source_revision"], 10)
+        self.assertEqual(packet["source_revision"], source_revision)
         self.assertEqual(packet["source_integrated_claim_count"], 10)
         self.assertEqual(packet["integrated_claim_interval"], 10)
         self.assertEqual(packet["root_statement"], "Classify all finite groups with the target closure property.")
@@ -676,7 +878,7 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
         ):
             root = Path(tmpdir)
             store = self._store(tmpdir)
-            self._set_revision(store, 10)
+            self._set_revision(store, 1)
             self._set_integrated_claim_count(store, 10)
             action = periodic_hmt_sidecar_action(store)
             assert action is not None
@@ -690,7 +892,7 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
                 "assert staging.is_dir()\n"
                 "(staging / 'writer-could-write.txt').write_text('ok')\n"
                 "out = pathlib.Path(args[args.index('--output-last-message') + 1])\n"
-                "payload = {'schema_version':1,'problem_id':'hmt-test','base_revision':10,"
+                f"payload = {{'schema_version':{SCHEMA_VERSION},'problem_id':'hmt-test','base_revision':1,"
                 "'actor_role':'writer','target_id':'root','operations':["
                 "{'op':'record_run_metrics','metrics':{'staging_probe':1}}]}\n"
                 "out.write_text(json.dumps(payload))\n",
@@ -704,6 +906,7 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
                 plan,
                 codex_bin=str(fake_codex),
                 timeout_sec=10,
+                enforce_backend_contract=False,
             )
 
             staging = store.state_dir / "artifacts" / "staging"

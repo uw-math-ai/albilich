@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Full-proof-first completion policy (2026-07-09 TODO 7).
+"""Full-proof-first completion policy.
 
 The run-level ``completion_policy`` decides how willing the scheduler is to
 stop with partial results:
@@ -61,7 +61,7 @@ INFRA_STOP_REASON_CODES = {
 STOP_REASON_CODES = CANONICAL_STOP_REASON_CODES | INFRA_STOP_REASON_CODES
 
 # Language/formulation problems become precise debts, never permission to
-# weaken the target (TODO 7 item 6). These are debt_type values (or obligation
+# weaken the target. These are legacy debt_type values (or obligation
 # prefixes) matching the existing free-text debt_type convention.
 LANGUAGE_DEBT_TYPES = {
     "ambiguous_hypothesis",
@@ -70,7 +70,7 @@ LANGUAGE_DEBT_TYPES = {
     "root_scope_mismatch",
 }
 
-# Advisor partial-mode transition contract (TODO 7 item 4): the advisor may
+# Advisor partial-mode transition contract: the advisor may
 # justify moving from full-proof pursuit to partial-report mode by attaching an
 # advisor_report whose metadata carries these keys; the scheduler guard honors
 # it as an explicit, recorded allowance.
@@ -422,10 +422,7 @@ def _actionable_narrowed_blockers(state: Mapping[str, Any]) -> List[str]:
 
 
 def _productive_branch_ids(state: Mapping[str, Any]) -> List[str]:
-    try:
-        summaries = build_branch_summaries(None, state=state)  # type: ignore[arg-type]
-    except Exception:
-        return []
+    summaries = build_branch_summaries(None, state=state)  # type: ignore[arg-type]
     return [
         str(summary.get("branch") or "")
         for summary in summaries

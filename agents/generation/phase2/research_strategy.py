@@ -6,8 +6,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
-from .graph_policy import DebtCoverageIndex, debt_covered_by_integrated_claim
-from .models import fingerprint_text, json_loads, normalize_text
+from .graph_policy import debt_covered_by_integrated_claim, get_debt_coverage_index
+from .models import canonical_math_text, fingerprint_text, json_loads, normalize_text
 from .research_intelligence import (
     DEEP_SESSION_ROI_VERSION,
     PRODUCTIVE_DELTA_KINDS,
@@ -25,6 +25,7 @@ from .research_intelligence import (
 
 
 STRATEGY_SCHEMA_VERSION = 1
+APPROACH_PORTFOLIO_CONTRACT_VERSION = 3
 ROOT_CUT_GATE_VERSION = 2
 COUNTEREXAMPLE_PREFLIGHT_VERSION = 1
 CANONICAL_ROUTE_OWNER_VERSION = 1
@@ -277,7 +278,7 @@ def minimal_active_debt_frontier(state: Mapping[str, Any]) -> Dict[str, Any]:
     """
     from .debt_canonicalizer import central_debt_clusters
 
-    coverage_index = DebtCoverageIndex(state)
+    coverage_index = get_debt_coverage_index(state)
     active = [
         row
         for row in state.get("debts", [])
@@ -669,11 +670,18 @@ def long_session_workspace(state: Mapping[str, Any], action: Mapping[str, Any] |
 
 
 def canonical_route_ownership(
-    state: Mapping[str, Any], action: Mapping[str, Any] | None = None
+    state: Mapping[str, Any],
+    action: Mapping[str, Any] | None = None,
+    *,
+    obligation_frontier: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     action = action or {}
     workspace = long_session_workspace(state, action)
-    frontier = decisive_obligation_frontier(state)
+    frontier = (
+        dict(obligation_frontier)
+        if obligation_frontier is not None
+        else decisive_obligation_frontier(state)
+    )
     route_id = str(action.get("route_id") or frontier.get("selected_route_id") or "")
     target_id = str(action.get("target_id") or "root")
     canonical_id = str(workspace.get("canonical_artifact_id") or "")
@@ -716,8 +724,16 @@ def canonical_route_ownership(
     }
 
 
-def root_cut_progress_gate(state: Mapping[str, Any]) -> Dict[str, Any]:
-    frontier = decisive_obligation_frontier(state)
+def root_cut_progress_gate(
+    state: Mapping[str, Any],
+    *,
+    obligation_frontier: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    frontier = (
+        dict(obligation_frontier)
+        if obligation_frontier is not None
+        else decisive_obligation_frontier(state)
+    )
     obligations = list(frontier.get("minimal_cut_obligations") or [])
     cut_signature = [
         f"{item.get('obligation_type')}:{item.get('obligation_id')}"
@@ -984,7 +1000,6 @@ def approach_portfolio_view(state: Mapping[str, Any]) -> Dict[str, Any]:
         key=lambda item: (
             0 if str(item.get("approach_id") or "") in selected_ids else 1,
             -int(item.get("contribution_level") or 0),
-            -float(item.get("novelty_score") or 0.0),
             str(item.get("approach_id") or ""),
         ),
     )
@@ -1044,9 +1059,11 @@ def approach_portfolio_view(state: Mapping[str, Any]) -> Dict[str, Any]:
             "0": "unplaced idea; no claimed root contribution",
         },
         "portfolio_policy": {
-            "exploit_percent": 50,
-            "explore_percent": 30,
-            "adversarial_percent": 20,
+            "allocation_rule": (
+                "interleave selected pilots, an untried mechanism, and an adversarial test; "
+                "the deterministic scheduler chooses the next admissible action"
+            ),
+            "fixed_percentage_claim": False,
             "qualitative_scores_only": True,
             "ideas_are_not_proof_evidence": True,
             "proof_debts_remain_strict": True,
@@ -1054,36 +1071,57 @@ def approach_portfolio_view(state: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _run_output_artifacts(state: Mapping[str, Any], run: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    artifact_ids = {
-        str(item)
-        for item in _json_list(run.get("output_artifact_ids_json") or run.get("output_artifact_ids"))
-        if str(item)
-    }
-    if not artifact_ids:
-        return []
-    return [row for row in _artifact_rows(state) if str(row.get("artifact_id") or "") in artifact_ids]
+def _run_has_accepted_mathematical_delta(
+    state: Mapping[str, Any], run: Mapping[str, Any]
+) -> bool:
+    """Whether the host journal recorded a mathematical change by this run.
+
+    Child-authored artifact labels are intentionally ignored.  The summary is
+    derived from an invariant-checked patch delta and a host-issued run id in
+    ``ProofStateStore.get_scheduler_state``.
+    """
+
+    run_id = str(run.get("run_id") or "")
+    if not run_id:
+        return False
+    return any(
+        str(delta.get("run_id") or "") == run_id and bool(delta.get("changes"))
+        for delta in state.get("accepted_mathematical_deltas", []) or []
+        if isinstance(delta, Mapping)
+    )
 
 
-def _run_has_productive_delta(state: Mapping[str, Any], run: Mapping[str, Any]) -> bool:
-    for artifact in _run_output_artifacts(state, run):
-        metadata = _artifact_metadata(artifact)
-        if str(metadata.get("mathematical_delta_kind") or "") in PRODUCTIVE_DELTA_KINDS:
-            return True
-        if metadata.get("changed_proof_state") is True or metadata.get("root_relevant_fact_added") is True:
-            return True
-        if str(metadata.get("artifact_roi") or "") in {
-            "productive",
-            "verifier_ready_route",
-            "route_repaired",
-            "root_cut_shrunk",
-        }:
-            return True
-        before = _json_list(metadata.get("root_cut_signature_before"))
-        after = _json_list(metadata.get("root_cut_signature_after"))
-        if before and after and before != after:
-            return True
-    return False
+def _selected_candidate_ids_in_trace(trace: Mapping[str, Any]) -> set[str]:
+    """Return selections on the actually selected path of a nested trace."""
+
+    selected_id = str(trace.get("selected_candidate_id") or "")
+    selected_ids = {selected_id} if selected_id else set()
+    nested_traces = trace.get("nested_policy_traces")
+    if isinstance(nested_traces, Mapping):
+        nested = nested_traces.get(selected_id)
+        if isinstance(nested, Mapping):
+            selected_ids.update(_selected_candidate_ids_in_trace(nested))
+    legacy_nested = trace.get("base_policy_trace")
+    if isinstance(legacy_nested, Mapping):
+        # Older traces stored only the selected base-policy comparison.
+        selected_ids.update(_selected_candidate_ids_in_trace(legacy_nested))
+    return selected_ids
+
+
+def _run_selected_exact_candidate(
+    run: Mapping[str, Any], candidate_id: str
+) -> Optional[bool]:
+    """Report exact selection, or ``None`` when trace identity is unavailable."""
+
+    if run.get("decision_trace_history_included") is False:
+        return None
+    raw_trace = run.get("decision_trace_json") or run.get("decision_trace")
+    if not raw_trace:
+        return None
+    trace = json_loads(raw_trace, {}) if isinstance(raw_trace, str) else raw_trace
+    if not isinstance(trace, Mapping) or not trace.get("candidates"):
+        return None
+    return candidate_id in _selected_candidate_ids_in_trace(trace)
 
 
 def bottleneck_lease_state(
@@ -1093,6 +1131,7 @@ def bottleneck_lease_state(
     action = action or {}
     target_id = str(action.get("target_id") or "")
     debt_id = str(action.get("debt_id") or _json_object(action.get("bottleneck_lock_signal")).get("debt_id") or "")
+    exact_candidate_id = str(action.get("bottleneck_candidate_id") or "")
     inferred_from_state = False
     if not target_id and not debt_id:
         blocking = sorted(
@@ -1137,6 +1176,19 @@ def bottleneck_lease_state(
         intent = str(run.get("search_intent") or "")
         if intent in reset_intents or intent.startswith(APPROACH_PILOT_INTENT_PREFIX):
             break
+        if exact_candidate_id:
+            exact_selection = _run_selected_exact_candidate(
+                run, exact_candidate_id
+            )
+            if exact_selection is False:
+                continue
+            if exact_selection is None and (
+                run.get("decision_trace_history_included") is False
+                or str(run.get("selection_design") or "") == "deterministic"
+            ):
+                # Do not charge an exact proof obligation when bounded trace
+                # history no longer proves which peer was selected.
+                break
         same_target = not target_id or str(run.get("target_id") or "") == target_id
         if (
             not same_target
@@ -1153,7 +1205,7 @@ def bottleneck_lease_state(
         if status not in {"completed", "succeeded", "success"}:
             continue
         failure_window_open = False
-        if _run_has_productive_delta(state, run):
+        if _run_has_accepted_mathematical_delta(state, run):
             break
         completed_no_delta += 1
     escape_required = (
@@ -1283,7 +1335,9 @@ def approach_brainstorming_trigger(
         and str(run.get("actor_role") or "") == "researcher"
         and str(run.get("status") or "").lower() in {"completed", "succeeded", "success"}
     ]
-    if len(later_completed) >= 6 and not any(_run_has_productive_delta(state, run) for run in later_completed):
+    if len(later_completed) >= 6 and not any(
+        _run_has_accepted_mathematical_delta(state, run) for run in later_completed
+    ):
         return {
             "due": True,
             "kind": "refresh",
@@ -1675,7 +1729,7 @@ def advisor_synthesis_trigger(state: Mapping[str, Any]) -> Dict[str, Any]:
         row
         for row in state.get("recent_runs", [])
         if int(row.get("state_revision") or 0) >= latest_revision
-        and str(row.get("actor_role") or "") in {"researcher", "villain", "literature_researcher", "strict_informal_verifier"}
+        and str(row.get("actor_role") or "") in {"researcher", "adversarial_reviewer", "villain", "literature_researcher", "strict_informal_verifier"}
     ]
     artifact_by_id = {str(row.get("artifact_id") or ""): row for row in _artifact_rows(state)}
 
@@ -2001,6 +2055,7 @@ def _approach_strategy_operation(brainstorming: Mapping[str, Any]) -> Dict[str, 
     operation = "approach_portfolio_refresh" if kind == "refresh" else "approach_portfolio_brainstorming"
     alignment = dict(brainstorming.get("approach_alignment") or {})
     return {
+        "_candidate_generator_id": "approach_portfolio",
         "operation": operation,
         "mode": "reduce",
         "target_id": "root",
@@ -2041,17 +2096,26 @@ def _approach_strategy_operation(brainstorming: Mapping[str, Any]) -> Dict[str, 
     }
 
 
-def next_strategy_operation(
+def strategy_operation_candidates(
     state: Mapping[str, Any],
     primary_action: Mapping[str, Any],
     *,
     steering_alignment: Optional[Mapping[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
+) -> list[Dict[str, Any]]:
+    """Materialize every admissible top-level research-strategy operation.
+
+    The previous function returned at the first matching branch.  That hid
+    simultaneous alternatives from the scheduler and made later branches
+    impossible to audit.  Order here records the historical precedence only;
+    the scheduler compares the returned operations explicitly.
+    """
+
     brainstorming = approach_brainstorming_trigger(
         state,
         primary_action,
         steering_alignment=steering_alignment,
     )
+    candidates: list[Dict[str, Any]] = []
     protected_alignment_modes = {
         "integrate",
         "formalize",
@@ -2065,12 +2129,13 @@ def next_strategy_operation(
         and brainstorming.get("alignment_required")
         and str(primary_action.get("mode") or "") not in protected_alignment_modes
     ):
-        return _approach_strategy_operation(brainstorming)
+        return [_approach_strategy_operation(brainstorming)]
     if _protected_primary_action(primary_action):
-        return None
+        return []
     reference = reference_solution_state(state)
     if reference.get("pending_reconstruction"):
-        return {
+        candidates.append({
+            "_candidate_generator_id": "reference_solution_reconstruction",
             "operation": "reference_solution_reconstruction",
             "mode": "reduce",
             "target_id": "root",
@@ -2090,13 +2155,14 @@ def next_strategy_operation(
             "long_mathematical_session_required": True,
             "verification_authority": False,
             "preferred_work_mode": "offline",
-        }
+        })
     if brainstorming.get("due"):
-        return _approach_strategy_operation(brainstorming)
+        candidates.append(_approach_strategy_operation(brainstorming))
     approach = selected_approach_candidate(state)
     if approach:
         approach_id = str(approach.get("approach_id") or "")
-        return {
+        candidates.append({
+            "_candidate_generator_id": "approach_pilot",
             "operation": "approach_pilot",
             "mode": "reduce",
             "target_id": str(approach.get("target_id") or primary_action.get("target_id") or "root"),
@@ -2110,11 +2176,12 @@ def next_strategy_operation(
             "proof_claim_creation_forbidden_unless_test_succeeds": True,
             "preferred_work_mode": "cas" if str(approach.get("estimated_cost") or "") == "low" and approach.get("computational_probe") else "offline",
             "research_philosophy": str(approach.get("mechanism") or "selected_approach_pilot"),
-        }
+        })
     fingerprints = _claim_statement_fingerprints(state)
     bridge = selected_bridge_candidate(state)
     if bridge and fingerprint_text(str(bridge.get("statement") or "")) not in fingerprints:
-        return {
+        candidates.append({
+            "_candidate_generator_id": "selected_bridge",
             "operation": "experiment" if _candidate_needs_experiment(bridge) else "bridge_promotion",
             "mode": "reduce",
             "target_id": str(primary_action.get("target_id") or "root"),
@@ -2125,11 +2192,12 @@ def next_strategy_operation(
             "experiment_workflow_required": _candidate_needs_experiment(bridge),
             "selected_bridge_promotion_required": not _candidate_needs_experiment(bridge),
             "preferred_work_mode": "cas" if _candidate_needs_experiment(bridge) else "offline",
-        }
+        })
     conjecture = selected_conjecture_candidate(state)
     if conjecture and fingerprint_text(str(conjecture.get("statement") or "")) not in fingerprints:
         experiment = _candidate_needs_experiment(conjecture)
-        return {
+        candidates.append({
+            "_candidate_generator_id": "selected_conjecture",
             "operation": "experiment" if experiment else "conjecture_proof",
             "mode": "reduce",
             "target_id": str(primary_action.get("target_id") or "root"),
@@ -2140,10 +2208,11 @@ def next_strategy_operation(
             "experiment_workflow_required": experiment,
             "selected_conjecture_proof_required": not experiment,
             "preferred_work_mode": "cas" if experiment else "offline",
-        }
+        })
     conceptual = conceptual_invariant_trigger(state)
     if conceptual.get("due"):
-        return {
+        candidates.append({
+            "_candidate_generator_id": "conceptual_invariant",
             "operation": "conceptual_invariant_discovery",
             "mode": "reduce",
             "target_id": str(conceptual.get("target_id") or "root"),
@@ -2159,10 +2228,11 @@ def next_strategy_operation(
             "research_philosophy": "conceptual_invariant",
             "research_attack_stage": "deep",
             "preferred_work_mode": "offline",
-        }
+        })
     authorization = active_invention_authorization(state)
     if authorization:
-        return {
+        candidates.append({
+            "_candidate_generator_id": "definition_invention",
             "operation": "definition_invention",
             "mode": "reduce",
             "target_id": str(primary_action.get("target_id") or "root"),
@@ -2177,11 +2247,12 @@ def next_strategy_operation(
                 "candidate_count": authorization.get("candidate_count", 0),
             },
             "preferred_work_mode": "offline",
-        }
+        })
     trigger = advisor_synthesis_trigger(state)
     if trigger.get("due"):
         if _compression_would_help(state) and not _compression_is_fresh_for_trigger(state, trigger):
-            return {
+            candidates.append({
+                "_candidate_generator_id": "proof_compression",
                 "operation": "proof_compression",
                 "mode": "reduce",
                 "target_id": "root",
@@ -2197,19 +2268,37 @@ def next_strategy_operation(
                 "research_attack_stage": "deep",
                 "synthesis_trigger": trigger,
                 "preferred_work_mode": "offline",
-            }
-        return {
-            "operation": "advisor_global_synthesis",
-            "mode": "triage_routes",
-            "target_id": "root",
-            "route_id": str(primary_action.get("route_id") or ""),
-            "search_intent": "advisor_global_synthesis",
-            "reason": "persisted research-state triggers require a global PhD-advisor synthesis",
-            "advisor_global_synthesis_required": True,
-            "global_synthesis_required": True,
-            "synthesis_trigger": trigger,
-        }
-    return None
+            })
+        else:
+            candidates.append({
+                "_candidate_generator_id": "advisor_synthesis",
+                "operation": "advisor_global_synthesis",
+                "mode": "triage_routes",
+                "target_id": "root",
+                "route_id": str(primary_action.get("route_id") or ""),
+                "search_intent": "advisor_global_synthesis",
+                "reason": "persisted research-state triggers require a global PhD-advisor synthesis",
+                "advisor_global_synthesis_required": True,
+                "global_synthesis_required": True,
+                "synthesis_trigger": trigger,
+            })
+    return candidates
+
+
+def next_strategy_operation(
+    state: Mapping[str, Any],
+    primary_action: Mapping[str, Any],
+    *,
+    steering_alignment: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Compatibility view returning the historically first strategy operation."""
+
+    candidates = strategy_operation_candidates(
+        state,
+        primary_action,
+        steering_alignment=steering_alignment,
+    )
+    return candidates[0] if candidates else None
 
 
 def _target_root_impact(state: Mapping[str, Any], target_id: str) -> float:
@@ -2251,37 +2340,47 @@ def _target_root_impact(state: Mapping[str, Any], target_id: str) -> float:
 
 
 def score_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return an auditable ordinal priority assessment.
+
+    The former implementation emitted decimal "probabilities" and
+    "expected values" that were constants chosen by the authors, not measured
+    estimates.  This version exposes the exact ordinal rules used by the
+    scheduler and keeps empirical run history in a separately labelled,
+    non-calibrated adjustment.
+    """
+
     mode = str(action.get("mode") or "")
     target_id = str(action.get("target_id") or "root")
     search_intent = str(action.get("search_intent") or "")
     is_experiment = bool(action.get("experiment_workflow_required")) or search_intent == "experiment_conjecture_proof"
     is_verification = mode in {"integrate", "formalize", "validate_counterexample"} or (mode == "prove" and bool(action.get("route_id")))
-    closing = 0.92 if is_verification else 0.62 if target_id == "root" and mode in {"prove", "reduce"} else 0.42
+    closure_priority = 4 if is_verification else 3 if target_id == "root" and mode in {"prove", "reduce"} else 2
     if action.get("selected_bridge_promotion_required"):
-        closing = 0.76
-    refuting = 0.82 if is_experiment else 0.55 if mode == "refute" else 0.18
-    root_progress = min(1.0, max(0.0, _target_root_impact(state, target_id)))
-    information = 0.9 if is_experiment else 0.76 if mode in {"triage_routes", "regulate_decomposition"} else 0.58
+        closure_priority = max(closure_priority, 3)
+    refutation_priority = 4 if mode in {"refute", "validate_counterexample"} else 3 if is_experiment else 1
+    root_impact = min(1.0, max(0.0, _target_root_impact(state, target_id)))
+    root_relevance_level = 4 if target_id == "root" else 3 if root_impact >= 0.7 else 2 if root_impact >= 0.35 else 1
+    information_priority = 4 if is_experiment or mode in {"triage_routes", "regulate_decomposition"} else 2
     if action.get("approach_brainstorming_required"):
-        closing = 0.22
-        refuting = 0.45
-        information = 0.92
-        root_progress = 0.72
+        closure_priority = 1
+        refutation_priority = 2
+        information_priority = 4
+        root_relevance_level = max(root_relevance_level, 3)
     selected_approach = _json_object(action.get("selected_approach"))
     if selected_approach:
         contribution = max(0, min(5, int(selected_approach.get("contribution_level") or 0)))
-        closing = max(closing, 0.3 + 0.11 * contribution)
-        information = max(information, 0.7)
-        root_progress = max(root_progress, min(1.0, 0.16 * contribution))
+        closure_priority = max(closure_priority, 1 + min(3, contribution // 2))
+        information_priority = max(information_priority, 3)
+        root_relevance_level = max(root_relevance_level, min(4, max(1, contribution)))
     reference_used = bool(reference_solution_state(state).get("available"))
-    reuse = (
-        0.95
+    reuse_priority = (
+        4
         if action.get("reference_solution_reconstruction_required")
-        else 0.85
+        else 4
         if action.get("proof_compression_operation_required")
-        else 0.68
+        else 3
         if action.get("advisor_global_synthesis_required")
-        else 0.35
+        else 1
     )
     duplicate_count = sum(
         1
@@ -2290,14 +2389,16 @@ def score_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[st
         and str(run.get("search_intent") or "") == search_intent
         and search_intent
     )
-    duplication = min(1.0, duplicate_count / 3.0)
+    duplication_penalty = min(4, duplicate_count)
     budget = _json_object(action.get("budget"))
-    requested = float(action.get("requested_tokens") or budget.get("requested_tokens") or budget.get("planned_tokens") or 0.0)
-    token_cost = min(1.0, requested / 250_000.0) if requested else 0.25
-    wall_cost = 0.8 if is_experiment else 0.55 if action.get("deep_session_required") else 0.3
-    verification_cost = 0.15 if is_verification else 0.55 if action.get("definition_invention_required") else 0.35
+    requested = int(action.get("requested_tokens") or budget.get("requested_tokens") or budget.get("planned_tokens") or 0)
+    token_cost_level = 4 if requested >= 250_000 else 3 if requested >= 100_000 else 2 if requested >= 25_000 else 1
+    execution_cost_level = 4 if is_experiment else 3 if action.get("deep_session_required") else 2
+    verification_cost_level = 1 if is_verification else 3 if action.get("definition_invention_required") else 2
     outcome_learning = verifier_filtered_outcome_learning(state, action)
-    outcome_adjustment = float(outcome_learning.get("current_family", {}).get("score_adjustment") or 0.0)
+    outcome_adjustment = float(
+        outcome_learning.get("current_family", {}).get("heuristic_score_adjustment") or 0.0
+    )
     compact_outcome_learning = {
         "outcome_learning_version": outcome_learning.get("outcome_learning_version"),
         "policy": outcome_learning.get("policy"),
@@ -2306,36 +2407,46 @@ def score_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[st
         "current_strategy_family": outcome_learning.get("current_strategy_family", ""),
         "current_family": outcome_learning.get("current_family", {}),
     }
-    score = (
-        1.6 * closing
-        + 1.25 * refuting
-        + 1.8 * root_progress
-        + 1.35 * information
-        + 0.55 * reuse
-        - 1.25 * duplication
-        - 0.45 * token_cost
-        - 0.25 * wall_cost
-        - 0.4 * verification_cost
+    priority = (
+        4 * closure_priority
+        + 3 * root_relevance_level
+        + 2 * information_priority
+        + refutation_priority
+        + reuse_priority
+        - 3 * duplication_penalty
+        - token_cost_level
+        - execution_cost_level
+        - verification_cost_level
         + outcome_adjustment
     )
     return {
-        "probability_of_closing_bottleneck": round(closing, 3),
-        "probability_of_refuting_route": round(refuting, 3),
-        "expected_root_progress": round(root_progress, 3),
-        "expected_information_gain": round(information, 3),
-        "reuse_value": round(reuse, 3),
-        "duplication_risk": round(duplication, 3),
-        "token_cost": round(token_cost, 3),
-        "wall_time_cost": round(wall_cost, 3),
-        "verification_cost": round(verification_cost, 3),
-        "expected_value_score": round(score, 4),
-        "heuristic_not_calibrated_probability": not bool(
-            outcome_learning.get("current_family", {}).get("trials")
-        ),
-        "verifier_filtered_outcome_learning": compact_outcome_learning,
-        "outcome_score_adjustment": round(outcome_adjustment, 4),
+        "priority_assessment_version": 2,
+        "scale": "ordinal levels 1 (low) through 4 (high); not probabilities or expected values",
+        "closure_priority": closure_priority,
+        "refutation_priority": refutation_priority,
+        "root_relevance_level": root_relevance_level,
+        "graph_root_impact_tiebreaker": round(root_impact, 3),
+        "information_priority": information_priority,
+        "reuse_priority": reuse_priority,
+        "duplicate_recent_attempts": duplicate_count,
+        "duplication_penalty": duplication_penalty,
+        "requested_tokens": requested,
+        "token_cost_level": token_cost_level,
+        "execution_cost_level": execution_cost_level,
+        "verification_cost_level": verification_cost_level,
+        "scheduler_priority": round(priority, 4),
+        "calibrated_probability": False,
+        "descriptive_outcome_summary": compact_outcome_learning,
+        # Compatibility alias for persisted dashboards written before schema
+        # v4. The payload itself explicitly states that it is not causal.
+        "causal_outcome_summary": compact_outcome_learning,
+        "outcome_heuristic_adjustment": round(outcome_adjustment, 4),
         "reference_solution_used": reference_used,
-        "rotation_tie_break_rule": "when scores differ by at most 0.25, prefer the least-recent researcher work mode",
+        "rotation_tie_break_active": False,
+        "rotation_tie_break_rule": (
+            "no work-mode tie-break is applied at this score layer; the scheduler's "
+            "persisted bounded-deferral rule governs top-level rotation"
+        ),
         "protected_verification_budget": "never charged to speculative research actions",
     }
 
@@ -2496,11 +2607,21 @@ def enrich_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[s
             **dict(enriched.get("bottleneck_lease") or {}),
         }
     selected_debt_obligation = _selected_action_debt_obligation(state, enriched)
-    cut_gate = root_cut_progress_gate(state)
+    # These three action views share the same mathematical cut.  Construct it
+    # once for this immutable scheduler snapshot so enrichment cannot repeat a
+    # graph-wide frontier computation under different field names.
+    graph_frontier = decisive_obligation_frontier(state)
+    cut_gate = root_cut_progress_gate(
+        state, obligation_frontier=graph_frontier
+    )
     if selected_debt_obligation:
         cut_gate = _align_frontier_to_selected_debt(cut_gate, selected_debt_obligation)
     enriched["root_cut_progress_gate"] = cut_gate
-    ownership = canonical_route_ownership(state, enriched)
+    ownership = canonical_route_ownership(
+        state,
+        enriched,
+        obligation_frontier=graph_frontier,
+    )
     enriched["canonical_route_ownership"] = ownership
     if (
         cut_gate.get("active")
@@ -2541,7 +2662,6 @@ def enrich_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[s
         enriched["evidence_based_strategic_review_required"] = True
         enriched["strategy_review_trigger"] = enriched.get("synthesis_trigger") or {}
         enriched["continue_long_proof_when_coherent"] = True
-    graph_frontier = decisive_obligation_frontier(state)
     if selected_debt_obligation:
         graph_frontier = _align_frontier_to_selected_debt(
             graph_frontier,
@@ -2655,7 +2775,7 @@ def enrich_action(state: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[s
         enriched["proof_interface_check_required"] = True
         enriched["proof_interface_contract"] = interface_contract
     enriched["research_cycle"] = research_cycle_state(state)
-    enriched["information_gain_score"] = score_action(state, enriched)
+    enriched["priority_assessment"] = score_action(state, enriched)
     return enriched
 
 
@@ -2682,7 +2802,7 @@ def _selected_action_debt_obligation(
     if not candidate_ids:
         return {}
 
-    coverage_index = DebtCoverageIndex(state)
+    coverage_index = get_debt_coverage_index(state)
     debts = {
         str(row.get("debt_id") or ""): row
         for row in state.get("debts", [])
@@ -2874,13 +2994,14 @@ def strategy_context_card(state: Mapping[str, Any], action: Mapping[str, Any]) -
         "theorem_adaptation_contract": dict(action.get("theorem_adaptation_contract") or {}),
         "proof_interface_contract": dict(action.get("proof_interface_contract") or {}),
         "experiment_conjecture_proof_contract": {
-            "experiment_workflow_version": STRATEGY_SCHEMA_VERSION,
+            "experiment_workflow_version": 2,
             "required_fields": list(EXPERIMENT_REQUIRED_FIELDS),
             "raw_output_is_not_progress": True,
-            "infinite_statement_requires_verified_finite_reduction": True,
+            "infinite_statement_verification_authority": False,
+            "host_reproduction_required_for_programs": True,
             "decision_changed_required": True,
         },
-        "action_information_gain_score": dict(action.get("information_gain_score") or {}),
+        "action_priority_assessment": dict(action.get("priority_assessment") or {}),
         "deep_session": dict(action.get("deep_session") or {}),
     }
 
@@ -2914,7 +3035,7 @@ def strategy_observability(state: Mapping[str, Any], action: Optional[Mapping[st
         "latest_conceptual_invariant_artifact_id": str(conceptual_artifact.get("artifact_id") or "") if conceptual_artifact else "",
         "conceptual_invariant_trigger": conceptual_invariant_trigger(state),
         "research_cycle": research_cycle_state(state),
-        "information_gain_score": dict((action or {}).get("information_gain_score") or {}),
+        "priority_assessment": dict((action or {}).get("priority_assessment") or {}),
         "decisive_obligation_frontier": decisive_obligation_frontier(state),
         "verifier_filtered_outcome_learning": verifier_filtered_outcome_learning(state, action or {}),
         "deep_session_roi": deep_session_roi(state, action or {}),
@@ -3337,11 +3458,12 @@ def _validate_conceptual_invariant_report(metadata: Mapping[str, Any]) -> list[s
 
 
 def _validate_experiment(metadata: Mapping[str, Any]) -> list[str]:
-    # Backward compatibility: pre-strategy CAS artifacts remain readable and
-    # attachable. New workflow prompts stamp experiment_workflow_version=1,
-    # which activates the strict decision-oriented contract.
+    # Pre-strategy artifacts already in a database remain readable. Every new
+    # versioned computation uses the reproducible v2 contract.
     if not metadata.get("experiment_workflow_version"):
         return []
+    if int(metadata.get("experiment_workflow_version") or 0) != 2:
+        return ["cas_experiment_report requires experiment_workflow_version=2"]
     errors = _require_fields(
         metadata,
         tuple(field for field in EXPERIMENT_REQUIRED_FIELDS if field != "counterexamples"),
@@ -3356,8 +3478,29 @@ def _validate_experiment(metadata: Mapping[str, Any]) -> list[str]:
         errors.append("cas_experiment_report expected_decisive_outputs must be a nonempty list")
     if not str(metadata.get("decision_changed") or "").strip():
         errors.append("cas_experiment_report requires decision_changed explaining the research consequence")
-    if metadata.get("claims_infinite_statement_verified") is True and metadata.get("complete_finite_reduction_verified") is not True:
-        errors.append("CAS output cannot verify an infinite statement without complete_finite_reduction_verified=true")
+    if metadata.get("claims_infinite_statement_verified") is True:
+        errors.append(
+            "a CAS experiment may not claim that an infinite statement is verified; attach a separate proof "
+            "inference and have a verifier certify its complete reduction"
+        )
+    request = metadata.get("reproduction_request")
+    if not isinstance(request, Mapping):
+        errors.append("cas_experiment_report requires reproduction_request")
+    else:
+        kind = str(request.get("kind") or "program").lower()
+        if kind not in {"program", "manual"}:
+            errors.append("reproduction_request.kind must be program or manual")
+    reproduction = metadata.get("host_reproduction")
+    if not isinstance(reproduction, Mapping):
+        errors.append("cas_experiment_report is missing host reproduction results")
+    elif isinstance(request, Mapping) and str(request.get("kind") or "program").lower() == "program":
+        if reproduction.get("reproduced") is not True:
+            errors.append(
+                "host CAS reproduction did not match the reported output: "
+                + str(reproduction.get("status") or "unknown")
+            )
+    if isinstance(reproduction, Mapping) and reproduction.get("proof_authority") is not False:
+        errors.append("host CAS reproduction must explicitly carry proof_authority=false")
     return errors
 
 
@@ -3402,16 +3545,52 @@ def _validate_approach_portfolio(metadata: Mapping[str, Any], conn: sqlite3.Conn
                     f"approach_portfolio alignment_evidence_artifact_ids contains unknown artifact {artifact_id}"
                 )
     candidates = _approach_candidates(metadata)
-    # Six initial ideas (three on refresh) remain the prompt-level quality
-    # target. Since this artifact is advisory and carries no proof authority,
-    # persist a smaller usable portfolio instead of discarding every idea when
-    # the model omits nonessential profiling metadata.
-    minimum = 3 if kind == "initial" else 2
+    try:
+        contract_version = int(metadata.get("portfolio_contract_version"))
+    except (TypeError, ValueError):
+        contract_version = -1
+    if contract_version != APPROACH_PORTFOLIO_CONTRACT_VERSION:
+        errors.append(
+            "new approach_portfolio artifacts require portfolio_contract_version="
+            f"{APPROACH_PORTFOLIO_CONTRACT_VERSION}; omitting the version may not "
+            "downgrade to the legacy diversity contract"
+        )
+    strict_diversity = contract_version >= 2
+    minimum = (6 if kind == "initial" else 3) if strict_diversity else (3 if kind == "initial" else 2)
     if not minimum <= len(candidates) <= 12:
         errors.append(f"approach_portfolio requires {minimum} to 12 approaches for portfolio_kind={kind or 'unknown'}")
         return errors
     approach_ids: set[str] = set()
     semantic_signatures: set[str] = set()
+    host_signatures: list[tuple[str, set[str], str]] = []
+    structural_families: set[tuple[str, str, str]] = set()
+    prior_host_signatures: set[str] = set()
+    prior_semantic_signatures: set[str] = set()
+    for row in conn.execute(
+        "SELECT metadata_json FROM artifacts WHERE artifact_type = 'approach_portfolio'"
+    ):
+        prior_metadata = _json_object(row["metadata_json"])
+        for prior_candidate in _approach_candidates(prior_metadata):
+            prior_host_signature, _prior_tokens, _prior_family = _host_approach_signature(
+                prior_candidate
+            )
+            if prior_host_signature:
+                prior_host_signatures.add(prior_host_signature)
+            prior_semantic = _json_object(prior_candidate.get("semantic_signature"))
+            if prior_semantic:
+                prior_semantic_signatures.add(
+                    normalize_text(
+                        json.dumps(prior_semantic, sort_keys=True, ensure_ascii=True)
+                    )
+                )
+    originality_statuses = {
+        "established_method",
+        "adaptation",
+        "new_combination",
+        "potentially_original",
+        "retained_prior_approach",
+        "unknown",
+    }
     for index, candidate in enumerate(candidates):
         prefix = f"approaches[{index}]"
         errors.extend(
@@ -3421,8 +3600,15 @@ def _validate_approach_portfolio(metadata: Mapping[str, Any], conn: sqlite3.Conn
                     "approach_id",
                     "title",
                     "mechanism",
+                    *(("method_family", "independent_starting_point", "representation_or_invariant")
+                      if strict_diversity else ()),
                     "root_consequence",
                     "decisive_test",
+                    *((
+                        "originality_status",
+                        "originality_rationale",
+                        "comparison_to_existing_work",
+                    ) if strict_diversity else ()),
                     "status",
                     *(("steering_impact",) if alignment_required else ()),
                 ),
@@ -3449,13 +3635,16 @@ def _validate_approach_portfolio(metadata: Mapping[str, Any], conn: sqlite3.Conn
             errors.append(f"{prefix} has invalid contribution_kind")
         if "estimated_cost" in candidate and str(candidate.get("estimated_cost") or "") not in APPROACH_COSTS:
             errors.append(f"{prefix} estimated_cost must be low, medium, or high")
-        if "novelty_score" in candidate:
-            try:
-                novelty = float(candidate.get("novelty_score"))
-            except (TypeError, ValueError):
-                novelty = -1.0
-            if not 0.0 <= novelty <= 1.0:
-                errors.append(f"{prefix} novelty_score must lie in [0, 1]")
+        originality_status = str(candidate.get("originality_status") or "")
+        if strict_diversity and originality_status not in originality_statuses:
+            errors.append(
+                f"{prefix} originality_status must be one of "
+                + ", ".join(sorted(originality_statuses))
+            )
+        if strict_diversity and "novelty_score" in candidate:
+            errors.append(
+                f"{prefix} may not use novelty_score; originality is not a calibrated probability"
+            )
         if "confidence" in candidate and str(candidate.get("confidence") or "") not in APPROACH_CONFIDENCE_LEVELS:
             errors.append(f"{prefix} confidence must be low, medium, or high")
         if str(candidate.get("status") or "") not in APPROACH_STATUSES:
@@ -3474,12 +3663,48 @@ def _validate_approach_portfolio(metadata: Mapping[str, Any], conn: sqlite3.Conn
         if fingerprint and fingerprint in semantic_signatures:
             errors.append(f"{prefix} duplicates another semantic_signature")
         semantic_signatures.add(fingerprint)
+        host_signature, host_tokens, family_key = _host_approach_signature(candidate)
+        rediscovered_prior = bool(
+            (host_signature and host_signature in prior_host_signatures)
+            or (fingerprint and fingerprint in prior_semantic_signatures)
+        )
+        if rediscovered_prior and originality_status in {
+            "new_combination",
+            "potentially_original",
+        }:
+            errors.append(
+                f"{prefix} duplicates a prior portfolio approach and may not be labelled "
+                f"{originality_status}; use retained_prior_approach or explain a material adaptation"
+            )
+        if strict_diversity and host_signature and any(host_signature == prior[0] for prior in host_signatures):
+            errors.append(f"{prefix} is a host-detected restatement of another approach")
+        for _, prior_tokens, prior_prefix in host_signatures:
+            union = host_tokens | prior_tokens
+            similarity = len(host_tokens & prior_tokens) / len(union) if union else 1.0
+            if strict_diversity and similarity >= 0.82:
+                errors.append(
+                    f"{prefix} is too similar to {prior_prefix} under the host token comparison ({similarity:.2f})"
+                )
+                break
+        host_signatures.append((host_signature, host_tokens, prefix))
+        structural_families.add(family_key)
+    required_families = 4 if kind == "initial" else 3
+    if strict_diversity and len(structural_families) < required_families:
+        errors.append(
+            f"approach_portfolio requires at least {required_families} distinct "
+            "(method_family, representation, proof_direction) combinations"
+        )
     selected = _unique_strings(metadata.get("selected_approach_ids"))
-    if selected and not 1 <= len(selected) <= 3:
+    if strict_diversity:
+        if not 2 <= len(selected) <= 3:
+            errors.append("approach_portfolio requires two or three selected_approach_ids")
+    elif selected and not 1 <= len(selected) <= 3:
         errors.append("approach_portfolio accepts at most three selected_approach_ids")
     unknown = [item for item in selected if item not in approach_ids]
     if unknown:
         errors.append("approach_portfolio selected_approach_ids must name portfolio approaches")
+    if strict_diversity and not str(metadata.get("selection_rationale") or "").strip():
+        errors.append("approach_portfolio requires selection_rationale comparing all candidates")
     supersedes = str(metadata.get("supersedes_artifact_id") or "")
     if kind in {"refresh", "challenge"} and not supersedes:
         errors.append("refreshed approach_portfolio requires supersedes_artifact_id")
@@ -3494,6 +3719,32 @@ def _validate_approach_portfolio(metadata: Mapping[str, Any], conn: sqlite3.Conn
     if not isinstance(questions, list):
         errors.append("approach_portfolio research_questions must be a list")
     return errors
+
+
+def _host_approach_signature(candidate: Mapping[str, Any]) -> tuple[str, set[str], tuple[str, str, str]]:
+    """Compute an operator-preserving diversity signature independently."""
+
+    semantic = _json_object(candidate.get("semantic_signature"))
+    method = canonical_math_text(str(candidate.get("method_family") or ""))
+    representation = canonical_math_text(str(candidate.get("representation_or_invariant") or ""))
+    direction = canonical_math_text(str(semantic.get("proof_direction") or "other"))
+    text = canonical_math_text(
+        "\n".join(
+            str(candidate.get(field) or "")
+            for field in (
+                "method_family",
+                "independent_starting_point",
+                "mechanism",
+                "representation_or_invariant",
+                "bridge_statement",
+                "root_consequence",
+                "decisive_test",
+            )
+        )
+    )
+    tokens = set(re.findall(r"[\w]+|[^\w\s]", text, flags=re.UNICODE))
+    signature = fingerprint_text(text) if text else ""
+    return signature, tokens, (method, representation, direction)
 
 
 def strategic_artifact_errors(
@@ -3540,7 +3791,7 @@ def strategic_artifact_errors(
         "advisor_synthesis": {"phd_advisor", "advisor"},
         "invention_authorization": {"phd_advisor", "advisor"},
         "bridge_lemma_search": {"researcher"},
-        "conjecture_portfolio": {"researcher", "villain"},
+        "conjecture_portfolio": {"researcher", "adversarial_reviewer", "villain"},
         "definition_candidate": {"researcher"},
         "deep_session_report": {"researcher"},
         "proof_compression": {"researcher", "phd_advisor", "advisor"},

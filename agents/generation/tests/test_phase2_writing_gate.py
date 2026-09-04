@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -18,9 +20,9 @@ from agents.generation.phase2.codex_runner import (
 )
 from agents.generation.phase2.context_builder import build_context_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
-from agents.generation.phase2.patches import apply_patch
+from agents.generation.phase2.patches import apply_operator_patch as apply_patch, apply_system_patch
 from agents.generation.phase2.report import build_markdown_report
-from agents.generation.phase2.steering import submit_steering
+from agents.generation.phase2.steering import submit_operator_steering
 from agents.generation.phase2.scheduler import (
     MAX_WRITING_GATE_DETERMINISTIC_REVISION_CYCLES,
     MAX_WRITING_GATE_REVISION_CYCLES,
@@ -35,6 +37,10 @@ from agents.generation.phase2.scheduler import (
     next_action,
 )
 from agents.generation.phase2.store import ProofStateStore
+from agents.generation.tests._phase2_test_support import (
+    certify_and_integrate_claim,
+    journal_legacy_fixture_mutation,
+)
 
 # The legacy three-lens roster: no longer dispatched by the scheduler, but the
 # prompt branches and guard vocabulary remain valid so old review data and
@@ -132,26 +138,12 @@ def make_solved_store(tmpdir: Path, problem_id: str) -> ProofStateStore:
     store = ProofStateStore(problem_id, generation_root=tmpdir / "generation")
     store.init_problem("prove the root theorem")
     store.set_completion_policy("publication_ready", reason="exercise the publication writing gate", source="test")
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute(
-            "INSERT INTO routes(route_id, conclusion_claim_id, label, strategy, status, relation_to_parent,"
-            " assumptions_json, conditions_json, evidence_artifact_ids_json, failure_fingerprint, created_at, updated_at)"
-            " VALUES ('route-root', 'root', 'root route', 'direct', 'integrated', 'sufficient',"
-            " '[]', '[]', '[]', '', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
-        )
-        conn.execute(
-            "UPDATE claims SET lifecycle_status='integrated', validation_status='informally_verified'"
-            " WHERE claim_id='root'"
-        )
-        conn.execute(
-            "INSERT INTO inferences(inference_id, route_id, conclusion_claim_id, explanation,"
-            " conditions_json, condition_claim_ids_json, validation_status, evidence_artifact_ids_json,"
-            " created_at, updated_at)"
-            " VALUES ('inf-root', 'route-root', 'root', 'Verified direct proof of the root claim.',"
-            " '[]', '[]', 'informally_verified', '[]',"
-            " '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
-        )
-        conn.commit()
+    certify_and_integrate_claim(
+        store,
+        claim_id="root",
+        route_id="route-root",
+        inference_id="inf-root",
+    )
     return store
 
 
@@ -279,7 +271,7 @@ def insert_final_paper(
         log_path = artifact_dir / f"{artifact_id}.latex.log"
         log_path.write_text(latex_log, encoding="utf-8")
         metadata["latex_log_path"] = str(log_path)
-    with sqlite3.connect(store.db_path) as conn:
+    def insert(conn: sqlite3.Connection, state_revision: int) -> None:
         conn.execute(
             "INSERT INTO artifacts(artifact_id, artifact_type, path, sha256, producer_role, run_id,"
             " state_revision, content_summary, metadata_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -287,16 +279,18 @@ def insert_final_paper(
                 artifact_id,
                 "final_paper",
                 str(path),
-                f"paper-{artifact_id}",
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 "writer",
                 "",
-                store.get_revision(),
+                state_revision,
                 "final paper",
                 json.dumps(metadata),
                 created_at,
             ),
         )
-        conn.commit()
+    journal_legacy_fixture_mutation(
+        store, insert, fixture_id=f"final-paper-{artifact_id}"
+    )
 
 
 def insert_final_proof_with_residue(store: ProofStateStore, artifact_id: str, content: str) -> None:
@@ -305,7 +299,7 @@ def insert_final_proof_with_residue(store: ProofStateStore, artifact_id: str, co
     artifact_dir.mkdir(parents=True, exist_ok=True)
     path = artifact_dir / f"{artifact_id}.md"
     path.write_text(content, encoding="utf-8")
-    with sqlite3.connect(store.db_path) as conn:
+    def insert(conn: sqlite3.Connection, state_revision: int) -> None:
         conn.execute(
             "INSERT INTO artifacts(artifact_id, artifact_type, path, sha256, producer_role, run_id,"
             " state_revision, content_summary, metadata_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -313,16 +307,18 @@ def insert_final_proof_with_residue(store: ProofStateStore, artifact_id: str, co
                 artifact_id,
                 "final_proof",
                 str(path),
-                "residue-test-sha",
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 "writer",
                 "",
-                0,
+                state_revision,
                 "final proof with residue",
                 json.dumps({"claim_id": "root"}),
                 "2026-01-02T00:00:00+00:00",
             ),
         )
-        conn.commit()
+    journal_legacy_fixture_mutation(
+        store, insert, fixture_id=f"residue-proof-{artifact_id}"
+    )
 
 
 def insert_final_proof_with_pdf_status(
@@ -344,7 +340,7 @@ def insert_final_proof_with_pdf_status(
         log_path = artifact_dir / f"{artifact_id}.latex.log"
         log_path.write_text(latex_log, encoding="utf-8")
         metadata["latex_log_path"] = str(log_path)
-    with sqlite3.connect(store.db_path) as conn:
+    def insert(conn: sqlite3.Connection, state_revision: int) -> None:
         conn.execute(
             "INSERT INTO artifacts(artifact_id, artifact_type, path, sha256, producer_role, run_id,"
             " state_revision, content_summary, metadata_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -352,16 +348,18 @@ def insert_final_proof_with_pdf_status(
                 artifact_id,
                 "final_proof",
                 str(path),
-                f"pdfstatus-{artifact_id}",
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 "writer",
                 "",
-                store.get_revision(),
+                state_revision,
                 "final proof with compile status",
                 json.dumps(metadata),
                 "2026-01-03T00:00:00+00:00",
             ),
         )
-        conn.commit()
+    journal_legacy_fixture_mutation(
+        store, insert, fixture_id=f"proof-status-{artifact_id}"
+    )
 
 
 def attach_writing_review(
@@ -401,7 +399,7 @@ def attach_writing_review(
 
 
 def record_writing_run(store: ProofStateStore, *, run_id: str, mode: str, search_intent: str, state_revision: int, status: str = "completed") -> None:
-    outcome = apply_patch(
+    outcome = apply_system_patch(
         store,
         {
             "schema_version": SCHEMA_VERSION,
@@ -422,6 +420,7 @@ def record_writing_run(store: ProofStateStore, *, run_id: str, mode: str, search
             ],
             "rationale": "record synthetic writing-gate run",
         },
+        mode=mode,
     )
     if not outcome.accepted:
         raise AssertionError(outcome.errors)
@@ -522,7 +521,7 @@ def resolve_writing_debt(store: ProofStateStore, *, debt_id: str, evidence_artif
 
 
 def active_writing_debts(store: ProofStateStore) -> list[dict]:
-    with sqlite3.connect(store.db_path) as conn:
+    with closing(sqlite3.connect(store.db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         return [
             dict(row)
@@ -957,8 +956,8 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertTrue(
                 any(d["debt_id"].startswith("writing-lint-") for d in active_writing_debts(store))
             )
-            submit_steering(
-                store.state_dir,
+            submit_operator_steering(
+                store,
                 "Run one more focused revision and remove the listed phrase.",
                 blocker_id=action["human_blocker_id"],
             )
@@ -1366,7 +1365,7 @@ class Phase2WritingGateSchedulerTest(unittest.TestCase):
             self.assertEqual("terminology_editor", action["critic_lens"])
             self.assertEqual("final-paper-clean", action["artifact_reviewed"])
             self.assertEqual([], active_writing_debts(store))
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute("SELECT status FROM debts WHERE debt_id LIKE 'writing-lint-%'").fetchall()
             self.assertTrue(rows)
@@ -1759,7 +1758,7 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
                 ],
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     "SELECT path, metadata_json FROM artifacts WHERE artifact_id='final-paper-good'"
@@ -1769,7 +1768,14 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
             metadata = json.loads(row["metadata_json"])
             self.assertIn(metadata.get("pdf_status"), {"compiled", "pdflatex_missing"})
             if metadata.get("pdf_status") == "compiled":
-                self.assertTrue(Path(row["path"]).with_suffix(".pdf").is_file())
+                pdf_path = Path(row["path"]).with_suffix(".pdf")
+                self.assertTrue(pdf_path.is_file())
+                self.assertEqual(
+                    metadata["pdf_sha256"],
+                    hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+                )
+                self.assertEqual(metadata["pdf_size_bytes"], pdf_path.stat().st_size)
+                self.assertTrue(metadata["latex_compilation_sandboxed"])
 
     def test_attached_final_paper_is_normalized_onto_the_house_template(self) -> None:
         # The deterministic template normalizer runs at attach time: a paper
@@ -1806,7 +1812,7 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
                 ],
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     "SELECT path, metadata_json FROM artifacts WHERE artifact_id='final-paper-nonhouse'"
@@ -1885,7 +1891,7 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
                 ],
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     "SELECT path, metadata_json FROM artifacts WHERE artifact_id='final-paper-staged'"
@@ -1899,6 +1905,46 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
                 self.assertTrue(stored.with_suffix(".pdf").is_file())
             # The staging file may remain; the recorded artifact is the copy.
             self.assertTrue(staging.is_file())
+
+    def test_path_based_writer_attach_enforces_bound_source_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(Path(tmpdir), "paper-path-source-binding-test")
+            staging = (
+                store.state_dir
+                / "artifacts"
+                / "staging"
+                / "final-paper-bound.tex"
+            )
+            staging.parent.mkdir(parents=True, exist_ok=True)
+            original = CLEAN_FINAL_PAPER.encode("utf-8")
+            substituted = CLEAN_FINAL_PAPER.replace(
+                "central object", "primary object"
+            ).encode("utf-8")
+            self.assertEqual(len(original), len(substituted))
+            staging.write_bytes(substituted)
+            outcome = self._patch(
+                store,
+                "writer",
+                [
+                    {
+                        "op": "attach_artifact",
+                        "artifact_id": "final-paper-bound",
+                        "artifact_type": "final_paper",
+                        "path": str(staging),
+                        "source_file_sha256": hashlib.sha256(original).hexdigest(),
+                        "source_file_size_bytes": len(original),
+                        "metadata": {"certificate_artifact_id": "final-proof-1"},
+                    }
+                ],
+            )
+            self.assertFalse(outcome.accepted)
+            self.assertTrue(
+                any(
+                    "content changed since result persistence" in error
+                    for error in outcome.errors
+                ),
+                outcome.errors,
+            )
 
     def test_path_based_final_paper_with_markdown_residue_is_rejected(self) -> None:
         # The writer guards run on path-loaded content exactly as on inline
@@ -1951,7 +1997,7 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
                 ],
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute("SELECT path FROM artifacts WHERE artifact_id='exp-log-1'").fetchone()
             managed = Path(row["path"]).resolve()
@@ -1982,7 +2028,7 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
                 ],
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     "SELECT path FROM artifacts WHERE artifact_id='final-paper-escaped'"
@@ -2080,7 +2126,7 @@ class Phase2WritingCriticPatchGuardTest(unittest.TestCase):
                 ],
             )
             self.assertTrue(outcome.accepted, outcome.errors)
-            with sqlite3.connect(store.db_path) as conn:
+            with closing(sqlite3.connect(store.db_path)) as conn, conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     "SELECT status, resolution_evidence_json FROM debts WHERE debt_id='writing-debt-resolve-me'"
@@ -2116,7 +2162,7 @@ class Phase2WritingModeGuidanceTest(unittest.TestCase):
         self.assertIn("MATHEMATICAL CORRECTNESS REVIEW IS OUT OF SCOPE", prompt)
         self.assertIn("at most 12", prompt.lower())
         self.assertIn("writing_review", prompt)
-        self.assertIn("add_debt", prompt)
+        self.assertIn("add_proof_obligation", prompt)
         self.assertIn("verdict:'pass', lens:'editor'", prompt)
         self.assertIn("never edit the paper", prompt.lower())
 
@@ -2177,7 +2223,7 @@ class Phase2WritingModeGuidanceTest(unittest.TestCase):
         self.assertIn("ONLY the final proof text", prompt)
         self.assertIn("no claim graph", prompt)
         self.assertIn("writing_review", prompt)
-        self.assertIn("add_debt", prompt)
+        self.assertIn("add_proof_obligation", prompt)
         self.assertIn("false positives are penalized", prompt.lower())
         self.assertIn("never edit the paper", prompt.lower())
 
@@ -2197,7 +2243,7 @@ class Phase2WritingModeGuidanceTest(unittest.TestCase):
             actor_role="writing_critic",
         )
         self.assertIn("ONLY critic permitted to compare the paper against its sources", prompt)
-        self.assertIn("citation/artifact ledger", prompt)
+        self.assertIn("citation and artifact register", prompt)
 
     def test_writer_revision_prompt_embeds_debts_and_diff_minimal_contract(self) -> None:
         prompt = build_session_prompt(
@@ -2215,8 +2261,9 @@ class Phase2WritingModeGuidanceTest(unittest.TestCase):
         )
         self.assertIn("DIFF-MINIMALLY", prompt)
         self.assertIn("debt-w1", prompt)
+        self.assertNotIn("proof obligation-w1", prompt)
         self.assertIn("L1-CITE-03", prompt)
-        self.assertIn("update_debt", prompt)
+        self.assertIn("update_proof_obligation", prompt)
         self.assertIn("References section intact", prompt)
 
     def test_writer_paper_authoring_prompt_embeds_the_paper_contract(self) -> None:
@@ -2253,9 +2300,10 @@ class Phase2WritingModeGuidanceTest(unittest.TestCase):
         )
         self.assertIn("Preserve every correct, rule-compliant passage", prompt)
         self.assertIn("debt-p1", prompt)
+        self.assertNotIn("proof obligation-p1", prompt)
         self.assertIn("COMPLETE revised LaTeX source", prompt)
         self.assertIn("final_paper", prompt)
-        self.assertIn("update_debt", prompt)
+        self.assertIn("update_proof_obligation", prompt)
 
     def test_writer_paper_prompts_prescribe_path_based_attach(self) -> None:
         # Both paper-authoring and paper-revision directives carry the LaTeX
@@ -2457,7 +2505,7 @@ class Phase2WritingReviewManifestTest(unittest.TestCase):
             self.assertEqual([], manifest["retrieval_cards"])
             self.assertEqual({}, manifest["graph_focus"])
             self.assertNotIn("claim_route_summary", packet)
-            self.assertNotIn("artifact_ledger", packet)
+            self.assertNotIn("artifact_catalog", packet)
             self.assertEqual("writing_critic", manifest["patch_contract"]["context_role"])
 
     def test_skeptical_editor_manifest_adds_brief_claim_route_summary(self) -> None:
@@ -2474,7 +2522,7 @@ class Phase2WritingReviewManifestTest(unittest.TestCase):
             self.assertTrue(packet["claim_route_summary"]["claims"])
             self.assertEqual([], manifest["claims"])
 
-    def test_provenance_auditor_manifest_keeps_citation_and_artifact_ledger(self) -> None:
+    def test_provenance_auditor_manifest_keeps_citation_and_artifact_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store_with_final_proof(Path(tmpdir), "writing-manifest-provenance-test")
             manifest = build_context_manifest(
@@ -2484,8 +2532,8 @@ class Phase2WritingReviewManifestTest(unittest.TestCase):
                 action={"mode": "review_writing", "target_id": "root", "critic_lens": "provenance_auditor", "artifact_reviewed": "fp-1"},
             )
             packet = manifest["writing_review_packet"]
-            self.assertIn("artifact_ledger", packet)
-            self.assertTrue(any(item["artifact_id"] == "fp-1" for item in packet["artifact_ledger"]))
+            self.assertIn("artifact_catalog", packet)
+            self.assertTrue(any(item["artifact_id"] == "fp-1" for item in packet["artifact_catalog"]))
             self.assertEqual([], manifest["claims"])
 
     def test_reviewed_paper_path_stays_in_allowed_evidence(self) -> None:
@@ -2526,7 +2574,10 @@ class Phase2WritingReviewManifestTest(unittest.TestCase):
             self.assertEqual("fp-1", packet["revision_of_artifact_id"])
             self.assertEqual("final_proof", packet["revised_artifact_type"])
             self.assertIn("We argue directly", packet["final_proof"]["content"])
-            self.assertEqual("debt-w1", packet["open_writing_debts"][0]["debt_id"])
+            self.assertEqual(
+                "debt-w1",
+                packet["open_writing_revision_obligations"][0]["proof_obligation_id"],
+            )
 
     def test_paper_authoring_manifest_embeds_certificate_literature_and_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2647,7 +2698,7 @@ class Phase2WritingReviewManifestTest(unittest.TestCase):
             self.assertIn("certificate", packet)
             self.assertEqual("fp-1", packet["certificate"]["artifact_id"])
             self.assertIn("We argue directly", packet["certificate"]["content"])
-            self.assertIn("artifact_ledger", packet)
+            self.assertIn("artifact_catalog", packet)
 
     def test_paper_revision_manifest_embeds_the_paper_and_latex_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2701,8 +2752,8 @@ class Phase2WritingReviewReportTest(unittest.TestCase):
             self.assertIn("## Writing Review", report)
             self.assertIn("`editor` `fail` on `final-paper-1` (`final_paper`", report)
             self.assertIn("`confused_reader` `pass` on `final-proof-1` (`final_proof`", report)
-            self.assertIn("Open writing debts: 1", report)
-            self.assertIn("Unresolved writing debts:", report)
+            self.assertIn("Open writing issues: 1", report)
+            self.assertIn("Unresolved writing issues:", report)
             self.assertIn("writing-open-debt", report)
 
     def test_report_names_the_shipped_final_paper_and_its_compile_status(self) -> None:
