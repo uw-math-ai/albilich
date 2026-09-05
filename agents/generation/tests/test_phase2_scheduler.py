@@ -4285,6 +4285,30 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
 
             self.assertEqual(errors, [])
 
+    def test_evidence_boundary_distinguishes_multiline_commands_from_output(self) -> None:
+        stale = "agents/generation/results/older_problem/phase2/artifacts/old.md"
+        header = "exec\n/bin/bash -lc \"python3 - <<'PY'\n"
+        trailer = "PY\" in /tmp/capsule\n succeeded in 19ms:\n"
+        cases = [
+            (header + "print(open('context.json').read())\n" + trailer + stale + "\n", False),
+            (header + "print(open('evidence/current.md').read())\n" + trailer + stale + "\n", False),
+            (header + "print(open('context.json').read())\n" + f"print(open('{stale}').read())\n" + trailer, True),
+            (header + "print(open('context.json').read())\n" + trailer + stale + "\nexec\n/bin/bash -lc 'find agents/generation/results/older_problem/phase2/artifacts' in /tmp/capsule\n succeeded in 0ms:\n" + stale + "\n", True),
+            ("exec\n/bin/bash -lc 'find .' in /tmp/capsule\n succeeded in 0ms:\ncontext.json\n" + stale + "\n", True),
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            context_path = root / "context.json"
+            log_path = root / "codex.log"
+            context_path.write_text(json.dumps({"local_search_policy": {"allowed_local_evidence_paths": []}}), encoding="utf-8")
+            for log, rejected in cases:
+                with self.subTest(log=log):
+                    log_path.write_text(log, encoding="utf-8")
+                    errors = _evidence_boundary_errors(
+                        {"log_path": str(log_path)}, {"context_path": str(context_path)},
+                    )
+                    self.assertEqual(rejected, bool(errors))
+
     def test_evidence_boundary_still_checks_explicit_access_beside_allowed_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

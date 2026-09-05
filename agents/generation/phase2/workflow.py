@@ -4106,23 +4106,27 @@ def _evidence_boundary_errors(execution: Mapping[str, Any], session_plan: Mappin
 def _iter_shell_evidence_access_lines(handle: Any) -> Iterator[str]:
     """Return Codex log lines from actual shell commands/output, not prompts."""
     in_exec_block = False
+    in_exec_command = False
     pending_exec_command = False
     scan_exec_output = True
     for line in handle:
         stripped = line.strip()
         if stripped == "exec":
             in_exec_block = False
+            in_exec_command = False
             pending_exec_command = True
             scan_exec_output = True
             continue
         if stripped == "codex" or stripped == "tokens used" or stripped.startswith("web search:"):
             in_exec_block = False
+            in_exec_command = False
             pending_exec_command = False
             scan_exec_output = True
             continue
         if pending_exec_command:
             pending_exec_command = False
             in_exec_block = True
+            in_exec_command = True
             scan_exec_output = not (
                 _shell_command_reads_context_manifest(stripped)
                 or _shell_command_reads_evidence_capsule(stripped)
@@ -4130,6 +4134,21 @@ def _iter_shell_evidence_access_lines(handle: Any) -> Iterator[str]:
             yield line
             continue
         if in_exec_block:
+            if in_exec_command:
+                # Codex prints multiline shell commands verbatim before the
+                # execution-result marker. Inspect every command line, but
+                # decide whether its *output* is inert only after seeing the
+                # entire command (e.g. a Python heredoc reading context.json).
+                if re.match(r"^(?:succeeded in |exited \d+ in )", stripped):
+                    in_exec_command = False
+                else:
+                    if (
+                        _shell_command_reads_context_manifest(stripped)
+                        or _shell_command_reads_evidence_capsule(stripped)
+                    ):
+                        scan_exec_output = False
+                    yield line
+                    continue
             if not scan_exec_output:
                 continue
             yield line
