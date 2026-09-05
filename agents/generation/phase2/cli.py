@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 from .audit import PAPER_AUDIT_RESEARCH_MODE, ingest_paper_audit
 from .bounded_io import read_bounded_text
+from .backend_contract import BackendContractError, attest_backend
 from .audit_checkpoint import (
     create_signed_audit_checkpoint,
     verify_signed_audit_checkpoint,
@@ -24,7 +25,7 @@ from .claude_runner import (
     make_claude_executor,
 )
 from .completion_policy import record_root_intent_resolution
-from .codex_runner import DEFAULT_CHILD_TIMEOUT_SECONDS, DEFAULT_CODEX_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_SANDBOX, prepare_session
+from .codex_runner import DEFAULT_CHILD_TIMEOUT_SECONDS, DEFAULT_CODEX_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_SANDBOX, prepare_session, resolve_codex_executable
 from .console import build_run_console, write_run_console
 from .context_builder import build_context_manifest
 from .formal_handoff import write_formalization_manifest
@@ -446,6 +447,21 @@ def main(argv: list[str] | None = None) -> None:
         )
         _print(result)
         return
+
+    # Validate the runtime before initializing or changing durable proof state.
+    # Otherwise a missing helper leaves a committed, unexecutable dispatch.
+    if (
+        args.command == "attempt" and not args.dry_run
+        or args.command == "run" and args.execute and not args.dry_run
+    ):
+        backend = getattr(args, "backend", "codex")
+        if backend == "codex":
+            args.codex_bin = resolve_codex_executable(args.codex_bin)
+        binary = args.claude_bin if backend == "claude" else args.codex_bin
+        try:
+            attest_backend(binary, backend)
+        except BackendContractError as exc:
+            parser.error(str(exc))
 
     store = _store(args.problem, getattr(args, "problem_id", None))
     if args.command == "attempt":

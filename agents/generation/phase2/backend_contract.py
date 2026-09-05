@@ -13,10 +13,12 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -181,6 +183,35 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _codex_companion_paths(path: Path) -> list[Path]:
+    """Locate the native 0.153 bundle, including official npm layouts."""
+    if path.name != "codex.js":
+        return [path.parent / "codex-code-mode-host"]
+    architecture = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x64"}.get(
+        platform.machine()
+    )
+    if sys.platform != "linux" or architecture is None:
+        raise BackendContractError("Codex npm companion discovery requires supported Linux")
+    triple = (
+        "aarch64-unknown-linux-musl" if architecture == "arm64"
+        else "x86_64-unknown-linux-musl"
+    )
+    package_root = path.parent.parent
+    package_name = f"codex-linux-{architecture}"
+    for vendor in (
+        package_root / "node_modules" / "@openai" / package_name / "vendor",
+        package_root.parent / package_name / "vendor",
+        package_root / "vendor",
+    ):
+        native = vendor / triple / "bin" / "codex"
+        if native.is_file():
+            return [native, native.with_name("codex-code-mode-host")]
+    raise BackendContractError(
+        "Codex npm native bundle is missing; reinstall the matching platform package "
+        "or pass --codex-bin with the native executable"
+    )
+
+
 def attest_backend(binary: str, backend: str) -> dict[str, Any]:
     """Return a reproducible attestation or fail before any model process starts."""
 
@@ -190,7 +221,7 @@ def attest_backend(binary: str, backend: str) -> dict[str, Any]:
     executable_sha256 = _sha256_file(path)
     cache_key = (backend, str(path), executable_sha256)
     cached = _ATTESTATION_CACHE.get(cache_key)
-    if cached is not None:
+    if cached is not None and attested_backend_unchanged(cached):
         return dict(cached)
 
     version_output = _probe([str(path), "--version"]).strip()
@@ -201,6 +232,20 @@ def attest_backend(binary: str, backend: str) -> dict[str, Any]:
             f"untested {backend} CLI version {'.'.join(map(str, version))}; "
             f"required interval is [{'.'.join(map(str, lower))}, {'.'.join(map(str, upper))})"
         )
+    companions: list[dict[str, str]] = []
+    if backend == "codex" and version >= (0, 153, 0):
+        # Standalone release archives contain only the main CLI. Code-mode
+        # tool execution also needs this sibling from the matching release.
+        # Do not silently fall back to an unrelated helper on PATH.
+        for launch_path in _codex_companion_paths(path):
+            helper = _resolve_executable(str(launch_path))
+            companions.append(
+                {
+                    "launch_path": str(launch_path),
+                    "executable_path": str(helper),
+                    "executable_sha256": _sha256_file(helper),
+                }
+            )
     help_argv = [str(path), "exec", "--help"] if backend == "codex" else [str(path), "--help"]
     help_output = _probe(help_argv)
     missing = sorted(flag for flag in REQUIRED_HELP_FLAGS[backend] if flag not in help_output)
@@ -226,6 +271,10 @@ def attest_backend(binary: str, backend: str) -> dict[str, Any]:
         "required_capabilities": capability_lines,
         "capability_probe_sha256": hashlib.sha256(help_output.encode()).hexdigest(),
     }
+    if companions:
+        payload["companion_executables"] = companions
+        if not attested_backend_unchanged(payload):
+            raise BackendContractError("backend companion changed during capability probes")
     payload["attestation_sha256"] = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -244,7 +293,18 @@ def attested_backend_unchanged(attestation: Mapping[str, Any]) -> bool:
         path = _resolve_executable(expected_path)
         if str(path) != expected_path:
             return False
-        return _sha256_file(path) == expected_digest
+        if _sha256_file(path) != expected_digest:
+            return False
+        for companion in attestation.get("companion_executables", []):
+            helper = _resolve_executable(
+                str(companion.get("launch_path") or companion["executable_path"])
+            )
+            if (
+                str(helper) != companion["executable_path"]
+                or _sha256_file(helper) != companion["executable_sha256"]
+            ):
+                return False
+        return True
     except (BackendContractError, OSError):
         return False
 

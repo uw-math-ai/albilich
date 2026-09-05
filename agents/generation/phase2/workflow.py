@@ -111,7 +111,7 @@ from .scheduler_registry import (
     mark_candidate_generators_skipped,
     new_parallel_generator_evaluation,
 )
-from .store import ProofStateStore
+from .store import ProofStateStore, ValidatedCommitSuperseded
 from . import steering
 
 STOP_WRITER_CONTEXT_MIN_CHARS = 150_000
@@ -1072,8 +1072,9 @@ def run_workflow(
                     execution_contract=execution_contract,
                 )
             except _StaleSchedulerDispatch:
-                # The rejected transaction inserted no dispatch and launched
-                # no child. Replan without consuming the caller's step count.
+                # No child launched. A pre-commit race needs a fresh decision;
+                # a post-commit race is picked up by durable dispatch recovery.
+                # Neither consumes the caller's step count.
                 index -= 1
                 continue
             entry["scheduler_dispatch_ids"] = [
@@ -1394,6 +1395,25 @@ def run_workflow(
             }
         elif not bool(scheduled[0].get("is_companion")):
             role_sessions.pop(primary_role, None)
+
+        # A tripped aggregate guard is permanent for this invocation. Preserve
+        # all returned work, then exit; retrying only launches more cancelled
+        # children and can never recover memory supervision.
+        if (
+            aggregate_rss_governor is not None
+            and aggregate_rss_governor.snapshot()["tripped"]
+        ):
+            entry["stop_reason"] = (
+                "aggregate child memory supervision tripped; "
+                "restart after checking resource limits"
+            )
+            entry["terminal_classification"] = "execution_configuration_required"
+            entry["execution_phase"] = "awaiting_operator_configuration"
+            entry["operator_action_required"] = (
+                "check memory usage and limits before resuming"
+            )
+            record_entry(entry)
+            break
 
         # Backend-outage circuit breaker: a wave where every session died almost
         # instantly with zero token usage is a provider/network outage, not
@@ -2452,9 +2472,12 @@ def _record_scheduler_dispatches(
         raise RuntimeError(
             "scheduler dispatch was not committed: " + "; ".join(outcome.errors)
         )
-    committed_heads = store.audit_chain_heads_after_validated_commit(
-        expected_revision=outcome.revision,
-    )
+    try:
+        committed_heads = store.audit_chain_heads_after_validated_commit(
+            expected_revision=outcome.revision,
+        )
+    except ValidatedCommitSuperseded as exc:
+        raise _StaleSchedulerDispatch(str(exc)) from exc
     return dispatches, committed_heads
 
 
@@ -3455,6 +3478,10 @@ def _looks_like_backend_outage(action_results: list[Mapping[str, Any]]) -> bool:
         if status not in {"failed", "timeout", "no_patch"}:
             return False
         execution = row.get("execution") if isinstance(row.get("execution"), Mapping) else {}
+        if str(execution.get("failure_kind") or "") in {
+            "resource_limit", "cancelled", "backend_contract", "configuration",
+        }:
+            return False
         usage = execution.get("usage") if isinstance(execution.get("usage"), Mapping) else {}
         try:
             total_tokens = int(usage.get("total_tokens") or 0)

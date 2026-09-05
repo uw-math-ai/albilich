@@ -53,6 +53,11 @@ SCHEDULER_RECENT_RUN_LIMIT = 96
 SCHEDULER_SESSION_PATCH_LIMIT = 384
 SCHEDULER_DECISION_TRACE_HISTORY_BYTE_LIMIT = 16 * 1024 * 1024
 
+
+class ValidatedCommitSuperseded(RuntimeError):
+    """A committed dispatch was superseded; recover it before replanning."""
+
+
 EVENT_HISTORY_GUARD_NAMES = (
     "guard_events_update",
     "guard_events_delete",
@@ -3915,10 +3920,15 @@ class ProofStateStore:
             if state is None:
                 raise RuntimeError("validated scheduler commit lost problem state")
             current_revision = int(state["current_revision"] or 0)
-            if current_revision != expected_revision:
+            if current_revision > expected_revision:
+                raise ValidatedCommitSuperseded(
+                    f"proof state advanced from dispatch revision {expected_revision} "
+                    f"to {current_revision}; recover before execution"
+                )
+            if current_revision < expected_revision:
                 raise RuntimeError(
-                    "proof state advanced after the scheduler dispatch commit; "
-                    "replan before execution"
+                    f"validated scheduler revision {expected_revision} is not visible "
+                    f"(current revision {current_revision}); check database storage"
                 )
             patch_raw = conn.execute(
                 "SELECT * FROM patches WHERE status = 'applied' "

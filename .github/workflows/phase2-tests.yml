@@ -20,6 +20,10 @@ jobs:
           node-version: "22"
       - name: Install the runtime-attested Codex CLI
         run: npm install --global @openai/codex@0.152.0
+      - name: Install sandbox and PDF test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap util-linux texlive-latex-base texlive-latex-recommended texlive-latex-extra texlive-fonts-recommended texlive-fonts-extra texlive-plain-generic tex-gyre
       - name: Attest the real Codex executable boundary
         run: python -m agents.generation.phase2.backend_contract codex --binary codex
       - name: Compile

@@ -56,6 +56,68 @@ from agents.generation.phase2.workflow import (
 
 
 class WorkflowOutageBreakerTests(unittest.TestCase):
+    def test_resource_failure_is_not_a_provider_outage(self) -> None:
+        from agents.generation.phase2.workflow import _looks_like_backend_outage
+        row = {"status": "failed", "execution": {"usage": {"total_tokens": 0}, "wall_time_seconds": 0.1}}
+        self.assertTrue(_looks_like_backend_outage([row]))
+        for kind in ("resource_limit", "cancelled", "backend_contract", "configuration"):
+            row["execution"]["failure_kind"] = kind
+            self.assertFalse(_looks_like_backend_outage([row]))
+
+    def test_tripped_memory_governor_stops_without_retry_or_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("memory-trip", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("Target theorem.")
+            calls = []
+            def executor(*, aggregate_rss_governor, **kwargs):
+                calls.append(kwargs)
+                limit = aggregate_rss_governor.snapshot()["limit_mb"]
+                aggregate_rss_governor.observe("test", limit + 1)
+                return {
+                    **self._failed_execution("memory-trip"),
+                    "usage": {"total_tokens": 0},
+                    "failure_kind": "resource_limit",
+                    "observed_aggregate_peak_memory_mb": limit + 1,
+                    "resource_limits": {"max_aggregate_child_process_tree_rss_mb": limit},
+                }
+            setattr(executor, CUSTOM_EXECUTOR_RESOURCE_ATTRIBUTE, CUSTOM_EXECUTOR_AGGREGATE_RSS_CAPABILITY)
+            with patch("agents.generation.phase2.workflow.time.sleep") as sleep:
+                result = run_workflow(store, steps=3, execute=True, parallel_librarian_verifier=False, parallel_branches=0, stop_on_rejection=False, write_on_stop=True, write_console=False, executor=executor)
+            self.assertEqual(1, len(calls))
+            sleep.assert_not_called()
+            self.assertEqual("execution_configuration_required", result["steps"][0]["terminal_classification"])
+            self.assertEqual("awaiting_human", store.get_run_status())
+            self.assertTrue(verify_patch_journal(store)["valid"])
+
+    def test_post_commit_revision_race_recovers_exact_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("post-commit-race", generation_root=Path(tmpdir) / "generation")
+            store.init_problem("Target theorem.")
+            original = store.audit_chain_heads_after_validated_commit
+            def advance_then_read(*, expected_revision):
+                outcome = apply_patch(store, {
+                    "schema_version": SCHEMA_VERSION, "problem_id": store.problem_id,
+                    "base_revision": store.get_revision(), "actor_role": "human_operator",
+                    "target_id": "root", "operations": [{"op": "attach_artifact", "artifact_id": "operator-note", "artifact_type": "note", "content": "Concurrent operator note.", "metadata": {"target_id": "root"}}],
+                })
+                self.assertTrue(outcome.accepted, outcome.errors)
+                return original(expected_revision=expected_revision)
+            calls = []
+            def executor(*, session_plan, **kwargs):
+                calls.append(session_plan["scheduler_dispatch_id"])
+                return self._failed_execution("post-commit-race")
+            setattr(executor, CUSTOM_EXECUTOR_RECOVERY_ATTRIBUTE, CUSTOM_EXECUTOR_RECOVERY_CAPABILITY)
+            setattr(executor, CUSTOM_EXECUTOR_IDENTITY_ATTRIBUTE, "post-commit-race-executor")
+            with patch.object(store, "audit_chain_heads_after_validated_commit", side_effect=advance_then_read):
+                result = run_workflow(store, steps=1, execute=True, parallel_librarian_verifier=False, parallel_branches=0, write_on_stop=False, write_console=False, executor=executor)
+            self.assertEqual(1, len(calls))
+            self.assertTrue(result["steps"][0]["dispatch_recovery"])
+            with store.connect() as conn:
+                self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM scheduler_dispatches").fetchone()[0])
+            self.assertTrue(verify_patch_journal(store)["valid"])
+            with self.assertRaisesRegex(RuntimeError, "not visible"):
+                original(expected_revision=store.get_revision() + 1)
+
     def test_capability_declared_custom_executor_runs_parallel_under_shared_rss(self) -> None:
         import agents.generation.phase2.workflow as workflow_mod
 

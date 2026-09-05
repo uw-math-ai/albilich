@@ -133,10 +133,27 @@ not turn the repository's historical runs into scheduler-calibration evidence.
 ## Quickstart
 
 ```bash
-npm install -g @openai/codex          # default execution backend
+npm install -g @openai/codex@0.152.0   # CI-tested execution backend
 python3 -m agents.generation.phase2.cli init    agents/generation/data/example.md
 python3 -m agents.generation.phase2.cli attempt agents/generation/data/example.md
 ```
+
+Execution requires Linux, `bubblewrap` (`bwrap`), and `prlimit` (util-linux).
+PDF export and the complete test suite also require `pdflatex` and the house
+template packages, including `newpxtext`/`newpxmath`. On Debian/Ubuntu install
+`texlive-latex-base texlive-latex-recommended texlive-latex-extra
+texlive-fonts-recommended texlive-fonts-extra texlive-plain-generic tex-gyre`.
+On macOS, run the worker **and dashboard in the same Linux VM**. Do not open
+one live SQLite WAL database concurrently from the host and guest; their
+shared-memory and locking mechanisms are not a cross-OS database service.
+Prefer a VM-local disk for proof state and export snapshots for host inspection.
+
+The attested Codex interval is `[0.152.0, 0.154.0)`. For a standalone 0.153.x
+installation, install the matching `codex-code-mode-host` companion beside the
+native Codex executable; downloading only the main CLI archive is insufficient.
+`attempt` and `run --execute` check the backend before changing proof state.
+The default is GPT-6 Astra (`gpt-6-astra`) with `xhigh` reasoning; explicit
+`--model` and `--reasoning-effort` overrides remain supported.
 
 A problem file is Markdown. Its full text becomes the immutable root statement,
 so a problem-id is fixed once and a re-run resumes the same proof state. Write a
@@ -427,7 +444,7 @@ Run-level research modes set the opening portfolio:
 Run from the repository root. The default backend is the Codex CLI. With live
 search on, an executed session may export repo-derived proof context to external
 model and search services; use `--web-search disabled` for offline attempts.
-Codex sessions default to `gpt-5.6-sol` with `xhigh` (Extra High) reasoning;
+Codex sessions default to `gpt-6-astra` (GPT-6 Astra) with `xhigh` (Extra High) reasoning;
 use `--model` and `--reasoning-effort` to override either setting for a run.
 
 ```bash

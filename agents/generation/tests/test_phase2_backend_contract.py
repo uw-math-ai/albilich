@@ -5,9 +5,11 @@ import tempfile
 import unittest
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 from agents.generation.phase2.backend_contract import (
     BackendContractError,
+    _codex_companion_paths,
     attest_backend,
     attested_backend_unchanged,
     parse_backend_version,
@@ -22,6 +24,43 @@ from agents.generation.phase2.codex_runner import (
 
 
 class BackendContractTests(unittest.TestCase):
+    def test_npm_companions_follow_platform_package_or_legacy_vendor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "agents.generation.phase2.backend_contract.platform.machine", return_value="aarch64"
+        ), patch("agents.generation.phase2.backend_contract.sys.platform", "linux"):
+            root = Path(tmpdir) / "@openai" / "codex"
+            wrapper = root / "bin" / "codex.js"
+            for vendor in (root / "vendor", root.parent / "codex-linux-arm64" / "vendor"):
+                native = vendor / "aarch64-unknown-linux-musl" / "bin" / "codex"
+                native.parent.mkdir(parents=True, exist_ok=True)
+                native.write_text("native CLI", encoding="utf-8")
+                self.assertEqual([native, native.with_name("codex-code-mode-host")], _codex_companion_paths(wrapper))
+                native.unlink()
+
+    def test_codex_153_requires_and_rechecks_code_mode_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary = Path(tmpdir) / "codex"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+            helper = binary.with_name("codex-code-mode-host")
+            def probe(argv):
+                if argv[-1] == "--version":
+                    return "codex-cli 0.153.0"
+                return "--config --disable --ignore-user-config --output-last-message --strict-config"
+            with patch("agents.generation.phase2.backend_contract._probe", side_effect=probe):
+                with self.assertRaisesRegex(BackendContractError, "codex-code-mode-host"):
+                    attest_backend(str(binary), "codex")
+                helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                helper.chmod(0o755)
+                attestation = attest_backend(str(binary), "codex")
+                self.assertTrue(attested_backend_unchanged(attestation))
+                helper.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+                self.assertFalse(attested_backend_unchanged(attestation))
+                self.assertNotEqual(attestation["attestation_sha256"], attest_backend(str(binary), "codex")["attestation_sha256"])
+                helper.unlink()
+                with self.assertRaisesRegex(BackendContractError, "codex-code-mode-host"):
+                    attest_backend(str(binary), "codex")
+
     def test_version_parser_rejects_nonsemantic_output(self) -> None:
         self.assertEqual(parse_backend_version("codex", "codex-cli 0.152.7"), (0, 152, 7))
         with self.assertRaises(BackendContractError):

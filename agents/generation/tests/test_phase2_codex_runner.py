@@ -17,6 +17,7 @@ from agents.generation.phase2.codex_runner import (
     DEFAULT_MAX_AGGREGATE_CHILD_RSS_MB,
     DEFAULT_MAX_CHILD_RSS_MB,
     MAX_RESOURCE_POLL_SECONDS,
+    RESOURCE_SAMPLE_FAIL_CLOSED_MB,
     AggregateProcessTreeRSSGovernor,
     _progress_interval_seconds,
     _child_max_rss_mb,
@@ -31,6 +32,20 @@ from agents.generation.phase2.codex_runner import (
 
 
 class CodexPatchExtractionTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux procfs")
+    def test_exited_unreaped_child_has_zero_rss(self) -> None:
+        process = subprocess.Popen(["/bin/true"])
+        try:
+            os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+            self.assertEqual(0.0, _process_tree_rss_mb(process.pid))
+        finally:
+            process.wait()
+
+    def test_live_process_with_missing_or_malformed_rss_still_fails_closed(self) -> None:
+        for status in ("State:\tS (sleeping)\n", "State:\tR (running)\nVmRSS:\tbad kB\n"):
+            with self.subTest(status=status), mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "read_text", return_value=status):
+                self.assertEqual(RESOURCE_SAMPLE_FAIL_CLOSED_MB, _process_tree_rss_mb(12345))
+
     def test_aggregate_rss_governor_trips_every_participant_permanently(self) -> None:
         governor = AggregateProcessTreeRSSGovernor(100.0)
         first_stop = threading.Event()

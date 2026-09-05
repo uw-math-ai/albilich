@@ -70,7 +70,7 @@ from .writing.paper_contract import (
 from .writing.revision import REVISION_DOCUMENT_ARTIFACT_TYPE
 from .writing.rubric import load_rubric, rules_for_critic
 
-DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+DEFAULT_CODEX_MODEL = "gpt-6-astra"
 DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_CODEX_PERMISSION_PROFILE = "albilich-evidence-capsule"
 # Kept under the historical name because this value is persisted in run
@@ -3919,6 +3919,21 @@ def _process_tree_rss_mb(root_pid: int) -> float:
             except (OSError, PermissionError):
                 return RESOURCE_SAMPLE_FAIL_CLOSED_MB
             pids.add(pid)
+            # Exited, unreaped children retain a procfs status entry but no
+            # address space (and therefore no VmRSS field). They are normal
+            # during final progress callbacks and must not trip the permanent
+            # aggregate governor. Missing RSS for a live process still fails
+            # closed below.
+            process_state = next(
+                (
+                    line.split()[1]
+                    for line in status.splitlines()
+                    if line.startswith("State:") and len(line.split()) >= 2
+                ),
+                "",
+            )
+            if process_state in {"Z", "X", "x"}:
+                continue
             rss_observed = False
             for line in status.splitlines():
                 if line.startswith("VmRSS:"):
