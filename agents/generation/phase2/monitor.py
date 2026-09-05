@@ -2962,7 +2962,7 @@ function renderResearcherMode(rmode){
     cycle: rmode.cycle, current: rmode.current, history: rmode.history,
     advisor_directive: rmode.advisor_directive, predicted_next: rmode.predicted_next,
   };
-  const villain = rmode.villain || {};
+  const villain = rmode.adversarial_reviewer || rmode.villain || {};
   const rDirective = (rmode.advisor_directive||{}).work_mode;
   const vDirective = (villain.advisor_directive||{}).work_mode;
   const rMode = String((rmode.current||{}).work_mode || (rmode.predicted_next||{}).work_mode || "");
@@ -3369,7 +3369,7 @@ function renderTimeline(rows){
       ${recoveredFailures.length?`<span class="pill info">${recoveredFailures.length} recovered later</span>`:""}
       ${unresolvedFailures?`<span class="pill bad">${unresolvedFailures} unresolved</span>`:""}</div>`;
   }
-  h += `<table><thead><tr><th>Run</th><th>Actor</th><th>Mode</th><th>Status</th><th class="num" title="Provider-reported input plus output; budget spend excludes cached input and includes reasoning.">Processed</th><th class="num">Wall</th></tr></thead><tbody>`;
+  h += `<table><thead><tr><th>Run</th><th>Actor</th><th>Mode</th><th>Status</th><th class="num" title="Gross input plus output, including cached input. Reasoning is already part of output; these are token counts, not provider billing.">Processed</th><th class="num">Wall</th></tr></thead><tbody>`;
   for (const r of rows){
     const recovered = Boolean(r.failure_recovered);
     const visibleStatus = String(r.display_status || r.status || "");
@@ -3861,6 +3861,7 @@ async function tick(forceHeavy=false){
     renderSignals(p.parallel_exchange);
     renderTimeline(p.run_timeline);
     if (proofStateChanged){
+      renderArtifacts(p.artifact_catalog);
       renderApproachPortfolio(p.research_strategy);
       renderProofSpine(p.proof_spine_status);
       renderBottleneck(p.bottleneck_frontier);

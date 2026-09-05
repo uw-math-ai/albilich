@@ -80,7 +80,10 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("const proofStateChanged = forceHeavy || lastProofRevision !== revisionKey;", INDEX_HTML)
         self.assertIn('document.addEventListener("visibilitychange"', INDEX_HTML)
         self.assertGreaterEqual(INDEX_HTML.count("if (document.hidden) return;"), 4)
-        self.assertNotIn("renderArtifacts(p.artifact_catalog)", INDEX_HTML)
+        self.assertIn("if (proofStateChanged){\n      renderArtifacts(p.artifact_catalog);", INDEX_HTML)
+        self.assertEqual(INDEX_HTML.count("renderArtifacts(p.artifact_catalog)"), 1)
+        self.assertIn("rmode.adversarial_reviewer || rmode.villain", INDEX_HTML)
+        self.assertNotIn("budget spend excludes cached input", INDEX_HTML)
 
     def test_orphan_display_delimiters_are_rendered_as_literal_tokens(self) -> None:
         self.assertIn("const literalDelimiters = part", INDEX_HTML)
@@ -384,7 +387,7 @@ class MonitorTest(unittest.TestCase):
     def test_token_ui_distinguishes_processed_from_budget_spend(self) -> None:
         self.assertIn('cached/input*100', INDEX_HTML)
         self.assertIn('>Processed</th>', INDEX_HTML)
-        self.assertIn('budget spend excludes cached input and includes reasoning', INDEX_HTML)
+        self.assertIn('Gross input plus output, including cached input. Reasoning is already part of output', INDEX_HTML)
 
     def test_dashboard_exposes_approach_portfolio_contributions_and_controls(self) -> None:
         self.assertIn('id="approachPortfolio"', INDEX_HTML)
