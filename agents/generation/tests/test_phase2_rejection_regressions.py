@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ from unittest.mock import patch
 
 from agents.generation.phase2.authority import PatchAuthority, authority_contract_errors
 from agents.generation.phase2.context_builder import build_context_manifest
+from agents.generation.phase2.codex_runner import build_session_prompt, execute_session
 from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.monitor import INDEX_HTML
 from agents.generation.phase2.patches import apply_operator_patch, preflight_patch_errors
@@ -21,6 +23,100 @@ from agents.generation.phase2.workflow import _apply_scheduled_results, run_work
 
 
 class RejectionRegressionTests(unittest.TestCase):
+    def test_artifact_paths_are_checked_before_repair_without_relaxing_staging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProofStateStore("artifact-preflight", generation_root=Path(tmp))
+            store.init_problem("The exact target.")
+            capsule = store.state_dir / "contexts" / "context" / "capsule"
+            capsule.mkdir(parents=True)
+            report = capsule / "report.md"
+            report.write_text("The proposed argument has an unresolved gap.", encoding="utf-8")
+            proposal = {"operations": [{"op": "attach_artifact", "artifact_id": "report",
+                "artifact_type": "verification_report", "path": str(report)}]}
+            errors = preflight_patch_errors(proposal, "strict_informal_verifier", store=store)
+            self.assertIn("attach_artifact.content and omit path", " ".join(errors))
+            self.assertEqual(0, store.get_revision())
+
+            # The writer's existing filename/type exception is not widened.
+            writer = copy.deepcopy(proposal)
+            writer["operations"][0]["artifact_type"] = "final_paper"
+            self.assertEqual([], preflight_patch_errors(writer, "writer", store=store))
+            writer["operations"][0]["artifact_id"] = "different-name"
+            self.assertIn("invalid attachment path", " ".join(preflight_patch_errors(writer, "writer", store=store)))
+            self.assertIn("invalid attachment path", " ".join(preflight_patch_errors(proposal, "writer", store=store)))
+
+            stored = store.state_dir / "artifacts" / "report.md"
+            stored.parent.mkdir(exist_ok=True)
+            stored.write_text(report.read_text(), encoding="utf-8")
+            operation = proposal["operations"][0]
+            operation["path"] = str(stored)
+            self.assertEqual([], preflight_patch_errors(proposal, "strict_informal_verifier", store=store))
+            operation["path"] = str(stored.with_name("missing.md"))
+            self.assertIn("does not exist", " ".join(preflight_patch_errors(proposal, "strict_informal_verifier", store=store)))
+            outside = Path(tmp) / "outside.md"
+            outside.write_text("Not authorized staging.", encoding="utf-8")
+            link = stored.with_name("linked.md")
+            link.symlink_to(outside)
+            operation["path"] = str(link)
+            self.assertIn("invalid attachment path", " ".join(preflight_patch_errors(proposal, "strict_informal_verifier", store=store)))
+            operation["content"] = report.read_text()
+            self.assertIn("must omit path", " ".join(preflight_patch_errors(proposal, "strict_informal_verifier")))
+            operation.pop("path")
+            self.assertEqual([], preflight_patch_errors(proposal, "strict_informal_verifier", store=store))
+
+    def test_runner_repairs_capsule_report_in_same_session_only_once(self):
+        from unittest.mock import Mock
+        for repaired_path_is_valid in (True, False):
+            with self.subTest(repaired_path_is_valid=repaired_path_is_valid), tempfile.TemporaryDirectory() as tmp:
+                store = ProofStateStore("capsule-report-repair", generation_root=Path(tmp))
+                store.init_problem("The exact target.")
+                capsule = store.state_dir / "contexts" / "context" / "capsule"
+                capsule.mkdir(parents=True)
+                context_path = capsule / "context.json"
+                context_path.write_text("{}", encoding="utf-8")
+                report = capsule / "report.md"
+                report.write_text("The claimed reduction has an unresolved gap.", encoding="utf-8")
+                proposal = {"schema_version": SCHEMA_VERSION, "problem_id": store.problem_id,
+                    "base_revision": 0, "actor_role": "strict_informal_verifier", "target_id": "root",
+                    "operations": [{"op": "attach_artifact", "artifact_id": "report",
+                        "artifact_type": "verification_report", "path": str(report),
+                        "metadata": {"verdict": "not_verified", "gaps": ["Unproved reduction."], "blocking_gap": True}}]}
+                repaired = copy.deepcopy(proposal)
+                if repaired_path_is_valid:
+                    repaired["operations"][0]["content"] = report.read_text()
+                    repaired["operations"][0].pop("path")
+                action = {"mode": "prove", "target_id": "root", "route_id": "route-root"}
+                plan = {"actor_role": "strict_informal_verifier", "target_id": "root", "state_revision": 0,
+                    "context_hash": "host-context", "context_path": str(context_path), "codex_workdir": str(capsule)}
+                commands = []
+                def fake_child(command, **kwargs):
+                    commands.append(command)
+                    output_path = Path(command[command.index("--output-last-message") + 1])
+                    output_path.write_text(json.dumps(proposal if len(commands) == 1 else repaired), encoding="utf-8")
+                    return Mock(pid=12345, returncode=0, stdout=io.StringIO("session id: same-test-session\n"),
+                                **{"wait.return_value": 0, "poll.return_value": 0})
+                runner = "agents.generation.phase2.codex_runner."
+                with patch(runner + "subprocess.Popen", side_effect=fake_child), \
+                     patch(runner + "resolve_codex_executable", return_value="/usr/bin/true"), \
+                     patch(runner + "_process_tree_rss_mb", return_value=1.0), \
+                     patch(runner + "resolve_cli_usage", return_value={"total_tokens": 0}):
+                    result = execute_session(store, action, plan, timeout_sec=600, enforce_backend_contract=False)
+                self.assertEqual(2, len(commands), result)
+                self.assertIn("resume", commands[1])
+                self.assertIn("same-test-session", commands[1])
+                self.assertIn("do not repeat the mathematical work", commands[1][-1])
+                self.assertTrue(result["preflight_repair"]["attempted"])
+                self.assertIn("invalid attachment path", " ".join(result["preflight_repair"]["errors_before"]))
+                self.assertEqual(not repaired_path_is_valid, bool(result["preflight_repair"]["errors_after"]))
+                self.assertEqual(proposal["operations"][0]["metadata"], result["patch"]["operations"][0]["metadata"])
+                self.assertEqual(0, store.get_revision())
+
+    def test_non_writer_prompt_requires_inline_report_without_changing_writer(self):
+        for role in ("strict_informal_verifier", "researcher", "phd_advisor", "writer"):
+            prompt = build_session_prompt(context_path=Path("context.json"),
+                action={"mode": "prove", "target_id": "root"}, actor_role=role)
+            self.assertEqual(role != "writer", "Attach reports using the complete text" in prompt)
+
     def test_parallel_result_keeps_original_context_revision_during_safe_rebase(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = ProofStateStore("parallel-authority", generation_root=Path(tmp))

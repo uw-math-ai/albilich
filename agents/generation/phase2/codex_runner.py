@@ -305,6 +305,11 @@ def build_session_prompt(*, context_path: Path, action: Mapping[str, Any], actor
             "Do not set producer_role on artifacts; the workflow records it from actor_role and rejects spoofing.",
             "Use add_proof_obligation/update_proof_obligation with proof_obligation_id and obligation_type. owner_id must be a concrete claim_id, route_id, or inference_id from the manifest or same patch (writing revision obligations alone use owner_type='artifact' with the reviewed final_proof artifact_id); never use role names as graph owners.",
             "Use manifest.patch_contract for patch shape; do not inspect framework source, schemas, tests, or README just to learn patch syntax.",
+            *([
+                "Attach reports using the complete text in attach_artifact.content and omit path. "
+                "A scratch file in your private evidence capsule is not a valid artifact attachment path. "
+                "If you wrote the report to a local file, reuse that text in content; do not repeat the analysis."
+            ] if actor_role != "writer" else []),
             "Do not add a new active sufficient route concluding an already integrated claim; closed branches should feed root synthesis by updating an existing inference with genuinely new evidence or by attacking the next root-level gap.",
             "Do not call tool_search, plugin discovery, connector discovery, plugin installation, browser/app/thread tools, or memory tools. "
             "The Albilich child session is already given its manifest and approved evidence boundary; plugin/tool discovery is outside the workflow and can corrupt structured patch output.",
@@ -2940,7 +2945,7 @@ def execute_session(
     repair_authority = session_authority(action, session_plan, {"session_id": session_id, "run_id": run_id})
     if status == "completed":
         preflight_errors = (
-            preflight_patch_errors(patch, actor_role, authority=repair_authority, problem_id=store.problem_id)
+            preflight_patch_errors(patch, actor_role, authority=repair_authority, problem_id=store.problem_id, store=store)
             if patch is not None
             else [f"returned output is not valid Albilich patch JSON: {patch_error or 'no JSON object found'}"]
         )
@@ -3095,7 +3100,7 @@ def execute_session(
                         repaired_text
                     )
                 errors_after = (
-                    preflight_patch_errors(repaired_patch, actor_role, authority=repair_authority, problem_id=store.problem_id)
+                    preflight_patch_errors(repaired_patch, actor_role, authority=repair_authority, problem_id=store.problem_id, store=store)
                     if repaired_patch is not None
                     else [f"repair output is not valid Albilich patch JSON: {repaired_error or 'no JSON object found'}"]
                 )

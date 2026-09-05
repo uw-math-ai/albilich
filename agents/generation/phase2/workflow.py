@@ -3873,6 +3873,7 @@ def _prepare_and_record_scheduled_result(
             preflight_patch_errors(
                 dict(patch),
                 str(session_plan.get("actor_role") or ""),
+                store=store,
             )
         )
         if not boundary_errors and isinstance(patch, dict):

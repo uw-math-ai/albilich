@@ -488,13 +488,14 @@ def _patch_resource_errors(patch: Mapping[str, Any]) -> List[str]:
 def preflight_patch_errors(
     patch: Mapping[str, Any], actor_role: str, *, authority: PatchAuthority | None = None,
     problem_id: str | None = None,
+    store: ProofStateStore | None = None,
 ) -> List[str]:
     """Runner-side contract checks that predict certain guard rejections.
 
-    Only violations that are decidable from the patch alone are flagged, so the
-    session that produced the patch can repair it in place instead of losing the
-    whole step to a workflow rejection. Anything that needs store state stays
-    with apply_patch.
+    Check patch shape and, when a store is supplied, the same read-only artifact
+    path boundary used by result persistence. This lets the producing session
+    repair its output without repeating its mathematical work. Proof-state and
+    evidence validation still belong to apply_patch.
     """
     resource_errors = _patch_resource_errors(patch)
     if resource_errors:
@@ -517,6 +518,31 @@ def preflight_patch_errors(
         errors.extend(authority_contract_errors(normalized, authority))
     if problem_id is not None and normalized.get("problem_id") != problem_id:
         errors.append(f"patch problem_id must equal {problem_id!r}")
+    for op in attached_ops.values():
+        if not str(op.get("path") or "").strip():
+            continue
+        if "content" in op:
+            errors.append(
+                "attach_artifact with inline content must omit path; the proof-state store writes artifacts"
+            )
+        elif store is not None:
+            try:
+                _validated_artifact_path(
+                    store,
+                    op["path"],
+                    allow_writer_context_staging=(
+                        actor_role == "writer"
+                        and str(op.get("artifact_type") or "") in WRITER_PATH_ATTACH_ARTIFACT_TYPES
+                    ),
+                    artifact_id=str(op.get("artifact_id") or ""),
+                )
+            except PatchRejected as exc:
+                errors.append(
+                    f"artifact {op.get('artifact_id')!r} has an invalid attachment path: {exc}. "
+                    "For a report written in this session's capsule, reuse its complete text as "
+                    "attach_artifact.content and omit path; do not repeat the mathematical work. "
+                    "Writer documents may instead use their prescribed matching artifact_id staging filename."
+                )
     from .research_strategy import STRATEGY_SCHEMA_VERSION, proof_compression_shape_errors
 
     for op in attached_ops.values():
