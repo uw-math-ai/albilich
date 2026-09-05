@@ -84,6 +84,8 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(INDEX_HTML.count("renderArtifacts(p.artifact_catalog)"), 1)
         self.assertIn("rmode.adversarial_reviewer || rmode.villain", INDEX_HTML)
         self.assertNotIn("budget spend excludes cached input", INDEX_HTML)
+        self.assertIn(".artifact-shell { grid-template-columns: minmax(0, 1fr); }", INDEX_HTML)
+        self.assertIn(".artifact-list { min-width: 0;", INDEX_HTML)
 
     def test_orphan_display_delimiters_are_rendered_as_literal_tokens(self) -> None:
         self.assertIn("const literalDelimiters = part", INDEX_HTML)
