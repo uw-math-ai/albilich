@@ -32,6 +32,52 @@ from agents.generation.phase2.codex_runner import (
 
 
 class CodexPatchExtractionTests(unittest.TestCase):
+    def test_thread_group_exit_resampling_is_bounded_and_fails_closed(self) -> None:
+        sampler = "agents.generation.phase2.codex_runner._sample_process_tree_rss_mb"
+        sleep = "agents.generation.phase2.codex_runner.time.sleep"
+        with mock.patch(sampler, side_effect=[None, 12.0]) as sample, mock.patch(sleep) as pause:
+            self.assertEqual(12.0, _process_tree_rss_mb(12345))
+            self.assertEqual(2, sample.call_count)
+            pause.assert_called_once_with(0.01)
+        with mock.patch(sampler, return_value=None) as sample, mock.patch(sleep) as pause:
+            self.assertEqual(RESOURCE_SAMPLE_FAIL_CLOSED_MB, _process_tree_rss_mb(12345))
+            self.assertEqual(3, sample.call_count)
+            self.assertEqual(2, pause.call_count)
+        with mock.patch(sampler, return_value=RESOURCE_SAMPLE_FAIL_CLOSED_MB), mock.patch(sleep) as pause:
+            self.assertEqual(RESOURCE_SAMPLE_FAIL_CLOSED_MB, _process_tree_rss_mb(12345))
+            pause.assert_not_called()
+
+    def test_exiting_task_without_address_space_keeps_its_live_children_counted(self) -> None:
+        def read(path, **kwargs):
+            value = str(path)
+            if value == "/proc/12345/status":
+                return "State:\tR (running)\nThreads:\t1\n"
+            if value == "/proc/12345/stat":
+                return "12345 (exiting task) R 1 1 1 0 0 4 0 0"
+            if value == "/proc/12345/task/12345/children":
+                return "12346"
+            if value == "/proc/12346/status":
+                return "State:\tS (sleeping)\nThreads:\t1\nVmRSS:\t1024 kB\n"
+            if value == "/proc/12346/task/12346/children":
+                return ""
+            raise AssertionError(value)
+        def tasks(path):
+            return iter([path / path.parent.name])
+        with (
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(Path, "read_text", autospec=True, side_effect=read),
+            mock.patch.object(Path, "iterdir", autospec=True, side_effect=tasks),
+        ):
+            self.assertEqual(1.0, _process_tree_rss_mb(12345))
+
+    def test_dead_leader_with_live_threads_does_not_bypass_memory_limit(self) -> None:
+        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "read_text", return_value="State:\tZ (zombie)\nThreads:\t2\n"):
+            self.assertEqual(RESOURCE_SAMPLE_FAIL_CLOSED_MB, _process_tree_rss_mb(12345))
+
+    def test_dead_task_with_zero_threads_has_zero_rss(self) -> None:
+        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "read_text", return_value="State:\tX (dead)\nThreads:\t0\n"):
+            self.assertEqual(0.0, _process_tree_rss_mb(12345))
+
     @unittest.skipUnless(sys.platform == "linux", "requires Linux procfs")
     def test_exited_unreaped_child_has_zero_rss(self) -> None:
         process = subprocess.Popen(["/bin/true"])

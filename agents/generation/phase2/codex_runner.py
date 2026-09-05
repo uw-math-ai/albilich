@@ -3891,7 +3891,18 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
 
 
 def _process_tree_rss_mb(root_pid: int) -> float:
-    """Best-effort resident memory sample for a Codex subprocess tree."""
+    """Sample RSS, allowing a bounded grace for thread-group exit races."""
+    for attempt in range(3):
+        sample = _sample_process_tree_rss_mb(root_pid)
+        if sample is not None:
+            return sample
+        if attempt < 2:
+            time.sleep(0.01)
+    return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+
+
+def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
+    """Return None only for an exiting group with potentially live threads."""
     if root_pid <= 0:
         return 0.0
     proc_root = Path("/proc")
@@ -3932,7 +3943,19 @@ def _process_tree_rss_mb(root_pid: int) -> float:
                 ),
                 "",
             )
+            thread_counts = [
+                line.split()[1:]
+                for line in status.splitlines()
+                if line.startswith("Threads:")
+            ]
+            # release_task() can already have decremented this to zero while
+            # the final procfs status read is in flight.
+            no_live_siblings = thread_counts in ([["0"]], [["1"]])
             if process_state in {"Z", "X", "x"}:
+                # A dead thread-group leader can leave live sibling threads.
+                # Do not mistake that group's unreadable memory for zero.
+                if not no_live_siblings:
+                    return None
                 continue
             rss_observed = False
             for line in status.splitlines():
@@ -3945,7 +3968,24 @@ def _process_tree_rss_mb(root_pid: int) -> float:
                     rss_observed = True
                     break
             if not rss_observed:
-                return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                # exit_mm() releases the address space before exit_notify()
+                # marks the task a zombie. In that interval status can still
+                # say R/S without VmRSS. Confirm PF_EXITING (linux/sched.h)
+                # and a single-thread task; other missing-RSS cases fail closed.
+                try:
+                    stat_tail = (process_root / "stat").read_text(
+                        encoding="utf-8", errors="strict"
+                    ).rpartition(")")[2].split()
+                    exiting = bool(int(stat_tail[6]) & 0x00000004)
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                except (OSError, UnicodeError, ValueError, IndexError):
+                    return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                if not exiting:
+                    return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                if not no_live_siblings:
+                    return None
+                # It has zero RSS, but enumerate any children not yet reparented.
             # Linux records children per task, not just per thread-group
             # leader. A multithreaded child may fork from any task, so reading
             # only task/<pid>/children misses a real resource-cap bypass.
