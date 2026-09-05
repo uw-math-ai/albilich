@@ -128,6 +128,7 @@ def record_run(
     status: str = "completed",
     failure_kind: str = "",
     error_summary: str = "",
+    created_at: str = "",
 ) -> None:
     action = {
         "mode": mode,
@@ -152,6 +153,8 @@ def record_run(
     )
     op["search_intent"] = search_intent
     op["failure_kind"] = failure_kind
+    if created_at:
+        op["created_at"] = created_at
     operations: list[dict[str, Any]] = []
     if error_summary:
         error_artifact_id = f"session_failure_{run_id.replace(':', '_').replace('/', '_')}"
@@ -1213,6 +1216,28 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
 
         self.assertEqual(rearmed["search_intent"], "post_integration_proof_spine")
         self.assertEqual(rearmed["recently_integrated_route_id"], "route-second")
+
+    def test_clock_rollback_cannot_hide_newer_integration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore(
+                "scheduler-clock-rollback", generation_root=Path(tmpdir) / "generation"
+            )
+            store.init_problem("Target theorem.")
+            for run_id, mode, intent, timestamp in (
+                ("first", "integrate", "", "2030-01-01T00:00:00+00:00"),
+                ("compression", "triage_routes", "post_integration_proof_spine", "2030-01-01T00:00:01+00:00"),
+                ("second", "integrate", "", "2029-12-31T23:59:00+00:00"),
+            ):
+                record_run(
+                    store, base_revision=store.get_revision(), run_id=run_id,
+                    mode=mode, target_id="root", route_id=f"route-{run_id}",
+                    search_intent=intent, created_at=timestamp,
+                )
+            recent = store.get_scheduler_state()["recent_runs"]
+            self.assertEqual(["second", "compression", "first"], [r["run_id"] for r in recent])
+            action = next_action(store, research_mode="balanced", web_search="disabled")
+            self.assertEqual("post_integration_proof_spine", action["search_intent"])
+            self.assertEqual("route-second", action["recently_integrated_route_id"])
 
     def test_advisor_proof_candidate_report_schedules_researcher_route_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

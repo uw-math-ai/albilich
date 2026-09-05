@@ -2962,21 +2962,26 @@ class ProofStateStore:
                 retrieval_run_total - sum(retrieval_run_counts.values()),
             )
             runs: list[Dict[str, Any]] = []
+            # Wall clocks may step backwards (notably in resumed VMs). The
+            # trigger-maintained, append-only source sequence is the durable
+            # completion order; timestamps are presentation data, not a cursor.
             recent_run_rows = [
                 dict(row)
                 for row in conn.execute(
                     """
                     WITH recent AS (
-                        SELECT *
-                        FROM runs
-                        ORDER BY created_at DESC, run_id DESC
+                        SELECT runs.*, source.sequence AS history_sequence
+                        FROM scheduler_source_entries AS source
+                        JOIN runs ON runs.run_id = source.record_id
+                        WHERE source.record_kind = 'run'
+                        ORDER BY source.sequence DESC
                         LIMIT ?
                     ), budgeted AS (
                         SELECT recent.*,
                                LENGTH(CAST(recent.decision_trace_json AS BLOB))
                                    AS decision_trace_bytes,
                                SUM(LENGTH(CAST(recent.decision_trace_json AS BLOB))) OVER (
-                                   ORDER BY recent.created_at DESC, recent.run_id DESC
+                                   ORDER BY recent.history_sequence DESC
                                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                                ) AS cumulative_decision_trace_bytes
                         FROM recent
@@ -2998,7 +3003,7 @@ class ProofStateStore:
                            r.created_at
                     FROM budgeted r
                     LEFT JOIN artifacts a ON a.artifact_id = r.error_artifact_id
-                    ORDER BY r.created_at DESC, r.run_id DESC
+                    ORDER BY r.history_sequence DESC
                     """,
                     (
                         SCHEDULER_RECENT_RUN_LIMIT,
