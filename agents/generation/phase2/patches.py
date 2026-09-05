@@ -485,7 +485,10 @@ def _patch_resource_errors(patch: Mapping[str, Any]) -> List[str]:
     return errors
 
 
-def preflight_patch_errors(patch: Mapping[str, Any], actor_role: str) -> List[str]:
+def preflight_patch_errors(
+    patch: Mapping[str, Any], actor_role: str, *, authority: PatchAuthority | None = None,
+    problem_id: str | None = None,
+) -> List[str]:
     """Runner-side contract checks that predict certain guard rejections.
 
     Only violations that are decidable from the patch alone are flagged, so the
@@ -510,6 +513,19 @@ def preflight_patch_errors(patch: Mapping[str, Any], actor_role: str) -> List[st
         if str(op.get("op") or "") in {"attach_artifact", "add_artifact"}
     }
     errors: List[str] = []
+    if authority is not None:
+        errors.extend(authority_contract_errors(normalized, authority))
+    if problem_id is not None and normalized.get("problem_id") != problem_id:
+        errors.append(f"patch problem_id must equal {problem_id!r}")
+    from .research_strategy import STRATEGY_SCHEMA_VERSION, proof_compression_shape_errors
+
+    for op in attached_ops.values():
+        if str(op.get("artifact_type") or "") != "proof_compression":
+            continue
+        metadata = op.get("metadata") if isinstance(op.get("metadata"), Mapping) else {}
+        if metadata.get("strategy_schema_version") != STRATEGY_SCHEMA_VERSION:
+            errors.append(f"proof_compression requires strategy_schema_version={STRATEGY_SCHEMA_VERSION}")
+        errors.extend(proof_compression_shape_errors(metadata))
     if actor_role == REFEREE_ROLE:
         reports = [
             op

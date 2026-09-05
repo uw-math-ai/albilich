@@ -1193,6 +1193,7 @@ def build_monitor_payload(store: ProofStateStore) -> Dict[str, Any]:
         "live": live,
         "seconds_since_activity": seconds_since_activity,
         "run_state": run_state,
+        "run_status": str(state.get("problem_state", {}).get("run_status") or ""),
         "problem_id": store.problem_id,
         "state_dir": str(store.state_dir),
         "errors": monitor_errors,
@@ -2256,10 +2257,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .artifact-reader .reader-statement { border-left: 3px solid var(--uw-gold); padding: 9px 12px; margin-bottom: 16px; background: color-mix(in srgb, var(--uw-gold) 9%, transparent); color: var(--text); font: 15px/1.6 Georgia, "Times New Roman", serif; white-space: pre-wrap; }
   .math-tex mjx-container { color: inherit; max-width: 100%; overflow-x: auto; overflow-y: hidden; }
   .math-tex mjx-container[display="true"] { margin: .65em 0; }
-  /* Never expose delimiter source while MathJax is replacing it.  Stable DOM
-     updates below mean this hidden state occurs only for genuinely new math,
-     not on every dashboard poll. */
-  .math-tex[data-math-pending="1"] { visibility: hidden; }
+  /* Escaped source must remain readable, including polls without MathJax. */
+  .math-tex[data-math-pending="1"] { visibility: visible; }
   .math-tex.math-typeset-failed { visibility: visible; }
   .math-document { color: var(--text); font: 14.5px/1.65 Georgia, "Times New Roman", serif; overflow-wrap: anywhere; }
   .math-document h3, .math-document h4 { font-family: var(--sans); margin: 22px 0 8px; }
@@ -2595,10 +2594,13 @@ function mathHTML(text){
 }
 let mathJaxQueue = Promise.resolve();
 function typesetPending(root=document){
-  if (!window.MathJax || typeof window.MathJax.typesetPromise !== 'function') return mathJaxQueue;
   const nodes = Array.from((root || document).querySelectorAll('[data-math-pending="1"]'));
   if (!nodes.length) return mathJaxQueue;
   nodes.forEach(node => node.removeAttribute('data-math-pending'));
+  if (!window.MathJax || typeof window.MathJax.typesetPromise !== 'function') {
+    nodes.forEach(node => node.classList.add('math-typeset-failed'));
+    return mathJaxQueue;
+  }
   // MathJax rejects overlapping typeset calls and large proof states can take
   // longer than one dashboard poll.  Queue each batch so display refreshes
   // cannot accumulate concurrent MathJax work and lock the renderer.
@@ -2675,7 +2677,7 @@ function renderKpis(snap){
     kpiCard("Root progress", `${num(snap.root_progress_score||0)}`, `${num(snap.verified_root_adjacent_claim_count||0)} near-root verified · ${num(snap.root_local_blocking_debt_count||0)} blockers`),
     kpiCard("Routes active", `${num(snap.active_route_count||0)}<small>/${num(snap.route_count||0)}</small>`, "proof trunks"),
     kpiCard("Open cases", `${num(openCases)}`, openCaseSub),
-    kpiCard("Child wall", `${fmtSec(snap.recorded_wall_seconds)}`, `${(Number(snap.recorded_peak_memory_mb)||0).toFixed(0)}MB peak`),
+    kpiCard("Child wall", `${fmtSec(snap.recorded_wall_seconds)}`, Number(snap.recorded_peak_memory_mb)>=1048577 ? "peak unavailable (sampling failed)" : `${(Number(snap.recorded_peak_memory_mb)||0).toFixed(0)}MB peak`),
   ].join("");
 }
 
@@ -2709,10 +2711,10 @@ function renderTokens(snap, usage){
     ? `<span class="inflight-tag">+${compact(inflight)} in-flight</span>`
     : (liveRuns > 0 ? `<span class="pill info">${liveRuns} live session(s) · tokens post at step end</span>` : "");
   const chips = [
-    ["Window charged", compact(windowSpent), true],
-    ["Lifetime charged", compact(lifetimeCharged), false],
+    ["Window budget used", compact(windowSpent), true],
+    ["Lifetime budget used", compact(lifetimeCharged), false],
     ["Processed (incl cached)", compact(processed), false],
-    ["Cached (free)", compact(cached), false],
+    ["Cached input (included)", compact(cached), false],
     ["Cache ratio", cacheRatio.toFixed(0)+"%", false],
     ["Output", compact(tot.output_tokens), false],
     ["Reasoning", compact(tot.reasoning_output_tokens), false],
@@ -2724,7 +2726,7 @@ function renderTokens(snap, usage){
   $("tokens").innerHTML = `
     <div class="top">
       <div>
-        <div class="lead">Current token budget window · charged (cached excluded)${inflight>0?" · live":""}</div>
+        <div class="lead">Current token budget window · includes cached input · not provider billing${inflight>0?" · live":""}</div>
         <div class="big">${compact(windowSpent)}<small> / ${compact(total)} window · ${compact(processed)} processed</small></div>
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${inflightTag}<span class="pctchip">${pctSpent.toFixed(1)}% used · ${compact(rem)} left</span></div>
@@ -3797,12 +3799,16 @@ setInterval(refreshSteering, 5000);
 function renderRunbar(mon, publication){
   const bar = $("runbar");
   const st = String(mon.run_state || "unknown");
+  const control = String(mon.run_status || "");
   const publicationAccepted = String((publication||{}).status || "") === "accepted";
   const live = !!mon.live;
   const secs = Number(mon.seconds_since_activity);
   const ageTxt = isFinite(secs) ? fmtSec(secs)+" ago" : "—";
   let cls, label, sub;
   if (publicationAccepted){ cls="completed"; label="✓ PUBLICATION ACCEPTED"; sub="writer-referee loop completed · static dashboard"; }
+  else if (control === "paused"){ cls="stopped"; label="Ⅱ RUN PAUSED"; sub="proof state preserved · no new model calls"; }
+  else if (control === "pause_requested"){ cls="running"; label="Ⅱ PAUSING"; sub="finishing current child · no new actions scheduled"; }
+  else if (control === "awaiting_human"){ cls="stopped"; label="Ⅱ ACTION REQUIRED"; sub="run halted · inspect the latest failure before resuming"; }
   else if (st === "running"){ cls="running"; label="● SYSTEM RUNNING"; sub="live agent active · last write "+ageTxt; }
   else if (st === "stalled" && live){ cls="running"; label="◑ DEEP STEP ACTIVE"; sub="live child running · quiet output for "+ageTxt+" · tokens may post at step end"; }
   else if (st === "stalled"){ cls="stalled"; label="◐ SYSTEM STALLED?"; sub="no write for "+ageTxt+" · no live child heartbeat found"; }
@@ -3833,7 +3839,9 @@ async function tick(forceHeavy=false){
       ? "publication_accepted"
       : (snap.public_status || "run");
     const displaySnap = displayStatus === snap.public_status ? snap : {...snap, public_status: displayStatus};
-    const revisionKey = snap.revision == null ? "missing" : String(snap.revision);
+    // Startup may serve a sparse console fallback before the authoritative
+    // snapshot of the same revision. Render the latter's newly loaded cards.
+    const revisionKey = `${snap.revision == null ? "missing" : snap.revision}:${mon.source || "unknown"}`;
     const proofStateChanged = forceHeavy || lastProofRevision !== revisionKey;
     $("pid").textContent = mon.problem_id || p.problem_id || "";
     document.title = `${displayStatus} · Albilich Monitor`;

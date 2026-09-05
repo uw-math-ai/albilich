@@ -245,6 +245,9 @@ def build_context_manifest(
         parallel_exchange = authenticated_parallel_exchange_card(
             store, conn=conn, journal_verified=True
         )
+        rejection_events = conn.execute(
+            "SELECT payload_json FROM events WHERE event_type = 'patch_rejected' ORDER BY rowid DESC LIMIT 12"
+        ).fetchall()
     problem = state["problem_state"]
     # Memory hygiene: collapse duplicate proof obligations before selection so a
     # packet never carries two copies of one obligation; report the collapse in
@@ -278,6 +281,17 @@ def build_context_manifest(
     else:
         selected_route = routes.get(route_id) if route_id else _best_route_for_target(routes.values(), target_id)
     role_policy = _role_context_policy(action)
+    recent_patch_rejections = []
+    for row in rejection_events:
+        rejected = json_loads(row[0], {})
+        if rejected.get("target_id") != target_id or rejected.get("actor_role") != role_policy.get("context_role"):
+            continue
+        recent_patch_rejections.append({
+            "kind": str(rejected.get("kind") or "")[:80],
+            "errors": [str(error)[:400] for error in (rejected.get("errors") or [])[:6]],
+        })
+        if len(recent_patch_rejections) == 2:
+            break
     complete_proof_context = str(role_policy.get("context_role") or "") in {
         "strict_informal_verifier",
         "integration_verifier",
@@ -640,6 +654,11 @@ def build_context_manifest(
         )
     if certified_memory.get("candidates"):
         manifest["certified_cross_run_memory"] = certified_memory
+    if recent_patch_rejections:
+        manifest["recent_patch_rejections"] = recent_patch_rejections
+        manifest["instructions"].append(
+            "Use recent_patch_rejections to avoid repeating output-contract errors. These are diagnostics, not mathematical evidence or permission to reference undisclosed entities; request missing context through request_context_entity."
+        )
     completion_policy = str(problem.get("completion_policy") or DEFAULT_COMPLETION_POLICY)
     manifest["completion_policy"] = {
         "policy": completion_policy,
@@ -975,7 +994,7 @@ def build_context_manifest(
                 "Set metadata.supersedes_synthesis_id exactly to "
                 f"{latest_synthesis_id}."
             )
-    if action and action.get("proof_compression_operation_required"):
+    if role_policy.get("context_role") in {"researcher", "phd_advisor", "advisor"} or (action and action.get("proof_compression_operation_required")):
         manifest["proof_compression_contract"] = {
             "artifact_type": "proof_compression",
             "metadata_shape": {
@@ -1000,6 +1019,10 @@ def build_context_manifest(
             "verified_fact_rule": "Every essential_verified_facts entry must be an existing claim_id from manifest.claims; the list may be empty when the state has no verified claims.",
             "active_picture_rule": "Only the shortest spine, one decisive missing theorem, strongest counterexample architecture, and at most three informative failures remain active; history stays stored as background.",
         }
+        manifest["instructions"].append(
+            "If attaching proof_compression, follow manifest.proof_compression_contract exactly; it is optional unless workflow_action.proof_compression_operation_required is true."
+        )
+    if action and action.get("proof_compression_operation_required"):
         manifest["instructions"].insert(1,
             "Perform canonical full-proof reconstruction and follow manifest.proof_compression_contract exactly: draft the entire shortest plausible proof in the artifact content, mark every unsupported sentence, isolate exactly one decisive missing theorem, retain only the strongest counterexample architecture and three informative failed ideas as active context, and keep all other history stored as background."
         )
@@ -6126,7 +6149,7 @@ def _required_instruction_fragments(manifest: Mapping[str, Any]) -> list[str]:
         required_fragments.append("manifest.bridge_lemma_search_contract exactly")
     if action.get("approach_brainstorming_required") or "approach_portfolio_contract" in manifest:
         required_fragments.append("manifest.approach_portfolio_contract exactly")
-    if action.get("proof_compression_operation_required"):
+    if "proof_compression_contract" in manifest:
         required_fragments.append("manifest.proof_compression_contract exactly")
     if action.get("advisor_global_synthesis_required"):
         required_fragments.append("manifest.advisor_synthesis_contract exactly")

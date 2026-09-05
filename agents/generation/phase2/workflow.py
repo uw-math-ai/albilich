@@ -729,6 +729,7 @@ def run_workflow(
 
     outage_streak = 0
     outage_refunds = 0
+    rejected_wave_streak = 0
     # steps <= 0 means "run until the wall clock, token budget, or a terminal
     # scheduler state stops the attempt" — no manual relaunch chains.
     step_limit = steps if steps > 0 else 10_000_000
@@ -1412,6 +1413,22 @@ def run_workflow(
             entry["operator_action_required"] = (
                 "check memory usage and limits before resuming"
             )
+            record_entry(entry)
+            break
+
+        # Continuing after one rejection must not mean spending the entire
+        # budget on an unrepaired output-contract loop. Accepted mathematical
+        # counterexamples/gap reports are progress, not rejected patches.
+        if action_results and all(str(row.get("status")) == "patch_rejected" for row in action_results):
+            rejected_wave_streak += 1
+        else:
+            rejected_wave_streak = 0
+        entry["rejected_wave_streak"] = rejected_wave_streak
+        if rejected_wave_streak >= 3:
+            entry["stop_reason"] = "three consecutive waves produced only rejected patches; inspect the patch errors before resuming"
+            entry["terminal_classification"] = "execution_configuration_required"
+            entry["execution_phase"] = "awaiting_operator_configuration"
+            entry["operator_action_required"] = "repair the output contract or context before resuming; no automatic writer was launched"
             record_entry(entry)
             break
 
@@ -3685,12 +3702,9 @@ def _apply_scheduled_results(
                     authority = session_authority(
                         action, authority_plan, execution
                     )
-                    patch = _rebase_parallel_patch_if_safe(
-                        dict(patch),
-                        store.get_revision(),
-                        action=action,
-                        parallel_group=int(item.get("parallel_group_size", 1)) > 1,
-                    )
+                    # Keep the child's original revision for session authority.
+                    # The shared retry path checks intervening mutations before
+                    # rebasing and carries that original revision to the guard.
                     patch_outcome = apply_patch_with_stale_retry(
                         store,
                         patch,
@@ -3704,6 +3718,8 @@ def _apply_scheduled_results(
         status = str(execution.get("status") or "completed")
         if patch_outcome and not patch_outcome.get("accepted") and status not in {"failed", "timeout", "no_patch", "cancelled", "blocked"}:
             status = "patch_rejected"
+        if status == "patch_rejected":
+            execution["patch_error"] = "\n".join(str(error) for error in (patch_outcome or {}).get("errors", []))
         metrics_outcome = _record_execution_metrics(
             store,
             action=action,

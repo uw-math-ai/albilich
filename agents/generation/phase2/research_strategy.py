@@ -3361,7 +3361,8 @@ def _validate_conjectures(metadata: Mapping[str, Any]) -> list[str]:
     return errors
 
 
-def _validate_proof_compression(metadata: Mapping[str, Any], conn: sqlite3.Connection) -> list[str]:
+def proof_compression_shape_errors(metadata: Mapping[str, Any]) -> list[str]:
+    """Patch-only checks shared by the repair preflight and the strict guard."""
     skeleton = _json_object(metadata.get("minimal_proof_skeleton"))
     errors = _require_fields(
         skeleton,
@@ -3378,10 +3379,6 @@ def _validate_proof_compression(metadata: Mapping[str, Any], conn: sqlite3.Conne
         errors.append(
             "minimal_proof_skeleton requires essential_verified_facts as a list (possibly empty)"
         )
-    claim_ids = {str(row[0]) for row in conn.execute("SELECT claim_id FROM claims").fetchall()}
-    unknown = [str(item) for item in _json_list(skeleton.get("essential_verified_facts")) if str(item) not in claim_ids]
-    if unknown:
-        errors.append(f"proof_compression essential_verified_facts contains unknown claims: {unknown[:3]}")
     if metadata.get("history_preserved") is not True:
         errors.append("proof_compression requires history_preserved=true")
     failed_ideas = skeleton.get("most_informative_failed_ideas")
@@ -3389,6 +3386,16 @@ def _validate_proof_compression(metadata: Mapping[str, Any], conn: sqlite3.Conne
         errors.append("minimal_proof_skeleton most_informative_failed_ideas must be a list")
     elif len(failed_ideas) > 3:
         errors.append("minimal_proof_skeleton may keep at most three most_informative_failed_ideas active")
+    return errors
+
+
+def _validate_proof_compression(metadata: Mapping[str, Any], conn: sqlite3.Connection) -> list[str]:
+    errors = proof_compression_shape_errors(metadata)
+    skeleton = _json_object(metadata.get("minimal_proof_skeleton"))
+    claim_ids = {str(row[0]) for row in conn.execute("SELECT claim_id FROM claims").fetchall()}
+    unknown = [str(item) for item in _json_list(skeleton.get("essential_verified_facts")) if str(item) not in claim_ids]
+    if unknown:
+        errors.append(f"proof_compression essential_verified_facts contains unknown claims: {unknown[:3]}")
     return errors
 
 

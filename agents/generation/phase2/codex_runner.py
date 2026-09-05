@@ -27,6 +27,7 @@ from .audit import (
     is_paper_audit_mode,
 )
 from .assurance import assurance_backend_conflict
+from .authority import session_authority
 from .budget import parse_token_usage
 from .backend_contract import (
     attest_backend,
@@ -2936,9 +2937,10 @@ def execute_session(
     # violations and let it re-emit a corrected patch instead of losing the
     # whole step.
     preflight_repair: Dict[str, Any] = {}
+    repair_authority = session_authority(action, session_plan, {"session_id": session_id, "run_id": run_id})
     if status == "completed":
         preflight_errors = (
-            preflight_patch_errors(patch, actor_role)
+            preflight_patch_errors(patch, actor_role, authority=repair_authority, problem_id=store.problem_id)
             if patch is not None
             else [f"returned output is not valid Albilich patch JSON: {patch_error or 'no JSON object found'}"]
         )
@@ -2948,8 +2950,12 @@ def execute_session(
                 [
                     "PATCH PRE-FLIGHT REJECTION. The patch you just returned would be rejected by the Albilich workflow:",
                     *[f"- {error}" for error in preflight_errors],
-                    "Re-emit ONE corrected, complete Albilich v1 patch JSON object (not a diff), keeping the same "
-                    "base_revision, problem_id, and actor_role.",
+                    "Re-emit ONE corrected, complete Albilich v1 patch JSON object (not a diff), using these host-issued fields: "
+                    + json.dumps({"base_revision": repair_authority.context_revision, "problem_id": store.problem_id,
+                                  "actor_role": actor_role, "target_id": repair_authority.target_id}),
+                    "This is structural repair only. Reuse the existing mathematical content; do not start new proof search. "
+                    "Follow the metadata contracts in context.json. Reference only disclosed entities or records created in this patch; "
+                    "use request_context_entity when an existing record was not disclosed.",
                     "Keep your verification_report/evidence artifacts. If the report honestly lists critical errors or "
                     "gaps, do NOT propose a verified status: attach the report, add one precise debt per gap, and leave "
                     "the status transitions out.",
@@ -3089,7 +3095,7 @@ def execute_session(
                         repaired_text
                     )
                 errors_after = (
-                    preflight_patch_errors(repaired_patch, actor_role)
+                    preflight_patch_errors(repaired_patch, actor_role, authority=repair_authority, problem_id=store.problem_id)
                     if repaired_patch is not None
                     else [f"repair output is not valid Albilich patch JSON: {repaired_error or 'no JSON object found'}"]
                 )

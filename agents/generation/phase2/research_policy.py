@@ -221,7 +221,7 @@ def _revision_int(value: Any) -> int:
         return -1
 
 
-def _recent_run_rows(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+def _recent_run_rows(state: Mapping[str, Any], *, actor_roles: set[str] | None = None) -> list[Mapping[str, Any]]:
     """Recent run rows, newest first, from either state snapshot shape.
 
     Scheduler state carries `recent_runs`; the full store snapshot only carries
@@ -229,8 +229,10 @@ def _recent_run_rows(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     """
     rows = state.get("recent_runs")
     if isinstance(rows, list):
-        return rows
+        return [row for row in rows if actor_roles is None or str(row.get("actor_role") or "") in actor_roles]
     rows = [row for row in state.get("runs", []) if isinstance(row, Mapping) and row.get("run_id")]
+    if actor_roles is not None:
+        rows = [row for row in rows if str(row.get("actor_role") or "") in actor_roles]
     rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
     return rows[:32]
 
@@ -314,15 +316,14 @@ def _researcher_work_mode_history(
 ) -> list[Dict[str, Any]]:
     """Recent work modes for one role's sessions, newest first."""
     history: list[Dict[str, Any]] = []
-    for run in _recent_run_rows(state):
-        recorded_role = str(run.get("actor_role") or "")
-        accepted_roles = (
-            {"adversarial_reviewer", "villain"}
-            if actor_role in {"adversarial_reviewer", "villain"}
-            else {actor_role}
-        )
-        if recorded_role not in accepted_roles:
-            continue
+    accepted_roles = (
+        {"adversarial_reviewer", "villain"}
+        if actor_role in {"adversarial_reviewer", "villain"}
+        else {actor_role}
+    )
+    # Limit each role's history after filtering. Many advisor passes must not
+    # erase the researcher's last mode from the dashboard or its rotation.
+    for run in _recent_run_rows(state, actor_roles=accepted_roles):
         work_mode = str(run.get("researcher_work_mode") or "").strip().lower()
         if work_mode not in RESEARCHER_WORK_MODES:
             continue

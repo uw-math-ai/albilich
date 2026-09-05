@@ -20,6 +20,7 @@
       "artifact_id",
       "claim_id",
       "conclusion_claim_id",
+      "conclusion_id",
       "debt_id",
       "error_artifact_id",
       "inference_id",
@@ -29,9 +30,11 @@
       "route_id",
       "suggested_next_target",
       "supersedes_artifact_id",
-      "target_id"
+      "target_id",
+      "target_claim_id"
     ],
     "entity_reference_list_fields": [
+      "add_evidence_artifact_ids",
       "condition_claim_ids",
       "condition_ids",
       "dependency_artifact_ids",
@@ -39,6 +42,7 @@
       "output_artifact_ids",
       "parent_ids",
       "premise_claim_ids",
+      "premise_ids",
       "replacement_claim_ids",
       "resolved_debt_ids",
       "resolved_proof_obligation_ids",

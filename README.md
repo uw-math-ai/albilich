@@ -155,6 +155,13 @@ native Codex executable; downloading only the main CLI archive is insufficient.
 The default is GPT-6 Astra (`gpt-6-astra`) with `xhigh` reasoning; explicit
 `--model` and `--reasoning-effort` overrides remain supported.
 
+Even with `--no-stop-on-rejection`, three consecutive execution waves containing
+only rejected patches halt in `awaiting_human`, without launching a stop writer.
+Inspect the recorded patch errors and repair the contract/context before resuming.
+The Codex runner can attempt one structural repair in the same session for
+patch-only schema and authority errors; proof-verification gates remain unchanged.
+Dashboard token budgets include cached input and are not provider billing totals.
+
 A problem file is Markdown. Its full text becomes the immutable root statement,
 so a problem-id is fixed once and a re-run resumes the same proof state. Write a
 problem file under `agents/generation/data/`; `example.md` is a runnable demo.
