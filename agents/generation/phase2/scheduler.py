@@ -5501,16 +5501,20 @@ def _bind_parallel_wave_decision(
     trace["parallel_wave_input_action_sha256"] = str(
         matching_rows[0].get("comparison_action_sha256") or ""
     )
-    comparison_action["decision_trace"] = bind_dispatched_action(
-        comparison_action, trace
+    # Comparison provenance belongs to the wrapper, not to the already admitted
+    # action payload. Keep that payload byte-for-byte reconstructible by the
+    # dispatch invariant (apart from the explicitly allowed wave annotations).
+    dispatched_action = dict(action)
+    dispatched_action["decision_trace"] = bind_dispatched_action(
+        dispatched_action, trace
     )
-    trace_errors = decision_trace_errors(comparison_action["decision_trace"])
+    trace_errors = decision_trace_errors(dispatched_action["decision_trace"])
     if trace_errors:
         raise RuntimeError(
             "invalid companion parallel-wave decision trace: "
             + "; ".join(trace_errors)
         )
-    return comparison_action
+    return dispatched_action
 
 
 def _bind_primary_parallel_wave_decision(

@@ -5,6 +5,7 @@ import unittest
 
 from agents.generation.phase2.decision_policy import (
     ActionCandidate,
+    action_sha256,
     bind_dispatched_action,
     decision_trace_errors,
     policy_trace_sha256,
@@ -43,7 +44,16 @@ class ParallelTraceBindingTests(unittest.TestCase):
         self.assertEqual([], decision_trace_errors(trace))
         candidate_id = bound["parallel_wave_candidate_id"]
         self.assertEqual(original, trace["nested_policy_traces"][candidate_id])
-        self.assertEqual(policy_trace_sha256(original), bound["base_policy_trace_sha256"])
+        self.assertEqual(
+            policy_trace_sha256(original), trace["candidates"][0]["base_policy_trace_sha256"]
+        )
+        # The dispatch invariant reconstructs the admitted input by removing
+        # placement annotations. Nesting provenance must not rewrite that input.
+        source_action = dict(bound)
+        source_action.pop("parallel_wave_candidate_id")
+        self.assertEqual(
+            wave["candidates"][1]["comparison_action_sha256"], action_sha256(source_action)
+        )
         self.assertEqual(
             wave["candidates"][1]["comparison_action_sha256"],
             trace["parallel_wave_input_action_sha256"],
