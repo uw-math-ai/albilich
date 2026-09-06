@@ -2175,7 +2175,12 @@ def _role_context_policy(action: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
             "retrieval_card_limit": 3,
             "theorem_library_limit": 4,
             "authoritative_packet": "selected verified route packet",
-            "summary": "integrate only after checking verified route evidence and root alignment",
+            "summary": (
+                "integrate the local claim after checking its verified route and dependency closure; keep unresolved root obligations active"
+                if str((action or {}).get("target_id") or "root") != "root"
+                and not (action or {}).get("root_alignment_audit")
+                else "integrate only after checking verified route evidence and root alignment"
+            ),
         }
     if mode == "formalize":
         return {
@@ -2487,7 +2492,9 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
                     "artifact_type=integration_report",
                     "content",
                     "metadata.integrates",
-                    "metadata.root_alignment",
+                    "metadata.claim_id",
+                    "metadata.route_id",
+                    *(["metadata.root_alignment"] if str(action.get("target_id") or "root") == "root" else []),
                     "metadata.resolved_debt_ids(optional; ids must come from manifest.debts)",
                     "metadata.resolved_debt_justifications(optional object; required for each integration_resolution_candidate)",
                 ],

@@ -1201,6 +1201,28 @@ def _base_mode_guidance(mode: str, actor_role: str, route_id: str, action: Mappi
                 "exactly one integration_report. Do not propose lifecycle transitions, debts, repairs, or new proof "
                 "material."
             )
+        if str(action.get("target_id") or "root") != "root" and not action.get("root_alignment_audit"):
+            return (
+                "LOCAL INTEGRATION: integrate only the selected non-root claim, not the root theorem. "
+                "A verified local lemma does not require a proof of the root to enter the reusable proof state. "
+                "Check the exact local statement, its hypotheses and conditions, the sufficient route, verified terminal "
+                "inferences, verified premises and condition claims, verified conclusion, and all local dependency blockers. "
+                "If any local gate fails, attach an integration_report with integrates=false and name the precise blocking debt; "
+                "do not integrate. If all local gates pass, attach an integration_report with integrates=true, route_id, claim_id, "
+                "missing=[], outcome=integrates, resolved_debt_ids, resolved_debt_justifications, proof_interface_check_version=2, "
+                "quantifiers_preserved, hypotheses_matched, cases_exhaustive, reduction_direction_valid, finite_scope_not_overclaimed, "
+                "dependencies_assemble, mathematical_interface_version=1, interface_checks, and unresolved_interface_mismatches=[]. "
+                "Then propose lifecycle integrated for this local claim only, with route_id, the report evidence_artifact_ids, "
+                "and matching resolved_debt_ids. No root_alignment certification is required for this local transition. "
+                "Keep root active and unsolved unless its own separate integration gates have been satisfied; never mark the root "
+                "integrated from this local report. Unresolved implications from this lemma to the root remain root-owned debts, "
+                "not blockers to the valid local deduction. Do not repeat a root-alignment-only audit instead of the requested "
+                "local integration. Earlier certified-partial root audits do not prohibit integrating this local claim. "
+                "Only resolve debts listed in manifest.debts whose exact obligations the route fully discharges. An "
+                "integration_resolution_candidate=true debt is optional upstream/root reconciliation: leave it active when "
+                "it is not discharged, and still integrate the local claim if its local gates pass. Justify every resolved "
+                "candidate under its id in resolved_debt_justifications; partial overlap does not resolve it."
+            )
         return (
             "Check that the selected sufficient route has verified inferences, verified premises, a verified conclusion claim, "
             "and no unresolved active blocking debt. For root integration, also perform statement alignment: the proved statement must be "
