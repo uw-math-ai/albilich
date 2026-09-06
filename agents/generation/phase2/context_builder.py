@@ -55,9 +55,11 @@ from .retrieval import (
 from .research_strategy import (
     ADVISOR_SYNTHESIS_REQUIRED_FIELDS,
     CONCEPTUAL_INVARIANT_REQUIRED_FIELDS,
+    CONCEPTUAL_INVARIANT_STATUSES,
     EXPERIMENT_REQUIRED_FIELDS,
     LEMMA_ROOT_LEVERAGE_GATE_FIELDS,
     PROOF_COMPRESSION_SKELETON_REQUIRED_FIELDS,
+    STRATEGY_SCHEMA_VERSION,
     apply_active_compression,
     strategy_context_card,
 )
@@ -1061,12 +1063,15 @@ def build_context_manifest(
     if action and action.get("conceptual_invariant_discovery_required"):
         manifest["conceptual_invariant_contract"] = {
             "artifact_type": "conceptual_invariant_report",
-            "required_fields": list(CONCEPTUAL_INVARIANT_REQUIRED_FIELDS),
+            "strategy_schema_version": STRATEGY_SCHEMA_VERSION,
+            "required_fields": ["strategy_schema_version", *CONCEPTUAL_INVARIANT_REQUIRED_FIELDS],
+            "metadata_rule": "Put strategy_schema_version and all required fields directly inside attach_artifact.metadata; candidate_invariants is a list in that metadata.",
             "candidate_count": "one to three",
             "candidate_fields": [
                 "invariant_id", "definition", "transformations_controlled", "local_lemmas_subsumed",
                 "root_consequence", "falsification_example", "failure_modes", "status",
             ],
+            "candidate_status_values": sorted(CONCEPTUAL_INVARIANT_STATUSES),
             "selection_rule": "select only an invariant that subsumes at least two local lemmas and has a concrete falsification test; selected_invariant_id may be none",
         }
         manifest["instructions"].append(

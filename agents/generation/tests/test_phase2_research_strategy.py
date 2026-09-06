@@ -1177,6 +1177,28 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         self.assertTrue(accepted.accepted, accepted.errors)
         self.assertEqual(manifest["conceptual_invariant_contract"]["candidate_count"], "one to three")
 
+    def test_compact_conceptual_contract_exposes_metadata_version_and_status_enum(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir, "compact-conceptual-contract")
+            manifest = build_context_manifest(
+                store,
+                max_chars=12_000,
+                action={
+                    "mode": "reduce",
+                    "target_id": "root",
+                    "conceptual_invariant_discovery_required": True,
+                },
+            )
+        contract = manifest["conceptual_invariant_contract"]
+        self.assertEqual(1, contract.get("strategy_schema_version"))
+        self.assertIn("strategy_schema_version", contract["required_fields"])
+        self.assertEqual(
+            {"selected", "viable", "rejected", "refuted"},
+            set(contract["candidate_status_values"]),
+        )
+        self.assertIn("attach_artifact.metadata", contract["metadata_rule"])
+        self.assertNotIn("complete_local_proof_candidate", contract["candidate_status_values"])
+
     def test_cas_mode_manifest_exposes_exact_experiment_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(tmpdir, "strategy-cas-contract")

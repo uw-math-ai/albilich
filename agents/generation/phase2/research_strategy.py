@@ -141,6 +141,7 @@ CONCEPTUAL_INVARIANT_REQUIRED_FIELDS = (
     "object_dictionary",
     "next_decisive_test",
 )
+CONCEPTUAL_INVARIANT_STATUSES = frozenset({"selected", "viable", "rejected", "refuted"})
 CONCEPTUAL_INVARIANT_INTENT = "conceptual_invariant_discovery"
 CONCEPTUAL_INVARIANT_LOCAL_PASS_THRESHOLD = 2
 CONCEPTUAL_INVARIANT_COOLDOWN_REVISIONS = 12
@@ -3456,7 +3457,7 @@ def _validate_conceptual_invariant_report(metadata: Mapping[str, Any]) -> list[s
         candidate_ids.add(invariant_id)
         if len(_json_list(candidate.get("local_lemmas_subsumed"))) < 2:
             errors.append(f"{prefix} must subsume at least two existing local lemmas")
-        if str(candidate.get("status") or "") not in {"selected", "viable", "rejected", "refuted"}:
+        if str(candidate.get("status") or "") not in CONCEPTUAL_INVARIANT_STATUSES:
             errors.append(f"{prefix} has invalid status {candidate.get('status')}")
     selected = str(metadata.get("selected_invariant_id") or "")
     if selected != "none" and selected not in candidate_ids:
