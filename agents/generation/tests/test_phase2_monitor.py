@@ -1,6 +1,10 @@
+import base64
 import json
 import hashlib
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -30,6 +34,70 @@ from agents.generation.phase2.store import ProofStateStore
 
 
 class MonitorTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for dashboard JavaScript regressions")
+    def test_math_startup_retry_queue_and_detached_nodes(self) -> None:
+        start = INDEX_HTML.index("function typesetPending(")
+        source = INDEX_HTML[start:INDEX_HTML.index("window.addEventListener('load'", start)]
+        script = r"""
+const assert = require('node:assert/strict');
+let mathJaxQueue = Promise.resolve();
+const window = {};
+function node(){
+  return {pending: true, failed: false, isConnected: true,
+    removeAttribute(){this.pending=false;},
+    classList: {add(){}, remove(){}}};
+}
+const first = node(), retired = node(), second = node();
+const root = items => ({querySelectorAll: () => items.filter(n => n.pending)});
+const document = root([first, retired]);
+""" + source + r"""
+(async () => {
+  await typesetPending(document);
+  assert(first.pending, 'early poll must remain eligible for startup retry');
+  let active = 0, calls = [];
+  window.MathJax = {typesetPromise: async nodes => {
+    assert.equal(++active, 1, 'typesetting must be serialized');
+    calls.push(nodes);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    active--;
+  }};
+  const a = typesetPending(document);
+  retired.isConnected = false;
+  const b = typesetPending(root([second]));
+  await Promise.all([a,b]);
+  assert.deepEqual(calls, [[first],[second]]);
+  assert(!first.pending);
+})().catch(error => {console.error(error); process.exitCode=1;});
+"""
+        subprocess.run([shutil.which("node"), "-e", script], check=True, capture_output=True, text=True)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for dashboard JavaScript regressions")
+    def test_display_math_stays_paired_across_markdown_blank_lines(self) -> None:
+        math_start = INDEX_HTML.index("const UNICODE_MATH_GLYPHS")
+        math_source = INDEX_HTML[math_start:INDEX_HTML.index("let mathJaxQueue", math_start)]
+        start = INDEX_HTML.index("function readableDocumentHTML(")
+        source = INDEX_HTML[start:INDEX_HTML.index("async function openArtifact(", start)]
+        script = r"""
+const assert = require('node:assert/strict');
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+""" + math_source + source + r"""
+const block = String.raw`\[
+\displaystyle\sum_{i=1}^n i
+
+- x < y
+\]`;
+const dollars = '$$\\displaystyle\\frac{1}{2}\n\n+z$$';
+const html = readableDocumentHTML('# Heading\n\nBefore\n'+block+'\nAfter\n'+dollars);
+assert.equal((html.match(/class="math-block"/g)||[]).length, 2);
+assert(html.includes(esc(block)));
+assert(html.includes(esc(dollars)));
+assert(!html.includes('•'));
+assert(html.includes('<h3>'));
+assert(!readableDocumentHTML('\\[x <script>alert(1)</script>\\]').includes('<script>'));
+assert(readableDocumentHTML('\\documentclass{article}').startsWith('<pre>'));
+"""
+        subprocess.run([shutil.which("node"), "-e", script], check=True, capture_output=True, text=True)
+
     def test_verification_history_recovers_legacy_blocking_report_target(self) -> None:
         state = {
             "runs": [{"run_id": "verify-lemma", "target_id": "claim-lemma"}],
@@ -780,6 +848,29 @@ class MonitorTest(unittest.TestCase):
                 self.assertNotIn("cdn.jsdelivr.net", html)
                 self.assertIn("Content-Security-Policy", resp.headers)
                 self.assertIn("script-src 'nonce-", resp.headers["Content-Security-Policy"])
+                scripts = re.findall(r"<script\b([^>]*)>", html)
+                self.assertEqual(len(scripts), 3)
+                nonce = re.search(r"script-src 'nonce-([^']+)'", resp.headers["Content-Security-Policy"])[1]
+                self.assertTrue(all(f'nonce="{nonce}"' in tag for tag in scripts))
+                self.assertEqual(re.findall(r'<script[^>]+src="([^"]+)"', html), [monitor_mod.MATHJAX_ASSET_URL])
+                self.assertIn("typeset: false", html)
+                self.assertIn("options: {enableMenu: false}", html)
+                packages = re.search(r"packages: \[([^\]]+)\]", html)[1]
+                for disabled in ("require", "autoload", "html", "setoptions"):
+                    self.assertNotIn(f"'{disabled}'", packages)
+
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}{monitor_mod.MATHJAX_ASSET_URL}") as resp:
+                    renderer = resp.read()
+                    self.assertEqual(resp.status, 200)
+                    self.assertEqual(resp.headers.get_content_type(), "application/javascript")
+                    self.assertEqual(resp.headers["X-Content-Type-Options"], "nosniff")
+                self.assertEqual(hashlib.sha256(renderer).hexdigest(), "a4354ff94fd868aea0cc6eaaa79a57fda0588646fc46ee3700a349ee0a11cbe6")
+                digest = base64.b64encode(hashlib.sha384(renderer).digest()).decode("ascii")
+                self.assertIn(f'integrity="sha384-{digest}"', html)
+                for path in ("/static/../monitor.py", "/static/mathjax-3.2.2/../LICENSE", "/static/unknown.js"):
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        urllib.request.urlopen(f"http://127.0.0.1:{port}{path}")
+                    self.assertEqual(error.exception.code, 404)
 
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/console") as resp:
                     data = json.loads(resp.read().decode("utf-8"))

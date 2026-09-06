@@ -52,6 +52,8 @@ PAPER_ARTIFACT_TYPES = {HUMAN_READABLE_TEXT_ARTIFACT_TYPE, "final_paper"}
 MAX_STEERING_REQUEST_BYTES = 64 * 1024
 MAX_SERVED_PDF_BYTES = 64 * 1024 * 1024
 MAX_CONSOLE_SNAPSHOT_BYTES = 64 * 1024 * 1024
+MATHJAX_ASSET_URL = "/static/mathjax-3.2.2/tex-svg-full.js"
+MATHJAX_ASSET_PATH = Path(__file__).parent / "static" / "mathjax-3.2.2" / "tex-svg-full.js"
 
 
 def _monitor_refresh_interval_seconds(poll_ms: int) -> float:
@@ -1526,6 +1528,18 @@ def _make_handler(
             if path == "/healthz":
                 self._send(200, b'{"ok":true}', "application/json")
                 return
+            if path == MATHJAX_ASSET_URL:
+                # A single, vendored asset, not a general filesystem endpoint.
+                # Never serve generated artifacts as executable dashboard code.
+                try:
+                    body = read_bounded_bytes(
+                        MATHJAX_ASSET_PATH, max_bytes=4 * 1024 * 1024, label="math renderer"
+                    )
+                except (OSError, ValueError):
+                    self._send(404, b'{"error":"math renderer unavailable"}', "application/json")
+                    return
+                self._send(200, body, "application/javascript; charset=utf-8")
+                return
             if path == "/api/files":
                 body = json.dumps({"files": _inspectable_files(store)}, ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
@@ -1826,9 +1840,34 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Albilich Monitor · __PROBLEM_ID__</title>
-<!-- The dashboard is deliberately self-contained. Loading third-party script
-     into this control-plane origin would give it access to proof data and the
-     per-instance steering token. Raw escaped LaTeX remains readable. -->
+<!-- Self-contained, pinned math renderer: no CDN or runtime package downloads
+     on the control-plane origin. Keep the nonce-only script policy intact. -->
+<script nonce="__SCRIPT_NONCE__">
+window.MathJax = {
+  loader: {load: []},
+  tex: {
+    inlineMath: [['$', '$'], ['\\(', '\\)']],
+    displayMath: [['$$', '$$'], ['\\[', '\\]']],
+    // Explicit allowlist: no require/autoload, HTML, URLs, or option changes
+    // supplied by generated TeX. All enabled packages are in the local bundle.
+    packages: ['base', 'ams', 'newcommand', 'noundefined', 'configmacros',
+               'mathtools', 'boldsymbol', 'braket', 'textmacros'],
+    maxMacros: 1000,
+    maxBuffer: 20 * 1024
+  },
+  svg: {fontCache: 'local'},
+  options: {enableMenu: false},
+  startup: {
+    typeset: false,
+    ready(){
+      MathJax.startup.defaultReady();
+      MathJax.startup.promise.then(() => typesetPending(document));
+    }
+  }
+};
+</script>
+<script nonce="__SCRIPT_NONCE__" defer src="/static/mathjax-3.2.2/tex-svg-full.js"
+        integrity="sha384-4kE/rQ11E8xT9QgrCBTyvenkuPfQo8rXYQvJZuMgxyPOoUfpatjQPlgdv6V5yhUK"></script>
 <style>
   /* ===== UW Math AI Lab palette: purple #4b2e83 + gold #b7a57a ===== */
   :root {
@@ -2596,26 +2635,29 @@ let mathJaxQueue = Promise.resolve();
 function typesetPending(root=document){
   const nodes = Array.from((root || document).querySelectorAll('[data-math-pending="1"]'));
   if (!nodes.length) return mathJaxQueue;
-  nodes.forEach(node => node.removeAttribute('data-math-pending'));
   if (!window.MathJax || typeof window.MathJax.typesetPromise !== 'function') {
+    // A fast first poll can beat the deferred renderer. Keep these eligible
+    // for its ready callback instead of permanently stranding raw delimiters.
     nodes.forEach(node => node.classList.add('math-typeset-failed'));
     return mathJaxQueue;
   }
+  nodes.forEach(node => {
+    node.removeAttribute('data-math-pending');
+    node.classList.remove('math-typeset-failed');
+  });
   // MathJax rejects overlapping typeset calls and large proof states can take
   // longer than one dashboard poll.  Queue each batch so display refreshes
   // cannot accumulate concurrent MathJax work and lock the renderer.
   mathJaxQueue = mathJaxQueue
     .catch(() => {})
-    .then(() => window.MathJax.typesetPromise(nodes))
+    .then(() => {
+      const connected = nodes.filter(node => node.isConnected);
+      return connected.length ? window.MathJax.typesetPromise(connected) : undefined;
+    })
     .catch(() => nodes.forEach(node => node.classList.add('math-typeset-failed')));
   return mathJaxQueue;
 }
-window.addEventListener('load', () => {
-  if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') typesetPending(document);
-  else document.querySelectorAll('[data-math-pending="1"]').forEach(node => {
-    node.removeAttribute('data-math-pending'); node.classList.add('math-typeset-failed');
-  });
-});
+window.addEventListener('load', () => typesetPending(document));
 const num = (n) => (Number(n)||0).toLocaleString();
 function compact(n){ n=Number(n)||0; if(n>=1e9) return (n/1e9).toFixed(2)+"B"; if(n>=1e6) return (n/1e6).toFixed(2)+"M"; if(n>=1e3) return (n/1e3).toFixed(1)+"K"; return String(n); }
 function fmtSec(s){ s=Number(s)||0; if(s<60) return s.toFixed(0)+"s"; const m=Math.floor(s/60),x=Math.round(s%60); if(m<60) return m+"m "+x+"s"; const h=Math.floor(m/60); return h+"h "+(m%60)+"m"; }
@@ -3392,17 +3434,24 @@ function readableDocumentHTML(content){
   const text = String(content||"").trim();
   if (!text) return `<div class="empty">No full text was stored for this artifact; the mathematical statement above is the readable record.</div>`;
   if (text.startsWith("{") || text.includes("\\documentclass")) return `<pre>${esc(text)}</pre>`;
-  const lines = text.split(/\r?\n/), out = []; let para = [];
+  // Markdown blank lines/list markers inside display math are TeX, not prose.
+  // Preserve each complete block as one node so its delimiters stay paired.
+  const parts = text.split(/(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/g), out = [];
+  let para = [];
   const flush = () => { if (para.length){ out.push(`<p>${mathHTML(para.join(" "))}</p>`); para=[]; } };
-  for (const raw of lines){
-    const line = raw.trim();
-    if (!line){ flush(); continue; }
-    const heading = line.match(/^(#{1,4})\s+(.+)$/);
-    if (heading){ flush(); const level = heading[1].length <= 2 ? "h3" : "h4"; out.push(`<${level}>${mathHTML(heading[2])}</${level}>`); continue; }
-    if (/^(?:[-*]|\d+\.)\s+/.test(line)){ flush(); out.push(`<p>• ${mathHTML(line.replace(/^(?:[-*]|\d+\.)\s+/, ""))}</p>`); continue; }
-    para.push(line);
+  for (let index=0; index<parts.length; index++){
+    if (index % 2){ flush(); out.push(`<div class="math-block">${mathHTML(parts[index])}</div>`); continue; }
+    for (const raw of parts[index].split(/\r?\n/)){
+      const line = raw.trim();
+      if (!line){ flush(); continue; }
+      const heading = line.match(/^(#{1,4})\s+(.+)$/);
+      if (heading){ flush(); const level = heading[1].length <= 2 ? "h3" : "h4"; out.push(`<${level}>${mathHTML(heading[2])}</${level}>`); continue; }
+      if (/^(?:[-*]|\d+\.)\s+/.test(line)){ flush(); out.push(`<p>• ${mathHTML(line.replace(/^(?:[-*]|\d+\.)\s+/, ""))}</p>`); continue; }
+      para.push(line);
+    }
+    flush();
   }
-  flush(); return out.join("");
+  return out.join("");
 }
 async function openArtifact(artifactId){
   if (!artifactId) return;

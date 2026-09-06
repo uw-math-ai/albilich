@@ -228,6 +228,6 @@ let removed = false, failed = false;
 const node = {removeAttribute: key => {removed = key === 'data-math-pending';},
               classList: {add: key => {failed = key === 'math-typeset-failed';}}};
 const document = {querySelectorAll: () => [node]};
-""" + source + "typesetPending(document); assert(removed); assert(failed);"
+""" + source + "typesetPending(document); assert(!removed); assert(failed);"
         subprocess.run([shutil.which("node"), "-e", script], check=True, capture_output=True, text=True)
         self.assertNotIn('.math-tex[data-math-pending="1"] { visibility: hidden;', INDEX_HTML)
