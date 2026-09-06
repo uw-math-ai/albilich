@@ -5469,8 +5469,13 @@ def _bind_parallel_wave_decision(
             "admitted companion is not uniquely selected in its parallel wave"
         )
     comparison_action = dict(action)
-    comparison_action.pop("decision_trace", None)
-    _, trace = select_action_candidate(
+    planner_trace = comparison_action.pop("decision_trace", None)
+    if isinstance(planner_trace, Mapping):
+        # A recursively planned background action already commits its inner
+        # comparison. Preserve the whole planner trace below this wave wrapper,
+        # rather than leaving its old inner digest without the matching tree.
+        comparison_action.pop("base_policy_trace_sha256", None)
+    comparison_action, trace = select_action_candidate(
         [
             ActionCandidate(
                 candidate_id=candidate_id,
@@ -5485,6 +5490,11 @@ def _bind_parallel_wave_decision(
             "the dispatched companion; the embedded parallel_wave_admission records "
             "the complete materialized wave comparison"
         ),
+        nested_policy_traces=(
+            {candidate_id: planner_trace}
+            if isinstance(planner_trace, Mapping)
+            else None
+        ),
     )
     trace["parallel_wave_admission"] = dict(wave_admission)
     trace["parallel_wave_candidate_id"] = candidate_id
@@ -5494,6 +5504,12 @@ def _bind_parallel_wave_decision(
     comparison_action["decision_trace"] = bind_dispatched_action(
         comparison_action, trace
     )
+    trace_errors = decision_trace_errors(comparison_action["decision_trace"])
+    if trace_errors:
+        raise RuntimeError(
+            "invalid companion parallel-wave decision trace: "
+            + "; ".join(trace_errors)
+        )
     return comparison_action
 
 
