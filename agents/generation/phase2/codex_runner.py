@@ -3950,6 +3950,21 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=5)
 
 
+def _proc_status_rss_kb(status: str) -> Optional[int]:
+    for line in status.splitlines():
+        if line.startswith("VmRSS:"):
+            fields = line.split()
+            if (
+                len(fields) != 3
+                or not fields[1].isascii()
+                or not fields[1].isdigit()
+                or fields[2] != "kB"
+            ):
+                raise ValueError("invalid procfs VmRSS")
+            return int(fields[1])
+    return None
+
+
 def _process_tree_rss_mb(root_pid: int) -> float:
     """Sample RSS, allowing a bounded grace for thread-group exit races."""
     for attempt in range(3):
@@ -3962,7 +3977,7 @@ def _process_tree_rss_mb(root_pid: int) -> float:
 
 
 def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
-    """Return None only for an exiting group with potentially live threads."""
+    """Return None for an exiting group whose surviving RSS is not yet readable."""
     if root_pid <= 0:
         return 0.0
     proc_root = Path("/proc")
@@ -4011,27 +4026,25 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
             # release_task() can already have decremented this to zero while
             # the final procfs status read is in flight.
             no_live_siblings = thread_counts in ([["0"]], [["1"]])
+            process_rss_kb = None
+            needs_sibling_rss = False
             if process_state in {"Z", "X", "x"}:
-                # A dead thread-group leader can leave live sibling threads.
-                # Do not mistake that group's unreadable memory for zero.
-                if not no_live_siblings:
-                    return None
-                continue
-            rss_observed = False
-            for line in status.splitlines():
-                if line.startswith("VmRSS:"):
-                    fields = line.split()
-                    try:
-                        rss_kb += int(fields[1])
-                    except (IndexError, ValueError):
-                        return RESOURCE_SAMPLE_FAIL_CLOSED_MB
-                    rss_observed = True
-                    break
-            if not rss_observed:
+                if no_live_siblings:
+                    continue
+                # pthread_exit() can leave the leader dead while sibling
+                # threads keep running indefinitely. Their shared address
+                # space is still measurable through task/<tid>/status.
+                needs_sibling_rss = True
+            else:
+                try:
+                    process_rss_kb = _proc_status_rss_kb(status)
+                except ValueError:
+                    return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+            if process_rss_kb is None and not needs_sibling_rss:
                 # exit_mm() releases the address space before exit_notify()
                 # marks the task a zombie. In that interval status can still
-                # say R/S without VmRSS. Confirm PF_EXITING (linux/sched.h)
-                # and a single-thread task; other missing-RSS cases fail closed.
+                # say R/S without VmRSS. Confirm PF_EXITING (linux/sched.h);
+                # other missing-RSS cases fail closed.
                 try:
                     stat_tail = (process_root / "stat").read_text(
                         encoding="utf-8", errors="strict"
@@ -4043,9 +4056,10 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
                     return RESOURCE_SAMPLE_FAIL_CLOSED_MB
                 if not exiting:
                     return RESOURCE_SAMPLE_FAIL_CLOSED_MB
-                if not no_live_siblings:
-                    return None
-                # It has zero RSS, but enumerate any children not yet reparented.
+                needs_sibling_rss = not no_live_siblings
+                # Single exiting tasks have zero RSS, but may still have
+                # children not yet reparented. Groups need a live task sample.
+            rss_kb += process_rss_kb or 0
             # Linux records children per task, not just per thread-group
             # leader. A multithreaded child may fork from any task, so reading
             # only task/<pid>/children misses a real resource-cap bypass.
@@ -4059,6 +4073,19 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
                     observed_tasks += 1
                     if observed_tasks > MAX_TRACKED_PROCESS_TREE_PIDS:
                         return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                    if needs_sibling_rss and process_rss_kb is None:
+                        try:
+                            task_status = (task_entry / "status").read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                            process_rss_kb = _proc_status_rss_kb(task_status)
+                            rss_kb += process_rss_kb or 0
+                        except (FileNotFoundError, ProcessLookupError):
+                            pass
+                        except (OSError, ValueError):
+                            return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                        # All threads share one address space: use the first
+                        # readable RSS once, but inspect every task's children.
                     try:
                         child_text = (task_entry / "children").read_text(
                             encoding="ascii", errors="strict"
@@ -4075,9 +4102,13 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
                         if child_pid not in pids:
                             frontier.append(child_pid)
             except (FileNotFoundError, ProcessLookupError):
+                if needs_sibling_rss and process_rss_kb is None:
+                    return None
                 continue
             except OSError:
                 return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+            if needs_sibling_rss and process_rss_kb is None:
+                return None
         return round(rss_kb / 1024.0, 3) if rss_kb > 0 else 0.0
 
     # Portable fallback for systems without procfs. Every helper has a short

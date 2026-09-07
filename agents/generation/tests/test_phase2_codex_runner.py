@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -71,8 +72,129 @@ class CodexPatchExtractionTests(unittest.TestCase):
             self.assertEqual(1.0, _process_tree_rss_mb(12345))
 
     def test_dead_leader_with_live_threads_does_not_bypass_memory_limit(self) -> None:
-        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "read_text", return_value="State:\tZ (zombie)\nThreads:\t2\n"):
+        with (
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(Path, "read_text", return_value="State:\tZ (zombie)\nThreads:\t2\n"),
+            mock.patch.object(Path, "iterdir", return_value=[Path("/proc/12345/task/12346")]),
+        ):
             self.assertEqual(RESOURCE_SAMPLE_FAIL_CLOSED_MB, _process_tree_rss_mb(12345))
+
+    def test_exited_leader_samples_shared_rss_once_and_keeps_thread_children(self) -> None:
+        for state in ("Z", "X", "R"):
+            with self.subTest(state=state):
+                files = {
+                    "/proc/12345/status": f"State:\t{state}\nThreads:\t3\n",
+                    "/proc/12345/stat": "12345 (exiting leader) R 1 1 1 0 0 4 0 0",
+                    "/proc/12345/task/12345/status": f"State:\t{state}\nThreads:\t3\n",
+                    "/proc/12345/task/12345/children": "",
+                    "/proc/12345/task/12347/status": "State:\tS\nVmRSS:\t2048 kB\n",
+                    "/proc/12345/task/12347/children": "",
+                    "/proc/12345/task/12348/status": "State:\tS\nVmRSS:\t2048 kB\n",
+                    "/proc/12345/task/12348/children": "12346",
+                    "/proc/12346/status": "State:\tS\nThreads:\t1\nVmRSS:\t1024 kB\n",
+                    "/proc/12346/task/12346/children": "",
+                }
+                def read(path, **kwargs):
+                    return files[str(path)]
+                def tasks(path):
+                    tids = (12345, 12347, 12348) if path.parent.name == "12345" else (12346,)
+                    return iter(path / str(tid) for tid in tids)
+                with (
+                    mock.patch.object(Path, "is_dir", return_value=True),
+                    mock.patch.object(Path, "read_text", autospec=True, side_effect=read),
+                    mock.patch.object(Path, "iterdir", autospec=True, side_effect=tasks),
+                ):
+                    self.assertEqual(3.0, _process_tree_rss_mb(12345))
+
+    def test_exited_leader_unreadable_sibling_rss_still_fails_closed(self) -> None:
+        for sibling in (
+            "State:\tS\n",
+            "State:\tS\nVmRSS:\tbad kB\n",
+            "State:\tS\nVmRSS:\t-1024 kB\n",
+            "State:\tS\nVmRSS:\t1024 MB\n",
+            PermissionError("denied"),
+            FileNotFoundError("task exited"),
+        ):
+            with self.subTest(sibling=sibling):
+                def read(path, **kwargs):
+                    if str(path) == "/proc/12345/status":
+                        return "State:\tZ\nThreads:\t2\n"
+                    if path.name == "children":
+                        return ""
+                    if isinstance(sibling, Exception):
+                        raise sibling
+                    return sibling
+                with (
+                    mock.patch.object(Path, "is_dir", return_value=True),
+                    mock.patch.object(Path, "read_text", autospec=True, side_effect=read),
+                    mock.patch.object(Path, "iterdir", return_value=[Path("/proc/12345/task/12346")]),
+                ):
+                    self.assertEqual(RESOURCE_SAMPLE_FAIL_CLOSED_MB, _process_tree_rss_mb(12345))
+
+    def test_disappearing_task_directory_does_not_discard_rss_or_hide_live_siblings(self) -> None:
+        for status, expected in (
+            ("State:\tS\nThreads:\t1\nVmRSS:\t1024 kB\n", 1.0),
+            ("State:\tZ\nThreads:\t2\n", RESOURCE_SAMPLE_FAIL_CLOSED_MB),
+        ):
+            with (
+                self.subTest(status=status),
+                mock.patch.object(Path, "is_dir", return_value=True),
+                mock.patch.object(Path, "read_text", return_value=status),
+                mock.patch.object(Path, "iterdir", side_effect=FileNotFoundError),
+            ):
+                self.assertEqual(expected, _process_tree_rss_mb(12345))
+
+    def test_sibling_rss_sampling_keeps_task_count_bound(self) -> None:
+        def read(path, **kwargs):
+            if str(path) == "/proc/12345/status":
+                return "State:\tZ\nThreads:\t3\n"
+            if path.name == "children":
+                return ""
+            return "State:\tS\nVmRSS:\t1024 kB\n"
+        with (
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(Path, "read_text", autospec=True, side_effect=read),
+            mock.patch.object(Path, "iterdir", return_value=[
+                Path("/proc/12345/task/12346"), Path("/proc/12345/task/12347"),
+            ]),
+            mock.patch("agents.generation.phase2.codex_runner.MAX_TRACKED_PROCESS_TREE_PIDS", 1),
+        ):
+            self.assertEqual(RESOURCE_SAMPLE_FAIL_CLOSED_MB, _process_tree_rss_mb(12345))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux procfs")
+    def test_exited_leader_with_live_thread_does_not_trip_aggregate_governor(self) -> None:
+        script = (
+            "import ctypes,threading,time\n"
+            "ready=threading.Event()\n"
+            "def worker():\n"
+            " memory=bytearray(8*1024*1024)\n"
+            " ready.set(); time.sleep(30)\n"
+            "threading.Thread(target=worker).start()\n"
+            "ready.wait(10); ctypes.CDLL(None).pthread_exit(None)\n"
+        )
+        process = subprocess.Popen([sys.executable, "-c", script])
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                status = Path(f"/proc/{process.pid}/status").read_text()
+                if "State:\tZ" in status and "Threads:\t2" in status:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("thread-group leader did not exit while its sibling remained alive")
+            governor = AggregateProcessTreeRSSGovernor(512)
+            sibling_stop = threading.Event()
+            governor.observe("other-worker", 40.0, stop_event=sibling_stop)
+            for _ in range(3):
+                sample = _process_tree_rss_mb(process.pid)
+                self.assertGreater(sample, 8.0)
+                self.assertLess(sample, 256.0)
+                self.assertFalse(governor.observe("exited-leader", sample)[1])
+                self.assertFalse(sibling_stop.is_set())
+                time.sleep(0.02)
+        finally:
+            process.kill()
+            process.wait(timeout=5)
 
     def test_dead_task_with_zero_threads_has_zero_rss(self) -> None:
         with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "read_text", return_value="State:\tX (dead)\nThreads:\t0\n"):
@@ -264,7 +386,9 @@ class CodexPatchExtractionTests(unittest.TestCase):
         )
         try:
             self.assertEqual("tree-ready", process.stdout.readline().strip())
-            self.assertGreater(_process_tree_rss_mb(process.pid), 40.0)
+            sample = _process_tree_rss_mb(process.pid)
+            self.assertGreater(sample, 40.0)
+            self.assertLess(sample, 512.0)
         finally:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
