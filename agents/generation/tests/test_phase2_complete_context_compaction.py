@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import unittest
 
 from agents.generation.phase2.context_builder import (
@@ -78,6 +79,76 @@ class CompleteContextCompactionTests(unittest.TestCase):
         source = self.manifest()
         fitted = _fit_manifest(source, max_chars=200_000)
         self.assertEqual(source["workflow_action"], fitted["workflow_action"])
+
+    def test_lossless_serialization_is_tried_before_removing_context(self):
+        source = self.manifest()
+        original = copy.deepcopy(source)
+        compact_size = len(json.dumps(source, ensure_ascii=False, separators=(",", ":")))
+        fitted = _fit_manifest(source, max_chars=compact_size + 300)
+        self.assertEqual("compact_json", fitted.get("context_serialization"))
+        self.assertLessEqual(len(render_manifest(fitted)), compact_size + 300)
+        self.assertEqual(fitted, json.loads(render_manifest(fitted)))
+        for key in original:
+            self.assertEqual(original[key], fitted[key], key)
+        self.assertEqual(original, source)
+
+    def test_optional_root_reconciliation_does_not_crowd_out_local_proof(self):
+        source = self.manifest()
+        source["workflow_action"] = {"mode": "integrate", "target_id": "lemma"}
+        required = {"debt_id": "local", "owner_id": "lemma", "obligation": "Exact blocker. " * 300}
+        optional = {
+            "debt_id": "root-candidate", "owner_id": "root",
+            "obligation": "Optional root reconciliation. " * 2000,
+            "integration_resolution_candidate": True,
+            "candidate_is_not_route_blocker": True,
+            "candidate_for_claim_id": "lemma",
+        }
+        source["debts"] = [required, optional]
+        source["context_coverage"] = {
+            "complete_for_assigned_proof_check": True,
+            "population_counts": {"proof_obligations": 2},
+        }
+        original = copy.deepcopy(source)
+        fitted = _fit_manifest(source, max_chars=50_000)
+        self.assertLessEqual(len(render_manifest(fitted)), 50_000)
+        self.assertEqual([required], fitted["debts"])
+        self.assertEqual(original["artifacts"], fitted["artifacts"])
+        self.assertEqual(original["inferences"], fitted["inferences"])
+        coverage = fitted["context_coverage"]
+        self.assertEqual(1, coverage["omitted_counts"]["proof_obligations"])
+        self.assertEqual(1, coverage["omitted_optional_reconciliation_candidates"])
+        self.assertTrue(coverage["complete_for_assigned_proof_check"])
+        self.assertEqual(original, source)
+
+    def test_candidate_flags_cannot_remove_a_route_local_blocker(self):
+        for owner in ("lemma", "premise", "route", "step"):
+            with self.subTest(owner=owner):
+                source = self.manifest()
+                source["claims"].append({"claim_id": "premise", "statement": "A required premise."})
+                source["debts"] = [{
+                    "debt_id": "required", "owner_id": owner,
+                    "obligation": "Required local blocker. " * 4000,
+                    "integration_resolution_candidate": True,
+                    "candidate_is_not_route_blocker": True,
+                    "candidate_for_claim_id": "lemma",
+                }]
+                with self.assertRaises(ContextTooLargeError):
+                    _fit_manifest(source, max_chars=60_000)
+
+    def test_reconciliation_trimming_is_only_for_nonroot_integration(self):
+        for role, target in (("strict_informal_verifier", "lemma"), ("formal_backend", "lemma"), ("integration_verifier", "root")):
+            with self.subTest(role=role, target=target):
+                source = self.manifest(role)
+                source["target_id"] = target
+                source["debts"] = [{
+                    "debt_id": "root-candidate", "owner_id": "root",
+                    "obligation": "Required in this proof scope. " * 4000,
+                    "integration_resolution_candidate": True,
+                    "candidate_is_not_route_blocker": True,
+                    "candidate_for_claim_id": target,
+                }]
+                with self.assertRaises(ContextTooLargeError):
+                    _fit_manifest(source, max_chars=60_000)
 
 
 if __name__ == "__main__":

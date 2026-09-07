@@ -15,7 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from agents.generation.phase2.graph_policy import active_frontier_pressure, build_graph_policy_index, build_proof_spine, claim_type_label, decomposition_cooldown_active, obvious_duplicate_claim_id, proof_trunk_maturity, root_distance_for_claim_id, route_scoreboard, supersession_index
 from agents.generation.phase2.codex_runner import _materialize_evidence_capsule, _persist_normalized_final_patch, actor_role_for_action, attached_artifact_ids, build_session_prompt, extract_patch_from_text, prepare_session, run_metrics_operation
-from agents.generation.phase2.context_builder import _fit_manifest, _retrieval_card, _select_artifacts, build_context_manifest, build_resume_delta_manifest
+from agents.generation.phase2.context_builder import _fit_manifest, _retrieval_card, _select_artifacts, build_context_manifest, build_resume_delta_manifest, render_manifest
 from agents.generation.phase2.models import SCHEMA_VERSION
 from agents.generation.phase2.patches import apply_operator_patch as apply_patch, apply_system_patch
 from agents.generation.phase2.receipt import build_partial_receipt_inventory, format_partial_receipt_appendix
@@ -8217,7 +8217,7 @@ class Phase2SchedulerDebtSelectionTest(unittest.TestCase):
                 since_revision=0,
             )
 
-        self.assertLessEqual(len(json.dumps(manifest)), 20_000)
+        self.assertLessEqual(len(render_manifest(manifest)), 20_000)
         self.assertEqual(manifest["role_context_policy"]["context_role"], "integration_verifier")
         self.assertIn("packet-target", {row["claim_id"] for row in manifest["claims"]})
         self.assertIn("inf-packet-target", {row["inference_id"] for row in manifest["inferences"]})

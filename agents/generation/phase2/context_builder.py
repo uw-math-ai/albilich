@@ -1815,6 +1815,10 @@ def manifest_hash(manifest: Mapping[str, Any]) -> str:
 
 
 def render_manifest(manifest: Mapping[str, Any]) -> str:
+    if manifest.get("context_serialization") == "compact_json":
+        # Whitespace is not proof evidence. Keep this choice in the manifest so
+        # the size check and the materialized child context use the same format.
+        return json.dumps(manifest, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
     return json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False)
 
 
@@ -6047,6 +6051,9 @@ def _fit_complete_proof_manifest(manifest: Dict[str, Any], *, max_chars: int) ->
         rendered = render_manifest(manifest)
         if len(rendered) <= max_chars:
             return manifest
+        if manifest.get("context_serialization") != "compact_json":
+            manifest["context_serialization"] = "compact_json"
+            continue
         if optional_keys:
             manifest.pop(optional_keys.pop(0), None)
             continue
@@ -6058,6 +6065,8 @@ def _fit_complete_proof_manifest(manifest: Dict[str, Any], *, max_chars: int) ->
                 # mapping while compacting its child-facing presentation.
                 manifest["workflow_action"] = dict(action)
                 manifest["workflow_action"].pop(key)
+            continue
+        if _trim_optional_integration_reconciliation(manifest):
             continue
         instructions = manifest.get("instructions")
         if isinstance(instructions, list) and len(instructions) > 3:
@@ -6076,10 +6085,70 @@ def _fit_complete_proof_manifest(manifest: Dict[str, Any], *, max_chars: int) ->
         )
 
 
+def _trim_optional_integration_reconciliation(manifest: Dict[str, Any]) -> bool:
+    """Drop only an advisory reconciliation candidate, never a proof blocker.
+
+    Ordinary integration appends lexical-overlap suggestions about older root
+    obligations after selecting the complete local proof closure. These are
+    optional extra work, not premises or blockers of the assigned route.
+    Omission leaves the durable obligation open and cannot certify discharge.
+    """
+
+    if not _integration_debts_are_authoritative(manifest):
+        return False
+    target_id = str(manifest.get("target_id") or "")
+    if not target_id or target_id == "root":
+        return False
+    protected_owners = {target_id}
+    protected_owners.update(
+        str(row.get("claim_id") or "")
+        for row in manifest.get("claims", [])
+        if isinstance(row, Mapping) and row.get("claim_id") != "root"
+    )
+    for key, identifier in (("routes", "route_id"), ("inferences", "inference_id")):
+        protected_owners.update(
+            str(row.get(identifier) or "")
+            for row in manifest.get(key, [])
+            if isinstance(row, Mapping)
+        )
+    debts = manifest.get("debts")
+    if not isinstance(debts, list):
+        return False
+    # Candidates are ranked best first; remove the lowest-priority one first.
+    for index in range(len(debts) - 1, -1, -1):
+        row = debts[index]
+        if not isinstance(row, Mapping):
+            continue
+        if not (
+            row.get("integration_resolution_candidate") is True
+            and row.get("candidate_is_not_route_blocker") is True
+            and row.get("candidate_for_claim_id") == target_id
+            and str(row.get("owner_id") or "") not in protected_owners
+        ):
+            continue
+        manifest["debts"] = debts[:index] + debts[index + 1:]
+        coverage = dict(manifest.get("context_coverage") or {})
+        coverage["omitted_optional_reconciliation_candidates"] = (
+            int(coverage.get("omitted_optional_reconciliation_candidates") or 0) + 1
+        )
+        coverage["optional_reconciliation_omission_rule"] = (
+            "Only advisory root-obligation reconciliation candidates were omitted; "
+            "all assigned proof inputs and route-local blockers remain complete. "
+            "Omitted obligations remain open and must not be certified resolved."
+        )
+        manifest["context_coverage"] = coverage
+        return True
+    return False
+
+
 def _refresh_context_coverage(manifest: Dict[str, Any]) -> None:
     coverage = manifest.get("context_coverage")
     if not isinstance(coverage, dict):
         return
+    # _fit_manifest owns a shallow top-level copy; do not mutate its caller's
+    # coverage report while fitting a child-facing presentation.
+    coverage = dict(coverage)
+    manifest["context_coverage"] = coverage
     keys = {
         "claims": ("claims", "claim_id"),
         "routes": ("routes", "route_id"),
