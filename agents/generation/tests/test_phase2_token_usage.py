@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -24,6 +25,7 @@ from agents.generation.phase2.codex_runner import (
     _codex_child_env,
     _should_suppress_child_log_line,
     _stale_retry_timeout_seconds,
+    _RSSSamplingFailure,
     execute_session,
     parse_codex_session_usage,
     prepare_session,
@@ -719,6 +721,56 @@ class Phase2TokenUsageTest(unittest.TestCase):
             self.assertTrue(result["preflight_repair"]["attempted"])
             self.assertIn("not valid Albilich patch JSON", result["preflight_repair"]["errors_before"][0])
             self.assertEqual(result["preflight_repair"]["errors_after"], [])
+
+    def test_repair_sampling_failure_is_visible_and_not_reported_as_measured_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_codex = root / "fake_codex.py"
+            repaired_patch = {
+                "schema_version": SCHEMA_VERSION,
+                "problem_id": "repair-rss-diagnostic",
+                "base_revision": 0,
+                "actor_role": "researcher",
+                "target_id": "root",
+                "operations": [{"op": "attach_artifact", "artifact_id": "repaired-note", "artifact_type": "proof_dossier", "content": "A repaired note."}],
+            }
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib,sys,time\n"
+                "out=pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1])\n"
+                "marker=pathlib.Path(__file__).with_suffix('.state')\n"
+                "if not marker.exists():\n"
+                " print('session id: 019ef5aa-0000-7000-9000-jsonfix001',flush=True)\n"
+                " out.write_text('malformed patch'); marker.write_text('repair')\n"
+                "else:\n"
+                f" out.write_text({json.dumps(json.dumps(repaired_patch))}); time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            store = ProofStateStore("repair-rss-diagnostic", generation_root=root / "generation")
+            store.init_problem("Prove the target theorem.")
+            action = {"mode": "prove", "target_id": "root"}
+            plan = prepare_session(store, action)
+            first_pid = None
+            def sample(pid):
+                nonlocal first_pid
+                if first_pid is None:
+                    first_pid = pid
+                if pid == first_pid:
+                    return 24.0
+                return _RSSSamplingFailure("children_read_error", pid=pid, path=f"/proc/{pid}/task/{pid}/children", error="unreadable")
+            governor = AggregateProcessTreeRSSGovernor(512)
+            with mock.patch("agents.generation.phase2.codex_runner._process_tree_rss_mb", side_effect=sample):
+                result = execute_session(store, action, plan, codex_bin=str(fake_codex), timeout_sec=200, enforce_backend_contract=False, aggregate_rss_governor=governor, stop_event=threading.Event())
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("resource_limit", result["failure_kind"])
+            self.assertIn("RSS sampling failed", result["patch_error"])
+            self.assertIn("children_read_error", result["patch_error"])
+            self.assertIn("RSS sampling failed", result["preflight_repair"]["resource_error"])
+            self.assertEqual("preflight_repair", result["memory_sampling_failures"][0]["phase"])
+            self.assertEqual(24.0, result["peak_memory_mb"])
+            self.assertEqual(24.0, result["observed_aggregate_peak_memory_mb"])
+            self.assertTrue(governor.snapshot()["tripped"])
 
     def test_default_codex_retry_stall_timeout_is_short(self) -> None:
         old_stale = os.environ.get("ALBILICH_CODEX_STALE_RETRY_SECONDS")

@@ -119,6 +119,34 @@ DEFAULT_CODEX_BIN_FALLBACKS = (
 )
 
 
+class _RSSSamplingFailure(float):
+    """Keep the fail-closed numeric contract without pretending it is RSS."""
+
+    def __new__(cls, reason: str, *, pid: int = 0, path: str = "", error: str = ""):
+        sample = super().__new__(cls, RESOURCE_SAMPLE_FAIL_CLOSED_MB)
+        sample.diagnostic = {
+            "reason": reason,
+            "pid": pid,
+            "path": path,
+            "error": error[:500],
+        }
+        return sample
+
+
+def _rss_sampling_diagnostic(sample: float) -> Dict[str, Any]:
+    if isinstance(sample, _RSSSamplingFailure):
+        return dict(sample.diagnostic)
+    if sample == RESOURCE_SAMPLE_FAIL_CLOSED_MB:
+        return {"reason": "legacy_sampling_failure", "pid": 0, "path": "", "error": ""}
+    return {}
+
+
+def _rss_sampling_failure_detail(diagnostic: Mapping[str, Any]) -> str:
+    return "RSS sampling failed (not a measured memory excess): " + json.dumps(
+        dict(diagnostic), sort_keys=True, ensure_ascii=True
+    )
+
+
 class AggregateProcessTreeRSSGovernor:
     """Conservatively bound aggregate local child-process memory.
 
@@ -146,6 +174,7 @@ class AggregateProcessTreeRSSGovernor:
         self._stop_events: dict[str, threading.Event] = {}
         self._tripped = False
         self._peak_mb = 0.0
+        self._sampling_failures: dict[str, Dict[str, Any]] = {}
 
     def observe(
         self,
@@ -163,8 +192,16 @@ class AggregateProcessTreeRSSGovernor:
             raise ValueError("aggregate RSS observation must be finite and nonnegative") from exc
         if current < 0.0 or current != current or current == float("inf"):
             raise ValueError("aggregate RSS observation must be finite and nonnegative")
+        diagnostic = _rss_sampling_diagnostic(current_rss_mb)
         with self._lock:
-            if current == 0.0:
+            if diagnostic:
+                # Unknown usage still trips every participant immediately,
+                # but must not overwrite measured RSS with a 1-TiB sentinel.
+                self._sampling_failures[participant] = diagnostic
+                self._tripped = True
+                if stop_event is not None:
+                    self._stop_events[participant] = stop_event
+            elif current == 0.0:
                 self._current_mb.pop(participant, None)
                 self._stop_events.pop(participant, None)
             else:
@@ -193,13 +230,18 @@ class AggregateProcessTreeRSSGovernor:
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
-            return {
+            result = {
                 "limit_mb": self.limit_mb,
                 "current_mb": sum(self._current_mb.values()),
                 "peak_mb": self._peak_mb,
                 "participant_count": len(self._current_mb),
                 "tripped": self._tripped,
             }
+            if self._sampling_failures:
+                result["sampling_failures"] = {
+                    key: dict(value) for key, value in self._sampling_failures.items()
+                }
+            return result
 DEFAULT_CODEX_CHILD_EXEC_ARGS = ("--ignore-user-config",)
 DEFAULT_CODEX_CHILD_DISABLED_FEATURES = (
     "apps",
@@ -2619,6 +2661,7 @@ def execute_session(
     process: subprocess.Popen[str] | None = None
     stream_thread: threading.Thread | None = None
     peak_memory_mb = 0.0
+    memory_sampling_failures: list[Dict[str, Any]] = []
     aggregate_current_rss_mb = 0.0
     progress_callback_errors: list[str] = []
     child_output_limit = threading.Event()
@@ -2636,12 +2679,22 @@ def execute_session(
         "enforcement": "supervisor polling plus bounded host capture",
     }
 
+    def record_memory_sample(sample: float, *, phase: str) -> None:
+        nonlocal peak_memory_mb
+        diagnostic = _rss_sampling_diagnostic(sample)
+        if diagnostic:
+            item = {**diagnostic, "phase": phase}
+            if item not in memory_sampling_failures and len(memory_sampling_failures) < 8:
+                memory_sampling_failures.append(item)
+        else:
+            peak_memory_mb = max(peak_memory_mb, sample)
+
     def sample_process_memory() -> tuple[float, float, bool]:
         nonlocal peak_memory_mb, aggregate_current_rss_mb
         current_rss_mb = (
             _process_tree_rss_mb(process.pid) if process is not None else 0.0
         )
-        peak_memory_mb = max(peak_memory_mb, current_rss_mb)
+        record_memory_sample(current_rss_mb, phase="session")
         aggregate_exceeded = False
         if aggregate_rss_governor is not None:
             aggregate_current_rss_mb, aggregate_exceeded = (
@@ -2667,6 +2720,8 @@ def execute_session(
             if aggregate_rss_governor is not None
             else {"peak_mb": 0.0, "limit_mb": 0.0}
         )
+        if snapshot.get("sampling_failures"):
+            return _rss_sampling_failure_detail(snapshot["sampling_failures"])
         return (
             "aggregate child process-tree RSS "
             f"{float(snapshot['peak_mb']):.3f} MB exceeded "
@@ -2836,6 +2891,10 @@ def execute_session(
                             detail = (
                                 "model response exceeded "
                                 f"{MAX_MODEL_RESPONSE_BYTES} bytes"
+                            )
+                        elif _rss_sampling_diagnostic(current_rss_mb):
+                            detail = _rss_sampling_failure_detail(
+                                _rss_sampling_diagnostic(current_rss_mb)
                             )
                         elif current_rss_mb > max_child_rss_mb:
                             detail = (
@@ -3079,6 +3138,7 @@ def execute_session(
                     repair_limit_error = ""
                     while repair_process.poll() is None:
                         repair_rss_mb = _process_tree_rss_mb(repair_process.pid)
+                        record_memory_sample(repair_rss_mb, phase="preflight_repair")
                         repair_aggregate_rss_mb = repair_rss_mb
                         repair_aggregate_exceeded = False
                         if aggregate_rss_governor is not None:
@@ -3101,17 +3161,17 @@ def execute_session(
                             pass
                         if repair_output_limit.is_set() or final_too_large:
                             repair_limit_error = "repair output exceeded its byte limit"
+                        elif _rss_sampling_diagnostic(repair_rss_mb):
+                            repair_limit_error = _rss_sampling_failure_detail(
+                                _rss_sampling_diagnostic(repair_rss_mb)
+                            )
                         elif repair_rss_mb > max_child_rss_mb:
                             repair_limit_error = (
                                 f"repair process tree RSS {repair_rss_mb:.1f} MB "
                                 f"exceeded {max_child_rss_mb:.1f} MB"
                             )
                         elif repair_aggregate_exceeded:
-                            repair_limit_error = (
-                                "aggregate child process-tree RSS "
-                                f"{repair_aggregate_rss_mb:.1f} MB exceeded "
-                                f"{aggregate_rss_governor.limit_mb:.1f} MB"
-                            )
+                            repair_limit_error = aggregate_limit_detail()
                         if repair_limit_error:
                             _terminate_process(repair_process)
                             break
@@ -3158,11 +3218,14 @@ def execute_session(
                     "errors_before": preflight_errors,
                     "errors_after": errors_after,
                     "repair_returncode": repair_process.returncode,
+                    "resource_error": repair_limit_error,
                 }
                 if repaired_patch is not None and not repaired_error:
                     _persist_normalized_final_patch(final_path, repaired_text, repaired_patch)
                     patch = repaired_patch
                     patch_error = ""
+                if repair_limit_error:
+                    patch_error = "\n".join(filter(None, [repair_limit_error, patch_error]))
                 if enforce_backend_contract and not attested_backend_unchanged(
                     backend_attestation
                 ):
@@ -3189,6 +3252,10 @@ def execute_session(
             "peak_mb": peak_memory_mb,
         }
     )
+    if memory_sampling_failures:
+        sampling_error = _rss_sampling_failure_detail(memory_sampling_failures[-1])
+        if sampling_error not in patch_error:
+            patch_error = "\n".join(filter(None, [sampling_error, patch_error]))
     result = {
         "backend": "codex",
         "backend_attestation": backend_attestation,
@@ -3207,6 +3274,7 @@ def execute_session(
             float(aggregate_rss_snapshot["peak_mb"]),
             3,
         ),
+        "memory_sampling_failures": memory_sampling_failures,
         "usage": usage,
         "session_id": session_id,
         "patch": patch,
@@ -3973,7 +4041,7 @@ def _process_tree_rss_mb(root_pid: int) -> float:
             return sample
         if attempt < 2:
             time.sleep(0.01)
-    return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+    return _RSSSamplingFailure("thread_group_exit_unreadable_after_retries", pid=root_pid)
 
 
 def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
@@ -3990,7 +4058,7 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
             if pid in pids:
                 continue
             if len(pids) >= MAX_TRACKED_PROCESS_TREE_PIDS:
-                return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                return _RSSSamplingFailure("process_count_limit", pid=pid)
             process_root = proc_root / str(pid)
             try:
                 status = (process_root / "status").read_text(
@@ -4002,8 +4070,8 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
                 if pid == root_pid:
                     return 0.0
                 continue
-            except (OSError, PermissionError):
-                return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+            except OSError as exc:
+                return _RSSSamplingFailure("status_read_error", pid=pid, path=str(process_root / "status"), error=str(exc))
             pids.add(pid)
             # Exited, unreaped children retain a procfs status entry but no
             # address space (and therefore no VmRSS field). They are normal
@@ -4038,8 +4106,8 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
             else:
                 try:
                     process_rss_kb = _proc_status_rss_kb(status)
-                except ValueError:
-                    return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                except ValueError as exc:
+                    return _RSSSamplingFailure("malformed_rss", pid=pid, path=str(process_root / "status"), error=str(exc))
             if process_rss_kb is None and not needs_sibling_rss:
                 # exit_mm() releases the address space before exit_notify()
                 # marks the task a zombie. In that interval status can still
@@ -4052,10 +4120,10 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
                     exiting = bool(int(stat_tail[6]) & 0x00000004)
                 except (FileNotFoundError, ProcessLookupError):
                     continue
-                except (OSError, UnicodeError, ValueError, IndexError):
-                    return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                except (OSError, UnicodeError, ValueError, IndexError) as exc:
+                    return _RSSSamplingFailure("exit_state_read_error", pid=pid, path=str(process_root / "stat"), error=str(exc))
                 if not exiting:
-                    return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                    return _RSSSamplingFailure("live_process_missing_rss", pid=pid, path=str(process_root / "status"), error=f"state={process_state}, threads={thread_counts}")
                 needs_sibling_rss = not no_live_siblings
                 # Single exiting tasks have zero RSS, but may still have
                 # children not yet reparented. Groups need a live task sample.
@@ -4072,7 +4140,7 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
                         continue
                     observed_tasks += 1
                     if observed_tasks > MAX_TRACKED_PROCESS_TREE_PIDS:
-                        return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                        return _RSSSamplingFailure("task_count_limit", pid=pid, path=str(task_root))
                     if needs_sibling_rss and process_rss_kb is None:
                         try:
                             task_status = (task_entry / "status").read_text(
@@ -4082,8 +4150,8 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
                             rss_kb += process_rss_kb or 0
                         except (FileNotFoundError, ProcessLookupError):
                             pass
-                        except (OSError, ValueError):
-                            return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                        except (OSError, ValueError) as exc:
+                            return _RSSSamplingFailure("sibling_rss_read_error", pid=pid, path=str(task_entry / "status"), error=str(exc))
                         # All threads share one address space: use the first
                         # readable RSS once, but inspect every task's children.
                     try:
@@ -4092,21 +4160,21 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
                         )
                     except (FileNotFoundError, ProcessLookupError):
                         continue
-                    except (OSError, UnicodeError):
-                        return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                    except (OSError, UnicodeError) as exc:
+                        return _RSSSamplingFailure("children_read_error", pid=pid, path=str(task_entry / "children"), error=str(exc))
                     for raw in child_text.split():
                         try:
                             child_pid = int(raw)
-                        except ValueError:
-                            return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                        except ValueError as exc:
+                            return _RSSSamplingFailure("malformed_child_pid", pid=pid, path=str(task_entry / "children"), error=str(exc))
                         if child_pid not in pids:
                             frontier.append(child_pid)
             except (FileNotFoundError, ProcessLookupError):
                 if needs_sibling_rss and process_rss_kb is None:
                     return None
                 continue
-            except OSError:
-                return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+            except OSError as exc:
+                return _RSSSamplingFailure("task_directory_read_error", pid=pid, path=str(task_root), error=str(exc))
             if needs_sibling_rss and process_rss_kb is None:
                 return None
         return round(rss_kb / 1024.0, 3) if rss_kb > 0 else 0.0
@@ -4134,7 +4202,7 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
                     continue
                 if child_pid not in pids:
                     if len(pids) >= MAX_TRACKED_PROCESS_TREE_PIDS:
-                        return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+                        return _RSSSamplingFailure("process_count_limit", pid=pid)
                     pids.add(child_pid)
                     next_frontier.append(child_pid)
         if not next_frontier:
@@ -4147,8 +4215,8 @@ def _sample_process_tree_rss_mb(root_pid: int) -> Optional[float]:
             stderr=subprocess.DEVNULL,
             timeout=2.0,
         )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return RESOURCE_SAMPLE_FAIL_CLOSED_MB
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return _RSSSamplingFailure("ps_rss_read_error", pid=root_pid, error=str(exc))
     rss_kb = 0
     for raw in output.split():
         try:

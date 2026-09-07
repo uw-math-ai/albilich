@@ -23,6 +23,8 @@ from agents.generation.phase2.codex_runner import (
     _progress_interval_seconds,
     _child_max_rss_mb,
     _process_tree_rss_mb,
+    _RSSSamplingFailure,
+    _rss_sampling_diagnostic,
     _read_bounded_text,
     _replace_oversized_model_output,
     _run_id,
@@ -33,6 +35,53 @@ from agents.generation.phase2.codex_runner import (
 
 
 class CodexPatchExtractionTests(unittest.TestCase):
+    def test_sampling_failure_trips_governor_without_fabricating_measured_rss(self) -> None:
+        for sample in (
+            _RSSSamplingFailure("status_read_error", pid=12345, path="/proc/12345/status", error="denied"),
+            RESOURCE_SAMPLE_FAIL_CLOSED_MB,
+        ):
+            with self.subTest(sample=type(sample).__name__):
+                governor = AggregateProcessTreeRSSGovernor(100)
+                sibling_stop, failed_stop = threading.Event(), threading.Event()
+                governor.observe("sibling", 40, stop_event=sibling_stop)
+                governor.observe("failed", 10, stop_event=failed_stop)
+                self.assertEqual((50, True), governor.observe("failed", sample, stop_event=failed_stop))
+                self.assertTrue(sibling_stop.is_set())
+                self.assertTrue(failed_stop.is_set())
+                snapshot = governor.snapshot()
+                self.assertEqual(50, snapshot["peak_mb"])
+                self.assertEqual(_rss_sampling_diagnostic(sample), snapshot["sampling_failures"]["failed"])
+                governor.release("failed")
+                self.assertTrue(governor.snapshot()["tripped"])
+                self.assertIn("failed", governor.snapshot()["sampling_failures"])
+                later_stop = threading.Event()
+                self.assertTrue(governor.observe("later", 1, stop_event=later_stop)[1])
+                self.assertTrue(later_stop.is_set())
+
+    def test_procfs_sampling_error_retains_bounded_reason_and_path(self) -> None:
+        with (
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(Path, "read_text", side_effect=PermissionError("denied" * 200)),
+        ):
+            sample = _process_tree_rss_mb(12345)
+        self.assertEqual(RESOURCE_SAMPLE_FAIL_CLOSED_MB, sample)
+        diagnostic = _rss_sampling_diagnostic(sample)
+        self.assertEqual("status_read_error", diagnostic["reason"])
+        self.assertEqual("/proc/12345/status", diagnostic["path"])
+        self.assertEqual(12345, diagnostic["pid"])
+        self.assertEqual(500, len(diagnostic["error"]))
+        with mock.patch("agents.generation.phase2.codex_runner._sample_process_tree_rss_mb", return_value=None), mock.patch("agents.generation.phase2.codex_runner.time.sleep"):
+            sample = _process_tree_rss_mb(12345)
+        self.assertEqual("thread_group_exit_unreadable_after_retries", _rss_sampling_diagnostic(sample)["reason"])
+
+    def test_sampling_diagnostics_survive_durable_and_public_execution_projection(self) -> None:
+        from agents.generation.phase2.workflow import _durable_execution_projection, _public_execution
+        failures = [{"reason": "task_directory_read_error", "pid": 12345, "phase": "preflight_repair"}]
+        execution = {"run_id": "rss-test", "memory_sampling_failures": failures}
+        durable = _durable_execution_projection(execution, dispatch_id="dispatch-rss-test")
+        self.assertEqual(failures, durable["memory_sampling_failures"])
+        self.assertEqual(failures, _public_execution(durable)["memory_sampling_failures"])
+
     def test_thread_group_exit_resampling_is_bounded_and_fails_closed(self) -> None:
         sampler = "agents.generation.phase2.codex_runner._sample_process_tree_rss_mb"
         sleep = "agents.generation.phase2.codex_runner.time.sleep"
