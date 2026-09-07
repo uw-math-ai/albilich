@@ -1072,6 +1072,12 @@ def build_context_manifest(
                 "root_consequence", "falsification_example", "failure_modes", "status",
             ],
             "candidate_status_values": sorted(CONCEPTUAL_INVARIANT_STATUSES),
+            "local_lemmas_subsumed_constraint": {
+                "type": "list",
+                "min_items": 2,
+                "applies_to": "every candidate, including rejected and refuted",
+            },
+            "ineligible_candidate_rule": "Do not invent local lemmas to meet the count. Omit candidates with fewer than two genuinely subsumed existing local lemmas from candidate_invariants and describe those discarded ideas in the report body. If no candidate qualifies, attach a research_diagnostic explaining the obstruction instead of an invalid conceptual_invariant_report.",
             "selection_rule": "select only an invariant that subsumes at least two local lemmas and has a concrete falsification test; selected_invariant_id may be none",
         }
         manifest["instructions"].append(

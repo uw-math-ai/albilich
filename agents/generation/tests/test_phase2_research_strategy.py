@@ -1198,6 +1198,12 @@ class Phase2ResearchStrategyTest(unittest.TestCase):
         )
         self.assertIn("attach_artifact.metadata", contract["metadata_rule"])
         self.assertNotIn("complete_local_proof_candidate", contract["candidate_status_values"])
+        self.assertEqual(
+            {"type": "list", "min_items": 2, "applies_to": "every candidate, including rejected and refuted"},
+            contract.get("local_lemmas_subsumed_constraint"),
+        )
+        self.assertIn("Do not invent", contract["ineligible_candidate_rule"])
+        self.assertIn("research_diagnostic", contract["ineligible_candidate_rule"])
 
     def test_cas_mode_manifest_exposes_exact_experiment_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
