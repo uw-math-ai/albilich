@@ -199,13 +199,18 @@ def dependency_closure_ids(
     return sorted(ordered)
 
 
-def dependency_digest(conn: sqlite3.Connection, dependency_ids: Sequence[str]) -> str:
+def dependency_digest(
+    conn: sqlite3.Connection,
+    dependency_ids: Sequence[str],
+    *,
+    status_overrides: Mapping[str, str] | None = None,
+) -> str:
     payload: list[Dict[str, Any]] = []
     for key in sorted(set(str(item) for item in dependency_ids if str(item))):
         kind, separator, identifier = key.partition(":")
         if not separator:
             continue
-        status = _entity_status(conn, kind, identifier)
+        status = (status_overrides or {}).get(key, _entity_status(conn, kind, identifier))
         payload.append(
             {
                 "entity": key,
@@ -214,6 +219,85 @@ def dependency_digest(conn: sqlite3.Connection, dependency_ids: Sequence[str]) -
             }
         )
     return _digest(payload)
+
+
+def rebase_dependency_lifecycle_bindings(
+    conn: sqlite3.Connection,
+    *,
+    previous_state: Mapping[str, Sequence[Mapping[str, Any]]],
+    applied_revision: int,
+) -> None:
+    """Preserve existing reviews across validated, lifecycle-only promotions.
+
+    Version-one dependency digests include a claim's lifecycle status.  An
+    integration promotion therefore changes that digest without changing the
+    reviewed mathematics.  Rebase only if the old digest is exactly reproduced
+    by restoring the promoted claims' previous statuses, with every subject and
+    all other statuses left current.  The normal invariant gate still checks
+    the integration certificate.  The enclosing patch journals these metadata
+    changes; neither the original review identity nor its bound revision moves.
+    """
+
+    promoted: dict[str, str] = {}
+    integrated = {
+        str(row["claim_id"]): str(row["validation_status"])
+        for row in conn.execute(
+            "SELECT claim_id, validation_status FROM claims WHERE lifecycle_status='integrated'"
+        )
+    }
+    for before in previous_state.get("claims", []):
+        validation = str(before.get("validation_status") or "")
+        if validation not in {"informally_verified", "formally_verified"} or before.get("lifecycle_status") == "integrated":
+            continue
+        claim_id = str(before["claim_id"])
+        if integrated.get(claim_id) == validation:
+            promoted[f"claim:{claim_id}"] = validation
+    if not promoted:
+        return
+
+    for before in previous_state.get("artifacts", []):
+        if before.get("artifact_type") not in CERTIFICATE_ARTIFACT_TYPES:
+            continue
+        artifact = conn.execute("SELECT * FROM artifacts WHERE artifact_id = ?", (before["artifact_id"],)).fetchone()
+        if artifact is None or artifact["sha256"] != before["sha256"]:
+            continue
+        old_metadata = json_loads(before["metadata_json"], {})
+        metadata = json_loads(artifact["metadata_json"], {})
+        old_bindings = old_metadata.get("host_certificate_bindings", {})
+        bindings = metadata.get("host_certificate_bindings", {})
+        changed = False
+        for key, binding in bindings.items():
+            if not isinstance(binding, Mapping) or binding != old_bindings.get(key) or binding.get("binding_version") != 1:
+                continue
+            dependencies = binding.get("dependency_entity_ids")
+            if not isinstance(dependencies, list) or not set(dependencies).intersection(promoted):
+                continue
+            kind, _, identifier = key.partition(":")
+            old_digest = str(binding.get("dependency_digest") or "")
+            if (
+                binding.get("artifact_sha256") != artifact["sha256"]
+                or binding.get("subject_digest") != entity_subject_digest(conn, kind, identifier)
+                or not _binding_status_is_current(conn, kind, identifier, str(binding.get("certified_status") or ""))
+                or old_digest != dependency_digest(conn, dependencies, status_overrides=promoted)
+            ):
+                continue
+            new_digest = dependency_digest(conn, dependencies)
+            if new_digest == old_digest:
+                continue
+            bindings[key] = {
+                **binding,
+                "dependency_digest": new_digest,
+                "dependency_lifecycle_rebases": [
+                    *binding.get("dependency_lifecycle_rebases", []),
+                    {"revision": applied_revision, "previous_dependency_digest": old_digest,
+                     "dependency_digest": new_digest,
+                     "claim_ids": sorted(item.partition(":")[2] for item in set(dependencies).intersection(promoted))},
+                ],
+            }
+            changed = True
+        if changed:
+            conn.execute("UPDATE artifacts SET metadata_json = ? WHERE artifact_id = ?",
+                         (json_dumps(metadata), artifact["artifact_id"]))
 
 
 def bind_new_certificates(

@@ -81,6 +81,7 @@ from .certificates import (
     entity_subject_digest,
     invalidate_dependents,
     invalidate_stale_refuted_obligations,
+    rebase_dependency_lifecycle_bindings,
 )
 from .receipt import compile_latex_artifact, format_partial_receipt_appendix, receipt_appendix_present, write_latex_pdf_sidecars
 from .research_intelligence import validate_state_independent_artifact_metadata
@@ -1761,6 +1762,9 @@ def apply_patch(
             # they must arrive as explicit operations.
             integration_reconciliations = _reconcile_invalid_integrations(conn)
 
+            rebase_dependency_lifecycle_bindings(
+                conn, previous_state=state_before, applied_revision=current_revision + 1
+            )
             bind_new_certificates(conn, applied_revision=current_revision + 1)
             certificate_revocations = invalidate_stale_refuted_obligations(conn)
 
