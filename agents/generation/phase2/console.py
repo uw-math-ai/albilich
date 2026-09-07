@@ -129,7 +129,8 @@ def _render_console_markdown(payload: Mapping[str, Any]) -> str:
         f"`{snapshot.get('open_blocking_case_count', snapshot.get('blocking_debt_count', 0))}` blocking{complete_record_note}",
         f"- Current token budget window: `{snapshot.get('tokens_budget_window_spent', 0)}` charged, `{snapshot.get('tokens_remaining', 0)}` remaining, `{snapshot.get('tokens_reserved_verification', 0)}` reserved",
         f"- Lifetime charged usage: `{snapshot.get('tokens_charged_lifetime', 0)}` tokens (cached input excluded)",
-        f"- Recorded usage: `{snapshot.get('recorded_tokens', 0)}` tokens / `{_format_seconds(snapshot.get('recorded_wall_seconds', 0))}` child wall / `{_format_memory(snapshot.get('recorded_peak_memory_mb', 0))}` peak memory",
+        f"- Run wall time (calendar): `{_format_seconds(snapshot.get('calendar_wall_seconds', 0))}` since initialization, including sleep and pauses; `{_format_seconds(snapshot.get('explicit_paused_seconds', 0))}` explicitly paused",
+        f"- Recorded usage: `{snapshot.get('recorded_tokens', 0)}` tokens / `{_format_seconds(snapshot.get('recorded_wall_seconds', 0))}` summed child runtime / `{_format_memory(snapshot.get('recorded_peak_memory_mb', 0))}` peak memory",
         f"- Stored memory: artifacts `{_format_bytes(snapshot.get('stored_memory_artifacts_bytes', 0))}`, native result `{_format_bytes(snapshot.get('native_result_dir_bytes', 0))}`, downloads `{_format_bytes(snapshot.get('downloaded_source_dir_bytes', 0))}`",
         f"- Latest run: {snapshot.get('latest_run_summary', 'none')}",
         f"- Verifier health: {snapshot.get('verifier_health', 'not yet measured')}",
@@ -465,6 +466,7 @@ def _run_snapshot(
             f"mode=`{latest_run.get('mode', '')}` status=`{latest_run.get('status', '')}`"
         )
     total_usage = _as_mapping(usage_summary.get("total_recorded"))
+    timing = _as_mapping(metrics.get("run_timing"))
     storage = _as_mapping(metrics.get("benchmark_storage"))
     math_yield = _as_mapping(metrics.get("math_yield"))
     root_progress = _as_mapping(metrics.get("root_progress"))
@@ -516,6 +518,10 @@ def _run_snapshot(
         "recorded_tokens": total_usage.get("total_tokens", 0),
         "recorded_cached_tokens": total_usage.get("cached_input_tokens", 0),
         "recorded_wall_seconds": total_usage.get("wall_time_seconds", 0),
+        # Calendar elapsed is not the sum of parallel workers' monotonic clocks.
+        # Keep the durable worker totals separate for usage accounting.
+        "calendar_wall_seconds": timing.get("wall_clock_seconds"),
+        "explicit_paused_seconds": timing.get("paused_seconds", 0),
         "recorded_peak_memory_mb": total_usage.get("peak_memory_mb", 0),
         "stored_memory_artifacts_bytes": storage.get("stored_memory_artifacts_bytes", 0),
         "native_result_dir_bytes": storage.get("native_result_dir_bytes", 0),

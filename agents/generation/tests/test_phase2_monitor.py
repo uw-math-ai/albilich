@@ -34,6 +34,43 @@ from agents.generation.phase2.store import ProofStateStore
 
 
 class MonitorTest(unittest.TestCase):
+    def test_calendar_wall_time_is_fresh_and_not_summed_worker_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            # An older, still-running worker may keep writing legacy snapshots.
+            (store.state_dir / "albilich_run_console.json").write_text(
+                json.dumps({"snapshot": {"calendar_wall_seconds": 1, "recorded_wall_seconds": 99999}}),
+                encoding="utf-8",
+            )
+            with patch.object(store, "get_run_timing", return_value={
+                "wall_clock_seconds": 3600.5, "active_compute_seconds": 9000,
+                "paused_seconds": 120, "pause_count": 1,
+            }):
+                payload = build_monitor_payload(store)
+            self.assertEqual(3600.5, payload["snapshot"]["calendar_wall_seconds"])
+            self.assertEqual(120, payload["snapshot"]["explicit_paused_seconds"])
+            self.assertEqual(0, payload["snapshot"]["recorded_wall_seconds"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for dashboard JavaScript regressions")
+    def test_calendar_wall_kpi_never_falls_back_to_child_sum(self) -> None:
+        start = INDEX_HTML.index("function kpiCard(")
+        source = INDEX_HTML[start:INDEX_HTML.index("function renderTokens(", start)]
+        script = r"""
+const assert = require('node:assert/strict');
+const kpis = {innerHTML: ''};
+const $ = () => kpis;
+const esc = String, num = String, fmtSec = n => `${n}s`, STATUS_CLASS = () => '';
+""" + source + r"""
+renderKpis({calendar_wall_seconds:3600, explicit_paused_seconds:120, recorded_wall_seconds:99999});
+assert(kpis.innerHTML.includes('Run wall time'));
+assert(kpis.innerHTML.includes('3600s'));
+assert(kpis.innerHTML.includes('120s explicitly paused'));
+assert(!kpis.innerHTML.includes('99999s'));
+renderKpis({recorded_wall_seconds:99999});
+assert(!kpis.innerHTML.includes('99999s'), 'legacy snapshot must not relabel summed child time as calendar time');
+"""
+        subprocess.run([shutil.which("node"), "-e", script], check=True, capture_output=True, text=True)
+
     @unittest.skipUnless(shutil.which("node"), "Node.js is needed for dashboard JavaScript regressions")
     def test_math_startup_retry_queue_and_detached_nodes(self) -> None:
         start = INDEX_HTML.index("function typesetPending(")

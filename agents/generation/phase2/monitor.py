@@ -2719,7 +2719,7 @@ function renderKpis(snap){
     kpiCard("Root progress", `${num(snap.root_progress_score||0)}`, `${num(snap.verified_root_adjacent_claim_count||0)} near-root verified · ${num(snap.root_local_blocking_debt_count||0)} blockers`),
     kpiCard("Routes active", `${num(snap.active_route_count||0)}<small>/${num(snap.route_count||0)}</small>`, "proof trunks"),
     kpiCard("Open cases", `${num(openCases)}`, openCaseSub),
-    kpiCard("Child wall", `${fmtSec(snap.recorded_wall_seconds)}`, Number(snap.recorded_peak_memory_mb)>=1048577 ? "peak unavailable (sampling failed)" : `${(Number(snap.recorded_peak_memory_mb)||0).toFixed(0)}MB peak`),
+    kpiCard("Run wall time", snap.calendar_wall_seconds == null ? "—" : fmtSec(snap.calendar_wall_seconds), `${fmtSec(snap.explicit_paused_seconds||0)} explicitly paused · includes sleep/pauses`),
   ].join("");
 }
 
