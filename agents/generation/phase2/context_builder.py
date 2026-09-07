@@ -6009,6 +6009,19 @@ def _fit_manifest(manifest: Dict[str, Any], *, max_chars: int) -> Dict[str, Any]
 def _fit_complete_proof_manifest(manifest: Dict[str, Any], *, max_chars: int) -> Dict[str, Any]:
     """Fit optional framing without deleting any mathematical proof input."""
 
+    # The primary action can carry global planner views even when its companion
+    # action only carries the local verification task.  These duplicate the
+    # advisory research_strategy/proof_spine sections removed below, not the
+    # authoritative claims, inferences, debts, or evidence for the proof check.
+    # Keep an explicit allowlist: interface/preflight contracts, assurance
+    # requirements, evidence ids, and unknown future fields must survive.
+    optional_action_keys = [
+        "minimal_active_debt_frontier",
+        "proof_program_view",
+        "priority_assessment",
+        "case_coverage_map",
+        "root_cut_progress_gate",
+    ]
     optional_keys = [
         "certified_cross_run_memory",
         "branch_summaries",
@@ -6036,6 +6049,15 @@ def _fit_complete_proof_manifest(manifest: Dict[str, Any], *, max_chars: int) ->
             return manifest
         if optional_keys:
             manifest.pop(optional_keys.pop(0), None)
+            continue
+        if optional_action_keys:
+            key = optional_action_keys.pop(0)
+            action = manifest.get("workflow_action")
+            if isinstance(action, Mapping) and key in action:
+                # Never mutate the admitted dispatch action through a shared
+                # mapping while compacting its child-facing presentation.
+                manifest["workflow_action"] = dict(action)
+                manifest["workflow_action"].pop(key)
             continue
         instructions = manifest.get("instructions")
         if isinstance(instructions, list) and len(instructions) > 3:
