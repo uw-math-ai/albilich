@@ -1,0 +1,26 @@
+# Targeted adversarial probe
+
+The attacked inference is `inf_orthogonal_full_outer_coset_source_closure_rev95`. Its critical interface is
+
+Aut(PΩ(V,Q)) = PΓ(V,Q)
+
+for simple groups of type B_m(q), with q odd and m≥5, and D_m^±(q), with m≥5. A refutation would require an abstract automorphism outside the projective semisimilarity group while all stated rank, characteristic, sign, and simplicity hypotheses remain true.
+
+## Competing structural conjectures
+
+- Rigidity conjecture: outside D_4 triality, every outer automorphism in these families is diagonal, field, or the ordinary D_m graph automorphism, and every such automorphism is induced by a semilinear similarity.
+- Hidden-outer conjecture: some D_m^± group with m≥5, especially in characteristic two or with a two-dimensional anisotropic kernel, possesses an abstract graph-type automorphism not induced by a semilinear similarity.
+
+## Full-hypothesis stress test
+
+The B_m diagram has no nontrivial graph symmetry for m≥5, so its possible diagonal and field automorphisms are already represented by similarities and companion-field semilinearity. For D_m with m≥5, the only Dynkin-diagram symmetry is the ordinary involution interchanging the two terminal nodes; the cited projective A-group theorem places this involution inside the projective semisimilarity group for both signs. The only larger diagram symmetry is the S_3 triality of D_4, but m≥5 excludes it. Field automorphisms are included by definition in Γ(V,Q), while diagonal automorphisms are supplied by the full similarity group. Characteristic-two odd-dimensional B-type groups are not silently included: the route explicitly transfers them to the symplectic family. The dimension bounds also remove the low-rank accidental-isomorphism zone, and simplicity is an explicit hypothesis.
+
+The same attack was carried through the wreath-product composition. If x in X has prime order, the integrated semilinear premise supplies an S^t-conjugator into D wr Sym(t), and that conjugator lies in X because S^t≤X. If X∩(D wr Sym(t)) equalled X, then S^t would lie in D wr Sym(t), forcing each coordinate copy of S into D∩S. But S≤D together with DS=Aut(S) would imply D=Aut(S), contradicting the stated properness of D. Thus no additional failure appears at the intersection/properness interface.
+
+## Result
+
+Status: not_refuted. The hidden-outer conjecture collapses to the excluded D_4 triality case; no example satisfying the full hypotheses was found. The anisotropic-kernel cases do not create a new abstract automorphism type once the cited full-automorphism theorem is assumed. This is not a proof independent of that theorem, but it finds no hypothesis mismatch in its use or in the subsequent wreath-product deduction.
+
+## Outcome-dependent next actions
+
+If an automorphism outside PΓ(V,Q) is later produced for any simple D_m^±(q) with m≥5, the inference should be challenged and sent for counterexample validation. If the cited full-automorphism classification remains intact, this OA interface should not be reopened; adversarial work should instead attack the residual bounded-rank/projective-degree assembly.

@@ -1,0 +1,5 @@
+{
+  "id": "realmath_matharxiv_03",
+  "answer": "\\[\n|\\mathcal{K}_c| = \\begin{cases}\n\\frac{1}{3}\\Bigl(2^{c-3}+2^{\\frac{c-4}{2}}\\Bigr) & \\text{if } c\\equiv 0 \\; (\\mathrm{mod}\\; 4),\\\\[1mm]\n\\frac{1}{3}\\Bigl(2^{c-3}+2^{\\frac{c-3}{2}}\\Bigr) & \\text{if } c\\equiv 1 \\; (\\mathrm{mod}\\; 4),\\\\[1mm]\n\\frac{1}{3}\\Bigl(2^{c-3}+2^{\\frac{c-4}{2}}-1\\Bigr) & \\text{if } c\\equiv 2 \\; (\\mathrm{mod}\\; 4),\\\\[1mm]\n\\frac{1}{3}\\Bigl(2^{c-3}+2^{\\frac{c-3}{2}}+1\\Bigr) & \\text{if } c\\equiv 3 \\; (\\mathrm{mod}\\; 4).\n\\end{cases}\n\\]",
+  "source": "http://arxiv.org/abs/2205.06122v1"
+}

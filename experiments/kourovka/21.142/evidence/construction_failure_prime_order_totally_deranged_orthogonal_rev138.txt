@@ -1,0 +1,21 @@
+# Adversarial attack on the terminal orthogonal common-overgroup interface
+
+## Named target
+This pass attacks the high-dimensional orthogonal component of `claim_terminal_simple_factor_exclusion_rev128`, as used by `inf_root_counterexample_cfsg_terminal_rev128`.
+
+## Structural counterexample attempt
+Specialize the universal wreath assertion to t=1 and an almost simple graph extension X of T=PΩ^+_{2m}(Q). The most dangerous published family consists of totally deranged elements: an element z is totally deranged when its conjugacy class misses every core-free maximal subgroup of X. If z had prime order r and y had a distinct prime order s with yT generating X/T, then no conjugates of z and y could lie in a common proper subgroup. Indeed, a maximal subgroup containing a conjugate of y cannot contain T, hence is core-free, while the class of z misses every core-free maximal subgroup. Such a pair would refute the terminal common-overgroup assertion already for t=1.
+
+## Exact source and hypothesis check
+Scott Harper, “Totally deranged elements of almost simple groups and invariable generating sets,” Journal of the London Mathematical Society 109 (2024), article e12935, DOI 10.1112/jlms.12935, arXiv:2304.10213v2, Theorem 2 on pages 1–2, classifies all totally deranged elements. In the only unbounded-rank orthogonal case, T=PΩ^+_{2m}(Q) with 2m a power of two at least 8, a totally deranged z satisfies: z lies in an inner-diagonal coset times a field automorphism of odd order e; writing Q=Q0^e, one has z^e=su with commuting semisimple and unipotent parts; |s| divides Q0^m-1; |z^e| does not divide 2(Q0^(m/2)+1); |s| does not divide Q0^(m/k)-1 for every prime k dividing 2f but not e; and each prime divisor k of e divides |s|. Harper also proves that totally deranged elements are exactly those lying in no core-free maximal subgroup.
+
+Let |z|=r be prime. The order e of its field component divides r, so e is 1 or r. If e=r, then z^e=1 and hence s=1, whereas Harper’s condition for the prime divisor r of e requires r to divide |s|=1, a contradiction. Thus e=1. If r is the defining characteristic, then s=1; taking k=2 in Harper’s condition is impossible because 2 divides 2f and 1 divides Q^(m/2)-1. If r is not the defining characteristic, then u=1 and |s|=r. Since m is even,
+
+Q^m-1=(Q^(m/2)-1)(Q^(m/2)+1).
+
+The prime r divides Q^m-1. Harper’s k=2 condition excludes r dividing Q^(m/2)-1, while the other order condition excludes r dividing Q^(m/2)+1. This is impossible. Therefore no totally deranged element in this family has prime order. Harper’s other possible family, Sp4(2^f), has bounded rank and is outside the terminal high-dimensional orthogonal regime; all other high-rank orthogonal families have no totally deranged elements at all.
+
+Harper’s Theorem 3 does construct invariable generating pairs {x,x^a} from the orthogonal totally deranged family, but both entries have the same composite order. It therefore does not satisfy either the exact-prime-order or distinct-primes hypotheses of the target.
+
+## Outcome
+Status: not_refuted. The strongest known orthogonal graph-automorphism obstruction cannot produce a counterexample under the target’s full prime-order hypotheses. This is only a failed refutation, not a proof of the terminal interface: absence of a totally deranged prime-order element is pointwise, whereas the target requires two prime-order classes to meet one common proper subgroup after independent socle conjugation. Any surviving counterexample must therefore exploit pairwise incompatibility among maximal-overgroup classes, rather than the failure of one generator to meet every core-free maximal subgroup.

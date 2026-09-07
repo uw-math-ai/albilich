@@ -1,9 +1,9 @@
 # Experiment evidence protocol
 
-Experiment datasets, run outputs, and empirical result reports are not distributed
-with this source tree. The auditor and synthetic regression fixtures remain
-available for validating separately held archives. A source-code checkout alone
-is not evidence of proof-solving performance.
+Only the paper-related experiment archives and the added Problem 21.149 archive
+are distributed with this source tree. The auditor and synthetic regression
+fixtures also support separately held archives. Historical run labels alone
+are not independent evidence of proof-solving performance.
 
 Future archives may be labelled `protocol_validated` only after the machine
 auditor verifies immutable prompts and problem hashes, environment and seed,

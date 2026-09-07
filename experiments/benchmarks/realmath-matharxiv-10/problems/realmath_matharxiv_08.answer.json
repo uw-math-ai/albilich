@@ -1,0 +1,5 @@
+{
+  "id": "realmath_matharxiv_08",
+  "answer": "$$\\mu(G_1+G_2;x)=\\frac{x(x-n_1-n_2)}{(x-n_1)(x-n_2)}\\,\\mu(G_1,x-n_2)\\,\\mu(G_2,x-n_1).$$",
+  "source": "http://arxiv.org/abs/2412.19095v1"
+}

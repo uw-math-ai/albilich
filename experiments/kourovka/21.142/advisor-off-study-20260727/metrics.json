@@ -1,0 +1,38 @@
+{
+  "experiment": "kourovka_problem_21_142_advisor_off_20260727",
+  "date": "2026-07-27",
+  "outcome": "unsolved_at_operator_stop",
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "xhigh",
+  "advisor_enabled": false,
+  "runs": 110,
+  "active_backend_compute_hours": 10.44,
+  "raw_tokens_approx": 54900000,
+  "budget_consumed_tokens_approx": 9670000,
+  "claims_total": 20,
+  "claims_verified": 18,
+  "integrated_routes": 16,
+  "root_concluding_routes": 0,
+  "patch_rejection_rate": 0.08,
+  "role_counts": {
+    "phd_advisor": 0,
+    "researcher": 55,
+    "strict_informal_verifier": 22,
+    "integration_verifier": 19,
+    "villain": 10,
+    "literature_researcher": 4
+  },
+  "baseline": {
+    "outcome": "solved_final",
+    "runs": 80,
+    "active_backend_compute_hours": 6.81,
+    "raw_tokens": 29684464,
+    "budget_consumed_tokens_approx": 6000000,
+    "claims_total": 11,
+    "claims_verified": 10,
+    "root_concluding_routes": 1,
+    "patch_rejection_rate": 0.01,
+    "phd_advisor_runs": 12
+  },
+  "scope_note": "One run per arm. The advisor-off arm was stopped at 1.53 times the baseline solve compute, before its full two-times allowance."
+}

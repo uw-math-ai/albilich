@@ -1,0 +1,19 @@
+{
+  "registry_version": 1,
+  "default_status": "unregistered",
+  "archives": {
+    "aaai27-final-paper": "historical_unvalidated",
+    "benchmarks/realmath-matharxiv-10": "historical_unvalidated",
+    "kourovka/17.91/cas-off-1h": "historical_unvalidated",
+    "kourovka/17.91/cas-on-1h": "historical_unvalidated",
+    "kourovka/20.2": "historical_unvalidated",
+    "kourovka/20.2/advisor-off-5h-20260727": "historical_unvalidated",
+    "kourovka/20.2/psl2-classification": "historical_unvalidated",
+    "kourovka/20.2/psl3-classification": "historical_unvalidated",
+    "kourovka/20.2/psl4-classification": "historical_unvalidated",
+    "kourovka/20.2/psln-revision-610-study": "historical_unvalidated",
+    "kourovka/21.142": "historical_unvalidated",
+    "kourovka/21.142/advisor-off-study-20260727": "historical_unvalidated",
+    "kourovka/21.149": "historical_unvalidated"
+  }
+}

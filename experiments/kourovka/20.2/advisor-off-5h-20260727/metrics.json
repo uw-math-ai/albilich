@@ -1,0 +1,61 @@
+{
+  "experiment": "kourovka_problem_20_2_original_advisor_off_5h_20260727",
+  "date": "2026-07-27",
+  "outcome": "solved_final",
+  "result_kind": "stronger",
+  "result_classification": "full_theorem_solved",
+  "explicit_witness": "PSL(2,7)",
+  "revision": 33,
+  "run_status": "completed",
+  "wall_cap_seconds": 18000,
+  "wall_cap_reached": false,
+  "wall_clock_seconds": 6408.161,
+  "active_backend_compute_seconds": 7699.857,
+  "peak_memory_mb": 288.5,
+  "runs": 18,
+  "input_tokens": 6020677,
+  "cached_input_tokens": 5055232,
+  "output_tokens": 286321,
+  "reasoning_output_tokens": 186839,
+  "total_tokens": 6306998,
+  "remaining_token_budget": 78561395,
+  "reserved_verification_budget": 12000000,
+  "role_counts": {
+    "integration_verifier": 1,
+    "literature_researcher": 1,
+    "phd_advisor": 0,
+    "researcher": 11,
+    "strict_informal_verifier": 2,
+    "villain": 2,
+    "writer": 1
+  },
+  "run_status_counts": {
+    "completed": 15,
+    "patch_rejected": 3
+  },
+  "search_setting_counts": {
+    "disabled": 16,
+    "live": 2
+  },
+  "advisor_audit": {
+    "advisor_enabled": false,
+    "phd_advisor_runs": 0,
+    "advisor_action_mode_runs": 0,
+    "advisor_produced_artifacts": 0,
+    "reallocated_advisor_slots": 1,
+    "reallocated_slot_tokens": 132859,
+    "reallocated_slot_wall_seconds": 314.263
+  },
+  "terminal_graph": {
+    "claims": 4,
+    "verified_claims": 1,
+    "integrated_claims": 1,
+    "routes": 1,
+    "inferences": 1,
+    "active_debts": 3,
+    "blocking_debts": 3,
+    "artifacts": 19,
+    "root_validation_status": "informally_verified",
+    "root_lifecycle_status": "integrated"
+  }
+}

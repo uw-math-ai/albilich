@@ -1,0 +1,5 @@
+{
+  "id": "realmath_matharxiv_02",
+  "answer": "We have $$\\sum_{\\gamma \\in \\Gamma_{5}(PG)} c(f(\\gamma)) \\equiv \\sum_{\\gamma \\in \\Gamma_{6}(PG)} c(f(\\gamma)) \\equiv \\sum_{\\gamma \\in \\Gamma_{9}(PG)} c(f(\\gamma)) \\equiv 1 \\pmod{2},$$ and $$\\sum_{\\gamma \\in \\Gamma_{8}(PG)} c(f(\\gamma)) \\equiv 0 \\pmod{4}.$$",
+  "source": "http://arxiv.org/abs/2205.01013v3"
+}

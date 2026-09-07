@@ -92,15 +92,16 @@ route. It also makes the boundary between “promising,” “strictly verified,
 
 ## Experiment data policy
 
-Experiment datasets, benchmark inputs and outputs, generated proofs, run logs,
-and empirical result reports have been withdrawn from the current source tree.
-Local copies are retained outside Git tracking; prior Git history is unchanged.
-Only runnable demo inputs, synthetic regression fixtures, benchmark tooling, and
-the experiment auditor remain. This release provides no empirical evidence for
-general performance or causal claims. Historical code-review and validation
-notes are dated engineering records, not current experiment results.
+The paper-related archives remain in [`experiments/`](experiments/): the
+ten-case RealMath study, Problem 20.2 and its PSL-family studies, the two
+one-hour Problem 17.91 runs, and Problem 21.142. Problem 21.149 is an additional
+historical archive. The [paper data index](experiments/aaai27-final-paper/)
+records the original paper mappings and identifies the later addition.
+Unrelated experiment data is excluded from Git tracking while local copies
+and prior Git history are retained. Archived outcomes are internal historical
+records, not independently graded general-performance or causal evidence.
 
-Separately held archives can be checked with the experiment auditor.
+The experiment auditor checks the retained archives and separately held data.
 An archive may be promoted to `protocol_validated` only with a complete protocol
 manifest, hashed problem and prompt files, environment and seed records, run and
 event logs, proof snapshot, independent grade, a predeclared stopping rule, and
@@ -159,6 +160,15 @@ native Codex executable; downloading only the main CLI archive is insufficient.
 `attempt` and `run --execute` check the backend before changing proof state.
 The default is GPT-6 Astra (`gpt-6-astra`) with `xhigh` reasoning; explicit
 `--model` and `--reasoning-effort` overrides remain supported.
+
+Astra sessions receive bounded noninteractive-task guidance: preserve the exact
+theorem, return blockers as structured artifacts, and leave parallel dispatch to
+the host. The runner rejects Astra's unsupported `none`/`minimal` efforts before
+starting a child; it does not silently increase effort, budgets, or context size.
+Other models keep their existing prompts. These adaptations follow
+[OpenAI's Astra guidance](https://developers.openai.com/api/docs/guides/latest-model)
+and retain all role, sandbox, and verification gates. They are not a measured
+proof-solving performance claim.
 
 Even with `--no-stop-on-rejection`, three consecutive execution waves containing
 only rejected patches halt in `awaiting_human`, without launching a stop writer.

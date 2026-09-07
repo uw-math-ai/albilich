@@ -1,0 +1,28 @@
+{
+  "experiment": "kourovka_problem_20_2_1_5h_class_run",
+  "date": "2026-07-15",
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "xhigh",
+  "outcome": "solved_final",
+  "result_kind": "stronger",
+  "revision": 44,
+  "wall_clock_seconds": 4566,
+  "active_backend_compute_seconds": 5983.210,
+  "peak_memory_mb": 381.2,
+  "runs": 23,
+  "input_tokens": 6456390,
+  "cached_input_tokens": 5487616,
+  "output_tokens": 258367,
+  "reasoning_output_tokens": 182337,
+  "total_tokens": 6714757,
+  "run_status_counts": {
+    "completed": 21,
+    "patch_rejected": 2
+  },
+  "work_mode_counts": {
+    "cas": 2,
+    "online": 1,
+    "offline": 4,
+    "none": 16
+  }
+}

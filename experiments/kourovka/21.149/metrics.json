@@ -1,0 +1,21 @@
+{
+  "experiment": "kourovka_problem_21_149_dlab_outer_order_automorphism_v45",
+  "archive_status": "historical_unvalidated",
+  "date": "2026-08-27",
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "xhigh",
+  "recorded_outcome": "internally_verified_stronger_theorem",
+  "revision": 225,
+  "runs": 119,
+  "lifecycle_wall_clock_seconds": 45323.681,
+  "active_backend_compute_seconds": 48672.845,
+  "peak_memory_mb": 200,
+  "input_tokens": 72207058,
+  "cached_input_tokens": 63256064,
+  "output_tokens": 1817384,
+  "reasoning_output_tokens": 1084765,
+  "total_tokens": 74024442,
+  "timing_note": "Lifecycle time is creation to the final recorded state update. Active compute sums child-session time and can exceed lifecycle time. Token totals include cached input.",
+  "independently_reverified_for_export": false,
+  "current_engine_replay_performed": false
+}

@@ -20747,6 +20747,15 @@ class ExactIdentityAndArchiveTests(unittest.TestCase):
             fingerprint_text(common + " - b"),
         )
 
+    def test_checked_in_experiment_archives_are_registered_and_not_overclaimed(self) -> None:
+        experiments_root = Path(__file__).resolve().parents[3] / "experiments"
+        result = audit_experiment_archives(experiments_root)
+        self.assertTrue(result["valid"], result["errors"])
+        self.assertTrue(result["archives"])
+        for archive in result["archives"].values():
+            if archive["status"] == "historical_unvalidated":
+                self.assertFalse(archive["general_performance_evidence"])
+
     def test_historical_archive_fixture_is_registered_and_not_overclaimed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

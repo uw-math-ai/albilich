@@ -37,7 +37,7 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python -m unittest discover -v -s agents/generation/tests -p 'test_phase2*.py'
-      # External experiment archives are not shipped. The suite above audits
-      # synthetic archives, including checksum, registration, and evidence gates.
+      - name: Audit retained paper archive labels and checksums
+        run: python -m agents.generation.phase2.experiment_audit
       - name: Validate checked-in JSON files
         run: python -m json.tool agents/generation/phase2/schemas/phase2_patch.schema.json >/dev/null

@@ -1,0 +1,1 @@
+The verified PSL bridge suggests replacing ordinary invariant blocks by nondegenerate form-module blocks. The symplectic candidate is selected and proved in the companion dossier. The unitary candidate is the weakest next bridge with comparable root leverage; orthogonal groups are postponed because their form types and graph cosets introduce additional obligations.

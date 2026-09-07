@@ -1,0 +1,119 @@
+{
+  "source_problem_id": "kourovka/problem_21_149_dlab_outer_order_automorphism_v45",
+  "source_revision": 225,
+  "source_run_status": "completed",
+  "legacy_problem_state_status": "active",
+  "root_validation_status": "informally_verified",
+  "root_lifecycle_status": "integrated",
+  "historical_console_public_status": "solved",
+  "historical_console_relation_to_target": "stronger",
+  "active_blocking_debt_count": 0,
+  "active_minor_debt_count": 10,
+  "archive_status": "historical_unvalidated",
+  "independently_reverified_for_export": false,
+  "current_engine_replay_performed": false,
+  "source_artifacts": {
+    "report.md": {
+      "artifact_id": "final_proof_root_rev216_endpoint_support_lattice_solution",
+      "state_revision": 216,
+      "sha256": "40e7fb69c0ae3229d64881a66a93a47168c6df53a46f4c2918584442d66803a8"
+    },
+    "paper.tex": {
+      "artifact_id": "final_paper_root_rev222_dlab_overgroup_obstruction",
+      "state_revision": 222,
+      "sha256": "d09465a299a6f0cd679ab26a77ede1520e790452256dc74fe046165efe73a8d8"
+    },
+    "evidence/strict_verification_rev211.md": {
+      "artifact_id": "verification_report_root_rev211_endpoint_support_lattice_route",
+      "state_revision": 211,
+      "sha256": "b48ad55da99adee20c939f7e266c5e365ce3decfdc46859954ba169d9fadf26d"
+    },
+    "evidence/root_integration_rev213.md": {
+      "artifact_id": "integration_report_root_rev213_endpoint_support_lattice_route",
+      "state_revision": 213,
+      "sha256": "ddedeac2325d28a52d7565cd5860cc46cbf2cb9fac8305606ff8f2c8ebee17f1"
+    }
+  },
+  "active_debts": [
+    {
+      "debt_id": "writing-lint-L4-SLOP-11-L191-b9b134c136",
+      "owner_type": "artifact",
+      "owner_id": "final_paper_root_rev222_dlab_overgroup_obstruction",
+      "obligation": "L4-SLOP-11: one-sentence paragraph (10 in this document); merge it or develop the topic sentence (line 191) — excerpt: \"The reduction to the germ kernel has two cases.\" — required fix: Merge the one-sentence paragraph at line 191 into an adjacent paragraph, or develop it to 3 or more sentences.",
+      "severity": "minor",
+      "status": "active"
+    },
+    {
+      "debt_id": "writing-lint-L4-SLOP-11-L267-c3b7594ccf",
+      "owner_type": "artifact",
+      "owner_id": "final_paper_root_rev222_dlab_overgroup_obstruction",
+      "obligation": "L4-SLOP-11: one-sentence paragraph (10 in this document); merge it or develop the topic sentence (line 267) — excerpt: \"The carrier calculus determines a point of the source interval from every point of \\(J_0\\). Monotonicity then follows from the availabili...\" — required fix: Merge the one-sentence paragraph at line 267 into an adjacent paragraph, or develop it to 3 or more sentences.",
+      "severity": "minor",
+      "status": "active"
+    },
+    {
+      "debt_id": "writing-lint-L4-SLOP-11-L291-30ea343149",
+      "owner_type": "artifact",
+      "owner_id": "final_paper_root_rev222_dlab_overgroup_obstruction",
+      "obligation": "L4-SLOP-11: one-sentence paragraph (10 in this document); merge it or develop the topic sentence (line 291) — excerpt: \"Define \\(\\pi(y)\\) as the unique point in \\(\\bigcap_n\\overline{L_n}\\).\" — required fix: Merge the one-sentence paragraph at line 291 into an adjacent paragraph, or develop it to 3 or more sentences.",
+      "severity": "minor",
+      "status": "active"
+    },
+    {
+      "debt_id": "writing-lint-L4-SLOP-11-L297-0fb980d7fc",
+      "owner_type": "artifact",
+      "owner_id": "final_paper_root_rev222_dlab_overgroup_obstruction",
+      "obligation": "L4-SLOP-11: one-sentence paragraph (10 in this document); merge it or develop the topic sentence (line 297) — excerpt: \"For one inclusion, refine inside \\(L\\). For the other, take a member of the defining sequence whose closure lies in \\(L\\). The carrier id...\" — required fix: Merge the one-sentence paragraph at line 297 into an adjacent paragraph, or develop it to 3 or more sentences.",
+      "severity": "minor",
+      "status": "active"
+    },
+    {
+      "debt_id": "writing-lint-L4-SLOP-11-L315-b667b337d5",
+      "owner_type": "artifact",
+      "owner_id": "final_paper_root_rev222_dlab_overgroup_obstruction",
+      "obligation": "L4-SLOP-11: one-sentence paragraph (10 in this document); merge it or develop the topic sentence (line 315) — excerpt: \"In this section, we transport a hypothetical ambient conjugator through the homeomorphism supplied by Theorem~\\ref{thm:spatial}. The tran...\" — required fix: Merge the one-sentence paragraph at line 315 into an adjacent paragraph, or develop it to 3 or more sentences.",
+      "severity": "minor",
+      "status": "active"
+    },
+    {
+      "debt_id": "writing-lint-L4-SLOP-11-L357-b22716022f",
+      "owner_type": "artifact",
+      "owner_id": "final_paper_root_rev222_dlab_overgroup_obstruction",
+      "obligation": "L4-SLOP-11: one-sentence paragraph (10 in this document); merge it or develop the topic sentence (line 357) — excerpt: \"Thus \\(vh^{-1}\\) centralizes \\(G\\). Lemma~\\ref{lem:trivial-centralizer} yields \\(v=h\\).\" — required fix: Merge the one-sentence paragraph at line 357 into an adjacent paragraph, or develop it to 3 or more sentences.",
+      "severity": "minor",
+      "status": "active"
+    },
+    {
+      "debt_id": "writing-lint-L4-SLOP-11-L455-ec5bd1a8ed",
+      "owner_type": "artifact",
+      "owner_id": "final_paper_root_rev222_dlab_overgroup_obstruction",
+      "obligation": "L4-SLOP-11: one-sentence paragraph (10 in this document); merge it or develop the topic sentence (line 455) — excerpt: \"which fixes every \\(x_{2m}\\) and gives continuity at \\(0\\).\" — required fix: Merge the one-sentence paragraph at line 455 into an adjacent paragraph, or develop it to 3 or more sentences.",
+      "severity": "minor",
+      "status": "active"
+    },
+    {
+      "debt_id": "writing-lint-L4-SLOP-11-L463-52b5083d13",
+      "owner_type": "artifact",
+      "owner_id": "final_paper_root_rev222_dlab_overgroup_obstruction",
+      "obligation": "L4-SLOP-11: one-sentence paragraph (10 in this document); merge it or develop the topic sentence (line 463) — excerpt: \"preserves the first nontrivial gradient and proves that \\(\\alpha_h\\) is an order automorphism.\" — required fix: Merge the one-sentence paragraph at line 463 into an adjacent paragraph, or develop it to 3 or more sentences.",
+      "severity": "minor",
+      "status": "active"
+    },
+    {
+      "debt_id": "writing-lint-L4-SLOP-11-L496-d9757db946",
+      "owner_type": "artifact",
+      "owner_id": "final_paper_root_rev222_dlab_overgroup_obstruction",
+      "obligation": "L4-SLOP-11: one-sentence paragraph (10 in this document); merge it or develop the topic sentence (line 496) — excerpt: \"This manuscript was generated by the Albilich automated theorem-proving system, its mathematical content was machine-verified as describe...\" — required fix: Merge the one-sentence paragraph at line 496 into an adjacent paragraph, or develop it to 3 or more sentences.",
+      "severity": "minor",
+      "status": "active"
+    },
+    {
+      "debt_id": "writing-lint-L4-SLOP-11-L60-d390f3f658",
+      "owner_type": "artifact",
+      "owner_id": "final_paper_root_rev222_dlab_overgroup_obstruction",
+      "obligation": "L4-SLOP-11: one-sentence paragraph (10 in this document); merge it or develop the topic sentence (line 60) — excerpt: \"In this section, we fix the source terminology and construct the order automorphism used in Theorem~A. The structural facts are separated...\" — required fix: Merge the one-sentence paragraph at line 60 into an adjacent paragraph, or develop it to 3 or more sentences.",
+      "severity": "minor",
+      "status": "active"
+    }
+  ]
+}

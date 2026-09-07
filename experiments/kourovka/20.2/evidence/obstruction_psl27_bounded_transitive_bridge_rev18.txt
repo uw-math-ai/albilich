@@ -1,0 +1,33 @@
+# Offline adversarial audit of the PSL(2,7) interface
+
+## Named interface attacked
+
+Let G=PSL(2,7). The advisor interface asserts that there is a proper subgroup H<G with [G:H] at most 32 such that the faithful transitive coset action of G on G/H has 3-closure properly containing G.
+
+## Full-hypothesis reduction
+
+Every transitive permutation representation of G is equivalent to a coset action on G/H. Because G is nonabelian simple, the core of every proper H is trivial, so every such action is faithful. Conjugate subgroups give equivalent actions. Thus testing every conjugacy class of proper subgroups of index at most 32 tests the exact interface, rather than a shadow based only on degrees or orbit counts.
+
+There are two useful representations of the obligation. In subgroup language it asks for a proper H of bounded index. In permutation/ternary-relation language it asks whether the automorphism group of the coloring of (G/H)^3 by G-orbits strictly contains G. The first representation makes exhaustiveness transparent; the second is exactly the definition of the 3-closure. The round trip is exact because the action is faithful and the computed color-preserving group is the 3-closure of the same coset action.
+
+## Competing structural conjectures
+
+Conjecture A (bounded transitive witness): failure of total 3-closure for PSL(2,7) is already visible in a transitive coset action of degree at most 32.
+
+Conjecture B (low-degree transitive rigidity): every such bounded transitive coset action is 3-closed, and any failure of total 3-closure—if one exists—first appears in a higher-index action or an intransitive diagonal union of coset actions.
+
+The manifest-supplied exhaustive certificate cas_psl27_coset_3closure_sweep_rev16 reports that all eight conjugacy classes of proper subgroups in the required index range were tested and that every resulting exact 3-closure equals G. The associated obstruction_psl27_low_degree_cosets_rev16 records the same complete finite-scope failure. Consequently the supplied evidence supports the bounded part of Conjecture B and obstructs Conjecture A throughout its stated scope. No status transition is proposed here because this villain pass does not validate the computation independently.
+
+## Smallest unsupported hypothesis
+
+To use this sweep to decide the root question one would need the following bounded-transitive replacement principle:
+
+If PSL(2,7) has any faithful permutation representation whose 3-closure properly contains PSL(2,7), then it has such a transitive coset representation of degree at most 32.
+
+Nothing in the manifest proves this principle. Total 3-closure quantifies over arbitrary faithful actions, including intransitive actions and actions of unbounded degree, so the completed transitive sweep cannot establish that PSL(2,7) is totally 3-closed.
+
+## Decisive next bounded attack
+
+A later CAS-mode pass should use GAP and the same eight certified coset actions. For every unordered pair with repetition whose disjoint-union degree is at most 64, form the diagonal action of G on (G/H1) disjoint union (G/H2) and compute its exact 3-closure. A proper closure would give a faithful counterexample to total 3-closure and identify the cross-orbit compatibility geometry to generalize. If all pairs are 3-closed, the bounded-transitive obstruction extends to the first intransitive layer, but still does not prove total 3-closure.
+
+Result: the named degree-at-most-32 transitive interface is obstructed by the supplied exhaustive certificate; the root remains not_refuted.

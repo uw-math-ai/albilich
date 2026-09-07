@@ -1,0 +1,1 @@
+The forward verified terminal-escape criterion was matched against the backward demand for an explicit seed. The selected bridge is now realized by the characteristic-two certificate in the accompanying proof dossier; the remaining root obligation is the second-stage containment for that concrete seed.

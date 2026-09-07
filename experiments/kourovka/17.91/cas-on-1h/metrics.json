@@ -1,0 +1,28 @@
+{
+  "experiment": "kourovka_problem_17_91_cas_on_1h",
+  "date": "2026-07-21",
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "xhigh",
+  "outcome": "certified_partial_progress",
+  "revision": 37,
+  "wall_clock_seconds": 3613,
+  "active_backend_compute_seconds": 5417.175,
+  "peak_memory_mb": 199.1,
+  "runs": 20,
+  "input_tokens": 5031315,
+  "cached_input_tokens": 4079360,
+  "output_tokens": 219582,
+  "reasoning_output_tokens": 151957,
+  "total_tokens": 5250897,
+  "run_status_counts": {
+    "completed": 17,
+    "patch_rejected": 2,
+    "timeout": 1
+  },
+  "work_mode_counts": {
+    "cas": 2,
+    "offline": 7,
+    "none": 11
+  },
+  "cas_total_tokens": 1677508
+}

@@ -40,8 +40,20 @@ agents/verification/logs/
 agents/verification/memory/
 agents/verification/results/
 
-# Experiment data stays local, including historical tracked archives.
-/experiments/
+# Retain only the paper archives and the requested Problem 21.149 addition.
+/experiments/*
+!/experiments/README.md
+!/experiments/archive_status.json
+!/experiments/aaai27-final-paper/
+!/experiments/benchmarks/
+/experiments/benchmarks/*
+!/experiments/benchmarks/realmath-matharxiv-10/
+!/experiments/kourovka/
+/experiments/kourovka/*
+!/experiments/kourovka/17.91/
+!/experiments/kourovka/20.2/
+!/experiments/kourovka/21.142/
+!/experiments/kourovka/21.149/
 /experiment data/
 /benchmark_runs/
 /examples run/
@@ -53,9 +65,6 @@ agents/verification/results/
 !/agents/generation/data/example/example2.md
 /agents/generation/proof_state.sqlite3*
 /scratchpad_claude_continuation.*
-/docs/ablation_phd_advisor_20260725.md
-/docs/ablation_phd_advisor_21_142_20260727.md
-/docs/benchmark_landscape_20260715.md
 /docs/public_sync_plan_20260714.md
 /ops/launch-kourovka-21-31
 
