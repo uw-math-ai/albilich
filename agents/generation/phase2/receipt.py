@@ -862,6 +862,15 @@ def _compile_latex(tex_path: Path, pdf_path: Path) -> Dict[str, str]:
                 "latex_log_path": str(log_path),
             }
         output_pdf = output_directory / f"{source_path.stem}.pdf"
+        # TeX can exit successfully while dropping glyphs. With the default
+        # tracinglostchars setting these warnings appear only in the .log,
+        # not stdout, so an exit-code-only publication gate is insufficient.
+        tex_log = output_directory / f"{source_path.stem}.log"
+        log_bytes = b""
+        if tex_log.is_file():
+            with tex_log.open("rb") as handle:
+                log_bytes = handle.read(MAX_LATEX_LOG_BYTES + 1)
+        missing_glyphs = b"Missing character:" in log_bytes or b"Missing character:" in output
         executable_unchanged = attested_executable_unchanged(attestation)
         output_size_valid = (
             output_pdf.is_file()
@@ -872,6 +881,8 @@ def _compile_latex(tex_path: Path, pdf_path: Path) -> Dict[str, str]:
             and len(output) <= MAX_LATEX_LOG_BYTES
             and output_size_valid
             and executable_unchanged
+            and len(log_bytes) <= MAX_LATEX_LOG_BYTES
+            and not missing_glyphs
         ):
             shutil.copyfile(output_pdf, pdf_path)
             return {
@@ -889,6 +900,14 @@ def _compile_latex(tex_path: Path, pdf_path: Path) -> Dict[str, str]:
         )
         if not executable_unchanged:
             detail += "\npdflatex executable changed during compilation"
+        if missing_glyphs:
+            detail += "\nPDF rejected: missing mathematical or text glyphs.\n"
+            detail += "\n".join(
+                line for line in log_bytes[:MAX_LATEX_LOG_BYTES].decode("utf-8", errors="replace").splitlines()
+                if "Missing character:" in line
+            )
+        if len(log_bytes) > MAX_LATEX_LOG_BYTES:
+            detail += "\npdflatex log exceeded the bounded log limit"
         if len(output) > MAX_LATEX_LOG_BYTES:
             detail += "\npdflatex output exceeded the bounded log limit"
         if output_pdf.exists() and not output_size_valid:

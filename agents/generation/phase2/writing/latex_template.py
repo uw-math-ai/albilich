@@ -82,6 +82,34 @@ _POST_HYPERREF_PACKAGES = {"amsrefs", "cleveref"}
 _HOUSE_HYPERREF = r"\usepackage[colorlinks=true,linkcolor=linkblue,citecolor=linkblue,urlcolor=linkblue]{hyperref}"
 _HOUSE_STRETCH = r"\emergencystretch=1.5em"
 
+# These packages replace the text/math families supplied by newpx. Loading
+# lmodern after newpxmath, for example, leaves newpx symbol slots pointing at
+# Latin Modern fonts: operators and delimiters silently disappear from PDFs.
+_SUPERSEDED_FONT_PACKAGES = {
+    "lmodern", "mathpazo", "mathptmx", "pxfonts", "txfonts", "times",
+    "newtxtext", "newtxmath",
+}
+
+
+def _remove_superseded_fonts(tex: str) -> str:
+    begin = _BEGIN_DOCUMENT_RE.search(tex)
+    if begin is None or _DOCUMENTCLASS_RE.search(tex[:begin.start()]) is None:
+        return tex
+
+    def keep_packages(match: re.Match[str]) -> str:
+        names = [name.strip() for name in match.group("names").split(",")]
+        kept = [name for name in names if name not in _SUPERSEDED_FONT_PACKAGES]
+        if kept == names:
+            return match.group(0)
+        if not kept:
+            return ""
+        options = "[" + match.group("opts") + "]" if match.group("opts") is not None else ""
+        return "\\usepackage" + options + "{" + ",".join(kept) + "}"
+
+    # Include declarations after \title/\newtheorem as well as the usual
+    # rewrite region. Never change mathematical content in the document body.
+    return _USEPACKAGE_RE.sub(keep_packages, tex[:begin.start()]) + tex[begin.start():]
+
 
 def normalize_paper_template(tex: str) -> str:
     """Rewrite ``final_paper`` LaTeX source onto the house template.
@@ -90,6 +118,7 @@ def normalize_paper_template(tex: str) -> str:
     booktabs tables) comes back unchanged. Text outside the preamble region
     and outside ``tabular`` environments is never touched.
     """
+    tex = _remove_superseded_fonts(tex)
     tex = _normalize_preamble(tex)
     tex = _normalize_tables(tex)
     return tex

@@ -46,10 +46,13 @@ class LocalIntegrationContractTests(unittest.TestCase):
         self.assertNotIn("LOCAL INTEGRATION", prompt)
 
     def test_explicit_alignment_audit_remains_an_audit(self) -> None:
-        prompt, policy, _ = self.packet("lemma", root_alignment_audit=True)
+        prompt, policy, contract = self.packet("lemma", root_alignment_audit=True)
         self.assertIn("perform an audit only", prompt)
         self.assertIn("root alignment", policy["summary"])
         self.assertNotIn("LOCAL INTEGRATION", prompt)
+        templates = contract["operation_templates"]
+        self.assertIn("artifact_type=root_alignment_audit", templates[0]["fields"])
+        self.assertFalse(any(row["op"] == "propose_status_transition" for row in templates))
 
     def test_local_integration_preserves_root_debt_and_leaves_scheduler_frontier(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

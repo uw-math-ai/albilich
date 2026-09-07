@@ -77,6 +77,22 @@ def tabular_body(tex: str) -> str:
 
 
 class PreambleNormalizationTest(unittest.TestCase):
+    def test_house_fonts_replace_conflicting_writer_fonts_everywhere_in_preamble(self) -> None:
+        source = normalize_paper_template(BAD_PREAMBLE_PAPER).replace(
+            r"\usepackage{graphicx}", r"\usepackage{lmodern,graphicx}"
+        ).replace(r"\title{A small theorem}", "\\title{A small theorem}\n\\usepackage{mathpazo}")
+        out = normalize_paper_template(source)
+        self.assertNotIn("lmodern", out)
+        self.assertNotIn("mathpazo", out)
+        self.assertIn(r"\usepackage{graphicx}", out)
+        self.assertEqual(source.split(r"\begin{document}")[1], out.split(r"\begin{document}")[1])
+        self.assertEqual(out, normalize_paper_template(out))
+
+    def test_already_house_preamble_cannot_reload_lmodern(self) -> None:
+        house = normalize_paper_template(BAD_PREAMBLE_PAPER)
+        source = house.replace(r"\usepackage{booktabs}", "\\usepackage{lmodern}\n\\usepackage{booktabs}")
+        self.assertNotIn("lmodern", normalize_paper_template(source))
+
     def test_bad_preamble_is_rewritten_to_the_house_template(self) -> None:
         out = normalize_paper_template(BAD_PREAMBLE_PAPER)
         preamble = out[: out.index(r"\begin{document}")]
@@ -209,6 +225,33 @@ class TableNormalizationTest(unittest.TestCase):
 
 
 class NormalizedOutputCompilesTest(unittest.TestCase):
+    def test_missing_glyphs_fail_publication_even_when_tex_exits_zero(self) -> None:
+        if not _find_pdflatex():
+            self.skipTest("pdflatex is not installed")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tex = Path(tmpdir) / "missing.tex"
+            tex.write_text(r"\documentclass{article}\begin{document}\font\bad=cmr10\bad\char200\end{document}")
+            result = compile_latex_artifact(tex, tex.with_suffix(".pdf"))
+            self.assertEqual("compile_failed", result["pdf_status"], result)
+            self.assertIn("Missing character:", Path(result["latex_log_path"]).read_text())
+            self.assertFalse(tex.with_suffix(".pdf").exists())
+
+    def test_normalized_writer_fonts_preserve_math_operator_glyphs(self) -> None:
+        if not _find_pdflatex():
+            self.skipTest("pdflatex is not installed")
+        source = r"""\documentclass{article}
+\usepackage{lmodern}
+\begin{document}
+Inline \(a+b-c\cdot d\backslash E=(x/y)[z]\).
+\[a+b-c\cdot d\backslash E=(x/y)[z].\]
+\end{document}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tex = Path(tmpdir) / "operators.tex"
+            tex.write_text(normalize_paper_template(source))
+            result = compile_latex_artifact(tex, tex.with_suffix(".pdf"))
+            self.assertEqual("compiled", result["pdf_status"], result)
+
     def test_pdflatex_override_survives_restricted_service_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             executable = Path(tmpdir) / "pdflatex"

@@ -1042,6 +1042,57 @@ class WorkflowOutageBreakerTests(unittest.TestCase):
                 )
             self.assertTrue(verify_patch_journal(store)["valid"])
 
+    def test_soft_pause_preserves_finished_child_result_before_parking(self) -> None:
+        import agents.generation.phase2.workflow as workflow_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ProofStateStore("soft-pause-result", generation_root=Path(tmpdir))
+            store.init_problem("Target theorem.")
+
+            def executor(*, action, session_plan, **kwargs):
+                store.request_pause(reason="Finish current work, then park.")
+                return {
+                    **self._failed_execution("soft-pause-result"),
+                    "actor_role": session_plan["actor_role"], "status": "completed",
+                    "returncode": 0, "patch_error": "",
+                    "patch": {
+                        "schema_version": SCHEMA_VERSION, "problem_id": store.problem_id,
+                        "base_revision": session_plan["state_revision"],
+                        "actor_role": session_plan["actor_role"], "target_id": action["target_id"],
+                        "operations": [{"op": "attach_artifact", "artifact_id": "finished-before-pause",
+                            "artifact_type": "research_notebook", "content": "Preserved child work."}],
+                    },
+                }
+
+            with patch.object(workflow_mod, "action_patch_contract_errors", return_value=[]):
+                result = run_workflow(store, steps=2, execute=True, parallel_librarian_verifier=False,
+                    parallel_branches=0, write_on_stop=False, write_console=False, executor=executor)
+            self.assertTrue(result["steps"][0]["patch_outcome"]["accepted"], result["steps"][0])
+            self.assertEqual("paused", store.get_run_status())
+            self.assertTrue(verify_patch_journal(store)["valid"])
+
+    def test_result_drain_rejects_hard_stop_and_completed_pause(self) -> None:
+        import agents.generation.phase2.workflow as workflow_mod
+
+        for control in ("hard", "parked", "resumed", "policy"):
+            with self.subTest(control=control), tempfile.TemporaryDirectory() as tmpdir:
+                store = ProofStateStore("drain-boundary", generation_root=Path(tmpdir))
+                store.init_problem("Target theorem.")
+                head = store.audit_chain_heads()["policy_event_head"]
+                if control == "hard":
+                    store.request_stop(hard=True)
+                else:
+                    store.request_pause()
+                    if control == "policy":
+                        store.set_completion_policy("partial_ok", source="test")
+                    else:
+                        store.set_run_status("paused", source="workflow")
+                        if control == "resumed":
+                            store.resume_run()
+                recovered, errors = workflow_mod._durable_result_recovery_policy_head(store, original_policy_head=head)
+                self.assertEqual("", recovered)
+                self.assertTrue(errors)
+
     def test_durable_result_does_not_override_operator_policy_change(self) -> None:
         import agents.generation.phase2.workflow as workflow_mod
 

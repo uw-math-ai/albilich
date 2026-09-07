@@ -15144,6 +15144,59 @@ def _route_without_inference(state: Mapping[str, Any]) -> Optional[Mapping[str, 
     return routes[0] if routes else None
 
 
+def _root_alignment_audit_is_current(
+    state: Mapping[str, Any], route: Mapping[str, Any]
+) -> bool:
+    """Do not spend another audit on an unchanged local-to-root proof graph.
+
+    This suppresses only periodic maintenance, never ordinary integration or
+    root certification. New root/route evidence or changed dependency claims
+    reopen the audit; unrelated research and mere run-count growth do not.
+    """
+    route_id = str(route.get("route_id") or "")
+    audits = state.get("audit_artifacts", state.get("artifacts", []))
+    audited_at = max(
+        (
+            str(row.get("created_at") or "")
+            for row in audits
+            if row.get("artifact_type") == "root_alignment_audit"
+            and row.get("producer_role") == "integration_verifier"
+            and str(_json_object(row.get("metadata_json")).get("route_id") or "") == route_id
+        ),
+        default="",
+    )
+    if not audited_at:
+        return False
+    claim_ids = {"root", str(route.get("conclusion_claim_id") or "")}
+    routes = state.get("routes", [])
+    inferences = state.get("inferences", [])
+    while True:
+        route_ids = {row["route_id"] for row in routes if row.get("conclusion_claim_id") in claim_ids}
+        selected = [row for row in inferences if row.get("route_id") in route_ids]
+        inference_ids = {row["inference_id"] for row in selected}
+        dependency_ids = {
+            str(row.get("premise_claim_id") or "")
+            for row in state.get("inference_premises", [])
+            if row.get("inference_id") in inference_ids
+        }
+        for row in selected:
+            dependency_ids.update(row.get("premise_claim_ids", []))
+            dependency_ids.update(_json_list(row.get("condition_claim_ids_json")))
+        if dependency_ids <= claim_ids:
+            break
+        claim_ids.update(dependency_ids)
+    subjects = (
+        [row for row in state.get("claims", []) if row.get("claim_id") in claim_ids]
+        + [row for row in routes if row.get("route_id") in route_ids]
+        + selected
+    )
+    return bool(subjects) and all(
+        str(row.get("updated_at") or row.get("created_at") or "")
+        and str(row.get("updated_at") or row.get("created_at") or "") <= audited_at
+        for row in subjects
+    )
+
+
 def _root_alignment_audit_candidates(
     state: Mapping[str, Any],
 ) -> list[Mapping[str, Any]]:
@@ -15160,6 +15213,9 @@ def _root_alignment_audit_candidates(
         routes_by_id[str(score.get("route_id") or "")]
         for score in routes
         if str(score.get("route_id") or "") in routes_by_id
+        and not _root_alignment_audit_is_current(
+            state, routes_by_id[str(score.get("route_id") or "")]
+        )
     ]
 
 

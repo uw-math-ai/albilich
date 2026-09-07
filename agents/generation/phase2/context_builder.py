@@ -2528,6 +2528,16 @@ def _patch_contract(action: Optional[Mapping[str, Any]], role_policy: Mapping[st
             },
             {"op": "add_debt", "fields": ["debt_id", "owner_type", "owner_id", "severity=blocking", "status=active", "obligation"]},
         ]
+    if mode == "integrate" and action.get("root_alignment_audit"):
+        contracts["integration_verifier"] = [
+            {"op": "attach_artifact", "fields": [
+                "artifact_id", "artifact_type=root_alignment_audit", "content",
+                "metadata.claim_id", "metadata.route_id", "metadata.relation_to_root",
+                "metadata.target_statement", "metadata.current_route_statement",
+                "metadata.missing_alignment_evidence", "metadata.hidden_assumptions",
+                "metadata.extra_assumptions", "metadata.recommended_next_action",
+            ]},
+        ]
     operation_templates = list(contracts.get(context_role, contracts["general"]))
     if context_role in {
         "researcher",

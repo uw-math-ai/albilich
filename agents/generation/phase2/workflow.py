@@ -3765,12 +3765,14 @@ def _durable_result_recovery_policy_head(
     *,
     original_policy_head: str,
 ) -> tuple[str, list[str]]:
-    """Allow only crash-stop/start policy events after a durable return.
+    """Allow crash recovery and draining a requested soft pause/stop.
 
     The result was already validated under ``original_policy_head`` before it
     became durable. A truthful workflow-abort transition and the automatic
-    stopped-to-running transition on restart must not invalidate it. Any
-    operator or scheduling-policy change still fails closed.
+    stopped-to-running transition on restart must not invalidate it.
+    A soft request explicitly lets already-dispatched children finish. Allow
+    that result to merge while the request is pending, not after the run has
+    parked or resumed. Hard stops and other policy changes still fail closed.
     """
 
     with store.connect() as conn:
@@ -3829,6 +3831,13 @@ def _durable_result_recovery_policy_head(
         source = str(payload.get("source") or "")
         previous = str(payload.get("from") or "")
         current = str(payload.get("to") or "")
+        if (
+            not waiting_for_restart
+            and previous == "running"
+            and current in {"pause_requested", "stopping"}
+            and payload.get("hard") is False
+        ):
+            continue
         if (
             not waiting_for_restart
             and source == "workflow_exception"

@@ -2933,7 +2933,7 @@ class ProofStateStore:
                     FROM artifacts
                     WHERE artifact_type IN (
                         'audit_subject', 'verification_report', 'integration_report',
-                        'formal_backend_result', 'referee_report'
+                        'formal_backend_result', 'referee_report', 'root_alignment_audit'
                     )
                     ORDER BY state_revision DESC, created_at DESC, artifact_id DESC
                     """
