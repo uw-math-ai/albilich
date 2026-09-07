@@ -551,16 +551,10 @@ def run_workflow(
             return
         action = completed["action"]
         execution = completed["execution"]
-        session_plan = completed["session_plan"]
         owner_entry = completed["owner_entry"]
-        errors = _evidence_boundary_errors(execution, session_plan)
-        patch = execution.get("patch")
-        if isinstance(patch, Mapping):
-            errors.extend(action_patch_contract_errors(action, patch))
-        if errors:
-            outcome: Dict[str, Any] = {"accepted": False, "errors": errors}
-        else:
-            outcome = publish_hmt_sidecar(store, action=action, execution=execution)
+        # Compilation and publication belong to the sidecar thread. Collect
+        # only bookkeeping here, so neither lane waits for the other's work.
+        outcome = completed["publish_outcome"]
         result = {
             "action": dict(action),
             "execution": _public_execution(execution),
@@ -672,13 +666,35 @@ def run_workflow(
                     "patch_error": f"{type(exc).__name__}: {exc}",
                     "usage": {},
                 }
+            if hmt_stop_event.is_set():
+                return
+            with console_lock:
+                owner_entry["hmt_sidecar_status"] = "publishing"
+                write_console_snapshot_locked(force=True)
+            try:
+                errors = _evidence_boundary_errors(execution, session_plan)
+                patch = execution.get("patch")
+                if isinstance(patch, Mapping):
+                    errors.extend(action_patch_contract_errors(action, patch))
+                outcome = (
+                    {"accepted": False, "errors": errors}
+                    if errors
+                    else publish_hmt_sidecar(store, action=action, execution=execution)
+                )
+            except Exception as exc:  # intentional-boundary: publication failure must not abort mathematical research
+                outcome = {"accepted": False, "errors": [f"{type(exc).__name__}: {exc}"]}
             with hmt_lock:
                 hmt_completed = {
                     "action": dict(action),
                     "session_plan": dict(session_plan),
                     "execution": execution,
+                    "publish_outcome": outcome,
                     "owner_entry": owner_entry,
                 }
+            if not hmt_stop_event.is_set():
+                # Do not wait for a possibly hours-long research step to make
+                # the finished paper and publication status visible.
+                collect_hmt_sidecar()
 
         hmt_thread = threading.Thread(
             target=invoke,

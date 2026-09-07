@@ -636,6 +636,64 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
                 result["steps"][0]["hmt_sidecar_status"],
             )
 
+    def test_completed_hmt_publishes_before_research_step_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            self._set_revision(store, 1)
+            research_started = threading.Event()
+            published = threading.Event()
+            observed_during_research = []
+
+            def executor(*, store, action, session_plan, **kwargs):
+                actor_role = str(session_plan["actor_role"])
+                if action.get("periodic_hmt"):
+                    self.assertTrue(research_started.wait(2))
+                    source = store.state_dir / "artifacts/staging/early-hmt.tex"
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_text(HMT_LATEX, encoding="utf-8")
+                    operations = [{
+                        "op": "attach_artifact", "artifact_id": "early-hmt",
+                        "artifact_type": "human_readable_mathematical_text",
+                        "path": str(source), "content_summary": "Cumulative partial result.",
+                    }]
+                else:
+                    research_started.set()
+                    observed_during_research.append(published.wait(5))
+                    operations = [{
+                        "op": "attach_artifact", "artifact_id": "research-after-hmt",
+                        "artifact_type": "source_synthesis_report",
+                        "content": "Research remained active after the HMT was published.",
+                        "content_summary": "Research did not gate HMT publication.",
+                    }]
+                return {
+                    "run_id": f"early-hmt-{actor_role}", "actor_role": actor_role,
+                    "status": "completed", "returncode": 0, "usage": {}, "patch_error": "",
+                    "patch": {
+                        "schema_version": SCHEMA_VERSION, "problem_id": store.problem_id,
+                        "base_revision": session_plan["state_revision"], "actor_role": actor_role,
+                        "target_id": "root", "operations": operations,
+                    },
+                }
+
+            def publish(*args, **kwargs):
+                outcome = publish_hmt_sidecar(*args, **kwargs)
+                if outcome.get("accepted"):
+                    published.set()
+                return outcome
+
+            with (
+                patch("agents.generation.phase2.hmt_sidecar.integrated_claim_count", return_value=10),
+                patch("agents.generation.phase2.workflow.publish_hmt_sidecar", side_effect=publish),
+            ):
+                result = run_workflow(
+                    store, steps=1, execute=True, parallel_librarian_verifier=False,
+                    parallel_branches=0, write_on_stop=False, write_console=False,
+                    executor=_declare_parallel_local_executor(executor),
+                )
+            self.assertEqual([True], observed_during_research)
+            self.assertEqual("early-hmt", read_hmt_catalog(store)[0]["artifact_id"])
+            self.assertEqual("completed", result["steps"][0]["hmt_sidecar_status"])
+
     def test_late_hmt_progress_does_not_resurrect_finished_owner_step(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
             os.environ, {"ALBILICH_HMT_INTEGRATED_CLAIM_INTERVAL": "10"}
@@ -731,7 +789,14 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
             self._set_revision(store, 1)
             hmt_calls = 0
             hmt_finished = threading.Event()
+            hmt_published = threading.Event()
             research_calls = 0
+
+            def publish(*args, **kwargs):
+                outcome = publish_hmt_sidecar(*args, **kwargs)
+                if outcome.get("accepted"):
+                    hmt_published.set()
+                return outcome
 
             def executor(
                 *,
@@ -788,6 +853,10 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
                 if research_calls in {1, 3}:
                     self.assertTrue(hmt_finished.wait(1.0))
                     hmt_finished.clear()
+                if research_calls == 3:
+                    # Compilation is now asynchronous too. Keep research
+                    # active long enough to observe the successful retry.
+                    self.assertTrue(hmt_published.wait(5.0))
                 actor_role = str(session_plan.get("actor_role") or actor_role_for_action(action))
                 artifact_id = f"research-during-hmt-retry-{research_calls}"
                 return {
@@ -815,9 +884,9 @@ class HumanReadableMathematicalTextTest(unittest.TestCase):
                     },
                 }
 
-            with patch(
-                "agents.generation.phase2.hmt_sidecar.integrated_claim_count",
-                return_value=10,
+            with (
+                patch("agents.generation.phase2.hmt_sidecar.integrated_claim_count", return_value=10),
+                patch("agents.generation.phase2.workflow.publish_hmt_sidecar", side_effect=publish),
             ):
                 result = run_workflow(
                     store,

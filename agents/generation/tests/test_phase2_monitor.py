@@ -17,7 +17,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from agents.generation.phase2.cli import _maybe_start_run_dashboard
-from agents.generation.phase2.console import _run_timeline
+from agents.generation.phase2.console import _current_invocation, _run_timeline
 import agents.generation.phase2.monitor as monitor_mod
 from agents.generation.phase2.monitor import (
     INDEX_HTML,
@@ -34,6 +34,43 @@ from agents.generation.phase2.store import ProofStateStore
 
 
 class MonitorTest(unittest.TestCase):
+    def test_console_keeps_hmt_publication_status_and_errors(self) -> None:
+        entries = _current_invocation([{
+            "step": 1, "execution_phase": "completed", "hmt_sidecar_status": "failed",
+            "hmt_sidecar_result": {"publish_outcome": {"accepted": False, "errors": ["HMT LaTeX did not compile"]}},
+        }])
+        self.assertEqual("failed", entries[0]["hmt_sidecar_status"])
+        self.assertEqual(["HMT LaTeX did not compile"], entries[0]["hmt_sidecar_errors"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for dashboard JavaScript regressions")
+    def test_empty_hmt_panel_reports_writer_and_publication_states(self) -> None:
+        start = INDEX_HTML.index("let paperRows =")
+        source = INDEX_HTML[start:INDEX_HTML.index("function publicationStatusLabel(", start)]
+        script = r"""
+const assert = require('node:assert/strict');
+const nodes = {};
+const $ = id => nodes[id] ||= {style:{}, textContent:'', innerHTML:'', disabled:false};
+const esc = String;
+""" + source + r"""
+renderPapers([], [{hmt_sidecar_status:'running'}]);
+assert.match($('paperMeta').textContent, /writer is drafting/);
+assert.equal($('paperFrame').style.display, 'none');
+assert.equal($('paperSelect').disabled, true);
+renderPapers([], [{hmt_sidecar_status:'publishing'}]);
+assert.match($('paperMeta').textContent, /Compiling and publishing/);
+renderPapers([], [{hmt_sidecar_status:'failed', hmt_sidecar_errors:['<script>failure</script>']}]);
+assert.match($('paperMeta').textContent, /publication failed/);
+assert.equal($('paperEmpty').textContent, '<script>failure</script>');
+assert.equal($('paperEmpty').innerHTML, '', 'errors must be inserted as text, not executable HTML');
+renderPapers([{artifact_id:'hmt', pdf_url:'/api/paper?id=hmt', kind:'HMT sidecar paper', source_revision:10}], []);
+assert.equal($('paperFrame').src, '/api/paper?id=hmt');
+assert.equal($('paperFrame').style.display, 'block');
+assert.equal($('paperEmpty').style.display, 'none');
+assert.equal($('paperOpen').href, '/api/paper?id=hmt');
+assert.equal($('paperSelect').disabled, false);
+"""
+        subprocess.run([shutil.which("node"), "-e", script], check=True, capture_output=True, text=True)
+
     def test_calendar_wall_time_is_fresh_and_not_summed_worker_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = self._store(tmpdir)

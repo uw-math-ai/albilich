@@ -571,6 +571,10 @@ def _current_invocation(history: list[Mapping[str, Any]]) -> list[dict[str, Any]
                 "live_session_updates": _live_session_updates(entry),
                 "terminal_classification": entry.get("terminal_classification", ""),
                 "stop_reason": entry.get("stop_reason", ""),
+                "hmt_sidecar_status": entry.get("hmt_sidecar_status", ""),
+                "hmt_sidecar_errors": _as_str_list(
+                    _as_mapping(_as_mapping(entry.get("hmt_sidecar_result")).get("publish_outcome")).get("errors")
+                )[:2],
             }
         )
     return entries

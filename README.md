@@ -148,7 +148,8 @@ Execution requires Linux, `bubblewrap` (`bwrap`), and `prlimit` (util-linux).
 PDF export and the complete test suite also require `pdflatex` and the house
 template packages, including `newpxtext`/`newpxmath`. On Debian/Ubuntu install
 `texlive-latex-base texlive-latex-recommended texlive-latex-extra
-texlive-fonts-recommended texlive-fonts-extra texlive-plain-generic tex-gyre`.
+texlive-fonts-recommended texlive-fonts-extra texlive-plain-generic tex-gyre lmodern`.
+The `lmodern` package supplies `lmodern.sty`; `fonts-lmodern` alone does not.
 On macOS, run the worker **and dashboard in the same Linux VM**. Do not open
 one live SQLite WAL database concurrently from the host and guest; their
 shared-memory and locking mechanisms are not a cross-OS database service.

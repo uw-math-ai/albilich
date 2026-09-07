@@ -3179,13 +3179,25 @@ function renderSession(payload){
 }
 
 function scoreColor(s){ s=Number(s); if(s>0) return "var(--good)"; if(s<0) return "var(--bad)"; return "var(--muted)"; }
-let paperRows = [], selectedPaperId = "", displayedPaperUrl = "";
+let paperRows = [], selectedPaperId = "", displayedPaperUrl = "", hmtDisplayState = {};
 function showSelectedPaper(){
   const paper = paperRows.find(row => row.artifact_id === selectedPaperId);
   const frame = $("paperFrame"), empty = $("paperEmpty"), open = $("paperOpen");
   if (!paper){
     frame.style.display = "none"; empty.style.display = "grid"; open.style.display = "none";
-    $("paperMeta").textContent = "The writer will add a cumulative partial paper at the next HMT milestone.";
+    const status = hmtDisplayState.hmt_sidecar_status || "";
+    const messages = {
+      running: "The HMT writer is drafting the cumulative paper. Research continues independently.",
+      publishing: "The HMT is written. Compiling and publishing its PDF now.",
+      failed: "HMT publication failed. The completed source, if available, is preserved for recovery.",
+      cancelled_on_research_stop: "HMT authoring was interrupted when the research run stopped.",
+      deferred_serial_executor: "HMT authoring is deferred: this executor does not support a parallel writer.",
+      completed: "HMT publication completed, but its PDF is not currently available."
+    };
+    $("paperMeta").textContent = messages[status] || "The writer will add a cumulative partial paper at the next HMT milestone.";
+    empty.textContent = (hmtDisplayState.hmt_sidecar_errors || []).join("; ") ||
+      (status === "running" ? "HMT is being written." : status === "publishing" ? "Preparing the HMT PDF…" : "No compiled HMT PDF yet.");
+    $("paperPrev").disabled = true; $("paperNext").disabled = true; $("paperSelect").disabled = true;
     return;
   }
   const index = paperRows.findIndex(row => row.artifact_id === selectedPaperId);
@@ -3195,9 +3207,11 @@ function showSelectedPaper(){
   $("paperMeta").textContent = `${paper.kind} ${index+1} of ${paperRows.length} · accepted-state revision ${paper.source_revision} · created ${paper.created_at||"—"} · ${paper.artifact_id}`;
   $("paperPrev").disabled = index <= 0; $("paperNext").disabled = index < 0 || index >= paperRows.length-1;
   $("paperSelect").value = selectedPaperId;
+  $("paperSelect").disabled = false;
 }
-function renderPapers(rows){
+function renderPapers(rows, invocations){
   if (!Array.isArray(rows)) return;
+  if (Array.isArray(invocations)) hmtDisplayState = [...invocations].reverse().find(entry => entry.hmt_sidecar_status) || {};
   const previousIds = paperRows.map(row => row.artifact_id).join("|");
   paperRows = rows;
   $("paperCount").textContent = rows.length ? `${rows.length} PDF${rows.length===1?"":"s"}` : "";
@@ -3904,7 +3918,7 @@ async function tick(forceHeavy=false){
     renderPipeline(p, activeStep(p));
     renderResearcherMode(p.researcher_mode_state);
     renderTokens(snap, p.usage_summary || {});
-    renderPapers(p.papers);
+    renderPapers(p.papers, p.current_invocation);
     renderPublicationWorkflow(p.publication_workflow);
     renderSession(p);
     renderSignals(p.parallel_exchange);
