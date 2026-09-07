@@ -40,6 +40,25 @@ agents/verification/logs/
 agents/verification/memory/
 agents/verification/results/
 
+# Experiment data stays local, including historical tracked archives.
+/experiments/
+/experiment data/
+/benchmark_runs/
+/examples run/
+/agents/generation/data/*
+!/agents/generation/data/example.md
+!/agents/generation/data/example/
+/agents/generation/data/example/*
+!/agents/generation/data/example/example1.md
+!/agents/generation/data/example/example2.md
+/agents/generation/proof_state.sqlite3*
+/scratchpad_claude_continuation.*
+/docs/ablation_phd_advisor_20260725.md
+/docs/ablation_phd_advisor_21_142_20260727.md
+/docs/benchmark_landscape_20260715.md
+/docs/public_sync_plan_20260714.md
+/ops/launch-kourovka-21-31
+
 # Zola build output and downloaded theme are ignored by agents/generation/site/.gitignore too.
 agents/generation/site/public/
 agents/generation/site/themes/

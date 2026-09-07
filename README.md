@@ -90,12 +90,17 @@ lemmas and more time attacking the exact statement that would close the best
 route. It also makes the boundary between “promising,” “strictly verified,”
 “integrated,” and “solved” explicit at every stage.
 
-## Experiment archives
+## Experiment data policy
 
-The [`experiments/`](experiments/) tree contains checksum-audited historical
-run records. Its registry marks the current archives as
-`historical_unvalidated`: the files are useful for provenance and case-study
-inspection, but they are not evidence for general performance or causal claims.
+Experiment datasets, benchmark inputs and outputs, generated proofs, run logs,
+and empirical result reports have been withdrawn from the current source tree.
+Local copies are retained outside Git tracking; prior Git history is unchanged.
+Only runnable demo inputs, synthetic regression fixtures, benchmark tooling, and
+the experiment auditor remain. This release provides no empirical evidence for
+general performance or causal claims. Historical code-review and validation
+notes are dated engineering records, not current experiment results.
+
+Separately held archives can be checked with the experiment auditor.
 An archive may be promoted to `protocol_validated` only with a complete protocol
 manifest, hashed problem and prompt files, environment and seed records, run and
 event logs, proof snapshot, independent grade, a predeclared stopping rule, and
@@ -114,7 +119,7 @@ detectable effect, and the stated standard-deviation assumption. The assumption
 and its basis remain scientific inputs rather than facts proved by the auditor.
 Protocol v4 archives remain replayable under their historical, structurally
 validated power declarations, but do not satisfy this stronger v5 guarantee. See
-[`experiments/README.md`](experiments/README.md).
+[`docs/experiment_protocol.md`](docs/experiment_protocol.md).
 
 Scheduler-calibration protocol v6 adds the missing runtime join. Each matched
 workflow condition is a protocol-v3 randomized block assignment tied to the
@@ -128,7 +133,7 @@ complete trace finalization record. Condition-blind graders sign only their
 condition-free grading-artifact manifest and blinded grading attestation; a
 separate execution-trace auditor signs the
 unblinded manifest and completeness statement. This validates an archived design; it does
-not turn the repository's historical runs into scheduler-calibration evidence.
+not itself establish proof-solving performance.
 
 ## Quickstart
 
